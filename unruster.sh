@@ -9,11 +9,18 @@
 #   crate. Findings are about the TARGET crate, not about UnRuster.
 #
 # Usage:
-#   ./unruster.sh <path-to-crate>           # analyze that crate
-#   ./unruster.sh --demo                    # bundled fixture (fires warnings)
-#   ./unruster.sh --self                    # analyze UnRuster's own source
-#   ./unruster.sh --view [path]             # launch egui viewer on collected facts
-#   ./unruster.sh <path> [extra cargo args] # forward extra args to `cargo check`
+#   ./unruster.sh <path>                      # analyze (refresh cache)
+#   ./unruster.sh --view <path>               # launch egui viewer (no refresh)
+#   ./unruster.sh --export <path>             # headless: write unruster-report.md
+#   ./unruster.sh --refresh --view <path>     # refresh, then launch viewer
+#   ./unruster.sh --refresh --export <path>   # refresh, then export report
+#   ./unruster.sh --demo                      # bundled fixture (fires warnings)
+#   ./unruster.sh --self                      # analyze UnRuster's own source
+#
+# Flag rules:
+#   --refresh re-runs the analysis (otherwise --view/--export use cached facts).
+#   With no mode flags, --refresh is implied. Any unrecognized argument is
+#   forwarded to `cargo check` (e.g. --all-features, -p somecrate).
 #
 # Env:
 #   UNRUSTER_PROFILE=release    use release build (default: debug)
@@ -25,20 +32,55 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="${UNRUSTER_PROFILE:-debug}"
 
 usage() {
-    sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
 if [[ $# -eq 0 ]]; then usage 1; fi
 
-VIEW_ONLY=0
-case "$1" in
-    -h|--help) usage 0 ;;
-    --demo)    shift; TARGET="$HERE/tests/fixtures/leaky" ;;
-    --self)    shift; TARGET="$HERE" ;;
-    --view)    shift; VIEW_ONLY=1; TARGET="${1:-$PWD}"; if [[ $# -gt 0 ]]; then shift; fi ;;
-    *)         TARGET="$1"; shift ;;
-esac
+# --- Parse flags ------------------------------------------------------------
+
+REFRESH=0
+VIEW=0
+EXPORT=0
+TARGET=""
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)   usage 0 ;;
+        --refresh)   REFRESH=1; shift ;;
+        --view)      VIEW=1;    shift ;;
+        --export)    EXPORT=1;  shift ;;
+        --demo)      TARGET="$HERE/tests/fixtures/leaky"; shift ;;
+        --self)      TARGET="$HERE"; shift ;;
+        --)          shift; EXTRA_ARGS+=("$@"); break ;;
+        -*)          EXTRA_ARGS+=("$1"); shift ;;
+        *)
+            if [[ -z "$TARGET" ]]; then
+                TARGET="$1"
+            else
+                EXTRA_ARGS+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+# No mode flags → refresh (legacy default).
+if [[ "$VIEW" == 0 && "$EXPORT" == 0 && "$REFRESH" == 0 ]]; then
+    REFRESH=1
+fi
+
+# Default target for --view/--export with no path: CWD.
+if [[ -z "$TARGET" ]]; then
+    if [[ "$VIEW" == 1 || "$EXPORT" == 1 ]]; then
+        TARGET="$PWD"
+    else
+        echo "error: no target path given" >&2
+        usage 1
+    fi
+fi
 
 if [[ -f "$TARGET" && "$(basename "$TARGET")" == "Cargo.toml" ]]; then
     TARGET="$(dirname "$TARGET")"
@@ -99,26 +141,33 @@ if [[ "${UNRUSTER_REBUILD:-0}" == "1" \
     (cd "$HERE" && cargo build --workspace ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"})
 fi
 
-if [[ "$VIEW_ONLY" == "1" ]]; then
+export PATH="$BIN_DIR:$PATH"
+
+# --- Refresh cache (if requested) ------------------------------------------
+
+if [[ "$REFRESH" == 1 ]]; then
+    echo "================================================================" >&2
+    echo "  UnRuster — analyzing: $TARGET" >&2
+    echo "  toolchain (forced):   $CHANNEL"                                  >&2
+    echo "  (findings below describe the target crate, not UnRuster)"        >&2
+    echo "================================================================" >&2
+
+    # Cargo skips rustc re-invocation when its fingerprint cache thinks
+    # nothing changed — and then our RUSTC_WRAPPER never runs and no facts
+    # get refreshed. Touching sources forces a re-check.
+    find "$TARGET/src" -name '*.rs' -exec touch {} + 2>/dev/null || true
+
+    (cd "$TARGET" && cargo unruster ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
+fi
+
+# --- View / export ----------------------------------------------------------
+
+if [[ "$EXPORT" == 1 ]]; then
+    echo "==> exporting report for $TARGET" >&2
+    "$BIN_DIR/unruster-viewer" --export "$TARGET"
+fi
+
+if [[ "$VIEW" == 1 ]]; then
     echo "==> launching viewer on $TARGET" >&2
     exec "$BIN_DIR/unruster-viewer" "$TARGET"
 fi
-
-# --- Run --------------------------------------------------------------------
-
-echo "================================================================" >&2
-echo "  UnRuster — analyzing: $TARGET" >&2
-echo "  toolchain (forced):   $CHANNEL"  >&2
-echo "  (findings below describe the target crate, not UnRuster)"      >&2
-echo "================================================================" >&2
-
-# Cargo skips rustc re-invocation when its fingerprint cache thinks nothing
-# changed — but then our RUSTC_WRAPPER never runs and no facts get refreshed.
-# Touching the source forces a re-check.
-find "$TARGET/src" -name '*.rs' -exec touch {} + 2>/dev/null || true
-
-# Put the bin dir on PATH so `cargo unruster` resolves, and so that
-# `cargo-unruster` finds its sibling `unruster-driver` via current_exe().
-export PATH="$BIN_DIR:$PATH"
-cd "$TARGET"
-exec cargo unruster "$@"

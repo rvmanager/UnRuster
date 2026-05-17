@@ -12,7 +12,7 @@ use rustc_middle::hir::nested_filter;
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::TyCtxt;
 
-use crate::facts::{CallEdge, CrateFacts, FieldDef, FunctionFact, StructFact};
+use crate::facts::{CallEdge, CrateFacts, FieldDef, FunctionFact, StructFact, TypeShape};
 
 pub fn collect<'tcx>(tcx: TyCtxt<'tcx>, facts: &mut CrateFacts) {
     collect_structs(tcx, facts);
@@ -48,6 +48,7 @@ impl<'a, 'tcx> Visitor<'tcx> for StructVisit<'a, 'tcx> {
                     name: f.ident.to_string(),
                     is_public: matches!(f.vis_span.is_dummy(), false)
                         || self.tcx.visibility(f.def_id.to_def_id()).is_public(),
+                    type_shape: type_shape_of(f.ty),
                 })
                 .collect();
             self.facts.structs.push(StructFact {
@@ -123,6 +124,38 @@ fn callee_def_id<'tcx>(
     func: &rustc_middle::mir::Operand<'tcx>,
 ) -> Option<DefId> {
     func.const_fn_def().map(|(did, _)| did)
+}
+
+/// Extract the outer container name and generic-arg names from a HIR type.
+/// Best-effort and pure-HIR; returns `None` for unrecognized shapes.
+fn type_shape_of<'tcx>(ty: &'tcx hir::Ty<'tcx>) -> Option<TypeShape> {
+    let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = &ty.kind else {
+        return None;
+    };
+    let seg = path.segments.last()?;
+    let outer = seg.ident.to_string();
+    let args: Vec<String> = seg
+        .args
+        .map(|ga| {
+            ga.args
+                .iter()
+                .filter_map(|arg| match arg {
+                    hir::GenericArg::Type(t) => {
+                        // `t` is `&Ty<'_, AmbigArg>`; we only need its
+                        // last path segment name, which is shape-identical
+                        // regardless of the AmbigArg marker.
+                        if let hir::TyKind::Path(hir::QPath::Resolved(_, p)) = &t.kind {
+                            p.segments.last().map(|s| s.ident.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(TypeShape { outer, args })
 }
 
 fn module_of(def_path: &str) -> String {

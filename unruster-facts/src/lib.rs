@@ -25,6 +25,12 @@ pub struct CrateFacts {
     pub structs: Vec<StructFact>,
     pub field_accesses: Vec<FieldAccessFact>,
     pub api_leaks: Vec<ApiLeakFact>,
+    /// Per-function rollup of which fields it reads/writes and which
+    /// downstream methods it calls. Computed in the driver so every
+    /// consumer (viewer, CI, LLM tooling) can use it without rebuilding
+    /// it from raw `field_accesses` + `calls`.
+    #[serde(default)]
+    pub function_profiles: Vec<FunctionProfile>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +63,41 @@ pub struct StructFact {
 pub struct FieldDef {
     pub name: String,
     pub is_public: bool,
+    /// Decomposition of the field's declared type (container shape +
+    /// generic arguments). `None` for types we couldn't parse cleanly.
+    #[serde(default)]
+    pub type_shape: Option<TypeShape>,
+}
+
+/// A simplified view of a field's declared type — enough to spot
+/// parallel-container smells like `Vec<NodeContent>` next to
+/// `HashMap<NodeId, ParentEdge>` (both keyed by NodeId).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeShape {
+    /// The outermost container, e.g. `"Vec"`, `"HashMap"`, `"Option"`,
+    /// `"Box"`. For non-container types this is just the type's name.
+    pub outer: String,
+    /// Generic arguments, left to right. For `HashMap<NodeId, X>` this
+    /// is `["NodeId", "X"]`. For `Vec<T>`: `["T"]`. Names are the last
+    /// path segment only, so `crate::foo::Bar` becomes `"Bar"`.
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct FunctionProfile {
+    pub def_path: String,
+    /// Distinct `(struct_def_path, field_name)` pairs this function reads.
+    pub fields_read: Vec<(String, String)>,
+    /// Distinct `(struct_def_path, field_name)` pairs this function writes
+    /// (includes mutable borrows).
+    pub fields_written: Vec<(String, String)>,
+    /// Distinct callees (def_paths) — sorted, deduplicated. Useful for
+    /// "same downstream call set" clustering.
+    pub callees: Vec<String>,
+    /// Suffix of the function's last path segment after the final `_`,
+    /// or the whole name. e.g. `aabb_drag` → `"drag"`, `process` →
+    /// `"process"`. Used by the multi-implementation detector.
+    pub name_suffix: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -7,9 +7,11 @@
 //! per-function syntactic check that also emits an inline rustc warning so
 //! the user sees it immediately on `cargo check`.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use rustc_middle::ty::TyCtxt;
 
-use crate::facts::CrateFacts;
+use crate::facts::{AccessKind, CrateFacts, FunctionProfile};
 use crate::report::Reporter;
 
 pub mod api_leak;
@@ -28,5 +30,48 @@ pub fn run_all<'tcx>(tcx: TyCtxt<'tcx>, reporter: &mut Reporter) -> CrateFacts {
     mutation::collect(tcx, &mut facts);
     api_leak::run(tcx, reporter, &mut facts);
 
+    build_function_profiles(&mut facts);
+
     facts
+}
+
+/// Roll up raw `field_accesses` + `calls` into one `FunctionProfile`
+/// per function. Lets the viewer (or any other consumer) do clustering
+/// and similarity work without re-aggregating per use.
+fn build_function_profiles(facts: &mut CrateFacts) {
+    let mut reads:    BTreeMap<&str, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut writes:   BTreeMap<&str, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut callees:  BTreeMap<&str, BTreeSet<String>>           = BTreeMap::new();
+
+    for acc in &facts.field_accesses {
+        let key = (acc.struct_def_path.clone(), acc.field_name.clone());
+        match acc.kind {
+            AccessKind::Read => {
+                reads.entry(acc.caller.as_str()).or_default().insert(key);
+            }
+            AccessKind::Write | AccessKind::MutBorrow => {
+                writes.entry(acc.caller.as_str()).or_default().insert(key);
+            }
+        }
+    }
+    for edge in &facts.calls {
+        callees.entry(edge.caller.as_str()).or_default().insert(edge.callee.clone());
+    }
+
+    facts.function_profiles = facts
+        .functions
+        .iter()
+        .map(|f| FunctionProfile {
+            def_path: f.def_path.clone(),
+            fields_read:    reads   .get(f.def_path.as_str()).cloned().unwrap_or_default().into_iter().collect(),
+            fields_written: writes  .get(f.def_path.as_str()).cloned().unwrap_or_default().into_iter().collect(),
+            callees:        callees .get(f.def_path.as_str()).cloned().unwrap_or_default().into_iter().collect(),
+            name_suffix:    name_suffix_of(&f.def_path),
+        })
+        .collect();
+}
+
+fn name_suffix_of(def_path: &str) -> String {
+    let last = def_path.rsplit("::").next().unwrap_or(def_path);
+    last.rsplit('_').next().unwrap_or(last).to_string()
 }
