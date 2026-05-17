@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/target/
+
+# macOS
+.DS_Store
+
+# Editor / IDE state
+.idea/
+.vscode/
+
+# Claude Code local session state — not for sharing
+.claude/
+
+# Local scratch / debug artifacts
+output.log
+*.log
+
+# Generated reports from `unruster-viewer` (write inside the analyzed project)
+unruster-report.md

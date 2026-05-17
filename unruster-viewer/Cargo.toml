@@ -1,0 +1,11 @@
+[package]
+name = "unruster-viewer"
+version = "0.1.0"
+edition = "2024"
+description = "Egui-based viewer for UnRuster facts files."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+unruster-facts = { path = "../unruster-facts" }
+eframe = "0.30"
+egui = "0.30"
