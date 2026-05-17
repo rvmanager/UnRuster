@@ -19,8 +19,11 @@
 #
 # Flag rules:
 #   --refresh re-runs the analysis (otherwise --view/--export use cached facts).
-#   With no mode flags, --refresh is implied. Any unrecognized argument is
-#   forwarded to `cargo check` (e.g. --all-features, -p somecrate).
+#   With no mode flags, --refresh is implied.
+#   --quiet redirects rustc/cargo output to a log file (auto-on when --refresh
+#     is paired with --view or --export). --verbose forces full output.
+#   Any unrecognized argument is forwarded to `cargo check`
+#   (e.g. --all-features, -p somecrate).
 #
 # Env:
 #   UNRUSTER_PROFILE=release    use release build (default: debug)
@@ -43,6 +46,7 @@ if [[ $# -eq 0 ]]; then usage 1; fi
 REFRESH=0
 VIEW=0
 EXPORT=0
+QUIET=-1   # -1 = auto, 0 = verbose, 1 = quiet
 TARGET=""
 EXTRA_ARGS=()
 
@@ -52,6 +56,8 @@ while [[ $# -gt 0 ]]; do
         --refresh)   REFRESH=1; shift ;;
         --view)      VIEW=1;    shift ;;
         --export)    EXPORT=1;  shift ;;
+        --quiet)     QUIET=1;   shift ;;
+        --verbose)   QUIET=0;   shift ;;
         --demo)      TARGET="$HERE/tests/fixtures/leaky"; shift ;;
         --self)      TARGET="$HERE"; shift ;;
         --)          shift; EXTRA_ARGS+=("$@"); break ;;
@@ -70,6 +76,16 @@ done
 # No mode flags → refresh (legacy default).
 if [[ "$VIEW" == 0 && "$EXPORT" == 0 && "$REFRESH" == 0 ]]; then
     REFRESH=1
+fi
+
+# Auto-quiet when refresh is paired with view/export — user wants the
+# follow-up, not the cargo output. Plain `--refresh` keeps full output.
+if [[ "$QUIET" == -1 ]]; then
+    if [[ "$REFRESH" == 1 && ( "$VIEW" == 1 || "$EXPORT" == 1 ) ]]; then
+        QUIET=1
+    else
+        QUIET=0
+    fi
 fi
 
 # Default target for --view/--export with no path: CWD.
@@ -146,18 +162,33 @@ export PATH="$BIN_DIR:$PATH"
 # --- Refresh cache (if requested) ------------------------------------------
 
 if [[ "$REFRESH" == 1 ]]; then
-    echo "================================================================" >&2
-    echo "  UnRuster — analyzing: $TARGET" >&2
-    echo "  toolchain (forced):   $CHANNEL"                                  >&2
-    echo "  (findings below describe the target crate, not UnRuster)"        >&2
-    echo "================================================================" >&2
+    echo "==> analyzing $TARGET  (toolchain $CHANNEL)" >&2
 
     # Cargo skips rustc re-invocation when its fingerprint cache thinks
     # nothing changed — and then our RUSTC_WRAPPER never runs and no facts
     # get refreshed. Touching sources forces a re-check.
     find "$TARGET/src" -name '*.rs' -exec touch {} + 2>/dev/null || true
 
-    (cd "$TARGET" && cargo unruster ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
+    if [[ "$QUIET" == 1 ]]; then
+        # Stream cargo to a log file in the cache dir. Forward only our own
+        # bookkeeping lines and any UnRuster diagnostic to the terminal so
+        # the user still sees `[api_leak]` findings without the nightly
+        # `float_literal_f32_fallback` flood.
+        CACHE_DIR="$HOME/Library/Caches/unruster"
+        mkdir -p "$CACHE_DIR"
+        LOG_FILE="$CACHE_DIR/refresh.log"
+        echo "    (full output → $LOG_FILE)" >&2
+
+        # The grep extracts: UnRuster's own status lines, and the start of
+        # any `[api_leak]` warning + its surrounding context. Everything
+        # else lands in the log file only.
+        (cd "$TARGET" && cargo unruster ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}) \
+            > "$LOG_FILE" 2>&1 \
+            || { tail -40 "$LOG_FILE" >&2; echo "==> refresh failed (see $LOG_FILE)" >&2; exit 1; }
+        grep -E '^(unruster:|warning: \[)' "$LOG_FILE" >&2 || true
+    else
+        (cd "$TARGET" && cargo unruster ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
+    fi
 fi
 
 # --- View / export ----------------------------------------------------------
