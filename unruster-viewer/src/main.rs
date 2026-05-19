@@ -119,6 +119,12 @@ struct App {
     multiimpl_min_modules: usize,
     multiimpl_jaccard_pct: usize,
 
+    // Parallel-state filters.
+    parallel_min_writer_jaccard_pct: usize,
+    parallel_hide_encapsulated: bool,
+    parallel_apply_idioms: bool,
+    parallel_max_findings: usize,
+
     // Selection (sprawling tab only).
     selected_field: Option<(String, String)>,
     last_export: Option<PathBuf>,
@@ -148,6 +154,10 @@ impl App {
             multiimpl_min_fns: 2,
             multiimpl_min_modules: 2,
             multiimpl_jaccard_pct: 15,
+            parallel_min_writer_jaccard_pct: 80,
+            parallel_hide_encapsulated: true,
+            parallel_apply_idioms: true,
+            parallel_max_findings: 25,
             selected_field: None,
             last_export: None,
         }
@@ -363,10 +373,19 @@ struct ParallelStateFinding {
     shape_a: TypeShape,
     shape_b: TypeShape,
     reason: String,
+    tier: ShapeTier,
+    writers_a: BTreeSet<String>,
+    writers_b: BTreeSet<String>,
+    writer_jaccard: f32,
+    severity: f32,
+    encapsulated: bool,
 }
 
 fn compute_parallel_state(app: &App) -> Vec<ParallelStateFinding> {
-    let mut out = Vec::new();
+    let writer_index = build_writer_index(app);
+    let base_jac = app.parallel_min_writer_jaccard_pct as f32 / 100.0;
+
+    let mut out: Vec<ParallelStateFinding> = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for facts in &app.facts {
         for s in &facts.structs {
@@ -381,6 +400,14 @@ fn compute_parallel_state(app: &App) -> Vec<ParallelStateFinding> {
             if !seen.insert(s.def_path.as_str()) {
                 continue;
             }
+
+            let triplet_idiom_fields: BTreeSet<String> = if app.parallel_apply_idioms {
+                let names: BTreeSet<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
+                collect_triplet_idiom_fields(&names)
+            } else {
+                BTreeSet::new()
+            };
+
             for i in 0..s.fields.len() {
                 for j in (i + 1)..s.fields.len() {
                     let (Some(sa), Some(sb)) = (
@@ -389,55 +416,130 @@ fn compute_parallel_state(app: &App) -> Vec<ParallelStateFinding> {
                     ) else {
                         continue;
                     };
-                    if let Some(reason) = parallel_reason(sa, sb) {
-                        out.push(ParallelStateFinding {
-                            struct_def_path: s.def_path.clone(),
-                            file: s.file.clone(),
-                            line: s.line,
-                            field_a: s.fields[i].name.clone(),
-                            field_b: s.fields[j].name.clone(),
-                            shape_a: sa.clone(),
-                            shape_b: sb.clone(),
-                            reason,
-                        });
+                    let Some((reason, tier)) = parallel_reason(sa, sb) else {
+                        continue;
+                    };
+                    let name_a = &s.fields[i].name;
+                    let name_b = &s.fields[j].name;
+
+                    // Phase 4: idiom blocklist (pairs + triplets).
+                    if app.parallel_apply_idioms {
+                        if triplet_idiom_fields.contains(name_a.as_str())
+                            && triplet_idiom_fields.contains(name_b.as_str())
+                        {
+                            continue;
+                        }
+                        if is_known_idiom_pair(name_a, name_b) {
+                            continue;
+                        }
                     }
+
+                    let key_a = (s.def_path.clone(), name_a.clone());
+                    let key_b = (s.def_path.clone(), name_b.clone());
+                    let writers_a = writer_index.get(&key_a).cloned().unwrap_or_default();
+                    let writers_b = writer_index.get(&key_b).cloned().unwrap_or_default();
+
+                    let inter = writers_a.intersection(&writers_b).count();
+                    let union = writers_a.union(&writers_b).count();
+                    let writer_jaccard = if union == 0 { 0.0 } else { inter as f32 / union as f32 };
+
+                    // Phase 2: co-mutation filter. Weak tier requires a tighter
+                    // bar since the shape alone is the noisiest signal.
+                    // Only apply when both sides have ≥2 writers — small writer
+                    // sets are deferred to the encapsulation filter.
+                    let both_have_multiple = writers_a.len() >= 2 && writers_b.len() >= 2;
+                    let effective_threshold = match tier {
+                        ShapeTier::Weak => base_jac.max(0.9),
+                        _ => base_jac,
+                    };
+                    if both_have_multiple && writer_jaccard < effective_threshold {
+                        continue;
+                    }
+
+                    // Phase 3: encapsulation filter — all writers are methods
+                    // on the owning struct AND the mutator set is small.
+                    let all_writers: BTreeSet<String> = writers_a.union(&writers_b).cloned().collect();
+                    let encapsulated = !all_writers.is_empty()
+                        && all_writers
+                            .iter()
+                            .all(|w| is_self_field_read(w, &s.def_path));
+                    if app.parallel_hide_encapsulated && encapsulated && all_writers.len() <= 4 {
+                        continue;
+                    }
+
+                    // Phase 6: severity = Jaccard × min-writers × tier weight.
+                    let min_writers = writers_a.len().min(writers_b.len()).max(1) as f32;
+                    let jac_for_score = if writer_jaccard <= 0.0 { 0.1 } else { writer_jaccard };
+                    let severity = jac_for_score * min_writers * tier.weight();
+
+                    out.push(ParallelStateFinding {
+                        struct_def_path: s.def_path.clone(),
+                        file: s.file.clone(),
+                        line: s.line,
+                        field_a: name_a.clone(),
+                        field_b: name_b.clone(),
+                        shape_a: sa.clone(),
+                        shape_b: sb.clone(),
+                        reason,
+                        tier,
+                        writers_a,
+                        writers_b,
+                        writer_jaccard,
+                        severity,
+                        encapsulated,
+                    });
                 }
             }
         }
     }
     out.retain(|f| matches_text(&f.struct_def_path, app));
+    out.sort_by(|a, b| {
+        b.severity
+            .partial_cmp(&a.severity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(app.parallel_max_findings);
     out
 }
 
 /// Why two fields might be parallel state. None means "not flagging."
-fn parallel_reason(a: &TypeShape, b: &TypeShape) -> Option<String> {
+/// Returns the reason text and a tier indicating how strong the shape signal is.
+fn parallel_reason(a: &TypeShape, b: &TypeShape) -> Option<(String, ShapeTier)> {
     if !is_container(&a.outer) || !is_container(&b.outer) {
         return None;
     }
-    // Both keyed by the same first generic (e.g. both HashMap<NodeId, _>).
+    // Strong: both unordered keyed containers (Map/Set), same key type. This
+    // is the genuine "two indexes of the same set" shape.
+    if is_unordered_keyed(&a.outer)
+        && is_unordered_keyed(&b.outer)
+        && !a.args.is_empty()
+        && a.args.first() == b.args.first()
+    {
+        return Some((
+            format!(
+                "both unordered, keyed on `{}` ({} + {})",
+                a.args[0], a.outer, b.outer
+            ),
+            ShapeTier::Strong,
+        ));
+    }
+    // Medium: same container kind, same first generic. E.g. two `Vec<NodeId>`
+    // or two `HashMap<NodeId, _>` (the latter is already Strong above).
     if a.outer == b.outer && !a.args.is_empty() && a.args.first() == b.args.first() {
-        return Some(format!("both `{}<{}…>`", a.outer, a.args[0]));
+        return Some((
+            format!("both `{}<{}…>`", a.outer, a.args[0]),
+            ShapeTier::Medium,
+        ));
     }
-    // Same first generic across two different container kinds
-    // (Vec<NodeContent> + HashMap<NodeId, …> where NodeContent == NodeId? no —
-    // but Vec<NodeId> + HashMap<NodeId, …> would qualify).
+    // Weak: different containers, same first generic (Vec<T> + Map<T, _>).
+    // Noisiest rule — must clear a tighter Jaccard bar in compute_parallel_state.
     if !a.args.is_empty() && !b.args.is_empty() && a.args.first() == b.args.first() {
-        return Some(format!(
-            "both index over `{}` ({}<{}> vs {}<{}>)",
-            a.args[0], a.outer, a.args[0], b.outer, b.args[0]
-        ));
-    }
-    // First arg of one == element of the other (cross-shape match).
-    if a.outer == "Vec" && !a.args.is_empty() && b.args.first() == a.args.first() {
-        return Some(format!(
-            "`Vec<{0}>` alongside `{1}<{0}, …>` — likely parallel storage",
-            a.args[0], b.outer
-        ));
-    }
-    if b.outer == "Vec" && !b.args.is_empty() && a.args.first() == b.args.first() {
-        return Some(format!(
-            "`Vec<{0}>` alongside `{1}<{0}, …>` — likely parallel storage",
-            b.args[0], a.outer
+        return Some((
+            format!(
+                "both index over `{}` ({}<{}> vs {}<{}>)",
+                a.args[0], a.outer, a.args[0], b.outer, b.args[0]
+            ),
+            ShapeTier::Weak,
         ));
     }
     None
@@ -514,6 +616,100 @@ fn is_container(name: &str) -> bool {
         name,
         "Vec" | "VecDeque" | "LinkedList" | "HashMap" | "BTreeMap" | "HashSet" | "BTreeSet" | "SmallVec" | "IndexMap"
     )
+}
+
+fn is_unordered_keyed(name: &str) -> bool {
+    matches!(name, "HashMap" | "BTreeMap" | "HashSet" | "BTreeSet" | "IndexMap")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeTier {
+    Strong,
+    Medium,
+    Weak,
+}
+
+impl ShapeTier {
+    fn weight(self) -> f32 {
+        match self {
+            ShapeTier::Strong => 1.0,
+            ShapeTier::Medium => 0.7,
+            ShapeTier::Weak => 0.4,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            ShapeTier::Strong => "strong",
+            ShapeTier::Medium => "medium",
+            ShapeTier::Weak => "weak",
+        }
+    }
+}
+
+const IDIOM_PAIRS: &[(&str, &str)] = &[
+    ("undo", "redo"),
+    ("undo_stack", "redo_stack"),
+    ("undos", "redos"),
+    ("x", "y"),
+    ("width", "height"),
+    ("w", "h"),
+    ("min", "max"),
+    ("start", "end"),
+    ("first", "last"),
+    ("from", "to"),
+    ("src", "dst"),
+    ("source", "target"),
+    ("input", "output"),
+    ("i", "o"),
+    ("in_tangent", "out_tangent"),
+];
+
+const IDIOM_TRIPLETS: &[(&str, &str, &str)] = &[
+    ("i", "o", "v"),
+    ("in_tangent", "out_tangent", "vertex"),
+    ("x", "y", "z"),
+    ("r", "g", "b"),
+];
+
+fn is_known_idiom_pair(a: &str, b: &str) -> bool {
+    IDIOM_PAIRS
+        .iter()
+        .any(|(p, q)| (a == *p && b == *q) || (a == *q && b == *p))
+}
+
+fn collect_triplet_idiom_fields(field_names: &BTreeSet<&str>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (a, b, c) in IDIOM_TRIPLETS {
+        if field_names.contains(*a) && field_names.contains(*b) && field_names.contains(*c) {
+            out.insert((*a).to_string());
+            out.insert((*b).to_string());
+            out.insert((*c).to_string());
+        }
+    }
+    out
+}
+
+fn build_writer_index(app: &App) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let is_test_fn: BTreeMap<&str, bool> = app
+        .facts
+        .iter()
+        .flat_map(|f| f.functions.iter().map(|fn_| (fn_.def_path.as_str(), fn_.is_test)))
+        .collect();
+    let mut idx: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for facts in &app.facts {
+        for acc in &facts.field_accesses {
+            if !app.include_test && *is_test_fn.get(acc.caller.as_str()).unwrap_or(&false) {
+                continue;
+            }
+            if !matches!(acc.kind, AccessKind::Write | AccessKind::MutBorrow) {
+                continue;
+            }
+            idx.entry((acc.struct_def_path.clone(), acc.field_name.clone()))
+                .or_default()
+                .insert(acc.caller.clone());
+        }
+    }
+    idx
 }
 
 // --- Multi-implementation ---------------------------------------------------
@@ -683,7 +879,23 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut self.coaccess_jaccard_pct, 30..=95).text("Jaccard ≥ %"));
                 }
                 Tab::Parallel => {
-                    ui.label("Looks for two fields on one struct whose types share a key or element — i.e. likely parallel storage.");
+                    ui.label(
+                        "Pairs of fields on one struct whose types share a key/element, \
+                         filtered by writer-set co-mutation and ranked by shape strength.",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.parallel_min_writer_jaccard_pct, 0..=100)
+                            .text("min writer Jaccard %"),
+                    );
+                    ui.checkbox(
+                        &mut self.parallel_hide_encapsulated,
+                        "hide encapsulated pairs",
+                    );
+                    ui.checkbox(&mut self.parallel_apply_idioms, "apply idiom blocklist");
+                    ui.add(
+                        egui::Slider::new(&mut self.parallel_max_findings, 5..=200)
+                            .text("max findings"),
+                    );
                 }
                 Tab::MultiImpl => {
                     ui.add(egui::Slider::new(&mut self.multiimpl_min_fns, 2..=10).text("min fns in group"));
@@ -798,7 +1010,8 @@ impl App {
     fn render_parallel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Parallel state");
         ui.label(
-            "Pairs of fields on the same struct that look like duplicate storage of the same logical data.",
+            "Pairs of fields on the same struct that look like duplicate storage of the same \
+             logical data. Ranked by writer-set co-mutation × shape strength.",
         );
         ui.separator();
         let findings = compute_parallel_state(self);
@@ -807,14 +1020,38 @@ impl App {
                 ui.weak("No parallel-state pairs found.");
             }
             for f in &findings {
+                let stars = "★".repeat((f.severity.round() as usize).clamp(0, 5));
+                let shared = f.writers_a.intersection(&f.writers_b).count();
                 ui.label(format!(
-                    "▶ {}  ({}:{})",
-                    f.struct_def_path, f.file, f.line
+                    "▶ {}  ({}:{})  {}  [{}]",
+                    f.struct_def_path,
+                    f.file,
+                    f.line,
+                    stars,
+                    f.tier.label(),
                 ));
                 ui.indent("p", |ui| {
-                    ui.label(format!("  • `{}: {}<{}>`", f.field_a, f.shape_a.outer, f.shape_a.args.join(", ")));
-                    ui.label(format!("  • `{}: {}<{}>`", f.field_b, f.shape_b.outer, f.shape_b.args.join(", ")));
+                    ui.label(format!(
+                        "  • `{}: {}<{}>`",
+                        f.field_a,
+                        f.shape_a.outer,
+                        f.shape_a.args.join(", ")
+                    ));
+                    ui.label(format!(
+                        "  • `{}: {}<{}>`",
+                        f.field_b,
+                        f.shape_b.outer,
+                        f.shape_b.args.join(", ")
+                    ));
                     ui.label(format!("  → {}", f.reason));
+                    ui.label(format!(
+                        "  writers: {} / {} (shared {}), Jaccard {:.0}%{}",
+                        f.writers_a.len(),
+                        f.writers_b.len(),
+                        shared,
+                        f.writer_jaccard * 100.0,
+                        if f.encapsulated { ", encapsulated" } else { "" },
+                    ));
                 });
                 ui.separator();
             }
@@ -960,19 +1197,26 @@ fn render_report(app: &App) -> String {
     // --- Parallel state --------------------------------------------------
     out.push_str("## Parallel state\n\n");
     out.push_str(
-        "Pairs of fields on the same struct whose types suggest duplicate storage of the same logical data.\n\n",
+        "Pairs of fields on the same struct whose types suggest duplicate storage of the \
+         same logical data. Ranked by writer-set co-mutation × shape strength.\n\n",
     );
     let parallel = compute_parallel_state(app);
     if parallel.is_empty() {
         out.push_str("_No findings._\n\n");
     }
     for p in &parallel {
+        let stars = "★".repeat((p.severity.round() as usize).clamp(0, 5));
+        let shared = p.writers_a.intersection(&p.writers_b).count();
         out.push_str(&format!(
-            "- `{}` — `{}: {}<{}>` and `{}: {}<{}>` ({})  — `{}:{}`\n",
+            "- `{}` — `{}: {}<{}>` and `{}: {}<{}>` ({}) — {} {}, Jaccard {:.0}%, writers {}/{} (shared {}){} — `{}:{}`\n",
             p.struct_def_path,
             p.field_a, p.shape_a.outer, p.shape_a.args.join(", "),
             p.field_b, p.shape_b.outer, p.shape_b.args.join(", "),
             p.reason,
+            p.tier.label(), stars,
+            p.writer_jaccard * 100.0,
+            p.writers_a.len(), p.writers_b.len(), shared,
+            if p.encapsulated { ", encapsulated" } else { "" },
             p.file, p.line,
         ));
     }
@@ -1035,6 +1279,13 @@ fn render_report(app: &App) -> String {
     out.push_str(&format!("- sprawling: min_writers={}, min_modules={}, count_mut_borrow_as_write={}\n", app.min_writers, app.min_modules, app.count_mut_borrow_as_write));
     out.push_str(&format!("- co-access: min_fields={}, min_fns={}, Jaccard≥{}%\n", app.coaccess_min_fields, app.coaccess_min_fns, app.coaccess_jaccard_pct));
     out.push_str(&format!("- multi-impl: min_fns={}, min_modules={}, shared callees≥{}%\n", app.multiimpl_min_fns, app.multiimpl_min_modules, app.multiimpl_jaccard_pct));
+    out.push_str(&format!(
+        "- parallel: min_writer_jaccard={}%, hide_encapsulated={}, apply_idioms={}, max_findings={}\n",
+        app.parallel_min_writer_jaccard_pct,
+        app.parallel_hide_encapsulated,
+        app.parallel_apply_idioms,
+        app.parallel_max_findings,
+    ));
     if !app.name_filter.is_empty() {
         out.push_str(&format!("- path includes: `{}`\n", app.name_filter));
     }
