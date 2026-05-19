@@ -10,7 +10,9 @@
 //!   duplicate storage of the same logical data.
 //! - **Multi-implementation** — functions sharing a naming/signature shape
 //!   across modules; candidates for unification.
-//! - **API leaks** — public functions returning concrete container types.
+//! - **Lints** — per-rule design findings: API leaks (concrete containers in
+//!   `pub` returns), stringly errors (`Result<_, String>` / `&str`),
+//!   and unsafe-fn missing `# Safety` doc sections.
 //!
 //! Filters are pure post-processing so thresholds can be tuned without
 //! recompiling. "Export report" writes a Markdown file aimed at being fed to
@@ -21,8 +23,8 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use unruster_facts::{
-    AccessKind, ApiLeakFact, CrateFacts, FunctionProfile, TypeShape, cache_dir_for,
-    load_all_facts,
+    AccessKind, ApiLeakFact, CrateFacts, FunctionProfile, StringlyErrorFact, TypeShape,
+    UnsafeNoSafetyDocFact, cache_dir_for, load_all_facts,
 };
 
 fn main() -> eframe::Result<()> {
@@ -79,7 +81,7 @@ enum Tab {
     CoAccess,
     Parallel,
     MultiImpl,
-    Leaks,
+    Lints,
 }
 
 impl Tab {
@@ -89,7 +91,7 @@ impl Tab {
             Tab::CoAccess => "Co-access clusters",
             Tab::Parallel => "Parallel state",
             Tab::MultiImpl => "Multi-implementation",
-            Tab::Leaks => "API leaks",
+            Tab::Lints => "Lints",
         }
     }
 }
@@ -880,7 +882,7 @@ impl eframe::App for App {
                 });
             });
             ui.horizontal(|ui| {
-                for tab in [Tab::Sprawling, Tab::CoAccess, Tab::Parallel, Tab::MultiImpl, Tab::Leaks] {
+                for tab in [Tab::Sprawling, Tab::CoAccess, Tab::Parallel, Tab::MultiImpl, Tab::Lints] {
                     if ui.selectable_label(self.tab == tab, tab.label()).clicked() {
                         self.tab = tab;
                     }
@@ -939,8 +941,11 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut self.multiimpl_min_modules, 2..=10).text("min modules"));
                     ui.add(egui::Slider::new(&mut self.multiimpl_jaccard_pct, 20..=90).text("shared callee ≥ %"));
                 }
-                Tab::Leaks => {
-                    ui.label("Pure-syntactic check: public fns returning concrete container types.");
+                Tab::Lints => {
+                    ui.label(
+                        "Per-rule findings, grouped by lint name. \
+                         Each entry mirrors an inline `cargo check` warning.",
+                    );
                 }
             }
             ui.separator();
@@ -966,7 +971,7 @@ impl eframe::App for App {
                 Tab::CoAccess => self.render_coaccess(ui),
                 Tab::Parallel => self.render_parallel(ui),
                 Tab::MultiImpl => self.render_multi_impl(ui),
-                Tab::Leaks => self.render_leaks(ui),
+                Tab::Lints => self.render_lints(ui),
             }
         });
     }
@@ -1134,22 +1139,92 @@ impl App {
         });
     }
 
-    fn render_leaks(&mut self, ui: &mut egui::Ui) {
-        ui.heading("API leaks");
-        ui.label("Public functions returning concrete container types.");
+    fn render_lints(&mut self, ui: &mut egui::Ui) {
+        let leaks: Vec<&ApiLeakFact> =
+            self.facts.iter().flat_map(|f| f.api_leaks.iter()).collect();
+        let stringly: Vec<&StringlyErrorFact> =
+            self.facts.iter().flat_map(|f| f.stringly_errors.iter()).collect();
+        let unsafe_docs: Vec<&UnsafeNoSafetyDocFact> = self
+            .facts
+            .iter()
+            .flat_map(|f| f.unsafe_no_safety_docs.iter())
+            .collect();
+
+        ui.heading("Lints");
+        ui.label(format!(
+            "api_leak: {}   stringly_error: {}   unsafe_no_safety_doc: {}",
+            leaks.len(),
+            stringly.len(),
+            unsafe_docs.len(),
+        ));
         ui.separator();
-        let leaks: Vec<&ApiLeakFact> = self.facts.iter().flat_map(|f| f.api_leaks.iter()).collect();
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            if leaks.is_empty() {
-                ui.weak("No api_leak findings.");
-            }
-            for leak in &leaks {
-                let kind = if leak.is_mut { "&mut" } else { "&" };
-                ui.label(format!(
-                    "• {}  →  returns {} {}<…>  ({}:{})",
-                    leak.function, kind, leak.container, leak.file, leak.line
-                ));
-            }
+            // --- api_leak ---------------------------------------------------
+            ui.collapsing(
+                format!("api_leak ({})", leaks.len()),
+                |ui| {
+                    ui.weak(
+                        "Public fns returning concrete owning containers — \
+                         callers should get a slice or iterator instead.",
+                    );
+                    if leaks.is_empty() {
+                        ui.weak("No findings.");
+                    }
+                    for leak in &leaks {
+                        let kind = if leak.is_mut { "&mut" } else { "&" };
+                        ui.label(format!(
+                            "• {}  →  returns {} {}<…>  ({}:{})",
+                            leak.function, kind, leak.container, leak.file, leak.line
+                        ));
+                    }
+                },
+            );
+
+            // --- stringly_error --------------------------------------------
+            ui.collapsing(
+                format!("stringly_error ({})", stringly.len()),
+                |ui| {
+                    ui.weak(
+                        "Public fns returning `Result<_, String>` / `Result<_, &str>` — \
+                         the error type carries no structure.",
+                    );
+                    if stringly.is_empty() {
+                        ui.weak("No findings.");
+                    }
+                    for s in &stringly {
+                        ui.label(format!(
+                            "• {}  →  Result<_, {}>  ({}:{})",
+                            s.function, s.error_form, s.file, s.line
+                        ));
+                    }
+                },
+            );
+
+            // --- unsafe_no_safety_doc --------------------------------------
+            ui.collapsing(
+                format!("unsafe_no_safety_doc ({})", unsafe_docs.len()),
+                |ui| {
+                    ui.weak(
+                        "Public `unsafe fn` without a `# Safety` rustdoc section — \
+                         caller obligations are undocumented.",
+                    );
+                    if unsafe_docs.is_empty() {
+                        ui.weak("No findings.");
+                    }
+                    for u in &unsafe_docs {
+                        let kind = if u.undocumented {
+                            "undocumented"
+                        } else {
+                            "missing # Safety"
+                        };
+                        ui.label(format!(
+                            "• {}  ({})  ({}:{})",
+                            u.function, kind, u.file, u.line
+                        ));
+                    }
+                },
+            );
         });
     }
 }
@@ -1292,12 +1367,15 @@ fn render_report(app: &App) -> String {
         out.push('\n');
     }
 
-    // --- API leaks ------------------------------------------------------
-    out.push_str("## API leaks\n\n");
+    // --- Lints ----------------------------------------------------------
+    out.push_str("## Lints\n\n");
+
+    // api_leak
+    let leaks: Vec<&ApiLeakFact> = app.facts.iter().flat_map(|f| f.api_leaks.iter()).collect();
+    out.push_str(&format!("### api_leak ({})\n\n", leaks.len()));
     out.push_str(
         "Public functions returning concrete container types — leaks internal storage into the API surface.\n\n",
     );
-    let leaks: Vec<&ApiLeakFact> = app.facts.iter().flat_map(|f| f.api_leaks.iter()).collect();
     if leaks.is_empty() {
         out.push_str("_None._\n\n");
     }
@@ -1306,6 +1384,46 @@ fn render_report(app: &App) -> String {
         out.push_str(&format!(
             "- `{}` returns `{} {}<…>` — `{}:{}`\n",
             leak.function, kind, leak.container, leak.file, leak.line
+        ));
+    }
+    out.push('\n');
+
+    // stringly_error
+    let stringly: Vec<&StringlyErrorFact> =
+        app.facts.iter().flat_map(|f| f.stringly_errors.iter()).collect();
+    out.push_str(&format!("### stringly_error ({})\n\n", stringly.len()));
+    out.push_str(
+        "Public functions whose error half is a `String` / `&str` — define a structured error type instead.\n\n",
+    );
+    if stringly.is_empty() {
+        out.push_str("_None._\n\n");
+    }
+    for s in &stringly {
+        out.push_str(&format!(
+            "- `{}` returns `Result<_, {}>` — `{}:{}`\n",
+            s.function, s.error_form, s.file, s.line
+        ));
+    }
+    out.push('\n');
+
+    // unsafe_no_safety_doc
+    let unsafe_docs: Vec<&UnsafeNoSafetyDocFact> = app
+        .facts
+        .iter()
+        .flat_map(|f| f.unsafe_no_safety_docs.iter())
+        .collect();
+    out.push_str(&format!("### unsafe_no_safety_doc ({})\n\n", unsafe_docs.len()));
+    out.push_str(
+        "Public `unsafe fn` without a `# Safety` rustdoc section — caller obligations are undocumented.\n\n",
+    );
+    if unsafe_docs.is_empty() {
+        out.push_str("_None._\n\n");
+    }
+    for u in &unsafe_docs {
+        let kind = if u.undocumented { "undocumented" } else { "missing # Safety" };
+        out.push_str(&format!(
+            "- `{}` ({}) — `{}:{}`\n",
+            u.function, kind, u.file, u.line
         ));
     }
     out.push('\n');
