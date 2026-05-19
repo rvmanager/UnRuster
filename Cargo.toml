@@ -1,6 +1,10 @@
 [workspace]
 members = ["unruster-facts", "unruster-viewer"]
-exclude = ["tests/fixtures/leaky"]
+exclude = [
+    "tests/fixtures/leaky",
+    "tests/fixtures/stringly",
+    "tests/fixtures/unsafe_docs",
+]
 
 [package]
 name = "unruster"

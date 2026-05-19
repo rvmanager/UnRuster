@@ -25,6 +25,15 @@ pub struct CrateFacts {
     pub structs: Vec<StructFact>,
     pub field_accesses: Vec<FieldAccessFact>,
     pub api_leaks: Vec<ApiLeakFact>,
+    /// Public functions whose return type is `Result<_, String>` /
+    /// `Result<_, &str>`. RuleBook §4.5: errors should be structured types.
+    #[serde(default)]
+    pub stringly_errors: Vec<StringlyErrorFact>,
+    /// Public `unsafe fn` whose doc comment lacks a `# Safety` section.
+    /// RuleBook §16.4: every public unsafe API must document the caller's
+    /// obligations.
+    #[serde(default)]
+    pub unsafe_no_safety_docs: Vec<UnsafeNoSafetyDocFact>,
     /// Per-function rollup of which fields it reads/writes and which
     /// downstream methods it calls. Computed in the driver so every
     /// consumer (viewer, CI, LLM tooling) can use it without rebuilding
@@ -123,6 +132,25 @@ pub struct ApiLeakFact {
     pub function: String,
     pub container: String,
     pub is_mut: bool,
+    pub file: String,
+    pub line: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StringlyErrorFact {
+    pub function: String,
+    /// `"String"` or `"&str"` — what the error half of the `Result` resolved to.
+    pub error_form: String,
+    pub file: String,
+    pub line: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UnsafeNoSafetyDocFact {
+    pub function: String,
+    /// `true` if the function had no doc comment at all (vs. a doc comment
+    /// that simply omitted the `# Safety` section).
+    pub undocumented: bool,
     pub file: String,
     pub line: u32,
 }

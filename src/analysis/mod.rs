@@ -18,6 +18,8 @@ pub mod api_leak;
 pub mod call_graph;
 pub mod lifetime_smells;
 pub mod mutation;
+pub mod stringly_error;
+pub mod unsafe_no_safety_doc;
 pub(crate) mod util;
 
 pub fn run_all<'tcx>(tcx: TyCtxt<'tcx>, reporter: &mut Reporter) -> CrateFacts {
@@ -29,6 +31,8 @@ pub fn run_all<'tcx>(tcx: TyCtxt<'tcx>, reporter: &mut Reporter) -> CrateFacts {
     call_graph::collect(tcx, &mut facts);
     mutation::collect(tcx, &mut facts);
     api_leak::run(tcx, reporter, &mut facts);
+    stringly_error::run(tcx, reporter, &mut facts);
+    unsafe_no_safety_doc::run(tcx, reporter, &mut facts);
 
     build_function_profiles(&mut facts);
 
