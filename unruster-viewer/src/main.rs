@@ -122,6 +122,7 @@ struct App {
     // Parallel-state filters.
     parallel_min_writer_jaccard_pct: usize,
     parallel_hide_encapsulated: bool,
+    parallel_hide_wire_structs: bool,
     parallel_apply_idioms: bool,
     parallel_max_findings: usize,
 
@@ -156,6 +157,7 @@ impl App {
             multiimpl_jaccard_pct: 15,
             parallel_min_writer_jaccard_pct: 80,
             parallel_hide_encapsulated: true,
+            parallel_hide_wire_structs: true,
             parallel_apply_idioms: true,
             parallel_max_findings: 25,
             selected_field: None,
@@ -443,22 +445,35 @@ fn compute_parallel_state(app: &App) -> Vec<ParallelStateFinding> {
                     let union = writers_a.union(&writers_b).count();
                     let writer_jaccard = if union == 0 { 0.0 } else { inter as f32 / union as f32 };
 
-                    // Phase 2: co-mutation filter. Weak tier requires a tighter
-                    // bar since the shape alone is the noisiest signal.
-                    // Only apply when both sides have ≥2 writers — small writer
-                    // sets are deferred to the encapsulation filter.
-                    let both_have_multiple = writers_a.len() >= 2 && writers_b.len() >= 2;
+                    // Phase 2: co-mutation filter. If both fields have at
+                    // least one writer and they don't share enough mutators,
+                    // the fields are mutated by independent sites — not
+                    // parallel storage. Weak tier requires a tighter bar
+                    // (shape alone is the noisiest signal).
+                    let both_have_writers = !writers_a.is_empty() && !writers_b.is_empty();
                     let effective_threshold = match tier {
                         ShapeTier::Weak => base_jac.max(0.9),
                         _ => base_jac,
                     };
-                    if both_have_multiple && writer_jaccard < effective_threshold {
+                    if both_have_writers && writer_jaccard < effective_threshold {
+                        continue;
+                    }
+
+                    let all_writers: BTreeSet<String> = writers_a.union(&writers_b).cloned().collect();
+
+                    // Phase 10: wire-struct filter — all writers are serde
+                    // trait-impl methods. Wire structs are Jaccard 1.0 by
+                    // construction (one serializer touches every field) and
+                    // their layout is a serialization constraint, not a
+                    // design smell.
+                    let all_serde = !all_writers.is_empty()
+                        && all_writers.iter().all(|w| is_serde_method(w));
+                    if app.parallel_hide_wire_structs && all_serde {
                         continue;
                     }
 
                     // Phase 3: encapsulation filter — all writers are methods
                     // on the owning struct AND the mutator set is small.
-                    let all_writers: BTreeSet<String> = writers_a.union(&writers_b).cloned().collect();
                     let encapsulated = !all_writers.is_empty()
                         && all_writers
                             .iter()
@@ -551,6 +566,24 @@ fn is_macro_generated(def_path: &str) -> bool {
     def_path.contains("::_::")
         || def_path.contains("::__Visitor")
         || def_path.contains("::__FieldVisitor")
+}
+
+/// True when a function's def_path looks like a serde trait-impl method:
+/// `<T as serde::ser::Serialize>::serialize`, `<T as Deserialize<'_>>::deserialize`,
+/// or a derive-generated visitor shim. Used to recognise wire structs whose
+/// fields are only mutated by serialization code (Jaccard 1.0 by definition).
+fn is_serde_method(def_path: &str) -> bool {
+    if def_path.contains("::__Visitor") || def_path.contains("::__FieldVisitor") {
+        return true;
+    }
+    if let Some(idx) = def_path.find(" as ") {
+        let trait_part = &def_path[idx + 4..];
+        return trait_part.starts_with("serde::")
+            || trait_part.starts_with("_serde::")
+            || trait_part.contains("Serialize")
+            || trait_part.contains("Deserialize");
+    }
+    false
 }
 
 /// Common trait-method or derive-method names that produce noise in
@@ -890,6 +923,10 @@ impl eframe::App for App {
                     ui.checkbox(
                         &mut self.parallel_hide_encapsulated,
                         "hide encapsulated pairs",
+                    );
+                    ui.checkbox(
+                        &mut self.parallel_hide_wire_structs,
+                        "hide serde wire structs",
                     );
                     ui.checkbox(&mut self.parallel_apply_idioms, "apply idiom blocklist");
                     ui.add(
@@ -1280,9 +1317,10 @@ fn render_report(app: &App) -> String {
     out.push_str(&format!("- co-access: min_fields={}, min_fns={}, Jaccard≥{}%\n", app.coaccess_min_fields, app.coaccess_min_fns, app.coaccess_jaccard_pct));
     out.push_str(&format!("- multi-impl: min_fns={}, min_modules={}, shared callees≥{}%\n", app.multiimpl_min_fns, app.multiimpl_min_modules, app.multiimpl_jaccard_pct));
     out.push_str(&format!(
-        "- parallel: min_writer_jaccard={}%, hide_encapsulated={}, apply_idioms={}, max_findings={}\n",
+        "- parallel: min_writer_jaccard={}%, hide_encapsulated={}, hide_wire_structs={}, apply_idioms={}, max_findings={}\n",
         app.parallel_min_writer_jaccard_pct,
         app.parallel_hide_encapsulated,
+        app.parallel_hide_wire_structs,
         app.parallel_apply_idioms,
         app.parallel_max_findings,
     ));
