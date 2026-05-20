@@ -1,44 +1,20 @@
-[workspace]
-members = ["unruster-facts", "unruster-viewer"]
-exclude = [
-    "tests/fixtures/leaky",
-    "tests/fixtures/stringly",
-    "tests/fixtures/unsafe_docs",
-]
-
 [package]
 name = "unruster"
 version = "0.1.0"
-edition = "2024"
-description = "Static analyzer for Rust: call graphs, data-structure ownership, and container-leakage detection."
+edition = "2021"
+description = "CLI for querying Rust codebases: inventory, call graph, field uses."
 license = "MIT OR Apache-2.0"
 
-[lib]
-path = "src/lib.rs"
-
-# Driver that wraps rustc. Cargo invokes this as RUSTC_WRAPPER.
 [[bin]]
-name = "unruster-driver"
-path = "src/bin/unruster-driver.rs"
-
-# Cargo subcommand: `cargo unruster` — sets RUSTC_WRAPPER and runs `cargo check`.
-[[bin]]
-name = "cargo-unruster"
-path = "src/bin/cargo-unruster.rs"
+name = "unruster"
+path = "src/main.rs"
 
 [dependencies]
-unruster-facts = { path = "unruster-facts" }
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 anyhow = "1"
-thiserror = "1"
-petgraph = "0.6"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [profile.release]
 lto = "thin"
-
-# rustc_private crates (rustc_driver, rustc_interface, rustc_middle, ...) are
-# not declared here. They are pulled in via `extern crate` in source files,
-# resolved from the active nightly toolchain's sysroot. This requires the
-# `rustc-dev` rustup component (see rust-toolchain.toml).

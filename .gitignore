@@ -15,6 +15,3 @@
 # Local scratch / debug artifacts
 output.log
 *.log
-
-# Generated reports from `unruster-viewer` (write inside the analyzed project)
-unruster-report.md
