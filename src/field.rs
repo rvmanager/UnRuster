@@ -186,9 +186,15 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
         }
         visit::visit_expr_struct(self, e);
     }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        for expr in crate::macro_scan::macro_exprs(m) {
+            self.visit_expr(&expr);
+        }
+    }
 }
 
-pub fn run(files: &[ParsedFile], ty: &str, field: &str, strict: bool) -> anyhow::Result<()> {
+fn collect(files: &[ParsedFile], ty: &str, field: &str, strict: bool) -> Vec<FieldHit> {
     let mut all = Vec::new();
     for f in files {
         let mut v = FieldVisitor {
@@ -206,6 +212,26 @@ pub fn run(files: &[ParsedFile], ty: &str, field: &str, strict: bool) -> anyhow:
         v.visit_file(&f.ast);
         all.extend(v.hits);
     }
+    all
+}
+
+pub fn run(
+    files: &[ParsedFile],
+    ty: &str,
+    field: &str,
+    strict: bool,
+    kinds: &[&str],
+    via_receiver: Option<&str>,
+    summary: bool,
+) -> anyhow::Result<()> {
+    let mut all = collect(files, ty, field, strict);
+
+    if !kinds.is_empty() {
+        all.retain(|h| kinds.contains(&h.kind));
+    }
+    if let Some(pat) = via_receiver {
+        all.retain(|h| h.note.contains(pat));
+    }
 
     all.sort_by(|a, b| {
         a.kind
@@ -222,14 +248,28 @@ pub fn run(files: &[ParsedFile], ty: &str, field: &str, strict: bool) -> anyhow:
             "init" => inits += 1,
             _ => {}
         }
-        println!(
-            "{}\t{}\t{}\t{}:{}",
-            h.kind, h.note, h.context, h.file, h.line
-        );
+        if !summary {
+            println!(
+                "{}\t{}\t{}\t{}:{}",
+                h.kind, h.note, h.context, h.file, h.line
+            );
+        }
     }
     eprintln!(
         "({} reads, {} writes, {} inits; strict={})",
         reads, writes, inits, strict
     );
+
+    // 0/N hint: if strict found nothing, see if candidates would.
+    if strict && all.is_empty() && via_receiver.is_none() && kinds.is_empty() {
+        let cand = collect(files, ty, field, false);
+        if !cand.is_empty() {
+            eprintln!(
+                "hint: strict matched 0; --candidates would report {} hit(s) via other receivers. \
+                 Try `--candidates` or `--candidates --via-receiver <substring>` to narrow.",
+                cand.len()
+            );
+        }
+    }
     Ok(())
 }

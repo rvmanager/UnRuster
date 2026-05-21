@@ -5,28 +5,66 @@ use clap::{Args, Parser, Subcommand};
 
 mod ast;
 mod callers;
+mod catch_all;
+mod dead_code;
+mod error_swallows;
 mod field;
+mod fields;
+mod impls;
+mod index;
 mod inventory;
+mod macro_scan;
+mod metrics;
+mod parallel_matches;
 mod parse;
+mod pass_through;
+mod takes_mut;
+mod type_refs;
+mod variants;
+
+use parse::Scope;
 
 #[derive(Parser)]
 #[command(
     name = "unruster",
-    about = "Query a Rust codebase: inventory, callers/callees, field uses.",
+    about = "Query a Rust codebase: inventory, callers/callees, field uses, variants, impls, metrics, dead-code.",
     long_about = "Query a Rust codebase via syntactic (syn) analysis.\n\
         \n\
+        Macro bodies are scanned best-effort: tokens are split on top-level\n\
+        `,`/`;` and each chunk is parsed as an expression. This works for any\n\
+        macro whose args are expression-like (println!, format!, write!, vec!,\n\
+        assert!, dbg!, and custom macros like dbg_log!, log_debug!, etc.).\n\
+        Quoting macros (quote!, parse_quote!) are skipped. `matches!(e, p)`\n\
+        is special-cased so the pattern arg is not treated as an expression.\n\
+        \n\
+        --scope (top-level) controls test-code inclusion:\n\
+        - production (default): skip files under tests/ and benches/, and items\n\
+          marked with #[cfg(test)] / #[test] / #[bench] / #[tokio::test].\n\
+        - tests: only files under tests/ or benches/ (or *_test*.rs).\n\
+        - all: everything.\n\
+        \n\
         Known limitations:\n\
-        - Macro bodies (println!, format!, write!, ...) are not scanned — field/call\n\
-          accesses inside macro args are missed.\n\
+        - Non-expression-shaped macro DSLs are still missed beyond the\n\
+          comma/semicolon split heuristic.\n\
         - Non-`self` field accesses are matched by field name only; the receiver's\n\
-          type isn't inferred. Use --candidates on field-uses to see them.\n\
-        - `cfg`-gated code is included regardless of features.",
+          type isn't inferred (use --candidates + --via-receiver).\n\
+        - Type matches across files use last-segment name matching; identical names\n\
+          in different modules are not disambiguated.\n\
+        - `cfg`-gated code other than `cfg(test)` is included regardless of features.",
     version
 )]
 struct Cli {
     /// Root directory (or file) to scan. Respects .gitignore.
     #[arg(long, short = 'r', default_value = ".")]
     root: PathBuf,
+
+    /// Test-code scope: production (default), tests, or all.
+    #[arg(long, global = true, default_value = "production")]
+    scope: String,
+
+    /// Skip per-row output; print only the summary line on stderr.
+    #[arg(long, global = true)]
+    summary: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -36,29 +74,69 @@ struct Cli {
 enum Cmd {
     /// List all top-level items (struct, enum, trait, fn, impl, ...).
     Inventory(InventoryArgs),
-    /// Find call sites of a function or method by name.
+    /// Find call sites of a function, method, or macro.
     Callers(CallersArgs),
     /// List callees made from inside a function or method.
     Callees(CalleesArgs),
     /// Find read/write sites of a field on a given type.
     FieldUses(FieldArgs),
+
+    /// List fields of a struct with read/write/init counts per field.
+    Fields(FieldsArgs),
+    /// List enum variants and their construction + match sites.
+    Variants(VariantsArgs),
+    /// List `impl` blocks; filter by self-type or by trait.
+    Impls(ImplsArgs),
+    /// Find every site that names a given type (coupling footprint).
+    TypeRefs(TypeRefsArgs),
+    /// Find fns whose signature takes `&mut <Type>`.
+    TakesMut(TakesMutArgs),
+    /// Rank fns by LOC / parameter count, structs by field count, enums by variant count.
+    Metrics(MetricsArgs),
+
+    /// List fns with no caller in the scanned tree (heuristic; pub items may have external callers).
+    DeadCode(DeadCodeArgs),
+    /// Find match sites on a given enum that contain a wildcard `_ =>` arm.
+    CatchAllArms(CatchAllArgs),
+    /// Group match sites on an enum by which variants they cover (shotgun-surgery candidates).
+    ParallelMatches(ParallelMatchesArgs),
+    /// Find Result/Option error-swallowing patterns (.ok(), .unwrap_or_default(), ...).
+    ErrorSwallows(ErrorSwallowsArgs),
+    /// Find pass-through wrappers: fns whose body is a single call/expression.
+    PassThrough(PassThroughArgs),
 }
 
 #[derive(Args)]
 struct InventoryArgs {
-    /// Filter to one kind: struct, enum, trait, fn, impl, mod, const, static, type, trait-fn.
+    /// Filter to one kind: struct, enum, trait, fn, impl, mod, const, static, type, trait-fn, impl-fn.
     #[arg(long, short = 'k')]
     kind: Option<String>,
+    /// Filter by visibility: pub, crate, priv.
+    #[arg(long)]
+    vis: Option<String>,
+    /// Render as a module tree instead of a flat list.
+    #[arg(long)]
+    tree: bool,
 }
 
 #[derive(Args)]
 struct CallersArgs {
-    /// Function or method to look for. Forms:
-    ///   bare name (e.g. `translate`)        — matches free fns and methods by last segment
+    /// Function, method, or macro to look for. Forms:
+    ///   bare name (e.g. `translate`)        — matches free fns, methods, and macros by last segment
     ///   `Type::method` (e.g. `Doc::write`)  — matches paths ending in `Type::method`
     ///   `.method` (e.g. `.write`)           — matches method calls only
-    ///   `::name` (e.g. `::open`)            — matches free-fn paths only
+    ///   `::name` (e.g. `::open`)            — matches free-fn paths only (skip methods/macros)
+    ///   `name!` (e.g. `eprintln!`)          — matches macro invocations only
     name: String,
+    /// Include indirect callers via the static call graph (last-segment name matching).
+    #[arg(long)]
+    transitive: bool,
+    /// Maximum transitive depth (default: unlimited).
+    #[arg(long)]
+    depth: Option<usize>,
+    /// Group results: `file` (path) or `module` (top-level module).
+    #[arg(long)]
+    by: Option<String>,
 }
 
 #[derive(Args)]
@@ -76,18 +154,159 @@ struct FieldArgs {
     /// Also report non-self field accesses (noisier; no type inference).
     #[arg(long)]
     candidates: bool,
+    /// Filter to reads only.
+    #[arg(long)]
+    reads_only: bool,
+    /// Filter to writes only.
+    #[arg(long)]
+    writes_only: bool,
+    /// Filter to inits only.
+    #[arg(long)]
+    inits_only: bool,
+    /// (With --candidates) restrict hits to a substring of the receiver
+    /// expression — e.g. `--via-receiver common` keeps `x.common.transform` but
+    /// drops `node.transform`.
+    #[arg(long)]
+    via_receiver: Option<String>,
+}
+
+#[derive(Args)]
+struct FieldsArgs {
+    /// Struct name (last segment, e.g. `Document`).
+    ty: String,
+}
+
+#[derive(Args)]
+struct VariantsArgs {
+    /// Enum name (last segment, e.g. `Token`).
+    name: String,
+    /// Match bare variant names too (e.g. `V1` in addition to `Enum::V1`).
+    /// Useful when callers `use Enum::*;` — noisier.
+    #[arg(long)]
+    bare: bool,
+}
+
+#[derive(Args)]
+struct ImplsArgs {
+    /// Filter to impls of this self-type (last segment).
+    #[arg(long)]
+    of: Option<String>,
+    /// Filter to impls of this trait (last segment).
+    #[arg(long = "trait")]
+    trait_: Option<String>,
+}
+
+#[derive(Args)]
+struct TypeRefsArgs {
+    /// Type name (last segment).
+    ty: String,
+}
+
+#[derive(Args)]
+struct TakesMutArgs {
+    /// Type name (last segment).
+    ty: String,
+}
+
+#[derive(Args)]
+struct MetricsArgs {
+    /// Sort fns by: `loc` (lines), `params` (parameter count).
+    #[arg(long, default_value = "loc")]
+    sort: String,
+    /// Top N per category to print.
+    #[arg(long, default_value_t = 20)]
+    top: usize,
+}
+
+#[derive(Args)]
+struct DeadCodeArgs {
+    /// Only list pub items.
+    #[arg(long)]
+    pub_only: bool,
+}
+
+#[derive(Args)]
+struct CatchAllArgs {
+    /// Enum name (last segment).
+    name: String,
+}
+
+#[derive(Args)]
+struct ParallelMatchesArgs {
+    /// Enum name (last segment).
+    name: String,
+}
+
+#[derive(Args)]
+struct ErrorSwallowsArgs {
+    /// Include `.unwrap_or(...)` (any arg). Noisy; off by default.
+    #[arg(long)]
+    include_unwrap_or: bool,
+}
+
+#[derive(Args)]
+struct PassThroughArgs {
+    /// Maximum body LOC to consider as pass-through (default 1).
+    #[arg(long, default_value_t = 1)]
+    max_loc: usize,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let files = parse::parse_dir(&cli.root)?;
+    let scope = Scope::parse(&cli.scope)?;
+    let files = parse::parse_dir(&cli.root, scope)?;
     if files.is_empty() {
-        eprintln!("warning: no .rs files found under {}", cli.root.display());
+        eprintln!(
+            "warning: no .rs files found under {} (scope={:?})",
+            cli.root.display(),
+            scope
+        );
     }
+    let idx = index::NameIndex::build(&files);
+    let summary = cli.summary;
     match cli.cmd {
-        Cmd::Inventory(a) => inventory::run(&files, a.kind.as_deref()),
-        Cmd::Callers(a) => callers::run_callers(&files, &a.name),
-        Cmd::Callees(a) => callers::run_callees(&files, &a.name),
-        Cmd::FieldUses(a) => field::run(&files, &a.ty, &a.field, !a.candidates),
+        Cmd::Inventory(a) => inventory::run(&files, a.kind.as_deref(), a.vis.as_deref(), a.tree, summary),
+        Cmd::Callers(a) => callers::run_callers(
+            &files,
+            &idx,
+            &a.name,
+            a.transitive,
+            a.depth,
+            a.by.as_deref(),
+            summary,
+        ),
+        Cmd::Callees(a) => callers::run_callees(&files, &idx, &a.name, summary),
+        Cmd::FieldUses(a) => {
+            let mut kinds: Vec<&str> = Vec::new();
+            if a.reads_only {
+                kinds.push("read");
+            }
+            if a.writes_only {
+                kinds.push("write");
+            }
+            if a.inits_only {
+                kinds.push("init");
+            }
+            field::run(
+                &files,
+                &a.ty,
+                &a.field,
+                !a.candidates,
+                &kinds,
+                a.via_receiver.as_deref(),
+                summary,
+            )
+        }
+        Cmd::Fields(a) => fields::run(&files, &idx, &a.ty, summary),
+        Cmd::Variants(a) => variants::run(&files, &idx, &a.name, a.bare, summary),
+        Cmd::Impls(a) => impls::run(&idx, a.of.as_deref(), a.trait_.as_deref(), summary),
+        Cmd::TypeRefs(a) => type_refs::run(&files, &idx, &a.ty, summary),
+        Cmd::TakesMut(a) => takes_mut::run(&files, &idx, &a.ty, summary),
+        Cmd::Metrics(a) => metrics::run(&files, &a.sort, a.top, summary),
+        Cmd::DeadCode(a) => dead_code::run(&files, &idx, a.pub_only, summary),
+        Cmd::CatchAllArms(a) => catch_all::run(&files, &idx, &a.name, summary),
+        Cmd::ParallelMatches(a) => parallel_matches::run(&files, &idx, &a.name, summary),
+        Cmd::ErrorSwallows(a) => error_swallows::run(&files, a.include_unwrap_or, summary),
+        Cmd::PassThrough(a) => pass_through::run(&files, a.max_loc, summary),
     }
 }

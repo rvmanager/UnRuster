@@ -1,9 +1,12 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_to_string, type_short};
+use crate::index::NameIndex;
 use crate::parse::{display_path, ParsedFile};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CallSite {
     file: String,
     line: usize,
@@ -94,6 +97,16 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
         self.record(target, line_of(&e.method));
         visit::visit_expr_method_call(self, e);
     }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        if let Some(last) = m.path.segments.last() {
+            let target = format!("{}!", path_to_string(&m.path));
+            self.record(target, line_of(&last.ident));
+        }
+        for expr in crate::macro_scan::macro_exprs(m) {
+            self.visit_expr(&expr);
+        }
+    }
 }
 
 fn collect_sites(files: &[ParsedFile]) -> Vec<CallSite> {
@@ -114,16 +127,19 @@ fn collect_sites(files: &[ParsedFile]) -> Vec<CallSite> {
 }
 
 fn matches_target(call_target: &str, query: &str) -> bool {
-    // query forms:
-    //   `foo`              -> matches path ending in `foo`, or method `.foo`
-    //   `Foo::bar`         -> matches path ending in `Foo::bar`
-    //   `.foo` (explicit)  -> matches method `.foo` only
-    //   `::foo` (explicit) -> matches free-fn last segment `foo` only (skip methods)
+    if let Some(name) = query.strip_suffix('!') {
+        let Some(target_macro) = call_target.strip_suffix('!') else {
+            return false;
+        };
+        let target_last = target_macro.rsplit("::").next().unwrap_or(target_macro);
+        let q_last = name.rsplit("::").next().unwrap_or(name);
+        return target_last == q_last;
+    }
     if let Some(method) = query.strip_prefix('.') {
         return call_target == format!(".{}", method);
     }
     if let Some(rest) = query.strip_prefix("::") {
-        if call_target.starts_with('.') {
+        if call_target.starts_with('.') || call_target.ends_with('!') {
             return false;
         }
         let last = rest.rsplit("::").next().unwrap_or(rest);
@@ -131,54 +147,214 @@ fn matches_target(call_target: &str, query: &str) -> bool {
         return target_last == last;
     }
     if query.contains("::") {
-        return call_target.ends_with(query);
+        let trimmed = call_target.strip_suffix('!').unwrap_or(call_target);
+        return trimmed.ends_with(query);
     }
-    // bare name: match either a path with that last segment, or a method of that name
     let target_last = if let Some(m) = call_target.strip_prefix('.') {
         m
+    } else if let Some(m) = call_target.strip_suffix('!') {
+        m.rsplit("::").next().unwrap_or(m)
     } else {
         call_target.rsplit("::").next().unwrap_or(call_target)
     };
     target_last == query
 }
 
-pub fn run_callers(files: &[ParsedFile], query: &str) -> anyhow::Result<()> {
+/// True if the index knows of any defined fn/method/etc. that matches the query.
+fn query_known(index: &NameIndex, query: &str) -> bool {
+    if query.ends_with('!') {
+        // Macros aren't in the NameIndex (we only index struct/enum/etc.).
+        // Assume known to avoid false alarms.
+        return true;
+    }
+    let last = query
+        .trim_start_matches('.')
+        .trim_start_matches("::")
+        .rsplit("::")
+        .next()
+        .unwrap_or(query);
+    if last.is_empty() {
+        return false;
+    }
+    !index
+        .iter()
+        .filter(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn"))
+        .filter(|d| d.name == last)
+        .next()
+        .is_none()
+        || index.knows_name(last)
+}
+
+fn top_module(qpath: &str) -> &str {
+    qpath.split("::").next().unwrap_or(qpath)
+}
+
+pub fn run_callers(
+    files: &[ParsedFile],
+    index: &NameIndex,
+    query: &str,
+    transitive: bool,
+    depth: Option<usize>,
+    by: Option<&str>,
+    summary: bool,
+) -> anyhow::Result<()> {
+    if !query_known(index, query) {
+        eprintln!(
+            "note: no fn/method matching `{}` is defined in the scanned tree \
+             (zero callers could mean the symbol doesn't exist; use --scope all if testing).",
+            query
+        );
+    }
+
     let sites = collect_sites(files);
-    let mut hits: Vec<&CallSite> = sites
+
+    let direct: Vec<&CallSite> = sites
         .iter()
         .filter(|s| matches_target(&s.target, query))
         .collect();
-    hits.sort_by(|a, b| {
-        a.caller
-            .cmp(&b.caller)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.line.cmp(&b.line))
-    });
-    for s in &hits {
-        println!("{}\t{}\t{}:{}", s.caller, s.target, s.file, s.line);
+
+    if !transitive {
+        emit_caller_rows(&direct, by, summary);
+        let unique = direct
+            .iter()
+            .map(|s| s.caller.as_str())
+            .collect::<BTreeSet<_>>();
+        eprintln!(
+            "({} call site(s) across {} caller(s))",
+            direct.len(),
+            unique.len()
+        );
+        return Ok(());
     }
-    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
-    for h in &hits {
-        *counts.entry(h.caller.as_str()).or_insert(0) += 1;
+
+    // Transitive: BFS from query outwards through the call graph.
+    // Build: target_last_name -> set of caller qpaths.
+    let mut rev: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for s in &sites {
+        let last = if let Some(m) = s.target.strip_prefix('.') {
+            m.to_string()
+        } else if let Some(m) = s.target.strip_suffix('!') {
+            m.rsplit("::").next().unwrap_or(m).to_string()
+        } else {
+            s.target.rsplit("::").next().unwrap_or(&s.target).to_string()
+        };
+        rev.entry(last).or_default().insert(s.caller.clone());
+    }
+
+    let max_depth = depth.unwrap_or(usize::MAX);
+    let seed_last = query
+        .trim_start_matches('.')
+        .trim_start_matches("::")
+        .trim_end_matches('!')
+        .rsplit("::")
+        .next()
+        .unwrap_or(query)
+        .to_string();
+
+    let mut visited: BTreeMap<String, usize> = BTreeMap::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    queue.push_back((seed_last, 0));
+
+    while let Some((name, d)) = queue.pop_front() {
+        if d >= max_depth {
+            continue;
+        }
+        let Some(callers) = rev.get(&name) else {
+            continue;
+        };
+        for caller in callers {
+            let caller_last = caller
+                .rsplit("::")
+                .next()
+                .unwrap_or(caller)
+                .to_string();
+            let entry = visited.entry(caller.clone()).or_insert(d + 1);
+            if *entry > d + 1 {
+                *entry = d + 1;
+            }
+            // Only enqueue if depth not yet reached.
+            if d + 1 < max_depth {
+                queue.push_back((caller_last, d + 1));
+            }
+        }
+    }
+
+    // Emit transitive callers grouped by depth.
+    let mut rows: Vec<(String, usize)> = visited.into_iter().collect();
+    rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    if !summary {
+        for (caller, d) in &rows {
+            println!("d{}\t{}", d, caller);
+        }
     }
     eprintln!(
-        "({} call sites across {} caller(s))",
-        hits.len(),
-        counts.len()
+        "({} direct, {} transitive caller(s); max_depth={})",
+        direct.len(),
+        rows.len(),
+        depth
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "∞".to_string())
     );
     Ok(())
 }
 
-pub fn run_callees(files: &[ParsedFile], query: &str) -> anyhow::Result<()> {
+fn emit_caller_rows(hits: &[&CallSite], by: Option<&str>, summary: bool) {
+    if summary {
+        return;
+    }
+    match by {
+        Some("file") => {
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for h in hits {
+                *counts.entry(h.file.as_str()).or_insert(0) += 1;
+            }
+            let mut rows: Vec<_> = counts.into_iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (file, n) in rows {
+                println!("{}\t{}", n, file);
+            }
+        }
+        Some("module") => {
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for h in hits {
+                *counts
+                    .entry(top_module(&h.caller).to_string())
+                    .or_insert(0) += 1;
+            }
+            let mut rows: Vec<_> = counts.into_iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for (m, n) in rows {
+                println!("{}\t{}", n, m);
+            }
+        }
+        _ => {
+            let mut sorted: Vec<&&CallSite> = hits.iter().collect();
+            sorted.sort_by(|a, b| {
+                a.caller
+                    .cmp(&b.caller)
+                    .then_with(|| a.file.cmp(&b.file))
+                    .then_with(|| a.line.cmp(&b.line))
+            });
+            for s in sorted {
+                println!("{}\t{}\t{}:{}", s.caller, s.target, s.file, s.line);
+            }
+        }
+    }
+}
+
+pub fn run_callees(
+    files: &[ParsedFile],
+    _index: &NameIndex,
+    query: &str,
+    summary: bool,
+) -> anyhow::Result<()> {
     let sites = collect_sites(files);
     let last = query.rsplit("::").next().unwrap_or(query);
 
     let in_target = |caller: &str| -> bool {
         if query.contains("::") {
-            // Qualified: match path suffix only.
             caller == query || caller.ends_with(&format!("::{}", query))
         } else {
-            // Bare name: match last segment.
             caller.rsplit("::").next().unwrap_or(caller) == last
         }
     };
@@ -189,7 +365,7 @@ pub fn run_callees(files: &[ParsedFile], query: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut counts = std::collections::BTreeMap::<String, (usize, String, usize)>::new();
+    let mut counts = BTreeMap::<String, (usize, String, usize)>::new();
     for h in &hits {
         let e = counts
             .entry(h.target.clone())
@@ -198,8 +374,10 @@ pub fn run_callees(files: &[ParsedFile], query: &str) -> anyhow::Result<()> {
     }
     let mut rows: Vec<_> = counts.into_iter().collect();
     rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
-    for (target, (n, file, line)) in &rows {
-        println!("{}\t{}\t{}:{}", n, target, file, line);
+    if !summary {
+        for (target, (n, file, line)) in &rows {
+            println!("{}\t{}\t{}:{}", n, target, file, line);
+        }
     }
     eprintln!("({} distinct callees)", rows.len());
     Ok(())
