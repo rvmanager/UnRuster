@@ -60,7 +60,85 @@ use parse::Scope;
         - --scope production (default) / tests / all: controls test-code inclusion.\n\
         - --cfg KEY[=VALUE]: repeatable. Items whose cfg evaluates to definitively\n\
           False under this env are stripped. Unknown keys leave items in.\n\
-        - --summary: skip per-row output, keep summary line.",
+        - --summary: skip per-row output, keep summary line.\n\
+        \n\
+        ──────────────────────────────────────────────────────────────────────\n\
+        DESIGN AUDIT PLAYBOOK — which queries surface which refactor candidate.\n\
+        Use this as input to design decisions; the tool finds candidates, you\n\
+        decide whether to act.\n\
+        \n\
+        EXTRACT A TRAIT (replace a concrete type with an interface):\n\
+          unruster takes-mut <Type>          # mutation surface\n\
+          unruster type-refs <Type>          # coupling: how many modules name it\n\
+          unruster callers --by module <Type>::<method>   # per-method caller spread\n\
+          unruster inventory --kind impl-fn | grep '<Type>::'   # method count\n\
+        Signal: many `&mut Type` fns + many modules naming Type, where most\n\
+        callers only touch a subset of methods → trait extraction lets callers\n\
+        depend on the interface, not the concrete type.\n\
+        \n\
+        PRIVATIZE A FIELD (stop external write bleeding):\n\
+          unruster fields <Type>             # pub/priv breakdown\n\
+          unruster field-uses <Type> <field> --candidates\n\
+        Signal: writes appear with context outside `Type::*` methods → make the\n\
+        field private and add a method that enforces the invariant.\n\
+        \n\
+        REPLACE ENUM-MATCH WITH POLYMORPHISM:\n\
+          unruster parallel-matches <Enum>   # match sites grouped by variant set\n\
+          unruster variants <Enum>           # ctor + match counts per variant\n\
+          unruster catch-all-arms <Enum>     # `_ =>` arms (knowledge leak)\n\
+        Signal: ≥2 match sites cover the same variant set → push behavior into\n\
+        a trait with one impl per variant; callers stop knowing the variants.\n\
+        \n\
+        NEWTYPE (when a primitive plays many roles — String/u32/usize as ids,\n\
+        sizes, indices all at once):\n\
+          unruster type-refs String          # often huge; tells you primitive is overloaded\n\
+          unruster takes-mut String\n\
+          unruster callers <fn-that-takes-primitive> --by module\n\
+        Signal: same primitive returned/accepted across unrelated APIs → wrap\n\
+        each role in a newtype (`UserId(u32)`, `Pixels(u32)`) so the compiler\n\
+        catches mix-ups.\n\
+        \n\
+        SPLIT A STRUCT (low-cohesion / god-struct):\n\
+          unruster fields <Type>             # field count + per-field counts\n\
+          unruster metrics --sort loc        # top structs by field count\n\
+          # Then for each field group, run:\n\
+          unruster field-uses <Type> <field> --candidates  # to map field-to-callers\n\
+        Signal: disjoint sets of fns touch disjoint sets of fields → split into\n\
+        focused structs that match the access pattern.\n\
+        \n\
+        DEAD ENUM VARIANTS (kept around with no producers):\n\
+          unruster variants <Enum>\n\
+        Signal: variant has 0 ctor sites and is only seen in `_ =>` arms → drop\n\
+        the variant (or document why it's a placeholder).\n\
+        \n\
+        GOD FUNCTION TO SPLIT:\n\
+          unruster metrics --sort loc --top 20\n\
+          unruster callees <Type>::<fn>      # check helper-call clustering\n\
+        Signal: long fn calling several disjoint helper clusters → split the\n\
+        body into named helpers.\n\
+        \n\
+        SHRINK A PUB SURFACE (internal API hygiene):\n\
+          unruster inventory --vis pub --kind impl-fn\n\
+          unruster dead-code --pub-only\n\
+          unruster callers --by module <Type>::<method>\n\
+        Signal: pub fn with 0 callers in the tree → privatize. pub fn called\n\
+        from 1 module → consider making it pub(crate) or pub(super).\n\
+        \n\
+        SILENT FALLBACKS (forbidden by callee's contract):\n\
+          unruster error-swallows [--include-unwrap-or]\n\
+        Signal: `match-err-wild` / `if-let-ok` / `let-_` / `.map_err(|_|)` /\n\
+        `.unwrap_or_default()` hits. Each row is a candidate — some are\n\
+        intentional (parse cascades, drop guards); review per site.\n\
+        \n\
+        BREAKING-CHANGE BLAST RADIUS (before renaming/changing a signature):\n\
+          unruster callers <Type>::<method>          # direct callers\n\
+          unruster callers --transitive <Type>::<method>   # indirect callers\n\
+          unruster type-refs <Type>                  # full coupling footprint\n\
+        Signal: caller count + transitive depth tells you the change cost.\n\
+        \n\
+        General principle: the tool finds candidates. The decision \"extract a\n\
+        trait here\" / \"newtype that primitive\" / \"split that fn\" stays with the\n\
+        person reading the output.",
     version
 )]
 struct Cli {
