@@ -5,8 +5,11 @@ use clap::{Args, Parser, Subcommand};
 
 mod ast;
 mod callers;
+mod casts;
 mod catch_all;
 mod cfg_eval;
+mod conversion_pairs;
+mod conversions;
 mod dead_code;
 mod error_swallows;
 mod field;
@@ -136,6 +139,27 @@ use parse::Scope;
           unruster type-refs <Type>                  # full coupling footprint\n\
         Signal: caller count + transitive depth tells you the change cost.\n\
         \n\
+        EXCESSIVE CASTS / SHAPE-JUGGLING (the wrong type was picked at the\n\
+        boundary; the same value gets renamed/reshaped/cast as it flows A→Z\n\
+        instead of being typed once and passed through):\n\
+          unruster casts                       # all `as` casts, classified\n\
+          unruster casts --class narrow-int,signed-flip,float-int,ptr   # high-risk subset\n\
+          unruster casts --by fn               # rank cast-heavy fns\n\
+          unruster casts --no-widen            # hide safe widenings\n\
+          unruster conversions --by fn --top 10   # find conversion-heavy fns\n\
+          unruster conversions --kind .into,.to_string,::from\n\
+          unruster conversion-pairs            # mutual From<A>↔B pairs\n\
+        Signals:\n\
+        - One fn doing many casts → the value enters in the wrong shape;\n\
+          pick one representation at the boundary, cast once, pass typed.\n\
+        - `narrow-int` / `signed-flip` / `float-int` hits → silent data loss\n\
+          candidates; either prove they're safe or introduce a checked helper.\n\
+        - A fn with 5+ .into() / .to_string() / ::from() calls is reshaping\n\
+          the same value repeatedly → likely the surrounding API wants the\n\
+          wrong type and the fn is compensating.\n\
+        - conversion-pairs reporting `A ↔ B` → A and B are the same logical\n\
+          concept in two shapes; merge or make one a view of the other.\n\
+        \n\
         REDUCE DATA REPLICATION / REPETITION / CONVERSION:\n\
           unruster impls --trait From                # From<X> for Y impl count\n\
           unruster impls --trait Into                # Into impls\n\
@@ -236,6 +260,16 @@ enum Cmd {
     ErrorSwallows(ErrorSwallowsArgs),
     /// Find pass-through wrappers: fns whose body is a single call/expression.
     PassThrough(PassThroughArgs),
+
+    /// Find `as` casts; classifies narrowing / signed-flip / pointer / float-int /
+    /// usize-cross. Many casts in one fn = shape-juggling design smell.
+    Casts(CastsArgs),
+    /// Find conversion method/fn calls (.into / .to_string / Type::from / ...).
+    /// Use `--by fn --top 10` to find conversion-heavy fns.
+    Conversions(ConversionsArgs),
+    /// Find bidirectional `From<A> for B` + `From<B> for A` pairs — same
+    /// concept in two shapes, prime merge candidates.
+    ConversionPairs,
 }
 
 #[derive(Args)]
@@ -383,6 +417,37 @@ struct PassThroughArgs {
     max_loc: usize,
 }
 
+#[derive(Args)]
+struct CastsArgs {
+    /// Filter to one or more comma-separated classes:
+    /// narrow-int, widen-int, signed-flip, float-int, int-float,
+    /// narrow-float, widen-float, ptr, usize-cross, unknown, other.
+    #[arg(long)]
+    class: Option<String>,
+    /// Group + count: fn, file, or module.
+    #[arg(long)]
+    by: Option<String>,
+    /// Suppress safe-widening rows (widen-int / widen-float).
+    #[arg(long)]
+    no_widen: bool,
+}
+
+#[derive(Args)]
+struct ConversionsArgs {
+    /// Filter to one or more comma-separated kinds:
+    /// `.into`, `.try_into`, `.to_string`, `.to_owned`, `.to_vec`,
+    /// `.as_str`, `.as_bytes`, `.as_ref`, `.as_mut`, `.parse`,
+    /// `.cloned`, `.copied`, `.collect`, `::from`, `::try_from`.
+    #[arg(long)]
+    kind: Option<String>,
+    /// Group + count: fn, file, or module. Without --by, lists every site.
+    #[arg(long)]
+    by: Option<String>,
+    /// Show only the top N rows (applies after --by grouping if set).
+    #[arg(long)]
+    top: Option<usize>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let scope = Scope::parse(&cli.scope)?;
@@ -443,5 +508,21 @@ fn main() -> Result<()> {
         Cmd::ParallelMatches(a) => parallel_matches::run(&files, &idx, &a.name, summary),
         Cmd::ErrorSwallows(a) => error_swallows::run(&files, a.include_unwrap_or, summary),
         Cmd::PassThrough(a) => pass_through::run(&files, a.max_loc, summary),
+        Cmd::Casts(a) => casts::run(
+            &files,
+            &sem.fn_sigs,
+            a.class.as_deref(),
+            a.by.as_deref(),
+            a.no_widen,
+            summary,
+        ),
+        Cmd::Conversions(a) => conversions::run(
+            &files,
+            a.kind.as_deref(),
+            a.by.as_deref(),
+            a.top,
+            summary,
+        ),
+        Cmd::ConversionPairs => conversion_pairs::run(&files, summary),
     }
 }
