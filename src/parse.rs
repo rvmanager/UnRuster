@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::ast::{has_test_attr, item_attrs};
+use crate::cfg_eval::{parse_cfg_attr, CfgEnv};
 
 pub struct ParsedFile {
     pub path: PathBuf,
@@ -28,7 +29,12 @@ impl Scope {
     }
 }
 
-pub fn parse_dir(root: &Path, scope: Scope) -> anyhow::Result<Vec<ParsedFile>> {
+pub fn parse_dir(
+    root: &Path,
+    scope: Scope,
+    user_cfgs: &[String],
+) -> anyhow::Result<Vec<ParsedFile>> {
+    let cfg_env = build_cfg_env(scope, user_cfgs);
     let mut files = Vec::new();
     for entry in ignore::WalkBuilder::new(root).standard_filters(true).build() {
         let entry = match entry {
@@ -58,8 +64,8 @@ pub fn parse_dir(root: &Path, scope: Scope) -> anyhow::Result<Vec<ParsedFile>> {
         };
         match syn::parse_file(&source) {
             Ok(mut ast) => {
-                if scope == Scope::Production {
-                    strip_test_items(&mut ast.items);
+                if scope != Scope::All {
+                    strip_dead_cfg_items(&mut ast.items, &cfg_env);
                 }
                 let module = module_path_for(root, path);
                 files.push(ParsedFile {
@@ -76,6 +82,20 @@ pub fn parse_dir(root: &Path, scope: Scope) -> anyhow::Result<Vec<ParsedFile>> {
 
 pub fn display_path(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+fn build_cfg_env(scope: Scope, user_cfgs: &[String]) -> CfgEnv {
+    let mut env = CfgEnv::new();
+    match scope {
+        Scope::Tests => {
+            env.bools.insert("test".to_string());
+        }
+        _ => {}
+    }
+    for raw in user_cfgs {
+        env.add(raw);
+    }
+    env
 }
 
 fn module_path_for(root: &Path, file: &Path) -> String {
@@ -120,18 +140,23 @@ fn looks_like_test_named(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Recursively remove items annotated with `#[cfg(test)]`, `#[test]`, etc.
-/// Also recurses into inline `mod foo { ... }` blocks.
-fn strip_test_items(items: &mut Vec<syn::Item>) {
+/// Strip items whose cfg attributes evaluate to definitively False, OR which carry
+/// a `#[test]` / `#[bench]` attribute (those imply test scope).
+fn strip_dead_cfg_items(items: &mut Vec<syn::Item>, env: &CfgEnv) {
     items.retain(|item| {
-        item_attrs(item)
-            .map(|a| !has_test_attr(a))
-            .unwrap_or(true)
+        let Some(attrs) = item_attrs(item) else { return true; };
+        // Always strip #[test]/#[bench]/etc. when test is not set.
+        if !env.bools.contains("test") && has_test_attr(attrs) {
+            return false;
+        }
+        // Evaluate cfg attributes.
+        let cfgs: Vec<_> = attrs.iter().filter_map(parse_cfg_attr).collect();
+        !env.strip(&cfgs)
     });
     for item in items {
         if let syn::Item::Mod(m) = item {
             if let Some((_, sub)) = &mut m.content {
-                strip_test_items(sub);
+                strip_dead_cfg_items(sub, env);
             }
         }
     }

@@ -5,6 +5,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{line_of, path_to_string, type_short};
 use crate::index::NameIndex;
 use crate::parse::{display_path, ParsedFile};
+use crate::semantic::{Semantic, UseMap};
 
 #[derive(Debug, Clone)]
 struct CallSite {
@@ -12,6 +13,9 @@ struct CallSite {
     line: usize,
     caller: String,
     target: String,
+    /// Target as resolved through the calling file's `use` map, if different
+    /// from `target`. Used as a secondary key for `matches_target`. Approximate.
+    target_resolved: Option<String>,
 }
 
 struct CallVisitor<'a> {
@@ -49,6 +53,7 @@ impl<'a> CallVisitor<'a> {
             line,
             caller: self.enclosing(),
             target,
+            target_resolved: None,
         });
     }
 }
@@ -109,7 +114,7 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     }
 }
 
-fn collect_sites(files: &[ParsedFile]) -> Vec<CallSite> {
+fn collect_sites(files: &[ParsedFile], sem: &Semantic, index: &NameIndex) -> Vec<CallSite> {
     let mut all = Vec::new();
     for f in files {
         let mut v = CallVisitor {
@@ -121,9 +126,35 @@ fn collect_sites(files: &[ParsedFile]) -> Vec<CallSite> {
             sites: Vec::new(),
         };
         v.visit_file(&f.ast);
+        // Resolve each target's head through the file's use-map (approximate).
+        if let Some(uses) = sem.uses_for(&f.path) {
+            for site in &mut v.sites {
+                site.target_resolved = resolve_target_via_uses(&site.target, uses, index);
+            }
+        }
         all.extend(v.sites);
     }
     all
+}
+
+fn resolve_target_via_uses(target: &str, uses: &UseMap, index: &NameIndex) -> Option<String> {
+    if target.starts_with('.') || target.ends_with('!') {
+        return None;
+    }
+    let segs: Vec<&str> = target.split("::").collect();
+    if segs.is_empty() {
+        return None;
+    }
+    let head = segs[0];
+    let resolved = uses.resolve(head, index)?;
+    if resolved == head {
+        return None;
+    }
+    if segs.len() == 1 {
+        Some(resolved)
+    } else {
+        Some(format!("{}::{}", resolved, segs[1..].join("::")))
+    }
 }
 
 fn matches_target(call_target: &str, query: &str) -> bool {
@@ -192,6 +223,7 @@ fn top_module(qpath: &str) -> &str {
 pub fn run_callers(
     files: &[ParsedFile],
     index: &NameIndex,
+    sem: &Semantic,
     query: &str,
     transitive: bool,
     depth: Option<usize>,
@@ -206,11 +238,17 @@ pub fn run_callers(
         );
     }
 
-    let sites = collect_sites(files);
+    let sites = collect_sites(files, sem, index);
 
     let direct: Vec<&CallSite> = sites
         .iter()
-        .filter(|s| matches_target(&s.target, query))
+        .filter(|s| {
+            matches_target(&s.target, query)
+                || s.target_resolved
+                    .as_deref()
+                    .map(|t| matches_target(t, query))
+                    .unwrap_or(false)
+        })
         .collect();
 
     if !transitive {
@@ -344,11 +382,12 @@ fn emit_caller_rows(hits: &[&CallSite], by: Option<&str>, summary: bool) {
 
 pub fn run_callees(
     files: &[ParsedFile],
-    _index: &NameIndex,
+    index: &NameIndex,
+    sem: &Semantic,
     query: &str,
     summary: bool,
 ) -> anyhow::Result<()> {
-    let sites = collect_sites(files);
+    let sites = collect_sites(files, sem, index);
     let last = query.rsplit("::").next().unwrap_or(query);
 
     let in_target = |caller: &str| -> bool {

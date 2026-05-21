@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand};
 mod ast;
 mod callers;
 mod catch_all;
+mod cfg_eval;
 mod dead_code;
 mod error_swallows;
 mod field;
@@ -18,6 +19,7 @@ mod metrics;
 mod parallel_matches;
 mod parse;
 mod pass_through;
+mod semantic;
 mod takes_mut;
 mod type_refs;
 mod variants;
@@ -30,27 +32,35 @@ use parse::Scope;
     about = "Query a Rust codebase: inventory, callers/callees, field uses, variants, impls, metrics, dead-code.",
     long_about = "Query a Rust codebase via syntactic (syn) analysis.\n\
         \n\
-        Macro bodies are scanned best-effort: tokens are split on top-level\n\
-        `,`/`;` and each chunk is parsed as an expression. This works for any\n\
-        macro whose args are expression-like (println!, format!, write!, vec!,\n\
-        assert!, dbg!, and custom macros like dbg_log!, log_debug!, etc.).\n\
-        Quoting macros (quote!, parse_quote!) are skipped. `matches!(e, p)`\n\
-        is special-cased so the pattern arg is not treated as an expression.\n\
+        Precision tiers (look for the `via` column on results to see which fired):\n\
         \n\
-        --scope (top-level) controls test-code inclusion:\n\
-        - production (default): skip files under tests/ and benches/, and items\n\
-          marked with #[cfg(test)] / #[test] / #[bench] / #[tokio::test].\n\
-        - tests: only files under tests/ or benches/ (or *_test*.rs).\n\
-        - all: everything.\n\
+        PRECISE (raw AST shape — trustworthy):\n\
+        - Item inventory, impl blocks, struct fields, enum variants.\n\
+        - self.field accesses inside `impl Type`.\n\
+        - Match-site / pattern shapes (catch-all-arms, parallel-matches).\n\
+        - Free-fn / method / macro call sites by last-segment name.\n\
         \n\
-        Known limitations:\n\
-        - Non-expression-shaped macro DSLs are still missed beyond the\n\
-          comma/semicolon split heuristic.\n\
-        - Non-`self` field accesses are matched by field name only; the receiver's\n\
-          type isn't inferred (use --candidates + --via-receiver).\n\
-        - Type matches across files use last-segment name matching; identical names\n\
-          in different modules are not disambiguated.\n\
-        - `cfg`-gated code other than `cfg(test)` is included regardless of features.",
+        APPROXIMATE (semantic-lite, may have false positives/negatives):\n\
+        - field-uses `via=ti`: receiver type inferred from local lets, params,\n\
+          and obvious constructors. Misses method-chain results, generics,\n\
+          trait dispatch, closure captures.\n\
+        - type-refs `via=alias`: walks `type X = Y;` chains. Misses associated-\n\
+          type re-exports (`impl Foo { type Out = Bar; }`).\n\
+        - callers `Type::method`: also matches paths where the head segment is\n\
+          renamed by `use foo::Type as Other`. Misses dyn-dispatch and generics.\n\
+        - dead-code: last-segment name matching; pub items may have external\n\
+          callers we don't see; trait methods are skipped to cut false positives.\n\
+        \n\
+        BEST-EFFORT (heuristic — flag and verify):\n\
+        - field-uses `via=?` (--candidates only): receiver type unknown.\n\
+        - Macro body scanning: token streams parsed speculatively as expressions.\n\
+        - Custom macros and DSLs whose args aren't expressions are missed.\n\
+        \n\
+        Top-level flags:\n\
+        - --scope production (default) / tests / all: controls test-code inclusion.\n\
+        - --cfg KEY[=VALUE]: repeatable. Items whose cfg evaluates to definitively\n\
+          False under this env are stripped. Unknown keys leave items in.\n\
+        - --summary: skip per-row output, keep summary line.",
     version
 )]
 struct Cli {
@@ -61,6 +71,12 @@ struct Cli {
     /// Test-code scope: production (default), tests, or all.
     #[arg(long, global = true, default_value = "production")]
     scope: String,
+
+    /// `--cfg KEY` or `--cfg KEY=VALUE` (repeatable). Items whose cfg
+    /// evaluates to definitively False under this env are stripped. Unknown
+    /// keys (no `--cfg` provided) leave the item in (best-effort).
+    #[arg(long, global = true)]
+    cfg: Vec<String>,
 
     /// Skip per-row output; print only the summary line on stderr.
     #[arg(long, global = true)]
@@ -254,7 +270,7 @@ struct PassThroughArgs {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let scope = Scope::parse(&cli.scope)?;
-    let files = parse::parse_dir(&cli.root, scope)?;
+    let files = parse::parse_dir(&cli.root, scope, &cli.cfg)?;
     if files.is_empty() {
         eprintln!(
             "warning: no .rs files found under {} (scope={:?})",
@@ -263,19 +279,21 @@ fn main() -> Result<()> {
         );
     }
     let idx = index::NameIndex::build(&files);
+    let sem = semantic::Semantic::build(&files);
     let summary = cli.summary;
     match cli.cmd {
         Cmd::Inventory(a) => inventory::run(&files, a.kind.as_deref(), a.vis.as_deref(), a.tree, summary),
         Cmd::Callers(a) => callers::run_callers(
             &files,
             &idx,
+            &sem,
             &a.name,
             a.transitive,
             a.depth,
             a.by.as_deref(),
             summary,
         ),
-        Cmd::Callees(a) => callers::run_callees(&files, &idx, &a.name, summary),
+        Cmd::Callees(a) => callers::run_callees(&files, &idx, &sem, &a.name, summary),
         Cmd::FieldUses(a) => {
             let mut kinds: Vec<&str> = Vec::new();
             if a.reads_only {
@@ -289,6 +307,7 @@ fn main() -> Result<()> {
             }
             field::run(
                 &files,
+                &sem.fn_sigs,
                 &a.ty,
                 &a.field,
                 !a.candidates,
@@ -300,7 +319,7 @@ fn main() -> Result<()> {
         Cmd::Fields(a) => fields::run(&files, &idx, &a.ty, summary),
         Cmd::Variants(a) => variants::run(&files, &idx, &a.name, a.bare, summary),
         Cmd::Impls(a) => impls::run(&idx, a.of.as_deref(), a.trait_.as_deref(), summary),
-        Cmd::TypeRefs(a) => type_refs::run(&files, &idx, &a.ty, summary),
+        Cmd::TypeRefs(a) => type_refs::run(&files, &idx, &sem.aliases, &a.ty, summary),
         Cmd::TakesMut(a) => takes_mut::run(&files, &idx, &a.ty, summary),
         Cmd::Metrics(a) => metrics::run(&files, &a.sort, a.top, summary),
         Cmd::DeadCode(a) => dead_code::run(&files, &idx, a.pub_only, summary),

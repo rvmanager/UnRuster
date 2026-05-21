@@ -3,18 +3,21 @@ use syn::visit::{self, Visit};
 use crate::ast::{line_of, path_to_string_with_args, type_short};
 use crate::index::NameIndex;
 use crate::parse::{display_path, ParsedFile};
+use crate::semantic::AliasGraph;
 
 #[derive(Debug)]
 struct Ref {
     file: String,
     line: usize,
     context: String,
-    role: &'static str, // "type" | "ctor" | "path"
+    role: &'static str, // "type" | "ctor"
     written: String,    // path as written, e.g. `crate::doc::Document`
+    matched_via: &'static str, // "name" | "alias"
 }
 
 struct RefVisitor<'a> {
-    target: &'a str,
+    targets: &'a [String], // primary name + all alias-equivalent names
+    primary: &'a str,
     file: &'a str,
     module: &'a str,
     fn_stack: Vec<String>,
@@ -43,14 +46,18 @@ impl<'a> RefVisitor<'a> {
         }
     }
 
-    fn matches_path_last(&self, p: &syn::Path) -> bool {
-        p.segments
-            .last()
-            .map(|s| s.ident == self.target)
-            .unwrap_or(false)
+    fn matches_path_last(&self, p: &syn::Path) -> Option<&'static str> {
+        let last = p.segments.last()?.ident.to_string();
+        if last == self.primary {
+            Some("name")
+        } else if self.targets.iter().any(|t| t == &last) {
+            Some("alias")
+        } else {
+            None
+        }
     }
 
-    fn record(&mut self, role: &'static str, written: String, line: usize) {
+    fn record(&mut self, role: &'static str, written: String, line: usize, via: &'static str) {
         let ctx = self.enclosing();
         self.out.push(Ref {
             file: self.file.to_string(),
@@ -58,6 +65,7 @@ impl<'a> RefVisitor<'a> {
             context: ctx,
             role,
             written,
+            matched_via: via,
         });
     }
 }
@@ -85,42 +93,70 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     }
 
     fn visit_type_path(&mut self, t: &'ast syn::TypePath) {
-        if self.matches_path_last(&t.path) {
+        if let Some(via) = self.matches_path_last(&t.path) {
             let line = t
                 .path
                 .segments
                 .last()
                 .map(|s| line_of(&s.ident))
                 .unwrap_or(0);
-            self.record("type", path_to_string_with_args(&t.path), line);
+            self.record("type", path_to_string_with_args(&t.path), line, via);
         }
         visit::visit_type_path(self, t);
     }
 
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*e.func {
-            // Detect `Type::new(...)`, `Type::default(...)`, `Type(arg)` (tuple struct ctor)
             let segs = &p.path.segments;
-            if segs.len() == 1 && segs[0].ident == self.target {
-                let line = line_of(&segs[0].ident);
-                self.record("ctor", path_to_string_with_args(&p.path), line);
-            } else if segs.len() >= 2 && segs[segs.len() - 2].ident == self.target {
-                let line = line_of(&segs[segs.len() - 2].ident);
-                self.record("ctor", path_to_string_with_args(&p.path), line);
+            // `Type(arg)` (tuple-struct ctor as call)
+            if segs.len() == 1 {
+                let id = &segs[0].ident.to_string();
+                let via = if id == self.primary {
+                    Some("name")
+                } else if self.targets.iter().any(|t| t == id) {
+                    Some("alias")
+                } else {
+                    None
+                };
+                if let Some(via) = via {
+                    self.record(
+                        "ctor",
+                        path_to_string_with_args(&p.path),
+                        line_of(&segs[0].ident),
+                        via,
+                    );
+                }
+            } else if segs.len() >= 2 {
+                let pen = &segs[segs.len() - 2].ident.to_string();
+                let via = if pen == self.primary {
+                    Some("name")
+                } else if self.targets.iter().any(|t| t == pen) {
+                    Some("alias")
+                } else {
+                    None
+                };
+                if let Some(via) = via {
+                    self.record(
+                        "ctor",
+                        path_to_string_with_args(&p.path),
+                        line_of(&segs[segs.len() - 2].ident),
+                        via,
+                    );
+                }
             }
         }
         visit::visit_expr_call(self, e);
     }
 
     fn visit_expr_struct(&mut self, e: &'ast syn::ExprStruct) {
-        if self.matches_path_last(&e.path) {
+        if let Some(via) = self.matches_path_last(&e.path) {
             let line = e
                 .path
                 .segments
                 .last()
                 .map(|s| line_of(&s.ident))
                 .unwrap_or(0);
-            self.record("ctor", path_to_string_with_args(&e.path), line);
+            self.record("ctor", path_to_string_with_args(&e.path), line, via);
         }
         visit::visit_expr_struct(self, e);
     }
@@ -132,7 +168,13 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     }
 }
 
-pub fn run(files: &[ParsedFile], index: &NameIndex, ty: &str, summary: bool) -> anyhow::Result<()> {
+pub fn run(
+    files: &[ParsedFile],
+    index: &NameIndex,
+    aliases: &AliasGraph,
+    ty: &str,
+    summary: bool,
+) -> anyhow::Result<()> {
     if !index.knows_name(ty) {
         eprintln!(
             "note: `{}` is not a known struct/enum/trait/type-alias in this tree; \
@@ -141,10 +183,24 @@ pub fn run(files: &[ParsedFile], index: &NameIndex, ty: &str, summary: bool) -> 
         );
     }
 
+    let targets = aliases.synonyms(ty);
+    if targets.len() > 1 {
+        eprintln!(
+            "note: also matching alias-equivalent names: {}",
+            targets
+                .iter()
+                .filter(|n| n.as_str() != ty)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let mut all: Vec<Ref> = Vec::new();
     for f in files {
         let mut v = RefVisitor {
-            target: ty,
+            targets: &targets,
+            primary: ty,
             file: &display_path(&f.path),
             module: &f.module,
             fn_stack: Vec::new(),
@@ -159,17 +215,24 @@ pub fn run(files: &[ParsedFile], index: &NameIndex, ty: &str, summary: bool) -> 
     all.sort_by(|a, b| {
         a.role
             .cmp(b.role)
+            .then_with(|| a.matched_via.cmp(b.matched_via))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))
     });
 
+    let mut alias_hits = 0usize;
     if !summary {
         for r in &all {
+            if r.matched_via == "alias" {
+                alias_hits += 1;
+            }
             println!(
-                "{}\t{}\t{}\t{}:{}",
-                r.role, r.written, r.context, r.file, r.line
+                "{}\t{}\t{}\t{}\t{}:{}",
+                r.role, r.matched_via, r.written, r.context, r.file, r.line
             );
         }
+    } else {
+        alias_hits = all.iter().filter(|r| r.matched_via == "alias").count();
     }
 
     let mut by_module = std::collections::BTreeMap::<String, usize>::new();
@@ -182,6 +245,11 @@ pub fn run(files: &[ParsedFile], index: &NameIndex, ty: &str, summary: bool) -> 
             .join("::");
         *by_module.entry(module_of).or_default() += 1;
     }
-    eprintln!("({} reference(s) across {} module(s))", all.len(), by_module.len());
+    eprintln!(
+        "({} reference(s) across {} module(s); {} via alias)",
+        all.len(),
+        by_module.len(),
+        alias_hits
+    );
     Ok(())
 }

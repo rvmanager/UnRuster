@@ -2,14 +2,21 @@ use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_last, path_to_string, type_short};
 use crate::parse::{display_path, ParsedFile};
+use crate::semantic::{FnSigIndex, FnTypes};
 
 #[derive(Debug)]
 struct FieldHit {
     kind: &'static str, // "read" | "write" | "init"
+    /// Why we believe this hit refers to the target type:
+    /// "self" — self in `impl Type`
+    /// "init" — `Type { f: ... }` struct literal
+    /// "ti"   — receiver type inferred (function-local) to be Type
+    /// "?"    — receiver type unknown (only emitted in --candidates mode)
+    via: &'static str,
     file: String,
     line: usize,
     context: String, // enclosing fn or impl
-    note: String,    // "self", "<expr>", base path, ...
+    receiver: String,
 }
 
 struct FieldVisitor<'a> {
@@ -17,13 +24,19 @@ struct FieldVisitor<'a> {
     module: &'a str,
     target_type: &'a str,
     target_field: &'a str,
+    /// strict: only emit "self" / "init" / "ti" hits.
+    /// non-strict (candidates): also emit "?" hits.
     strict: bool,
 
     impl_stack: Vec<String>,
     fn_stack: Vec<String>,
+    /// Per-fn-body type maps. Pushed on fn entry, popped on exit. The last
+    /// entry is the currently-enclosing fn.
+    fn_types_stack: Vec<FnTypes>,
     mod_stack: Vec<String>,
     in_write_lhs: bool,
 
+    fn_sigs: &'a FnSigIndex,
     hits: Vec<FieldHit>,
 }
 
@@ -54,14 +67,23 @@ impl<'a> FieldVisitor<'a> {
             .unwrap_or(false)
     }
 
-    fn record(&mut self, kind: &'static str, line: usize, note: String) {
+    fn record(&mut self, kind: &'static str, via: &'static str, line: usize, receiver: String) {
         self.hits.push(FieldHit {
             kind,
+            via,
             file: self.file.to_string(),
             line,
             context: self.enclosing(),
-            note,
+            receiver,
         });
+    }
+
+    /// Try to infer the receiver type using the enclosing fn's `FnTypes`.
+    /// Returns `Some(type_last)` if known, `None` if no inference possible.
+    fn infer_receiver(&self, base: &syn::Expr) -> Option<String> {
+        self.fn_types_stack
+            .last()
+            .and_then(|ft| ft.type_of(base, self.fn_sigs))
     }
 }
 
@@ -74,7 +96,10 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.fn_stack.push(i.sig.ident.to_string());
+        self.fn_types_stack
+            .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
         visit::visit_item_fn(self, i);
+        self.fn_types_stack.pop();
         self.fn_stack.pop();
     }
 
@@ -86,7 +111,10 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.fn_stack.push(i.sig.ident.to_string());
+        self.fn_types_stack
+            .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
         visit::visit_impl_item_fn(self, i);
+        self.fn_types_stack.pop();
         self.fn_stack.pop();
     }
 
@@ -122,7 +150,6 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     }
 
     fn visit_expr_reference(&mut self, e: &'ast syn::ExprReference) {
-        // `&mut self.f` counts as a write (read-modify-write potential).
         if e.mutability.is_some() {
             let saved = self.in_write_lhs;
             self.in_write_lhs = true;
@@ -137,26 +164,57 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
         if let syn::Member::Named(id) = &e.member {
             if id == self.target_field {
                 let is_write = self.in_write_lhs;
-                // Only the outermost field-access node is the target of the write;
-                // its inner base is just read to compute the place.
                 let was_write = self.in_write_lhs;
                 self.in_write_lhs = false;
 
-                let (note, confirmed) = match &*e.base {
+                let kind: &'static str = if is_write { "write" } else { "read" };
+
+                // Classify the receiver:
+                //   self in impl Type → "self"        (always emit)
+                //   non-self, type inferred to Type → "ti"  (always emit)
+                //   non-self, inferred to different type → drop (not target)
+                //   non-self, type unknown → "?"      (emit only if !strict)
+                match &*e.base {
                     syn::Expr::Path(p) if p.path.is_ident("self") => {
                         if self.in_target_impl() {
-                            ("self".to_string(), true)
-                        } else {
-                            (format!("self (in impl {})", self.impl_stack.last().cloned().unwrap_or_default()), false)
+                            self.record(kind, "self", line_of(id), "self".to_string());
+                        } else if !self.strict {
+                            self.record(
+                                kind,
+                                "?",
+                                line_of(id),
+                                format!(
+                                    "self (in impl {})",
+                                    self.impl_stack.last().cloned().unwrap_or_default()
+                                ),
+                            );
                         }
                     }
-                    syn::Expr::Path(p) => (path_to_string(&p.path), false),
-                    _ => ("<expr>".to_string(), false),
-                };
-
-                if confirmed || !self.strict {
-                    let kind: &'static str = if is_write { "write" } else { "read" };
-                    self.record(kind, line_of(id), note);
+                    base => {
+                        let inferred = self.infer_receiver(base);
+                        match inferred {
+                            Some(t) if t == self.target_type => {
+                                let recv = match base {
+                                    syn::Expr::Path(p) => path_to_string(&p.path),
+                                    _ => "<expr>".to_string(),
+                                };
+                                self.record(kind, "ti", line_of(id), recv);
+                            }
+                            Some(_) => {
+                                // Inferred to a different type — definitely not target.
+                                // Drop.
+                            }
+                            None => {
+                                if !self.strict {
+                                    let recv = match base {
+                                        syn::Expr::Path(p) => path_to_string(&p.path),
+                                        _ => "<expr>".to_string(),
+                                    };
+                                    self.record(kind, "?", line_of(id), recv);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 self.visit_expr(&e.base);
@@ -170,7 +228,10 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     fn visit_expr_struct(&mut self, e: &'ast syn::ExprStruct) {
         let lit_ty = path_last(&e.path);
         let resolved_ty = if lit_ty == "Self" {
-            self.impl_stack.last().cloned().unwrap_or_else(|| lit_ty.clone())
+            self.impl_stack
+                .last()
+                .cloned()
+                .unwrap_or_else(|| lit_ty.clone())
         } else {
             lit_ty.clone()
         };
@@ -179,7 +240,7 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
                 if let syn::Member::Named(id) = &fv.member {
                     if id == self.target_field {
                         let line = line_of(id);
-                        self.record("init", line, resolved_ty.clone());
+                        self.record("init", "init", line, resolved_ty.clone());
                     }
                 }
             }
@@ -194,7 +255,13 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     }
 }
 
-fn collect(files: &[ParsedFile], ty: &str, field: &str, strict: bool) -> Vec<FieldHit> {
+fn collect(
+    files: &[ParsedFile],
+    ty: &str,
+    field: &str,
+    strict: bool,
+    fn_sigs: &FnSigIndex,
+) -> Vec<FieldHit> {
     let mut all = Vec::new();
     for f in files {
         let mut v = FieldVisitor {
@@ -205,8 +272,10 @@ fn collect(files: &[ParsedFile], ty: &str, field: &str, strict: bool) -> Vec<Fie
             strict,
             impl_stack: Vec::new(),
             fn_stack: Vec::new(),
+            fn_types_stack: Vec::new(),
             mod_stack: Vec::new(),
             in_write_lhs: false,
+            fn_sigs,
             hits: Vec::new(),
         };
         v.visit_file(&f.ast);
@@ -217,6 +286,7 @@ fn collect(files: &[ParsedFile], ty: &str, field: &str, strict: bool) -> Vec<Fie
 
 pub fn run(
     files: &[ParsedFile],
+    fn_sigs: &FnSigIndex,
     ty: &str,
     field: &str,
     strict: bool,
@@ -224,23 +294,28 @@ pub fn run(
     via_receiver: Option<&str>,
     summary: bool,
 ) -> anyhow::Result<()> {
-    let mut all = collect(files, ty, field, strict);
+    let mut all = collect(files, ty, field, strict, fn_sigs);
 
     if !kinds.is_empty() {
         all.retain(|h| kinds.contains(&h.kind));
     }
     if let Some(pat) = via_receiver {
-        all.retain(|h| h.note.contains(pat));
+        all.retain(|h| h.receiver.contains(pat));
     }
 
     all.sort_by(|a, b| {
         a.kind
             .cmp(b.kind)
+            .then_with(|| a.via.cmp(b.via))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))
     });
 
-    let (mut reads, mut writes, mut inits) = (0usize, 0usize, 0usize);
+    let mut reads = 0usize;
+    let mut writes = 0usize;
+    let mut inits = 0usize;
+    let mut ti_count = 0usize;
+    let mut q_count = 0usize;
     for h in &all {
         match h.kind {
             "read" => reads += 1,
@@ -248,25 +323,29 @@ pub fn run(
             "init" => inits += 1,
             _ => {}
         }
+        match h.via {
+            "ti" => ti_count += 1,
+            "?" => q_count += 1,
+            _ => {}
+        }
         if !summary {
             println!(
-                "{}\t{}\t{}\t{}:{}",
-                h.kind, h.note, h.context, h.file, h.line
+                "{}\t{}\t{}\t{}\t{}:{}",
+                h.kind, h.via, h.receiver, h.context, h.file, h.line
             );
         }
     }
     eprintln!(
-        "({} reads, {} writes, {} inits; strict={})",
-        reads, writes, inits, strict
+        "({} reads, {} writes, {} inits; via: {} type-inferred, {} unknown receiver; strict={})",
+        reads, writes, inits, ti_count, q_count, strict
     );
 
-    // 0/N hint: if strict found nothing, see if candidates would.
     if strict && all.is_empty() && via_receiver.is_none() && kinds.is_empty() {
-        let cand = collect(files, ty, field, false);
+        let cand = collect(files, ty, field, false, fn_sigs);
         if !cand.is_empty() {
             eprintln!(
-                "hint: strict matched 0; --candidates would report {} hit(s) via other receivers. \
-                 Try `--candidates` or `--candidates --via-receiver <substring>` to narrow.",
+                "hint: strict matched 0; --candidates would report {} hit(s) (mostly unknown receivers). \
+                 Try `--candidates` or `--candidates --via-receiver <substring>`.",
                 cand.len()
             );
         }
