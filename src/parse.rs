@@ -36,10 +36,17 @@ pub fn parse_dir(
 ) -> anyhow::Result<Vec<ParsedFile>> {
     let cfg_env = build_cfg_env(scope, user_cfgs);
     let mut files = Vec::new();
+    let mut walk_errs = 0usize;
+    let mut read_errs = 0usize;
+    let mut parse_errs = 0usize;
     for entry in ignore::WalkBuilder::new(root).standard_filters(true).build() {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                walk_errs += 1;
+                eprintln!("warning: walk error: {}", e);
+                continue;
+            }
         };
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
@@ -58,6 +65,7 @@ pub fn parse_dir(
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
+                read_errs += 1;
                 eprintln!("warning: read failed for {}: {}", path.display(), e);
                 continue;
             }
@@ -74,8 +82,22 @@ pub fn parse_dir(
                     module,
                 });
             }
-            Err(e) => eprintln!("warning: parse failed for {}: {}", path.display(), e),
+            Err(e) => {
+                parse_errs += 1;
+                eprintln!("warning: parse failed for {}: {}", path.display(), e);
+            }
         }
+    }
+    let skipped = walk_errs + read_errs + parse_errs;
+    if skipped > 0 {
+        eprintln!(
+            "(scanned {} file(s); {} skipped: {} walk, {} read, {} parse errors)",
+            files.len(),
+            skipped,
+            walk_errs,
+            read_errs,
+            parse_errs
+        );
     }
     Ok(files)
 }

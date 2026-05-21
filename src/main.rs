@@ -136,9 +136,42 @@ use parse::Scope;
           unruster type-refs <Type>                  # full coupling footprint\n\
         Signal: caller count + transitive depth tells you the change cost.\n\
         \n\
+        REDUCE DATA REPLICATION / REPETITION / CONVERSION:\n\
+          unruster impls --trait From                # From<X> for Y impl count\n\
+          unruster impls --trait Into                # Into impls\n\
+          unruster impls --trait TryFrom\n\
+          unruster impls --trait AsRef               # cheap-conversion proliferation\n\
+          unruster fields <A> ; unruster fields <B>  # field-shape overlap between candidates\n\
+          unruster pass-through                      # thin wrappers, often in conversion layers\n\
+          unruster parallel-matches <Enum>           # same per-variant logic in multiple sites\n\
+          unruster callers .clone                    # clone() hotspots — fragmented ownership\n\
+          unruster callers .to_string                # conversion hotspot\n\
+          unruster callers .to_owned\n\
+          unruster callers .into\n\
+          unruster inventory --kind fn               # then grep '::(from|to|as|into)_' for clusters\n\
+        Signals:\n\
+        - Many `From<A> for B` (plus `From<B> for A`) impls between the same\n\
+          two types → A and B are the same logical concept in two shapes;\n\
+          merge them, or make one a view (`AsRef<B> for A`).\n\
+        - Two structs whose `fields <T>` outputs share most field names+types\n\
+          → parallel data representations; collapse to one and convert at the\n\
+          boundary, or make one a wrapper of the other.\n\
+        - `.clone()` called heavily on one type → ownership is fragmented;\n\
+          consider `Rc`/`Arc`, a single-owner pattern, or borrowing.\n\
+        - `parallel-matches` finding the same variant set in many sites →\n\
+          per-variant logic is being re-derived; push the work onto the type\n\
+          (trait method) so the logic lives in one place.\n\
+        - A cluster of `to_*` / `from_*` / `as_*` / `into_*` fns on the same\n\
+          type, especially with overlapping names (`to_str`, `as_str`,\n\
+          `to_string`, `into_string`) → conversion namespace is sprawling;\n\
+          consolidate to the standard trait impls (`AsRef<str>`, `Display`)\n\
+          and delete the bespoke helpers.\n\
+        - pass-through fn whose body is `to_other_repr(x)` → the two reprs\n\
+          coexist with no behavior difference; one should win.\n\
+        \n\
         General principle: the tool finds candidates. The decision \"extract a\n\
-        trait here\" / \"newtype that primitive\" / \"split that fn\" stays with the\n\
-        person reading the output.",
+        trait here\" / \"newtype that primitive\" / \"split that fn\" / \"merge\n\
+        these two types\" stays with the person reading the output.",
     version
 )]
 struct Cli {
