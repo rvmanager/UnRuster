@@ -22,6 +22,11 @@ pub struct Defn {
     pub owner: Option<String>,
     /// For "impl" headers: the trait being implemented, if any.
     pub trait_name: Option<String>,
+    /// True for impl-fn defns whose enclosing `impl` block is a trait impl
+    /// (i.e. `impl SomeTrait for T { fn ... }`). False for inherent impls and
+    /// for non-fn defns. Used by `dead-code` to skip dynamically-dispatched
+    /// trait methods.
+    pub in_trait_impl: bool,
 }
 
 pub struct NameIndex {
@@ -74,14 +79,6 @@ impl NameIndex {
         } else {
             ids.iter().map(|&i| &self.defns[i]).collect()
         }
-    }
-
-    /// Lookup restricted to a specific kind (e.g. "struct", "enum", "trait").
-    pub fn lookup_kind(&self, query: &str, kind: &str) -> Vec<&Defn> {
-        self.lookup(query)
-            .into_iter()
-            .filter(|d| d.kind == kind)
-            .collect()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Defn> {
@@ -148,6 +145,7 @@ impl<'a> IndexVisitor<'a> {
             module: self.current_module(),
             owner: self.current_owner(),
             trait_name: None,
+            in_trait_impl: false,
         });
     }
 }
@@ -197,6 +195,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                     module: self.current_module(),
                     owner: self.trait_stack.last().cloned(),
                     trait_name: None,
+                    in_trait_impl: false,
                 });
             }
         }
@@ -257,6 +256,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
             None => format!("impl {}", type_to_string(&i.self_ty)),
         };
         let module = self.current_module();
+        let is_trait_impl = trait_name.is_some();
         self.out.push(Defn {
             kind: "impl",
             name: self_ty.clone(),
@@ -267,6 +267,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
             module: module.clone(),
             owner: Some(self_ty.clone()),
             trait_name,
+            in_trait_impl: false,
         });
         self.impl_stack.push(self_ty);
         for item in &i.items {
@@ -283,6 +284,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                     module: module.clone(),
                     owner: self.impl_stack.last().cloned(),
                     trait_name: None,
+                    in_trait_impl: is_trait_impl,
                 });
             }
         }

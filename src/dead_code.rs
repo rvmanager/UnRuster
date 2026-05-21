@@ -70,34 +70,11 @@ pub fn run(
         if matches!(d.name.as_str(), "main" | "start") {
             continue;
         }
-        // Trait methods whose owning trait is implemented somewhere are likely
-        // dispatched dynamically — skip to avoid false positives.
-        if d.kind == "trait-fn" {
-            continue;
-        }
-        // Default impls of common traits (Display, Debug, Drop, Clone, ...) get
-        // called by `{}`/`{:?}`/auto-drop and are easy to miss-name. Skip fns
-        // whose name is a known trait-method convention.
-        if matches!(
-            d.name.as_str(),
-            "fmt"
-                | "from"
-                | "into"
-                | "as_ref"
-                | "as_mut"
-                | "deref"
-                | "deref_mut"
-                | "drop"
-                | "clone"
-                | "default"
-                | "hash"
-                | "eq"
-                | "ne"
-                | "cmp"
-                | "partial_cmp"
-                | "next"
-                | "size_hint"
-        ) {
+        // Trait-defined methods and methods inside `impl Trait for T` are
+        // dispatched dynamically (or by trait-method auto-dispatch). The index
+        // marks the latter with `in_trait_impl`; skip both to avoid massive
+        // false-positive noise from `Visit`, `Display`, `Iterator`, etc.
+        if d.kind == "trait-fn" || d.in_trait_impl {
             continue;
         }
         if sink.called.contains(&d.name) {

@@ -116,7 +116,12 @@ enum Cmd {
     CatchAllArms(CatchAllArgs),
     /// Group match sites on an enum by which variants they cover (shotgun-surgery candidates).
     ParallelMatches(ParallelMatchesArgs),
-    /// Find Result/Option error-swallowing patterns (.ok(), .unwrap_or_default(), ...).
+    /// Find Result/Option error-swallowing patterns. Detects method calls
+    /// (`.ok()`, `.err()`, `.unwrap_or_default()`, `.unwrap_or_else(...)`,
+    /// `.map_err(|_|...)`) and syntactic forms (`match { Err(_) => ... }`,
+    /// `if let Ok(...)` with no else, `while let Ok(...)`, `let _ = expr;`).
+    /// Each row carries a `kind` label so you can grep by category. Some hits
+    /// are intentional (e.g. `let _ =` of a Drop guard) — review per site.
     ErrorSwallows(ErrorSwallowsArgs),
     /// Find pass-through wrappers: fns whose body is a single call/expression.
     PassThrough(PassThroughArgs),

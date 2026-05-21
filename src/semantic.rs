@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{path_to_string, type_last_segment, type_to_string};
+use crate::ast::type_last_segment;
 use crate::index::NameIndex;
 use crate::parse::ParsedFile;
 
@@ -382,14 +382,3 @@ impl Semantic {
     }
 }
 
-// Keep an unused-import-killer reference; type_to_string is exposed for
-// future commands that want to render inferred types.
-#[allow(dead_code)]
-fn _keep_alive(t: &syn::Type) -> String {
-    type_to_string(t)
-}
-
-#[allow(dead_code)]
-fn _path(p: &syn::Path) -> String {
-    path_to_string(p)
-}

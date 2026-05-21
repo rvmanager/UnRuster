@@ -1,11 +1,16 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, type_short};
+use crate::ast::{line_of, line_of_span, type_short};
 use crate::parse::{display_path, ParsedFile};
 
 #[derive(Debug)]
 struct Hit {
-    kind: &'static str, // ".ok" | ".unwrap_or_default" | ".unwrap_or_else" | ".unwrap_or"
+    /// Method-call swallows:
+    ///   ".ok" | ".err" | ".unwrap_or_default" | ".unwrap_or_else" |
+    ///   ".unwrap_or" | ".map_err(|_|...)"
+    /// Syntactic swallows:
+    ///   "match-err-wild" | "if-let-ok" | "while-let-ok" | "let-_"
+    kind: &'static str,
     file: String,
     line: usize,
     context: String,
@@ -40,6 +45,66 @@ impl<'a> SwallowVisitor<'a> {
             path.join("::")
         }
     }
+
+    fn record(&mut self, kind: &'static str, line: usize) {
+        let ctx = self.enclosing();
+        self.hits.push(Hit {
+            kind,
+            file: self.file.to_string(),
+            line,
+            context: ctx,
+        });
+    }
+}
+
+/// True for `_` and underscore-prefixed bindings (`_`, `_e`, `_err`) — the
+/// convention for "intentionally discarded." A bare `e` returns false because
+/// it may be referenced in the body.
+fn pat_is_discarded(p: &syn::Pat) -> bool {
+    match p {
+        syn::Pat::Wild(_) => true,
+        syn::Pat::Ident(i) => {
+            i.subpat.is_none() && i.ident.to_string().starts_with('_')
+        }
+        syn::Pat::Reference(r) => pat_is_discarded(&r.pat),
+        syn::Pat::Paren(p) => pat_is_discarded(&p.pat),
+        _ => false,
+    }
+}
+
+/// `Err(_)` / `Err(_e)` — the error contents are discarded by the pattern.
+/// `Err(e)` is NOT flagged because the body may reference `e`.
+fn pat_is_err_swallow(p: &syn::Pat) -> bool {
+    match p {
+        syn::Pat::TupleStruct(ts) => {
+            let last = ts
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            last == "Err" && ts.elems.iter().all(pat_is_discarded)
+        }
+        syn::Pat::Or(o) => o.cases.iter().any(pat_is_err_swallow),
+        syn::Pat::Reference(r) => pat_is_err_swallow(&r.pat),
+        syn::Pat::Paren(p) => pat_is_err_swallow(&p.pat),
+        _ => false,
+    }
+}
+
+/// `Ok(_)` / `Ok(x)` head — used to identify if-let-ok / while-let-ok forms.
+fn pat_is_ok(p: &syn::Pat) -> bool {
+    match p {
+        syn::Pat::TupleStruct(ts) => ts
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident == "Ok")
+            .unwrap_or(false),
+        syn::Pat::Reference(r) => pat_is_ok(&r.pat),
+        syn::Pat::Paren(p) => pat_is_ok(&p.pat),
+        _ => false,
+    }
 }
 
 impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
@@ -72,19 +137,71 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
             "unwrap_or_default" if e.args.is_empty() => Some(".unwrap_or_default"),
             "unwrap_or_else" => Some(".unwrap_or_else"),
             "unwrap_or" if self.include_unwrap_or => Some(".unwrap_or"),
-            "ok_or_default" => Some(".ok_or_default"),
+            "map_err" => {
+                // Flag only when the closure's first arg is `_` or `_name` —
+                // the error contents are intentionally discarded.
+                let mut discarded = false;
+                if let Some(syn::Expr::Closure(c)) = e.args.first() {
+                    if let Some(first) = c.inputs.first() {
+                        discarded = pat_is_discarded(first);
+                    }
+                }
+                if discarded {
+                    Some(".map_err(|_|)")
+                } else {
+                    None
+                }
+            }
             _ => None,
         };
         if let Some(k) = kind {
-            let ctx = self.enclosing();
-            self.hits.push(Hit {
-                kind: k,
-                file: self.file.to_string(),
-                line: line_of(&e.method),
-                context: ctx,
-            });
+            self.record(k, line_of(&e.method));
         }
         visit::visit_expr_method_call(self, e);
+    }
+
+    fn visit_expr_match(&mut self, e: &'ast syn::ExprMatch) {
+        for arm in &e.arms {
+            if pat_is_err_swallow(&arm.pat) {
+                let line = line_of_span(arm.fat_arrow_token.spans[0]);
+                self.record("match-err-wild", line);
+                break; // one report per match site
+            }
+        }
+        visit::visit_expr_match(self, e);
+    }
+
+    fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
+        if e.else_branch.is_none() {
+            if let syn::Expr::Let(le) = &*e.cond {
+                if pat_is_ok(&le.pat) {
+                    self.record("if-let-ok", line_of(&e.if_token));
+                }
+            }
+        }
+        visit::visit_expr_if(self, e);
+    }
+
+    fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
+        if let syn::Expr::Let(le) = &*e.cond {
+            if pat_is_ok(&le.pat) {
+                self.record("while-let-ok", line_of(&e.while_token));
+            }
+        }
+        visit::visit_expr_while(self, e);
+    }
+
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        // `let _ = expr;` with init — explicit discard.
+        let is_wild = match &l.pat {
+            syn::Pat::Wild(_) => true,
+            syn::Pat::Type(pt) => matches!(*pt.pat, syn::Pat::Wild(_)),
+            _ => false,
+        };
+        if is_wild && l.init.is_some() {
+            self.record("let-_", line_of(&l.let_token));
+        }
+        visit::visit_local(self, l);
     }
 }
 
