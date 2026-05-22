@@ -23,6 +23,7 @@ mod parallel_matches;
 mod parse;
 mod pass_through;
 mod semantic;
+mod stringly;
 mod takes_mut;
 mod type_refs;
 mod variants;
@@ -138,6 +139,23 @@ use parse::Scope;
           unruster callers --transitive <Type>::<method>   # indirect callers\n\
           unruster type-refs <Type>                  # full coupling footprint\n\
         Signal: caller count + transitive depth tells you the change cost.\n\
+        \n\
+        STRINGLY-TYPED CODE (logic branches on string literals — fragile to\n\
+        typos, silent on missing cases, no compile-time exhaustiveness):\n\
+          unruster stringly                       # ==, .eq(), match, assert_eq! with str literals\n\
+          unruster stringly --include-substring   # also .starts_with/.ends_with/.contains\n\
+          unruster stringly --include-map-keys    # also map.get(\"lit\"), .contains_key, .remove\n\
+          unruster stringly --by fn               # rank worst offenders\n\
+        Signals:\n\
+        - A fn with multiple `match-lit` arms → replace with an enum; the\n\
+          compiler then catches typos and forces exhaustiveness.\n\
+        - `cmp-eq` / `cmp-method` hits → the string is acting as an identifier;\n\
+          consider a newtype (`pub struct ActionId(&'static str)` with named\n\
+          associated consts) or a proper enum if the set is closed.\n\
+        - `substr` hits → if the prefix/suffix encodes a category, lift it\n\
+          into the type system (enum at the API boundary, parsed once).\n\
+        - `map-lit-key` hits → consider an enum keyed map or a typed registry\n\
+          (`HashMap<MyKey, V>` where `MyKey` is an enum).\n\
         \n\
         EXCESSIVE CASTS / SHAPE-JUGGLING (the wrong type was picked at the\n\
         boundary; the same value gets renamed/reshaped/cast as it flows A→Z\n\
@@ -270,6 +288,10 @@ enum Cmd {
     /// Find bidirectional `From<A> for B` + `From<B> for A` pairs — same
     /// concept in two shapes, prime merge candidates.
     ConversionPairs,
+    /// Find stringly-typed code: branching/matching on string literals.
+    /// Catches `x == "lit"`, `x.eq("lit")`, `match x { "lit" => ... }`,
+    /// `assert_eq!(x, "lit")`. Each row = candidate for an enum or newtype.
+    Stringly(StringlyArgs),
 }
 
 #[derive(Args)]
@@ -433,6 +455,21 @@ struct CastsArgs {
 }
 
 #[derive(Args)]
+struct StringlyArgs {
+    /// Also flag `.starts_with("lit")` / `.ends_with("lit")` / `.contains("lit")`.
+    /// Off by default — many legitimate text-processing uses.
+    #[arg(long)]
+    include_substring: bool,
+    /// Also flag `map.get("lit")` / `.contains_key("lit")` / `.remove("lit")`.
+    /// Off by default — many legitimate canonical-key map uses.
+    #[arg(long)]
+    include_map_keys: bool,
+    /// Group + count: fn, file, or module.
+    #[arg(long)]
+    by: Option<String>,
+}
+
+#[derive(Args)]
 struct ConversionsArgs {
     /// Filter to one or more comma-separated kinds:
     /// `.into`, `.try_into`, `.to_string`, `.to_owned`, `.to_vec`,
@@ -524,5 +561,12 @@ fn main() -> Result<()> {
             summary,
         ),
         Cmd::ConversionPairs => conversion_pairs::run(&files, summary),
+        Cmd::Stringly(a) => stringly::run(
+            &files,
+            a.include_substring,
+            a.include_map_keys,
+            a.by.as_deref(),
+            summary,
+        ),
     }
 }
