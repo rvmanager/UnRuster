@@ -25,6 +25,7 @@ mod pass_through;
 mod semantic;
 mod stringly;
 mod takes_mut;
+mod tests_cmd;
 mod type_refs;
 mod variants;
 
@@ -152,6 +153,20 @@ use parse::Scope;
           unruster callers --transitive <Type>::<method>   # indirect callers\n\
           unruster type-refs <Type>                  # full coupling footprint\n\
         Signal: caller count + transitive depth tells you the change cost.\n\
+        \n\
+        TEST-SUITE AUDIT (find inconsistencies in what's tested across\n\
+        commands or features — \"every fn has a smoke test but only some\n\
+        have a --summary test\"):\n\
+          unruster tests                          # list every #[test] fn + file:start-end\n\
+          unruster tests --with-hint              # add args() fingerprint per test\n\
+          unruster tests --by-subcommand          # histogram of tests per CLI subcommand\n\
+        Signals:\n\
+        - `--by-subcommand` reveals coverage imbalance: a command with 5\n\
+          tests vs 1 means the rare one is under-tested.\n\
+        - `--with-hint` exposes near-duplicates (same args fingerprint = same\n\
+          test in disguise) and missing flag combos at a glance.\n\
+        - `file:start-end` lets an agent read just the relevant body via\n\
+          `sed -n start,endp file` instead of scanning the whole file.\n\
         \n\
         STRINGLY-TYPED CODE (logic branches on string literals — fragile to\n\
         typos, silent on missing cases, no compile-time exhaustiveness):\n\
@@ -308,6 +323,12 @@ enum Cmd {
     /// Catches `x == "lit"`, `x.eq("lit")`, `match x { "lit" => ... }`,
     /// `assert_eq!(x, "lit")`. Each row = candidate for an enum or newtype.
     Stringly(StringlyArgs),
+    /// List `#[test]`/`#[bench]`/`#[tokio::test]` fns with `file:start-end`
+    /// + name. Always scans the full tree (ignores --scope) since test code
+    /// is the whole point. Use `--with-hint` to include the `args(...)` body
+    /// fingerprint; use `--by subcommand` to group tests by which CLI
+    /// subcommand they invoke (assert_cmd-style: looks at `.args([...])`).
+    Tests(TestsArgs),
 }
 
 #[derive(Args)]
@@ -476,6 +497,19 @@ struct CastsArgs {
 }
 
 #[derive(Args)]
+struct TestsArgs {
+    /// Include a compact fingerprint of the test body's first `.args([...])`
+    /// call (the `--root <path>` / `--scope <val>` prefix is stripped).
+    #[arg(long)]
+    with_hint: bool,
+    /// Group + count tests by which CLI subcommand they invoke (heuristic:
+    /// scans `.args([...])` calls in the body for a known-subcommand-shaped
+    /// string literal). Drops the per-test list, prints a histogram.
+    #[arg(long)]
+    by_subcommand: bool,
+}
+
+#[derive(Args)]
 struct StringlyArgs {
     /// Also flag `.starts_with("lit")` / `.ends_with("lit")` / `.contains("lit")`.
     /// Off by default — many legitimate text-processing uses.
@@ -604,5 +638,19 @@ fn main() -> Result<()> {
             a.by.as_deref(),
             summary,
         ),
+        Cmd::Tests(a) => {
+            // Always scan the full tree — under --scope production the
+            // tests we want to enumerate would be stripped.
+            let all_files = if scope == Scope::All {
+                None
+            } else {
+                Some(parse::parse_dir(&cli.root, Scope::All, &cli.cfg)?)
+            };
+            let source: &[parse::ParsedFile] = match &all_files {
+                Some(v) => v,
+                None => &files,
+            };
+            tests_cmd::run(source, a.with_hint, a.by_subcommand, summary)
+        }
     }
 }

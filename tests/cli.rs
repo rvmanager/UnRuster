@@ -1476,6 +1476,59 @@ fn playbook_pub_surface_audit() {
         .success();
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  `tests` subcommand itself.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn tests_lists_test_fns() {
+    // Self-referential: against the unruster root, must find the fixture's
+    // `#[test] fn it_runs` and direct test attrs.
+    ur().args(["--root", "fixtures/sample", "tests"])
+        .assert()
+        .success()
+        .stdout(contains("it_runs"));
+}
+
+#[test]
+fn tests_with_hint_includes_args() {
+    // Against unruster's own tests dir, hints should expose the args fingerprint.
+    ur().args(["--root", ".", "tests", "--with-hint"])
+        .assert()
+        .success()
+        .stdout(contains("inventory"));
+}
+
+#[test]
+fn tests_by_subcommand_groups() {
+    // Histogram should mention inventory (heavily tested subcommand).
+    ur().args(["--root", ".", "tests", "--by-subcommand"])
+        .assert()
+        .success()
+        .stdout(contains("inventory"));
+}
+
+#[test]
+fn tests_summary_mode() {
+    assert_summary_silent_stdout(&["--root", ".", "--summary", "tests"]);
+}
+
+#[test]
+fn tests_row_shape_default() {
+    // Default rows: attr, file:start-end, qpath  → 3 cols.
+    let out = ur_stdout(&["--root", "fixtures/sample", "tests"]);
+    assert!(!rows_of(&out).is_empty());
+    assert_tsv_cols(&out, 3);
+}
+
+#[test]
+fn tests_row_shape_with_hint() {
+    // With-hint rows: attr, file:start-end, qpath, hint  → 4 cols.
+    let out = ur_stdout(&["--root", "fixtures/sample", "tests", "--with-hint"]);
+    assert!(!rows_of(&out).is_empty());
+    assert_tsv_cols(&out, 4);
+}
+
 #[test]
 fn playbook_field_bleed_audit() {
     // From --help: "PRIVATIZE A FIELD" — fields + field-uses --candidates.
