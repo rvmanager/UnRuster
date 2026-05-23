@@ -1,0 +1,1 @@
+Non-.rs file in fixture so parse.rs's extension-check continue branch fires.

@@ -122,12 +122,11 @@ impl<'a> IndexVisitor<'a> {
         path.join("::")
     }
 
+    // `push()` is only invoked for top-level items (struct/enum/trait/fn/etc.),
+    // never during impl/trait iteration — those construct Defns directly. So
+    // the "current owner" at push time is always None.
     fn current_owner(&self) -> Option<String> {
-        if let Some(t) = self.impl_stack.last() {
-            Some(t.clone())
-        } else {
-            self.trait_stack.last().cloned()
-        }
+        None
     }
 
     fn current_module(&self) -> String {

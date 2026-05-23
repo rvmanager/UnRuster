@@ -166,6 +166,23 @@ fn field_uses_writes_only_filter() {
 }
 
 #[test]
+fn field_uses_hint_when_strict_empty_but_candidates_match() {
+    // No `impl NoSuchType { self.transform = ... }` exists, but many other
+    // `self.transform` accesses do — strict matches 0, candidates would match
+    // many. Exercises the hint code in field.rs.
+    let out = ur()
+        .args(["--root", FIXTURE, "field-uses", "NoSuchType", "transform"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("hint:"),
+        "expected hint about candidates, got stderr:\n{}",
+        stderr
+    );
+}
+
+#[test]
 fn field_uses_via_receiver_filter() {
     ur().args([
         "--root",
@@ -188,6 +205,26 @@ fn fields_lists_struct_fields_with_counts() {
         .success()
         .stdout(contains("transform"))
         .stdout(contains("name"));
+}
+
+#[test]
+fn fields_exotic_field_types() {
+    // Drives ast::type_to_string through Tuple / Array / Ptr / TraitObject /
+    // BareFn / Parenthesized / QSelf / leading `::` / Never branches.
+    ur().args(["--root", FIXTURE, "fields", "ExoticFields"])
+        .assert()
+        .success()
+        .stdout(contains("tup"))
+        .stdout(contains("fn_ptr"));
+}
+
+#[test]
+fn type_refs_array_type() {
+    // Drives type_to_string through impls on `&u8` and `[u8; 4]`
+    ur().args(["--root", FIXTURE, "impls"])
+        .assert()
+        .success()
+        .stdout(contains("HasDefault"));
 }
 
 // ─── variants ──────────────────────────────────────────────────────────────
@@ -250,6 +287,30 @@ fn type_refs_via_alias() {
         .success();
 }
 
+#[test]
+fn type_refs_unknown_warns() {
+    ur().args(["--root", FIXTURE, "type-refs", "NotAType"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn type_refs_in_submodule_file() {
+    // Exercises the `module-not-empty` path inside RefVisitor::enclosing.
+    ur().args(["--root", FIXTURE, "type-refs", "G1"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn type_refs_tuple_struct_ctor() {
+    // `TupleS(1, 2)` is a single-segment Expr::Call — type_refs.rs len==1 branch.
+    ur().args(["--root", FIXTURE, "type-refs", "TupleS"])
+        .assert()
+        .success()
+        .stdout(contains("TupleS"));
+}
+
 // ─── takes-mut ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -258,6 +319,54 @@ fn takes_mut_finds_mut_params() {
         .assert()
         .success()
         .stdout(contains("Document::touch"));
+}
+
+#[test]
+fn takes_mut_with_u8_param() {
+    // Finds &mut u8 params in exotic.rs — exercises module-non-empty enclosing.
+    ur().args(["--root", FIXTURE, "takes-mut", "u8"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn takes_mut_unknown_type_warns() {
+    // Exercises the knows_name false branch (note about unknown type).
+    let out = ur()
+        .args(["--root", FIXTURE, "takes-mut", "NoSuchType"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a known"));
+}
+
+#[test]
+fn callees_no_calls_message() {
+    // Exercises "no fn matching" path.
+    let out = ur()
+        .args(["--root", FIXTURE, "callees", "no_such_fn_xyz"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no fn matching") || stderr.contains("0 distinct"));
+}
+
+#[test]
+fn pass_through_method_call_form() {
+    // wrap_method body is `d.render()` — Expr::MethodCall.
+    ur().args(["--root", FIXTURE, "pass-through"])
+        .assert()
+        .success()
+        .stdout(contains("wrap_method"));
+}
+
+#[test]
+fn pass_through_macro_form() {
+    // wrap_macro_call body is `println!("x")` — Expr::Macro.
+    ur().args(["--root", FIXTURE, "pass-through"])
+        .assert()
+        .success()
+        .stdout(contains("wrap_macro_call"));
 }
 
 // ─── metrics ───────────────────────────────────────────────────────────────
@@ -844,6 +953,73 @@ fn cfg_multi_flags_unix_macos() {
     .assert()
     .success()
     .stdout(contains("macos_only"));
+}
+
+#[test]
+fn cfg_any_keeps_with_gpu() {
+    ur().args([
+        "--root",
+        FIXTURE,
+        "--cfg",
+        "feature=gpu",
+        "inventory",
+        "--kind",
+        "fn",
+    ])
+    .assert()
+    .success()
+    .stdout(contains("any_gfx_backend"));
+}
+
+#[test]
+fn cfg_any_keeps_with_metal_too() {
+    ur().args([
+        "--root",
+        FIXTURE,
+        "--cfg",
+        "feature=metal",
+        "inventory",
+        "--kind",
+        "fn",
+    ])
+    .assert()
+    .success()
+    .stdout(contains("any_gfx_backend"));
+}
+
+#[test]
+fn cfg_not_inverts() {
+    let out = ur()
+        .args([
+            "--root",
+            FIXTURE,
+            "--cfg",
+            "feature=no_color",
+            "inventory",
+            "--kind",
+            "fn",
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.contains("with_color"), "with_color should be stripped under --cfg feature=no_color");
+}
+
+#[test]
+fn cfg_quoted_value_parses() {
+    // `--cfg feature="gpu"` (with quotes) should behave the same as bare.
+    ur().args([
+        "--root",
+        FIXTURE,
+        "--cfg",
+        "feature=\"gpu\"",
+        "inventory",
+        "--kind",
+        "fn",
+    ])
+    .assert()
+    .success()
+    .stdout(contains("gpu_only"));
 }
 
 #[test]

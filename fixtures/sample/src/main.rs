@@ -23,6 +23,9 @@ pub enum Token {
     Resize { w: u32, h: u32 },
 }
 
+/// Top-level variant constant — exercises SiteVisitor::enclosing top-level branch.
+pub const SAMPLE_TOKEN: Token = Token::Eof;
+
 pub trait Render {
     fn render(&self) -> String;
 }
@@ -52,6 +55,16 @@ impl Document {
 
     pub fn add_child(d: &mut Document, c: Document) {
         d.children.push(c);
+    }
+
+    /// Match-on-enum inside an `impl` block — exercises catch_all + parallel_matches
+    /// when impl_stack is non-empty (RefVisitor::enclosing impl_stack branch).
+    pub fn classify_token(&self, t: &Token) -> u8 {
+        match t {
+            Token::Eof => 0,
+            Token::Word(_) => 1,
+            _ => 99,
+        }
     }
 }
 
@@ -85,6 +98,15 @@ pub fn classify(t: &Token) -> u8 {
     match t {
         Token::Eof => 0,
         Token::Word(_) => 1,
+        _ => 99,
+    }
+}
+
+/// Or-pattern + wildcard — exercises catch_all Or-arm + parallel_matches Or-case branches.
+pub fn classify_or(t: &Token) -> u8 {
+    match t {
+        Token::Eof | Token::Word(_) => 1,
+        Token::Number(_) => 2,
         _ => 99,
     }
 }
@@ -212,6 +234,15 @@ pub fn macos_only() {}
 
 #[cfg(any(test, feature = "tracing"))]
 pub fn telemetry_helper() {}
+
+#[cfg(any(feature = "gpu", feature = "metal"))]
+pub fn any_gfx_backend() {}
+
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+pub fn gpu_macos_only() {}
+
+#[cfg(not(feature = "no_color"))]
+pub fn with_color() {}
 
 // Triggers more cast classes.
 pub fn cast_variety(x: u32, y: f64) -> (i8, f32, *const u8) {
