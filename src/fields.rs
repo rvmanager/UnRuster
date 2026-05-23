@@ -66,6 +66,10 @@ impl<'a> CountVisitor<'a> {
     }
 }
 
+fn is_self_in_target_impl(base: &syn::Expr, in_target_impl: bool) -> bool {
+    matches!(base, syn::Expr::Path(p) if p.path.is_ident("self")) && in_target_impl
+}
+
 impl<'ast, 'a> Visit<'ast> for CountVisitor<'a> {
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
         self.impl_stack
@@ -117,24 +121,24 @@ impl<'ast, 'a> Visit<'ast> for CountVisitor<'a> {
     }
 
     fn visit_expr_field(&mut self, e: &'ast syn::ExprField) {
-        if let syn::Member::Named(id) = &e.member {
-            if id == self.target_field {
-                let is_write = self.in_write_lhs;
-                self.in_write_lhs = false;
-                if let syn::Expr::Path(p) = &*e.base {
-                    if p.path.is_ident("self") && self.in_target_impl() {
-                        if is_write {
-                            self.counts.writes += 1;
-                        } else {
-                            self.counts.reads += 1;
-                        }
-                    }
-                }
-                self.visit_expr(&e.base);
-                return;
+        let syn::Member::Named(id) = &e.member else {
+            visit::visit_expr_field(self, e);
+            return;
+        };
+        if id != self.target_field {
+            visit::visit_expr_field(self, e);
+            return;
+        }
+        let is_write = self.in_write_lhs;
+        self.in_write_lhs = false;
+        if is_self_in_target_impl(&e.base, self.in_target_impl()) {
+            if is_write {
+                self.counts.writes += 1;
+            } else {
+                self.counts.reads += 1;
             }
         }
-        visit::visit_expr_field(self, e);
+        self.visit_expr(&e.base);
     }
 
     fn visit_expr_struct(&mut self, e: &'ast syn::ExprStruct) {

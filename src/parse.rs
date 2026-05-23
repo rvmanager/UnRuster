@@ -11,22 +11,13 @@ pub struct ParsedFile {
     pub module: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Scope {
+    #[value(alias = "prod")]
     Production,
+    #[value(alias = "test")]
     Tests,
     All,
-}
-
-impl Scope {
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "production" | "prod" => Ok(Scope::Production),
-            "tests" | "test" => Ok(Scope::Tests),
-            "all" => Ok(Scope::All),
-            _ => anyhow::bail!("invalid --scope {:?}: expected production|tests|all", s),
-        }
-    }
 }
 
 pub fn parse_dir(

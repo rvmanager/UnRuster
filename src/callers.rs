@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string, type_short};
+use crate::ast::{line_of, path_to_string, print_grouped_counts, type_short};
 use crate::index::NameIndex;
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{Semantic, UseMap};
@@ -341,29 +341,9 @@ fn emit_caller_rows(hits: &[&CallSite], by: Option<&str>, summary: bool) {
         return;
     }
     match by {
-        Some("file") => {
-            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-            for h in hits {
-                *counts.entry(h.file.as_str()).or_insert(0) += 1;
-            }
-            let mut rows: Vec<_> = counts.into_iter().collect();
-            rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-            for (file, n) in rows {
-                println!("{}\t{}", n, file);
-            }
-        }
+        Some("file") => print_grouped_counts(hits, None, |h| h.file.clone()),
         Some("module") => {
-            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-            for h in hits {
-                *counts
-                    .entry(top_module(&h.caller).to_string())
-                    .or_insert(0) += 1;
-            }
-            let mut rows: Vec<_> = counts.into_iter().collect();
-            rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            for (m, n) in rows {
-                println!("{}\t{}", n, m);
-            }
+            print_grouped_counts(hits, None, |h| top_module(&h.caller).to_string())
         }
         _ => {
             let mut sorted: Vec<&&CallSite> = hits.iter().collect();

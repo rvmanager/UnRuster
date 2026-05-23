@@ -235,8 +235,9 @@ struct Cli {
     root: PathBuf,
 
     /// Test-code scope: production (default), tests, or all.
-    #[arg(long, global = true, default_value = "production")]
-    scope: String,
+    /// Aliases: `prod` = production, `test` = tests.
+    #[arg(long, global = true, value_enum, default_value = "production")]
+    scope: Scope,
 
     /// `--cfg KEY` or `--cfg KEY=VALUE` (repeatable). Items whose cfg
     /// evaluates to definitively False under this env are stripped. Unknown
@@ -507,7 +508,7 @@ struct ConversionsArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let scope = Scope::parse(&cli.scope)?;
+    let scope = cli.scope;
     let files = parse::parse_dir(&cli.root, scope, &cli.cfg)?;
     if files.is_empty() {
         eprintln!(

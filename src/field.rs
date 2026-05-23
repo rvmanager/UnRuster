@@ -85,6 +85,40 @@ impl<'a> FieldVisitor<'a> {
             .last()
             .and_then(|ft| ft.type_of(base, self.fn_sigs))
     }
+
+    /// Classify the receiver of a `<base>.<target_field>` access.
+    /// Returns `Some((via, receiver-display))` when the access matches the
+    /// target type (under strict + candidates rules), `None` when it should
+    /// be dropped (inferred to a different type, or strict-mode unknown).
+    fn classify_base(&self, base: &syn::Expr) -> Option<(&'static str, String)> {
+        // `self` in an `impl Type` — always emit.
+        if let syn::Expr::Path(p) = base {
+            if p.path.is_ident("self") {
+                if self.in_target_impl() {
+                    return Some(("self", "self".to_string()));
+                }
+                if self.strict {
+                    return None;
+                }
+                let owner = self.impl_stack.last().cloned().unwrap_or_default();
+                return Some(("?", format!("self (in impl {})", owner)));
+            }
+        }
+        // Non-self: try the local type inferencer.
+        match self.infer_receiver(base) {
+            Some(t) if t == self.target_type => Some(("ti", recv_display(base))),
+            Some(_) => None, // inferred to a different type — definitely not target
+            None if self.strict => None,
+            None => Some(("?", recv_display(base))),
+        }
+    }
+}
+
+fn recv_display(base: &syn::Expr) -> String {
+    match base {
+        syn::Expr::Path(p) => path_to_string(&p.path),
+        _ => "<expr>".to_string(),
+    }
 }
 
 impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
@@ -161,68 +195,25 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     }
 
     fn visit_expr_field(&mut self, e: &'ast syn::ExprField) {
-        if let syn::Member::Named(id) = &e.member {
-            if id == self.target_field {
-                let is_write = self.in_write_lhs;
-                let was_write = self.in_write_lhs;
-                self.in_write_lhs = false;
-
-                let kind: &'static str = if is_write { "write" } else { "read" };
-
-                // Classify the receiver:
-                //   self in impl Type → "self"        (always emit)
-                //   non-self, type inferred to Type → "ti"  (always emit)
-                //   non-self, inferred to different type → drop (not target)
-                //   non-self, type unknown → "?"      (emit only if !strict)
-                match &*e.base {
-                    syn::Expr::Path(p) if p.path.is_ident("self") => {
-                        if self.in_target_impl() {
-                            self.record(kind, "self", line_of(id), "self".to_string());
-                        } else if !self.strict {
-                            self.record(
-                                kind,
-                                "?",
-                                line_of(id),
-                                format!(
-                                    "self (in impl {})",
-                                    self.impl_stack.last().cloned().unwrap_or_default()
-                                ),
-                            );
-                        }
-                    }
-                    base => {
-                        let inferred = self.infer_receiver(base);
-                        match inferred {
-                            Some(t) if t == self.target_type => {
-                                let recv = match base {
-                                    syn::Expr::Path(p) => path_to_string(&p.path),
-                                    _ => "<expr>".to_string(),
-                                };
-                                self.record(kind, "ti", line_of(id), recv);
-                            }
-                            Some(_) => {
-                                // Inferred to a different type — definitely not target.
-                                // Drop.
-                            }
-                            None => {
-                                if !self.strict {
-                                    let recv = match base {
-                                        syn::Expr::Path(p) => path_to_string(&p.path),
-                                        _ => "<expr>".to_string(),
-                                    };
-                                    self.record(kind, "?", line_of(id), recv);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                self.visit_expr(&e.base);
-                self.in_write_lhs = was_write;
-                return;
-            }
+        let syn::Member::Named(id) = &e.member else {
+            visit::visit_expr_field(self, e);
+            return;
+        };
+        if id != self.target_field {
+            visit::visit_expr_field(self, e);
+            return;
         }
-        visit::visit_expr_field(self, e);
+        let is_write = self.in_write_lhs;
+        let was_write = self.in_write_lhs;
+        self.in_write_lhs = false;
+        let kind: &'static str = if is_write { "write" } else { "read" };
+
+        if let Some((via, recv)) = self.classify_base(&e.base) {
+            self.record(kind, via, line_of(id), recv);
+        }
+
+        self.visit_expr(&e.base);
+        self.in_write_lhs = was_write;
     }
 
     fn visit_expr_struct(&mut self, e: &'ast syn::ExprStruct) {

@@ -202,6 +202,35 @@ pub fn has_allow_dead_code(attrs: &[syn::Attribute]) -> bool {
     false
 }
 
+/// Group `items` by `key`, sort by count desc, optionally truncate to top N,
+/// print one row per group as `<count>\t<key>` on stdout.
+///
+/// Shared by commands that support `--by fn|file|module`.
+pub fn print_grouped_counts<T, F>(items: &[T], top: Option<usize>, key: F)
+where
+    F: Fn(&T) -> String,
+{
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for item in items {
+        *counts.entry(key(item)).or_insert(0) += 1;
+    }
+    let mut rows: Vec<(String, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if let Some(n) = top {
+        rows.truncate(n);
+    }
+    for (k, n) in rows {
+        println!("{}\t{}", n, k);
+    }
+}
+
+/// Top-level module of a `qpath` like `inventory::Visitor::record`. Returns
+/// the whole string if there's no `::`.
+pub fn top_module_of(qpath: &str) -> &str {
+    qpath.split("::").next().unwrap_or(qpath)
+}
+
 /// Get the attributes list for any `syn::Item`. Returns None for variants
 /// without attrs (rare/forbidden ones).
 pub fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {

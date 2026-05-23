@@ -1,6 +1,6 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, type_short};
+use crate::ast::{line_of, print_grouped_counts, top_module_of, type_short};
 use crate::parse::{display_path, ParsedFile};
 
 #[derive(Debug)]
@@ -169,53 +169,10 @@ pub fn run(
 
     if !summary {
         match by {
-            Some("fn") => {
-                let mut counts = std::collections::BTreeMap::<String, usize>::new();
-                for h in &all {
-                    *counts.entry(h.context.clone()).or_insert(0) += 1;
-                }
-                let mut rows: Vec<_> = counts.into_iter().collect();
-                rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                if let Some(n) = top {
-                    rows.truncate(n);
-                }
-                for (ctx, n) in rows {
-                    println!("{}\t{}", n, ctx);
-                }
-            }
-            Some("file") => {
-                let mut counts = std::collections::BTreeMap::<String, usize>::new();
-                for h in &all {
-                    *counts.entry(h.file.clone()).or_insert(0) += 1;
-                }
-                let mut rows: Vec<_> = counts.into_iter().collect();
-                rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                if let Some(n) = top {
-                    rows.truncate(n);
-                }
-                for (file, n) in rows {
-                    println!("{}\t{}", n, file);
-                }
-            }
+            Some("fn") => print_grouped_counts(&all, top, |h| h.context.clone()),
+            Some("file") => print_grouped_counts(&all, top, |h| h.file.clone()),
             Some("module") => {
-                let mut counts = std::collections::BTreeMap::<String, usize>::new();
-                for h in &all {
-                    let m = h
-                        .context
-                        .split("::")
-                        .next()
-                        .unwrap_or(&h.context)
-                        .to_string();
-                    *counts.entry(m).or_insert(0) += 1;
-                }
-                let mut rows: Vec<_> = counts.into_iter().collect();
-                rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                if let Some(n) = top {
-                    rows.truncate(n);
-                }
-                for (m, n) in rows {
-                    println!("{}\t{}", n, m);
-                }
+                print_grouped_counts(&all, top, |h| top_module_of(&h.context).to_string())
             }
             _ => {
                 all.sort_by(|a, b| {
