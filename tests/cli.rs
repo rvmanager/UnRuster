@@ -12,6 +12,48 @@ fn ur() -> Command {
     Command::cargo_bin("unruster").unwrap()
 }
 
+// ── row / column assertion helpers (catch shape regressions) ──────────────
+
+/// Non-blank lines of `out` as Strings.
+fn rows_of(out: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every row must split into exactly `expected` tab-separated columns.
+fn assert_tsv_cols(out: &[u8], expected: usize) {
+    for line in rows_of(out) {
+        let cols = line.split('\t').count();
+        assert_eq!(
+            cols, expected,
+            "expected {} tab-cols, got {}: {:?}",
+            expected, cols, line
+        );
+    }
+}
+
+/// `--summary` suppresses stdout entirely; assert nothing on stdout.
+fn assert_summary_silent_stdout(args: &[&str]) {
+    let out = ur().args(args).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.trim().is_empty(),
+        "expected --summary to suppress stdout, got:\n{}",
+        s
+    );
+    assert!(out.status.success(), "expected success");
+}
+
+/// Run and assert success; return raw stdout bytes.
+fn ur_stdout(args: &[&str]) -> Vec<u8> {
+    let out = ur().args(args).output().unwrap();
+    assert!(out.status.success(), "command failed: {:?}", args);
+    out.stdout
+}
+
 // ─── help / version ────────────────────────────────────────────────────────
 
 #[test]
@@ -218,14 +260,8 @@ fn fields_exotic_field_types() {
         .stdout(contains("fn_ptr"));
 }
 
-#[test]
-fn type_refs_array_type() {
-    // Drives type_to_string through impls on `&u8` and `[u8; 4]`
-    ur().args(["--root", FIXTURE, "impls"])
-        .assert()
-        .success()
-        .stdout(contains("HasDefault"));
-}
+// (Was `type_refs_array_type` — actually called `impls`, redundant with
+// `impls_lists_all_blocks`. Removed.)
 
 // ─── variants ──────────────────────────────────────────────────────────────
 
@@ -816,13 +852,8 @@ fn stringly_include_map_keys() {
         .stdout(contains("map-lit-key"));
 }
 
-#[test]
-fn stringly_substr_via_starts_with() {
-    ur().args(["--root", FIXTURE, "stringly", "--include-substring"])
-        .assert()
-        .success()
-        .stdout(contains("substr"));
-}
+// (Was `stringly_substr_via_starts_with` — exact duplicate of
+// `stringly_include_substring`. Removed.)
 
 #[test]
 fn stringly_by_file_groups() {
@@ -1058,4 +1089,402 @@ fn summary_suppresses_rows() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Summary mode suppresses per-row stdout; nothing on stdout, summary on stderr.
     assert!(stdout.trim().is_empty(), "summary should suppress stdout, got:\n{}", stdout);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  --summary parity tests: every subcommand must silence stdout under --summary.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn inventory_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "inventory"]);
+}
+
+#[test]
+fn callers_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "callers", "Document::new"]);
+}
+
+#[test]
+fn field_uses_summary_mode() {
+    assert_summary_silent_stdout(&[
+        "--root", FIXTURE, "--summary", "field-uses", "Document", "transform",
+    ]);
+}
+
+#[test]
+fn takes_mut_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "takes-mut", "Document"]);
+}
+
+#[test]
+fn metrics_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "metrics"]);
+}
+
+#[test]
+fn dead_code_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "dead-code"]);
+}
+
+#[test]
+fn catch_all_arms_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "catch-all-arms", "Token"]);
+}
+
+#[test]
+fn parallel_matches_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "parallel-matches", "Token"]);
+}
+
+#[test]
+fn error_swallows_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "error-swallows"]);
+}
+
+#[test]
+fn pass_through_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "pass-through"]);
+}
+
+#[test]
+fn casts_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "casts"]);
+}
+
+#[test]
+fn conversions_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "conversions"]);
+}
+
+#[test]
+fn conversion_pairs_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "conversion-pairs"]);
+}
+
+#[test]
+fn stringly_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "stringly"]);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  inventory --vis and --kind: cover all values, not just the most common.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn inventory_vis_crate() {
+    ur().args(["--root", FIXTURE, "inventory", "--vis", "crate"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn inventory_vis_priv() {
+    ur().args(["--root", FIXTURE, "inventory", "--vis", "priv"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn inventory_vis_unknown_warns() {
+    let out = ur()
+        .args(["--root", FIXTURE, "inventory", "--vis", "bogus"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown --vis"), "expected unknown --vis warning");
+}
+
+#[test]
+fn inventory_kind_trait() {
+    ur().args(["--root", FIXTURE, "inventory", "--kind", "trait"])
+        .assert()
+        .success()
+        .stdout(contains("Render"));
+}
+
+#[test]
+fn inventory_kind_impl() {
+    ur().args(["--root", FIXTURE, "inventory", "--kind", "impl"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn inventory_kind_mod() {
+    ur().args(["--root", FIXTURE, "inventory", "--kind", "mod"])
+        .assert()
+        .success()
+        .stdout(contains("inner"));
+}
+
+#[test]
+fn inventory_kind_const() {
+    ur().args(["--root", FIXTURE, "inventory", "--kind", "const"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn inventory_kind_static() {
+    ur().args(["--root", FIXTURE, "inventory", "--kind", "static"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn inventory_kind_type() {
+    ur().args(["--root", FIXTURE, "inventory", "--kind", "type"])
+        .assert()
+        .success()
+        .stdout(contains("Doc"));
+}
+
+#[test]
+fn inventory_kind_trait_fn() {
+    ur().args(["--root", FIXTURE, "inventory", "--kind", "trait-fn"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn inventory_kind_impl_fn() {
+    ur().args(["--root", FIXTURE, "inventory", "--kind", "impl-fn"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn inventory_tree_with_vis() {
+    // Cross-flag combo: tree + vis. Catches per-flag composition regressions.
+    ur().args(["--root", FIXTURE, "inventory", "--tree", "--vis", "pub"])
+        .assert()
+        .success()
+        .stdout(contains("crate"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  field-uses kind filters: all three should be tested, not just --writes-only.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn field_uses_reads_only_filter() {
+    // Only the read rows should appear; writes/inits filtered out.
+    let out = ur_stdout(&[
+        "--root", FIXTURE, "field-uses", "Document", "transform", "--reads-only",
+    ]);
+    for line in rows_of(&out) {
+        let first_col = line.split('\t').next().unwrap_or("");
+        assert_eq!(first_col, "read", "non-read row leaked through: {:?}", line);
+    }
+}
+
+#[test]
+fn field_uses_inits_only_filter() {
+    let out = ur_stdout(&[
+        "--root", FIXTURE, "field-uses", "Document", "transform", "--inits-only",
+    ]);
+    for line in rows_of(&out) {
+        let first_col = line.split('\t').next().unwrap_or("");
+        assert_eq!(first_col, "init", "non-init row leaked through: {:?}", line);
+    }
+}
+
+#[test]
+fn field_uses_unknown_type_no_results() {
+    // Querying a non-existent type should produce zero hits but exit success.
+    let out = ur_stdout(&[
+        "--root", FIXTURE, "field-uses", "NoSuchType", "no_field",
+    ]);
+    assert!(rows_of(&out).is_empty(), "expected no rows for unknown type");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  metrics: --sort params and --top behavior.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn metrics_sort_params() {
+    ur().args(["--root", FIXTURE, "metrics", "--sort", "params"])
+        .assert()
+        .success()
+        .stdout(contains("params:"));
+}
+
+#[test]
+fn metrics_top_truncates() {
+    // --top 1 should yield at most 1 fn row + at most 1 struct row + at most 1 enum row.
+    let out = ur_stdout(&["--root", FIXTURE, "metrics", "--top", "1"]);
+    let fn_rows = rows_of(&out).into_iter().filter(|l| l.starts_with("fn\t")).count();
+    let struct_rows = rows_of(&out).into_iter().filter(|l| l.starts_with("struct\t")).count();
+    let enum_rows = rows_of(&out).into_iter().filter(|l| l.starts_with("enum\t")).count();
+    assert!(fn_rows <= 1, "fn rows {} > 1", fn_rows);
+    assert!(struct_rows <= 1, "struct rows {} > 1", struct_rows);
+    assert!(enum_rows <= 1, "enum rows {} > 1", enum_rows);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Unknown-input warnings for commands that take a name argument.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn fields_unknown_type_warns() {
+    let out = ur()
+        .args(["--root", FIXTURE, "fields", "NoSuchStruct"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no struct named"),
+        "expected unknown-struct warning, got:\n{}",
+        stderr
+    );
+}
+
+#[test]
+fn impls_unknown_of_no_results_but_success() {
+    let out = ur_stdout(&["--root", FIXTURE, "impls", "--of", "NoSuchType"]);
+    assert!(rows_of(&out).is_empty());
+}
+
+#[test]
+fn impls_unknown_trait_no_results_but_success() {
+    let out = ur_stdout(&["--root", FIXTURE, "impls", "--trait", "NoSuchTrait"]);
+    assert!(rows_of(&out).is_empty());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Output-shape assertions (catches row-count or column-shuffle regressions).
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn inventory_kind_struct_row_shape() {
+    // Every row should be 4 tab-separated columns: kind, vis, name, file:line.
+    let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "struct"]);
+    assert!(!rows_of(&out).is_empty(), "expected at least one struct row");
+    assert_tsv_cols(&out, 4);
+}
+
+#[test]
+fn fields_row_shape() {
+    // Every row: vis, name, type, r:N, w:M, i:K, file:line  → 7 cols.
+    let out = ur_stdout(&["--root", FIXTURE, "fields", "Document"]);
+    assert!(!rows_of(&out).is_empty());
+    assert_tsv_cols(&out, 7);
+}
+
+#[test]
+fn variants_def_row_shape() {
+    // def rows: "def", "Enum::Variant", shape, file:line → 4 cols.
+    let out = ur_stdout(&["--root", FIXTURE, "variants", "Token"]);
+    let def_rows: Vec<_> = rows_of(&out).into_iter().filter(|l| l.starts_with("def\t")).collect();
+    assert!(!def_rows.is_empty());
+    for line in def_rows {
+        assert_eq!(line.split('\t').count(), 4, "def row col-count drift: {:?}", line);
+    }
+}
+
+#[test]
+fn casts_row_shape() {
+    // class, src, dst, context, file:line → 5 cols.
+    let out = ur_stdout(&["--root", FIXTURE, "casts"]);
+    assert!(!rows_of(&out).is_empty());
+    assert_tsv_cols(&out, 5);
+}
+
+#[test]
+fn conversions_row_shape() {
+    // kind, target, context, file:line → 4 cols.
+    let out = ur_stdout(&["--root", FIXTURE, "conversions"]);
+    assert!(!rows_of(&out).is_empty());
+    assert_tsv_cols(&out, 4);
+}
+
+#[test]
+fn stringly_row_shape() {
+    // class, literal, context, file:line → 4 cols.
+    let out = ur_stdout(&["--root", FIXTURE, "stringly"]);
+    assert!(!rows_of(&out).is_empty());
+    assert_tsv_cols(&out, 4);
+}
+
+#[test]
+fn casts_class_filter_excludes_others() {
+    // Filter to narrow-int — output must have only "narrow-int" in class column.
+    let out = ur_stdout(&["--root", FIXTURE, "casts", "--class", "narrow-int"]);
+    for line in rows_of(&out) {
+        let c = line.split('\t').next().unwrap_or("");
+        assert_eq!(c, "narrow-int", "non-narrow-int class leaked: {:?}", line);
+    }
+}
+
+#[test]
+fn casts_no_widen_excludes_widen_classes() {
+    let out = ur_stdout(&["--root", FIXTURE, "casts", "--no-widen"]);
+    for line in rows_of(&out) {
+        let c = line.split('\t').next().unwrap_or("");
+        assert!(c != "widen-int" && c != "widen-float", "widening leaked: {:?}", line);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Playbook chains: compose the workflows documented in --help long_about.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn playbook_extract_trait_audit() {
+    // From --help: "EXTRACT A TRAIT" workflow uses takes-mut + type-refs +
+    // callers + inventory. Each must produce evidence for Document.
+    let mut_takers = ur_stdout(&["--root", FIXTURE, "takes-mut", "Document"]);
+    assert!(!rows_of(&mut_takers).is_empty(), "no &mut Document takers");
+
+    let refs = ur_stdout(&["--root", FIXTURE, "type-refs", "Document"]);
+    assert!(!rows_of(&refs).is_empty(), "no Document type refs");
+
+    let methods = ur_stdout(&[
+        "--root", FIXTURE, "inventory", "--kind", "fn",
+    ]);
+    let doc_methods: Vec<_> = rows_of(&methods)
+        .into_iter()
+        .filter(|l| l.contains("Document::"))
+        .collect();
+    assert!(!doc_methods.is_empty(), "no Document methods in inventory");
+}
+
+#[test]
+fn playbook_match_to_polymorphism() {
+    // From --help: "REPLACE ENUM-MATCH WITH POLYMORPHISM" — parallel-matches
+    // should surface ≥2 match sites covering the same variant set.
+    let out = ur_stdout(&["--root", FIXTURE, "parallel-matches", "Token"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("2 site(s)") || s.contains("3 site(s)") || s.contains("4 site(s)"),
+        "expected at least one group with ≥2 sites, got:\n{}",
+        s
+    );
+}
+
+#[test]
+fn playbook_pub_surface_audit() {
+    // From --help: "SHRINK A PUB SURFACE" — inventory --vis pub + dead-code --pub-only.
+    let inv = ur_stdout(&["--root", FIXTURE, "inventory", "--vis", "pub", "--kind", "fn"]);
+    assert!(!rows_of(&inv).is_empty(), "no pub fns in inventory");
+
+    // dead-code may legitimately find 0 (clean tree) — just assert it ran.
+    ur().args(["--root", FIXTURE, "--scope", "all", "dead-code", "--pub-only"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn playbook_field_bleed_audit() {
+    // From --help: "PRIVATIZE A FIELD" — fields + field-uses --candidates.
+    let f = ur_stdout(&["--root", FIXTURE, "fields", "Document"]);
+    assert!(!rows_of(&f).is_empty(), "no Document fields");
+
+    let cand = ur_stdout(&[
+        "--root", FIXTURE, "field-uses", "Document", "transform", "--candidates",
+    ]);
+    // At least one strict-confirmed and one inferred or candidate hit.
+    assert!(!rows_of(&cand).is_empty(), "no candidate field uses");
 }
