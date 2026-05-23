@@ -182,6 +182,26 @@ fn tokens_contain_test(ts: &TokenStream) -> bool {
     false
 }
 
+/// True if any attribute is `#[allow(dead_code)]` (possibly inside
+/// `#[allow(unused, dead_code)]` or `#[allow(dead_code, ...)]`).
+pub fn has_allow_dead_code(attrs: &[syn::Attribute]) -> bool {
+    for a in attrs {
+        if !a.path().is_ident("allow") {
+            continue;
+        }
+        if let syn::Meta::List(ml) = &a.meta {
+            for tt in ml.tokens.clone() {
+                if let TokenTree::Ident(id) = tt {
+                    if id == "dead_code" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Get the attributes list for any `syn::Item`. Returns None for variants
 /// without attrs (rare/forbidden ones).
 pub fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {

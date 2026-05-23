@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 use crate::ast::path_to_string;
@@ -42,21 +43,56 @@ impl<'ast> Visit<'ast> for CallSink {
             self.visit_expr(&expr);
         }
     }
+
+    fn visit_item_macro(&mut self, im: &'ast syn::ItemMacro) {
+        // `macro_rules! foo { ... }` definitions: walk the body tokens and
+        // treat every identifier as "potentially called." Otherwise a fn
+        // referenced only from a custom macro expansion would look dead.
+        let is_macro_rules = im
+            .mac
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident == "macro_rules")
+            .unwrap_or(false);
+        if is_macro_rules {
+            collect_idents(&im.mac.tokens, &mut self.called);
+        }
+        visit::visit_item_macro(self, im);
+    }
+}
+
+fn collect_idents(ts: &TokenStream, out: &mut BTreeSet<String>) {
+    for tt in ts.clone() {
+        match tt {
+            TokenTree::Ident(id) => {
+                out.insert(id.to_string());
+            }
+            TokenTree::Group(g) => collect_idents(&g.stream(), out),
+            _ => {}
+        }
+    }
 }
 
 pub fn run(
     files: &[ParsedFile],
     index: &NameIndex,
+    call_source: &[ParsedFile],
     pub_only: bool,
     summary: bool,
 ) -> anyhow::Result<()> {
     let mut sink = CallSink {
         called: BTreeSet::new(),
     };
-    for f in files {
+    for f in call_source {
         sink.visit_file(&f.ast);
     }
-    // Index of all defined fns by last name → file/line for the report.
+    // `files` is the source of candidate defns; `index` is the canonical view
+    // of those. (When `call_source != files`, the index would be the wrong
+    // shape for filtering by file presence; but we only need it for kind/owner
+    // info per candidate, and rebuilding it for `files` is what main.rs does.)
+    let _ = files;
+
     let mut hits: Vec<(&str, &crate::index::Defn)> = Vec::new();
     for d in index.iter() {
         match d.kind {
@@ -66,15 +102,13 @@ pub fn run(
         if pub_only && d.vis != "pub" {
             continue;
         }
-        // `main` / `start` are entry points — never dead.
         if matches!(d.name.as_str(), "main" | "start") {
             continue;
         }
-        // Trait-defined methods and methods inside `impl Trait for T` are
-        // dispatched dynamically (or by trait-method auto-dispatch). The index
-        // marks the latter with `in_trait_impl`; skip both to avoid massive
-        // false-positive noise from `Visit`, `Display`, `Iterator`, etc.
         if d.kind == "trait-fn" || d.in_trait_impl {
+            continue;
+        }
+        if d.allow_dead {
             continue;
         }
         if sink.called.contains(&d.name) {
@@ -91,7 +125,9 @@ pub fn run(
         }
     }
     eprintln!(
-        "({} candidate dead fn(s); pub_only={}; heuristic — pub items may have external callers, trait fns are skipped)",
+        "({} candidate dead fn(s); pub_only={}; heuristic — call-set built from full tree \
+         incl. tests; trait impls + `#[allow(dead_code)]` skipped; pub items may still have \
+         external callers we can't see.)",
         hits.len(),
         pub_only
     );

@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, line_of_span, path_to_string, type_short, type_to_string, vis_str};
+use crate::ast::{
+    has_allow_dead_code, line_of, line_of_span, path_to_string, type_short, type_to_string,
+    vis_str,
+};
 use crate::parse::{display_path, ParsedFile};
 
 #[derive(Debug, Clone)]
@@ -27,6 +30,9 @@ pub struct Defn {
     /// for non-fn defns. Used by `dead-code` to skip dynamically-dispatched
     /// trait methods.
     pub in_trait_impl: bool,
+    /// True if the item (or its enclosing impl block) carries `#[allow(dead_code)]`.
+    /// `dead-code` skips these to respect the author's explicit opt-out.
+    pub allow_dead: bool,
 }
 
 pub struct NameIndex {
@@ -134,6 +140,17 @@ impl<'a> IndexVisitor<'a> {
     }
 
     fn push(&mut self, kind: &'static str, name: String, vis: &'static str, line: usize) {
+        self.push_with(kind, name, vis, line, false);
+    }
+
+    fn push_with(
+        &mut self,
+        kind: &'static str,
+        name: String,
+        vis: &'static str,
+        line: usize,
+        allow_dead: bool,
+    ) {
         let qpath = self.qualify(&name);
         self.out.push(Defn {
             kind,
@@ -146,6 +163,7 @@ impl<'a> IndexVisitor<'a> {
             owner: self.current_owner(),
             trait_name: None,
             in_trait_impl: false,
+            allow_dead,
         });
     }
 }
@@ -196,6 +214,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                     owner: self.trait_stack.last().cloned(),
                     trait_name: None,
                     in_trait_impl: false,
+                    allow_dead: has_allow_dead_code(&f.attrs),
                 });
             }
         }
@@ -203,11 +222,12 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.push(
+        self.push_with(
             "fn",
             i.sig.ident.to_string(),
             vis_str(&i.vis),
             line_of(&i.sig.ident),
+            has_allow_dead_code(&i.attrs),
         );
     }
 
@@ -257,6 +277,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
         };
         let module = self.current_module();
         let is_trait_impl = trait_name.is_some();
+        let impl_block_allow = has_allow_dead_code(&i.attrs);
         self.out.push(Defn {
             kind: "impl",
             name: self_ty.clone(),
@@ -268,6 +289,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
             owner: Some(self_ty.clone()),
             trait_name,
             in_trait_impl: false,
+            allow_dead: impl_block_allow,
         });
         self.impl_stack.push(self_ty);
         for item in &i.items {
@@ -285,6 +307,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                     owner: self.impl_stack.last().cloned(),
                     trait_name: None,
                     in_trait_impl: is_trait_impl,
+                    allow_dead: impl_block_allow || has_allow_dead_code(&f.attrs),
                 });
             }
         }

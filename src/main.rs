@@ -115,11 +115,24 @@ use parse::Scope;
         Signal: variant has 0 ctor sites and is only seen in `_ =>` arms → drop\n\
         the variant (or document why it's a placeholder).\n\
         \n\
-        GOD FUNCTION TO SPLIT:\n\
-          unruster metrics --sort loc --top 20\n\
-          unruster callees <Type>::<fn>      # check helper-call clustering\n\
-        Signal: long fn calling several disjoint helper clusters → split the\n\
-        body into named helpers.\n\
+        GOD FUNCTION TO SPLIT (long, complex, or deeply-nested fns; metrics\n\
+        carries loc + params + cyclo + nesting per fn):\n\
+          unruster metrics --sort loc --top 20             # by line count\n\
+          unruster metrics --sort cyclo --top 20           # by cyclomatic complexity\n\
+          unruster metrics --sort nesting --top 20         # by max nesting depth\n\
+          unruster metrics --sort cyclo --threshold 15     # all fns above complexity 15\n\
+          unruster metrics --sort nesting --threshold 4    # deeply-indented offenders\n\
+          unruster callees <Type>::<fn>                    # check helper-call clustering\n\
+        Signals:\n\
+        - High LOC + low cyclo (e.g. 100 LOC, cyclo 3) → mostly straight-line;\n\
+          extract named sections for readability rather than splitting hard.\n\
+        - High cyclo (>= ~15) → many branches; split decision logic into\n\
+          focused helpers (one per branch family), or replace match-on-enum\n\
+          with trait dispatch (see parallel-matches signals above).\n\
+        - High nesting (>= ~4) → indentation pyramid; flatten with early\n\
+          returns / guard clauses, or extract inner blocks into named fns.\n\
+        - High loc + high cyclo + high nesting → genuine god fn; this is the\n\
+          combination worth splitting first.\n\
         \n\
         SHRINK A PUB SURFACE (internal API hygiene):\n\
           unruster inventory --vis pub --kind impl-fn\n\
@@ -260,7 +273,9 @@ enum Cmd {
     TypeRefs(TypeRefsArgs),
     /// Find fns whose signature takes `&mut <Type>`.
     TakesMut(TakesMutArgs),
-    /// Rank fns by LOC / parameter count, structs by field count, enums by variant count.
+    /// Rank fns by LOC, params, cyclomatic complexity, or nesting depth;
+    /// structs by field count; enums by variant count. Use `--threshold N` to
+    /// filter by the sort metric.
     Metrics(MetricsArgs),
 
     /// List fns with no caller in the scanned tree (heuristic; pub items may have external callers).
@@ -398,12 +413,17 @@ struct TakesMutArgs {
 
 #[derive(Args)]
 struct MetricsArgs {
-    /// Sort fns by: `loc` (lines), `params` (parameter count).
+    /// Sort fns by: `loc` (lines), `params`, `cyclo` (cyclomatic complexity),
+    /// `nesting` (max control-flow nesting depth).
     #[arg(long, default_value = "loc")]
     sort: String,
     /// Top N per category to print.
     #[arg(long, default_value_t = 20)]
     top: usize,
+    /// Only show fns where the sort metric is >= N. E.g. with
+    /// `--sort cyclo --threshold 15`, only fns with cyclo >= 15.
+    #[arg(long)]
+    threshold: Option<usize>,
 }
 
 #[derive(Args)]
@@ -539,8 +559,23 @@ fn main() -> Result<()> {
         Cmd::Impls(a) => impls::run(&idx, a.of.as_deref(), a.trait_.as_deref(), summary),
         Cmd::TypeRefs(a) => type_refs::run(&files, &idx, &sem.aliases, &a.ty, summary),
         Cmd::TakesMut(a) => takes_mut::run(&files, &idx, &a.ty, summary),
-        Cmd::Metrics(a) => metrics::run(&files, &a.sort, a.top, summary),
-        Cmd::DeadCode(a) => dead_code::run(&files, &idx, a.pub_only, summary),
+        Cmd::Metrics(a) => metrics::run(&files, &a.sort, a.top, a.threshold, summary),
+        Cmd::DeadCode(a) => {
+            // Build the call-set from the FULL tree (including tests + cfg(test))
+            // regardless of the user's --scope, so production items called only
+            // from tests aren't false-flagged. Skip the re-parse if the user
+            // already asked for --scope all.
+            let all_files_owned: Option<Vec<parse::ParsedFile>> = if scope == Scope::All {
+                None
+            } else {
+                Some(parse::parse_dir(&cli.root, Scope::All, &cli.cfg)?)
+            };
+            let call_source: &[parse::ParsedFile] = match &all_files_owned {
+                Some(v) => v,
+                None => &files,
+            };
+            dead_code::run(&files, &idx, call_source, a.pub_only, summary)
+        }
         Cmd::CatchAllArms(a) => catch_all::run(&files, &idx, &a.name, summary),
         Cmd::ParallelMatches(a) => parallel_matches::run(&files, &idx, &a.name, summary),
         Cmd::ErrorSwallows(a) => error_swallows::run(&files, a.include_unwrap_or, summary),

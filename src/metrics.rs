@@ -11,6 +11,8 @@ struct FnMetric {
     line: usize,
     loc: usize,
     params: usize,
+    cyclo: usize,
+    nesting: usize,
 }
 
 #[derive(Debug)]
@@ -62,6 +64,7 @@ impl<'a> MetricsVisitor<'a> {
             .iter()
             .filter(|i| !matches!(i, syn::FnArg::Receiver(_)))
             .count();
+        let (cyclo, nesting) = compute_complexity(body);
         let qpath = self.qualify(&sig.ident.to_string());
         self.fns.push(FnMetric {
             qpath,
@@ -69,6 +72,8 @@ impl<'a> MetricsVisitor<'a> {
             line: start,
             loc,
             params,
+            cyclo,
+            nesting,
         });
     }
 }
@@ -118,7 +123,133 @@ impl<'ast, 'a> Visit<'ast> for MetricsVisitor<'a> {
     }
 }
 
-pub fn run(files: &[ParsedFile], sort: &str, top: usize, summary: bool) -> anyhow::Result<()> {
+// ─── complexity ────────────────────────────────────────────────────────────
+
+/// Cyclomatic complexity = 1 + N(decision points). Decision points:
+/// - each `if` / `else if` (one per ExprIf node)
+/// - each non-wildcard match arm
+/// - each `while`, `while let`, `for`, `loop`
+/// - each `&&` / `||` in expressions
+/// - each `?` operator
+///
+/// Nesting depth = max depth of nested control-flow bodies (if / else / match
+/// arm / while / for / loop). Closures and plain blocks don't count.
+fn compute_complexity(body: &syn::Block) -> (usize, usize) {
+    let mut v = ComplexityVisitor {
+        cyclo: 1, // base path
+        nest_current: 0,
+        nest_max: 0,
+    };
+    v.visit_block(body);
+    (v.cyclo, v.nest_max)
+}
+
+struct ComplexityVisitor {
+    cyclo: usize,
+    nest_current: usize,
+    nest_max: usize,
+}
+
+impl ComplexityVisitor {
+    fn enter(&mut self) {
+        self.nest_current += 1;
+        if self.nest_current > self.nest_max {
+            self.nest_max = self.nest_current;
+        }
+    }
+    fn exit(&mut self) {
+        self.nest_current = self.nest_current.saturating_sub(1);
+    }
+
+    fn is_wildcard_pat(p: &syn::Pat) -> bool {
+        matches!(p, syn::Pat::Wild(_))
+            || matches!(p, syn::Pat::Ident(i) if i.subpat.is_none())
+    }
+}
+
+impl<'ast> Visit<'ast> for ComplexityVisitor {
+    fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
+        self.cyclo += 1;
+        self.enter();
+        self.visit_expr(&e.cond);
+        for stmt in &e.then_branch.stmts {
+            self.visit_stmt(stmt);
+        }
+        if let Some((_, else_expr)) = &e.else_branch {
+            self.visit_expr(else_expr);
+        }
+        self.exit();
+    }
+
+    fn visit_expr_match(&mut self, e: &'ast syn::ExprMatch) {
+        for arm in &e.arms {
+            if !Self::is_wildcard_pat(&arm.pat) {
+                self.cyclo += 1;
+            }
+        }
+        self.enter();
+        self.visit_expr(&e.expr);
+        for arm in &e.arms {
+            if let Some((_, g)) = &arm.guard {
+                self.cyclo += 1;
+                self.visit_expr(g);
+            }
+            self.visit_expr(&arm.body);
+        }
+        self.exit();
+    }
+
+    fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
+        self.cyclo += 1;
+        self.enter();
+        self.visit_expr(&e.cond);
+        for stmt in &e.body.stmts {
+            self.visit_stmt(stmt);
+        }
+        self.exit();
+    }
+
+    fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
+        self.cyclo += 1;
+        self.enter();
+        self.visit_expr(&e.expr);
+        for stmt in &e.body.stmts {
+            self.visit_stmt(stmt);
+        }
+        self.exit();
+    }
+
+    fn visit_expr_loop(&mut self, e: &'ast syn::ExprLoop) {
+        self.cyclo += 1;
+        self.enter();
+        for stmt in &e.body.stmts {
+            self.visit_stmt(stmt);
+        }
+        self.exit();
+    }
+
+    fn visit_expr_binary(&mut self, e: &'ast syn::ExprBinary) {
+        if matches!(e.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) {
+            self.cyclo += 1;
+        }
+        visit::visit_expr_binary(self, e);
+    }
+
+    fn visit_expr_try(&mut self, e: &'ast syn::ExprTry) {
+        self.cyclo += 1;
+        visit::visit_expr_try(self, e);
+    }
+}
+
+// ─── run ────────────────────────────────────────────────────────────────────
+
+pub fn run(
+    files: &[ParsedFile],
+    sort: &str,
+    top: usize,
+    threshold: Option<usize>,
+    summary: bool,
+) -> anyhow::Result<()> {
     let mut fns: Vec<FnMetric> = Vec::new();
     let mut structs: Vec<StructMetric> = Vec::new();
     let mut enums: Vec<EnumMetric> = Vec::new();
@@ -135,9 +266,32 @@ pub fn run(files: &[ParsedFile], sort: &str, top: usize, summary: bool) -> anyho
         v.visit_file(&f.ast);
     }
 
+    // Apply threshold filter on the sort metric.
+    if let Some(t) = threshold {
+        match sort {
+            "loc" => fns.retain(|m| m.loc >= t),
+            "params" => fns.retain(|m| m.params >= t),
+            "cyclo" => fns.retain(|m| m.cyclo >= t),
+            "nesting" => fns.retain(|m| m.nesting >= t),
+            _ => {}
+        }
+    }
+
     match sort {
-        "loc" => fns.sort_by(|a, b| b.loc.cmp(&a.loc).then_with(|| b.params.cmp(&a.params))),
+        "loc" => fns.sort_by(|a, b| b.loc.cmp(&a.loc).then_with(|| b.cyclo.cmp(&a.cyclo))),
         "params" => fns.sort_by(|a, b| b.params.cmp(&a.params).then_with(|| b.loc.cmp(&a.loc))),
+        "cyclo" => fns.sort_by(|a, b| {
+            b.cyclo
+                .cmp(&a.cyclo)
+                .then_with(|| b.nesting.cmp(&a.nesting))
+                .then_with(|| b.loc.cmp(&a.loc))
+        }),
+        "nesting" => fns.sort_by(|a, b| {
+            b.nesting
+                .cmp(&a.nesting)
+                .then_with(|| b.cyclo.cmp(&a.cyclo))
+                .then_with(|| b.loc.cmp(&a.loc))
+        }),
         _ => {
             eprintln!("unknown --sort `{}`; using `loc`", sort);
             fns.sort_by(|a, b| b.loc.cmp(&a.loc));
@@ -149,8 +303,8 @@ pub fn run(files: &[ParsedFile], sort: &str, top: usize, summary: bool) -> anyho
     if !summary {
         for m in fns.iter().take(top) {
             println!(
-                "fn\tloc:{}\tparams:{}\t{}\t{}:{}",
-                m.loc, m.params, m.qpath, m.file, m.line
+                "fn\tloc:{}\tparams:{}\tcyclo:{}\tnesting:{}\t{}\t{}:{}",
+                m.loc, m.params, m.cyclo, m.nesting, m.qpath, m.file, m.line
             );
         }
         for m in structs.iter().take(top) {
@@ -168,12 +322,15 @@ pub fn run(files: &[ParsedFile], sort: &str, top: usize, summary: bool) -> anyho
     }
 
     eprintln!(
-        "({} fns, {} structs, {} enums; showing top {} each; sort={})",
+        "({} fns, {} structs, {} enums; showing top {} each; sort={}{})",
         fns.len(),
         structs.len(),
         enums.len(),
         top,
-        sort
+        sort,
+        threshold
+            .map(|t| format!("; threshold={}", t))
+            .unwrap_or_default()
     );
     Ok(())
 }
