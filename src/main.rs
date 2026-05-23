@@ -67,181 +67,158 @@ use parse::Scope;
           False under this env are stripped. Unknown keys leave items in.\n\
         - --summary: skip per-row output, keep summary line.\n\
         \n\
-        ──────────────────────────────────────────────────────────────────────\n\
-        DESIGN AUDIT PLAYBOOK — which queries surface which refactor candidate.\n\
-        Use this as input to design decisions; the tool finds candidates, you\n\
-        decide whether to act.\n\
+        ══════════════════════════════════════════════════════════════════════\n\
+        DESIGN AUDIT PLAYBOOK — pick the theme matching your concern.\n\
+        The tool finds candidates; you decide whether to act.\n\
         \n\
-        EXTRACT A TRAIT (replace a concrete type with an interface):\n\
-          unruster takes-mut <Type>          # mutation surface\n\
-          unruster type-refs <Type>          # coupling: how many modules name it\n\
+        INDEX (five themes, jump to the one you need):\n\
+          1. TYPE & DATA DESIGN     — when types should change shape\n\
+          2. ENCAPSULATION & API    — what's leaking, hidden, or expensive to change\n\
+          3. DISPATCH & CONTROL FLOW — branching smells: scattered logic, god fns\n\
+          4. CORRECTNESS & SAFETY   — silent errors, silent data loss\n\
+          5. AUDIT META             — auditing the test suite itself\n\
+        \n\
+        ──── 1. TYPE & DATA DESIGN ──────────────────────────────────────────\n\
+        When concrete types should become traits, primitives become newtypes,\n\
+        structs should split, or duplicate concepts should merge.\n\
+        \n\
+        ◇ EXTRACT A TRAIT (concrete type → interface)\n\
+          unruster takes-mut <Type>                       # mutation surface\n\
+          unruster type-refs <Type>                       # modules naming it\n\
           unruster callers --by module <Type>::<method>   # per-method caller spread\n\
           unruster inventory --kind impl-fn | grep '<Type>::'   # method count\n\
-        Signal: many `&mut Type` fns + many modules naming Type, where most\n\
-        callers only touch a subset of methods → trait extraction lets callers\n\
-        depend on the interface, not the concrete type.\n\
+          Signal: many `&mut Type` fns + many naming modules + most callers\n\
+          touch only a subset → extract trait(s); callers depend on interface.\n\
         \n\
-        PRIVATIZE A FIELD (stop external write bleeding):\n\
-          unruster fields <Type>             # pub/priv breakdown\n\
-          unruster field-uses <Type> <field> --candidates\n\
-        Signal: writes appear with context outside `Type::*` methods → make the\n\
-        field private and add a method that enforces the invariant.\n\
-        \n\
-        REPLACE ENUM-MATCH WITH POLYMORPHISM:\n\
-          unruster parallel-matches <Enum>   # match sites grouped by variant set\n\
-          unruster variants <Enum>           # ctor + match counts per variant\n\
-          unruster catch-all-arms <Enum>     # `_ =>` arms (knowledge leak)\n\
-        Signal: ≥2 match sites cover the same variant set → push behavior into\n\
-        a trait with one impl per variant; callers stop knowing the variants.\n\
-        \n\
-        NEWTYPE (when a primitive plays many roles — String/u32/usize as ids,\n\
-        sizes, indices all at once):\n\
-          unruster type-refs String          # often huge; tells you primitive is overloaded\n\
+        ◇ NEWTYPE (primitive overloaded across roles — `String`/`u32` as both id\n\
+          and value)\n\
+          unruster type-refs String                       # often huge\n\
           unruster takes-mut String\n\
-          unruster callers <fn-that-takes-primitive> --by module\n\
-        Signal: same primitive returned/accepted across unrelated APIs → wrap\n\
-        each role in a newtype (`UserId(u32)`, `Pixels(u32)`) so the compiler\n\
-        catches mix-ups.\n\
+          unruster callers <fn-taking-primitive> --by module\n\
+          Signal: same primitive returned/accepted across unrelated APIs →\n\
+          wrap each role (`UserId(u32)`, `Pixels(u32)`) so the compiler catches\n\
+          mix-ups.\n\
         \n\
-        SPLIT A STRUCT (low-cohesion / god-struct):\n\
-          unruster fields <Type>             # field count + per-field counts\n\
-          unruster metrics --sort loc        # top structs by field count\n\
-          # Then for each field group, run:\n\
-          unruster field-uses <Type> <field> --candidates  # to map field-to-callers\n\
-        Signal: disjoint sets of fns touch disjoint sets of fields → split into\n\
-        focused structs that match the access pattern.\n\
+        ◇ SPLIT A STRUCT (low-cohesion / god-struct)\n\
+          unruster fields <Type>                          # field count\n\
+          unruster metrics --top 10                       # top structs by field count\n\
+          unruster field-uses <Type> <field> --candidates # field-to-callers map\n\
+          Signal: disjoint sets of fns touch disjoint sets of fields → split.\n\
         \n\
-        DEAD ENUM VARIANTS (kept around with no producers):\n\
+        ◇ DEAD ENUM VARIANTS\n\
           unruster variants <Enum>\n\
-        Signal: variant has 0 ctor sites and is only seen in `_ =>` arms → drop\n\
-        the variant (or document why it's a placeholder).\n\
+          Signal: 0 ctor sites + only seen in `_ =>` arms → drop the variant.\n\
         \n\
-        GOD FUNCTION TO SPLIT (long, complex, or deeply-nested fns; metrics\n\
-        carries loc + params + cyclo + nesting per fn):\n\
-          unruster metrics --sort loc --top 20             # by line count\n\
-          unruster metrics --sort cyclo --top 20           # by cyclomatic complexity\n\
-          unruster metrics --sort nesting --top 20         # by max nesting depth\n\
-          unruster metrics --sort cyclo --threshold 15     # all fns above complexity 15\n\
-          unruster metrics --sort nesting --threshold 4    # deeply-indented offenders\n\
-          unruster callees <Type>::<fn>                    # check helper-call clustering\n\
-        Signals:\n\
-        - High LOC + low cyclo (e.g. 100 LOC, cyclo 3) → mostly straight-line;\n\
-          extract named sections for readability rather than splitting hard.\n\
-        - High cyclo (>= ~15) → many branches; split decision logic into\n\
-          focused helpers (one per branch family), or replace match-on-enum\n\
-          with trait dispatch (see parallel-matches signals above).\n\
-        - High nesting (>= ~4) → indentation pyramid; flatten with early\n\
-          returns / guard clauses, or extract inner blocks into named fns.\n\
-        - High loc + high cyclo + high nesting → genuine god fn; this is the\n\
-          combination worth splitting first.\n\
+        ◇ REDUCE DATA REPLICATION / REPETITION / CONVERSION\n\
+          unruster impls --trait From / Into / TryFrom / AsRef\n\
+          unruster fields <A> ; unruster fields <B>       # shape overlap\n\
+          unruster conversion-pairs                       # mutual From pairs\n\
+          unruster pass-through                           # thin wrapper layers\n\
+          unruster callers .clone                         # clone hotspots\n\
+          unruster callers .to_string / .to_owned / .into # conversion hotspots\n\
+          unruster inventory --kind fn | grep '::(from|to|as|into)_'\n\
+          Signals: bidirectional `A ↔ B` From + overlapping fields = same\n\
+          concept in two shapes (merge); heavy `.clone()` on one type =\n\
+          fragmented ownership (Rc/Arc/borrow); sprawling `to_*`/`from_*`\n\
+          namespaces on one type = collapse to standard trait impls.\n\
         \n\
-        SHRINK A PUB SURFACE (internal API hygiene):\n\
+        ──── 2. ENCAPSULATION & API SURFACE ─────────────────────────────────\n\
+        What's leaking out, what should be hidden, what's the cost of changing\n\
+        a published signature.\n\
+        \n\
+        ◇ PRIVATIZE A FIELD (stop external write bleeding)\n\
+          unruster fields <Type>                          # pub/priv breakdown\n\
+          unruster field-uses <Type> <field> --candidates\n\
+          Signal: writes from contexts outside `Type::*` → make field private,\n\
+          expose a method that enforces the invariant.\n\
+        \n\
+        ◇ SHRINK A PUB SURFACE (internal API hygiene)\n\
           unruster inventory --vis pub --kind impl-fn\n\
           unruster dead-code --pub-only\n\
           unruster callers --by module <Type>::<method>\n\
-        Signal: pub fn with 0 callers in the tree → privatize. pub fn called\n\
-        from 1 module → consider making it pub(crate) or pub(super).\n\
+          Signal: pub fn with 0 callers → privatize. pub fn called from 1\n\
+          module → consider `pub(crate)` or `pub(super)`.\n\
         \n\
-        SILENT FALLBACKS (forbidden by callee's contract):\n\
+        ◇ BREAKING-CHANGE BLAST RADIUS (before renaming/changing a signature)\n\
+          unruster callers <Type>::<method>\n\
+          unruster callers --transitive <Type>::<method>\n\
+          unruster type-refs <Type>\n\
+          Signal: direct + transitive caller count + coupling footprint tells\n\
+          you the change cost.\n\
+        \n\
+        ──── 3. DISPATCH & CONTROL FLOW ─────────────────────────────────────\n\
+        Branching design smells: scattered per-variant logic, brittle string\n\
+        dispatch, oversized functions that should split.\n\
+        \n\
+        ◇ REPLACE ENUM-MATCH WITH POLYMORPHISM\n\
+          unruster parallel-matches <Enum>                # match sites by variant set\n\
+          unruster variants <Enum>                        # ctor + match per variant\n\
+          unruster catch-all-arms <Enum>                  # `_ =>` arms (knowledge leak)\n\
+          Signal: ≥2 match sites cover the same variant set → push behavior\n\
+          into a trait method per variant; callers stop knowing the variants.\n\
+        \n\
+        ◇ STRINGLY-TYPED CODE (logic branches on string literals)\n\
+          unruster stringly                               # ==, .eq, match, assert_eq!\n\
+          unruster stringly --include-substring           # also .starts_with/.contains\n\
+          unruster stringly --include-map-keys            # also map.get(\"lit\")\n\
+          unruster stringly --by fn                       # rank worst offenders\n\
+          Signals: multiple `match-lit` arms in one fn → replace with enum\n\
+          (compiler catches typos); `cmp-eq`/`cmp-method` hits → newtype the id\n\
+          (e.g. `pub struct ActionId(&'static str)`); `map-lit-key` →\n\
+          `HashMap<MyEnumKey, V>` instead of `HashMap<String, V>`.\n\
+        \n\
+        ◇ GOD FUNCTION TO SPLIT (long / complex / deeply-nested)\n\
+          unruster metrics --sort loc --top 20            # by line count\n\
+          unruster metrics --sort cyclo --top 20          # by cyclomatic complexity\n\
+          unruster metrics --sort nesting --top 20        # by max nesting depth\n\
+          unruster metrics --sort cyclo --threshold 15    # above-threshold\n\
+          unruster metrics --sort nesting --threshold 4   # deeply-indented\n\
+          unruster callees <Type>::<fn>                   # helper-call clustering\n\
+          Signals: high LOC + low cyclo → extract named sections, not split;\n\
+          high cyclo (≥15) → split decision logic into focused helpers, or\n\
+          trait-dispatch (theme 3); high nesting (≥4) → flatten with early\n\
+          returns / guard clauses; all three high → genuine god fn, split first.\n\
+        \n\
+        ──── 4. CORRECTNESS & SAFETY ────────────────────────────────────────\n\
+        Runtime risks hidden in the code: silent error-swallowing, silent data\n\
+        loss from casts and conversions.\n\
+        \n\
+        ◇ SILENT FALLBACKS (Result/Option error swallowing)\n\
           unruster error-swallows [--include-unwrap-or]\n\
-        Signal: `match-err-wild` / `if-let-ok` / `let-_` / `.map_err(|_|)` /\n\
-        `.unwrap_or_default()` hits. Each row is a candidate — some are\n\
-        intentional (parse cascades, drop guards); review per site.\n\
+          Signal: `match-err-wild` / `if-let-ok` / `let-_` / `.map_err(|_|)` /\n\
+          `.unwrap_or_default()` hits. Some are intentional (parse cascades,\n\
+          drop guards) — review per site.\n\
         \n\
-        BREAKING-CHANGE BLAST RADIUS (before renaming/changing a signature):\n\
-          unruster callers <Type>::<method>          # direct callers\n\
-          unruster callers --transitive <Type>::<method>   # indirect callers\n\
-          unruster type-refs <Type>                  # full coupling footprint\n\
-        Signal: caller count + transitive depth tells you the change cost.\n\
-        \n\
-        TEST-SUITE AUDIT (find inconsistencies in what's tested across\n\
-        commands or features — \"every fn has a smoke test but only some\n\
-        have a --summary test\"):\n\
-          unruster tests                          # list every #[test] fn + file:start-end\n\
-          unruster tests --with-hint              # add args() fingerprint per test\n\
-          unruster tests --by-subcommand          # histogram of tests per CLI subcommand\n\
-        Signals:\n\
-        - `--by-subcommand` reveals coverage imbalance: a command with 5\n\
-          tests vs 1 means the rare one is under-tested.\n\
-        - `--with-hint` exposes near-duplicates (same args fingerprint = same\n\
-          test in disguise) and missing flag combos at a glance.\n\
-        - `file:start-end` lets an agent read just the relevant body via\n\
-          `sed -n start,endp file` instead of scanning the whole file.\n\
-        \n\
-        STRINGLY-TYPED CODE (logic branches on string literals — fragile to\n\
-        typos, silent on missing cases, no compile-time exhaustiveness):\n\
-          unruster stringly                       # ==, .eq(), match, assert_eq! with str literals\n\
-          unruster stringly --include-substring   # also .starts_with/.ends_with/.contains\n\
-          unruster stringly --include-map-keys    # also map.get(\"lit\"), .contains_key, .remove\n\
-          unruster stringly --by fn               # rank worst offenders\n\
-        Signals:\n\
-        - A fn with multiple `match-lit` arms → replace with an enum; the\n\
-          compiler then catches typos and forces exhaustiveness.\n\
-        - `cmp-eq` / `cmp-method` hits → the string is acting as an identifier;\n\
-          consider a newtype (`pub struct ActionId(&'static str)` with named\n\
-          associated consts) or a proper enum if the set is closed.\n\
-        - `substr` hits → if the prefix/suffix encodes a category, lift it\n\
-          into the type system (enum at the API boundary, parsed once).\n\
-        - `map-lit-key` hits → consider an enum keyed map or a typed registry\n\
-          (`HashMap<MyKey, V>` where `MyKey` is an enum).\n\
-        \n\
-        EXCESSIVE CASTS / SHAPE-JUGGLING (the wrong type was picked at the\n\
-        boundary; the same value gets renamed/reshaped/cast as it flows A→Z\n\
-        instead of being typed once and passed through):\n\
-          unruster casts                       # all `as` casts, classified\n\
-          unruster casts --class narrow-int,signed-flip,float-int,ptr   # high-risk subset\n\
-          unruster casts --by fn               # rank cast-heavy fns\n\
-          unruster casts --no-widen            # hide safe widenings\n\
-          unruster conversions --by fn --top 10   # find conversion-heavy fns\n\
+        ◇ EXCESSIVE CASTS / SHAPE-JUGGLING (the same value renamed/reshaped\n\
+          repeatedly because the wrong type was chosen at the boundary)\n\
+          unruster casts                                  # all `as` casts, classified\n\
+          unruster casts --class narrow-int,signed-flip,float-int,ptr\n\
+          unruster casts --by fn                          # rank cast-heavy fns\n\
+          unruster casts --no-widen                       # hide safe widenings\n\
+          unruster conversions --by fn --top 10           # conversion-heavy fns\n\
           unruster conversions --kind .into,.to_string,::from\n\
-          unruster conversion-pairs            # mutual From<A>↔B pairs\n\
-        Signals:\n\
-        - One fn doing many casts → the value enters in the wrong shape;\n\
-          pick one representation at the boundary, cast once, pass typed.\n\
-        - `narrow-int` / `signed-flip` / `float-int` hits → silent data loss\n\
-          candidates; either prove they're safe or introduce a checked helper.\n\
-        - A fn with 5+ .into() / .to_string() / ::from() calls is reshaping\n\
-          the same value repeatedly → likely the surrounding API wants the\n\
-          wrong type and the fn is compensating.\n\
-        - conversion-pairs reporting `A ↔ B` → A and B are the same logical\n\
-          concept in two shapes; merge or make one a view of the other.\n\
+          Signals: one fn doing many casts → wrong-typed input, cast once at\n\
+          boundary; `narrow-int`/`signed-flip`/`float-int` → silent data-loss\n\
+          candidates (prove safe or use checked helper); fn with 5+ conversion\n\
+          calls = surrounding API wants the wrong type.\n\
         \n\
-        REDUCE DATA REPLICATION / REPETITION / CONVERSION:\n\
-          unruster impls --trait From                # From<X> for Y impl count\n\
-          unruster impls --trait Into                # Into impls\n\
-          unruster impls --trait TryFrom\n\
-          unruster impls --trait AsRef               # cheap-conversion proliferation\n\
-          unruster fields <A> ; unruster fields <B>  # field-shape overlap between candidates\n\
-          unruster pass-through                      # thin wrappers, often in conversion layers\n\
-          unruster parallel-matches <Enum>           # same per-variant logic in multiple sites\n\
-          unruster callers .clone                    # clone() hotspots — fragmented ownership\n\
-          unruster callers .to_string                # conversion hotspot\n\
-          unruster callers .to_owned\n\
-          unruster callers .into\n\
-          unruster inventory --kind fn               # then grep '::(from|to|as|into)_' for clusters\n\
-        Signals:\n\
-        - Many `From<A> for B` (plus `From<B> for A`) impls between the same\n\
-          two types → A and B are the same logical concept in two shapes;\n\
-          merge them, or make one a view (`AsRef<B> for A`).\n\
-        - Two structs whose `fields <T>` outputs share most field names+types\n\
-          → parallel data representations; collapse to one and convert at the\n\
-          boundary, or make one a wrapper of the other.\n\
-        - `.clone()` called heavily on one type → ownership is fragmented;\n\
-          consider `Rc`/`Arc`, a single-owner pattern, or borrowing.\n\
-        - `parallel-matches` finding the same variant set in many sites →\n\
-          per-variant logic is being re-derived; push the work onto the type\n\
-          (trait method) so the logic lives in one place.\n\
-        - A cluster of `to_*` / `from_*` / `as_*` / `into_*` fns on the same\n\
-          type, especially with overlapping names (`to_str`, `as_str`,\n\
-          `to_string`, `into_string`) → conversion namespace is sprawling;\n\
-          consolidate to the standard trait impls (`AsRef<str>`, `Display`)\n\
-          and delete the bespoke helpers.\n\
-        - pass-through fn whose body is `to_other_repr(x)` → the two reprs\n\
-          coexist with no behavior difference; one should win.\n\
+        ──── 5. AUDIT META ─────────────────────────────────────────────────\n\
+        Auditing the test suite itself — coverage imbalance, near-duplicates,\n\
+        missing flag combos.\n\
         \n\
-        General principle: the tool finds candidates. The decision \"extract a\n\
-        trait here\" / \"newtype that primitive\" / \"split that fn\" / \"merge\n\
-        these two types\" stays with the person reading the output.",
+        ◇ TEST-SUITE AUDIT\n\
+          unruster tests                                  # list #[test] fns + file:start-end\n\
+          unruster tests --with-hint                      # add args() fingerprint per test\n\
+          unruster tests --by-subcommand                  # histogram by CLI subcommand\n\
+          Signals: `--by-subcommand` exposes coverage imbalance (5 tests vs 1);\n\
+          `--with-hint` exposes near-duplicates (same args fingerprint = same\n\
+          test in disguise); `file:start-end` lets an agent read just the\n\
+          relevant body via `sed -n start,endp file`.\n\
+        \n\
+        ─────────────────────────────────────────────────────────────────────\n\
+        Closing principle: the tool finds candidates. The decision \"extract a\n\
+        trait\" / \"newtype that primitive\" / \"split that fn\" / \"merge these\n\
+        two types\" stays with the person reading the output.",
     version
 )]
 struct Cli {
