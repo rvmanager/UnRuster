@@ -157,6 +157,33 @@ use parse::Scope;
           Signal: ≥2 match sites cover the same variant set → push behavior\n\
           into a trait method per variant; callers stop knowing the variants.\n\
         \n\
+        ◇ PARTIAL-ENUMERATION DEFECT (a predicate that silently mis-bins a NEW\n\
+          variant — run BEFORE adding a variant to find every site that won't\n\
+          force-update)\n\
+          unruster enum-coverage <Enum>                   # the one-stop synthesis\n\
+          unruster parallel-matches <Enum> --partial --rank-by-gap --show-missing\n\
+          unruster parallel-matches <Enum> --include-matches-macro\n\
+          Signal: `enum-coverage` lists every PARTIAL match / `matches!` site —\n\
+          one row per (gap_score, covered, missing, file:line), sorted by\n\
+          gap_score = covered/total descending. The top rows are predicates\n\
+          covering almost every variant (e.g. 7/8): a new variant falls into\n\
+          their `_`/`matches!`-false arm with zero compiler warning. Exhaustive\n\
+          sites are compiler-protected and hidden. `matches!()` is\n\
+          guaranteed-supported (always on in enum-coverage; opt-in elsewhere via\n\
+          --include-matches-macro) — its implicit no-match arm IS the risk.\n\
+        \n\
+        ◇ SIBLING-COHORT DIVERGENCE (one sibling in a `do_x_*` family forgot a\n\
+          call its cohort-mates all make — e.g. `wrap_in_transform` skipped\n\
+          `mark_pending` that `wrap_in_group`/`_composite` both call)\n\
+          unruster callers <helper> --among '<name-glob>'  # who calls it / who doesn't\n\
+          unruster cohort-callees '<name-glob>'             # (callee × fn) matrix\n\
+          Signal: `--among` lists each cohort fn ✓ (calls helper) or ✗ (doesn't);\n\
+          the ✗ rows are candidates. `cohort-callees` shows the whole grid —\n\
+          a callee present in the majority of columns but missing from one is\n\
+          flagged `<- divergence`. The tool finds the asymmetry; you decide\n\
+          whether that sibling SHOULD have made the call (some omissions are\n\
+          correct — not every sibling wraps an expandable kind).\n\
+        \n\
         ◇ STRINGLY-TYPED CODE (logic branches on string literals)\n\
           unruster stringly                               # ==, .eq, match, assert_eq!\n\
           unruster stringly --include-substring           # also .starts_with/.contains\n\
@@ -276,7 +303,21 @@ enum Cmd {
     /// Find match sites on a given enum that contain a wildcard `_ =>` arm.
     CatchAllArms(CatchAllArgs),
     /// Group match sites on an enum by which variants they cover (shotgun-surgery candidates).
+    /// `--partial` hides compiler-protected exhaustive groups; `--rank-by-gap`
+    /// sorts by coverage ratio; `--show-missing` lists uncovered variants;
+    /// `--include-matches-macro` also scans `matches!()`.
     ParallelMatches(ParallelMatchesArgs),
+    /// Score every PARTIAL match / `matches!` site on an enum by coverage
+    /// (gap_score = covered/total), sorted descending. Top rows are the
+    /// predicates closest to exhaustive — the ones a newly-added variant would
+    /// silently mis-bind. Synthesis of `parallel-matches --partial
+    /// --rank-by-gap --show-missing --include-matches-macro`.
+    EnumCoverage(EnumCoverageArgs),
+    /// Cohort divergence matrix: for a name-pattern cohort of fns (e.g.
+    /// `wrap_in_*`), show a (callee × function) grid. A callee called by most
+    /// of the cohort but missing from one column is a divergence candidate —
+    /// the sibling that forgot to call a shared helper.
+    CohortCallees(CohortCalleesArgs),
     /// Find Result/Option error-swallowing patterns. Detects method calls
     /// (`.ok()`, `.err()`, `.unwrap_or_default()`, `.unwrap_or_else(...)`,
     /// `.map_err(|_|...)`) and syntactic forms (`match { Err(_) => ... }`,
@@ -339,6 +380,13 @@ struct CallersArgs {
     /// Group results: `file` (path) or `module` (top-level module).
     #[arg(long)]
     by: Option<String>,
+    /// Cohort mode: invert the query. Instead of listing call sites, show which
+    /// functions in this name-pattern cohort (last-segment glob, `*` = any run,
+    /// e.g. `wrap_in_*`) call the named helper (✓) and which don't (✗). The ✗
+    /// rows — siblings that skip a helper their cohort-mates use — are your
+    /// divergence candidates.
+    #[arg(long)]
+    among: Option<String>,
 }
 
 #[derive(Args)]
@@ -442,6 +490,38 @@ struct CatchAllArgs {
 struct ParallelMatchesArgs {
     /// Enum name (last segment).
     name: String,
+    /// Hide exhaustive groups (variant set == the full enum). Exhaustive
+    /// matches are compiler-protected; only partials can silently mis-bind a
+    /// newly-added variant.
+    #[arg(long)]
+    partial: bool,
+    /// Sort groups by coverage ratio (covered/total) descending instead of by
+    /// site count. A 7/8 predicate is a louder defect signal than a 1/8 one.
+    /// Prefixes each group with `[covered/total]`.
+    #[arg(long)]
+    rank_by_gap: bool,
+    /// For each group, also list the variants NOT covered.
+    #[arg(long)]
+    show_missing: bool,
+    /// Also scan `matches!(x, Enum::V ...)` invocations. `matches!` carries an
+    /// implicit no-match arm, so it's treated as a wildcard group — exactly the
+    /// silent-misclassify risk. Off by default for back-compat; guaranteed-
+    /// supported (not best-effort) when set. `enum-coverage` always includes it.
+    #[arg(long)]
+    include_matches_macro: bool,
+}
+
+#[derive(Args)]
+struct EnumCoverageArgs {
+    /// Enum name (last segment).
+    name: String,
+}
+
+#[derive(Args)]
+struct CohortCalleesArgs {
+    /// Name pattern for the cohort (last-segment glob, `*` = any run). E.g.
+    /// `wrap_in_*`, `*_handler`, `parse_*_token`.
+    pattern: String,
 }
 
 #[derive(Args)]
@@ -533,16 +613,22 @@ fn main() -> Result<()> {
     let summary = cli.summary;
     match cli.cmd {
         Cmd::Inventory(a) => inventory::run(&files, a.kind.as_deref(), a.vis.as_deref(), a.tree, summary),
-        Cmd::Callers(a) => callers::run_callers(
-            &files,
-            &idx,
-            &sem,
-            &a.name,
-            a.transitive,
-            a.depth,
-            a.by.as_deref(),
-            summary,
-        ),
+        Cmd::Callers(a) => {
+            if let Some(pattern) = a.among.as_deref() {
+                callers::run_callers_among(&files, &idx, &sem, &a.name, pattern, summary)
+            } else {
+                callers::run_callers(
+                    &files,
+                    &idx,
+                    &sem,
+                    &a.name,
+                    a.transitive,
+                    a.depth,
+                    a.by.as_deref(),
+                    summary,
+                )
+            }
+        }
         Cmd::Callees(a) => callers::run_callees(&files, &idx, &sem, &a.name, summary),
         Cmd::FieldUses(a) => {
             let mut kinds: Vec<&str> = Vec::new();
@@ -589,7 +675,18 @@ fn main() -> Result<()> {
             dead_code::run(&files, &idx, call_source, a.pub_only, summary)
         }
         Cmd::CatchAllArms(a) => catch_all::run(&files, &idx, &a.name, summary),
-        Cmd::ParallelMatches(a) => parallel_matches::run(&files, &idx, &a.name, summary),
+        Cmd::ParallelMatches(a) => parallel_matches::run(
+            &files,
+            &idx,
+            &a.name,
+            a.partial,
+            a.rank_by_gap,
+            a.show_missing,
+            a.include_matches_macro,
+            summary,
+        ),
+        Cmd::EnumCoverage(a) => parallel_matches::run_enum_coverage(&files, &idx, &a.name, summary),
+        Cmd::CohortCallees(a) => callers::run_cohort_callees(&files, &idx, &sem, &a.pattern, summary),
         Cmd::ErrorSwallows(a) => error_swallows::run(&files, a.include_unwrap_or, summary),
         Cmd::PassThrough(a) => pass_through::run(&files, a.max_loc, summary),
         Cmd::Casts(a) => casts::run(

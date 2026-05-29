@@ -360,6 +360,236 @@ fn emit_caller_rows(hits: &[&CallSite], by: Option<&str>, summary: bool) {
     }
 }
 
+/// Last-segment glob match. `*` matches any (possibly empty) run of chars.
+/// No other metacharacters. `name` is the bare last segment of an item.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    // Fast path: no wildcard means exact match.
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    // Anchored prefix (text before the first `*`).
+    let mut rest = name;
+    if let Some(first) = parts.first() {
+        if !rest.starts_with(first) {
+            return false;
+        }
+        rest = &rest[first.len()..];
+    }
+    // Anchored suffix (text after the last `*`).
+    if let Some(last) = parts.last() {
+        if !rest.ends_with(last) {
+            return false;
+        }
+        rest = &rest[..rest.len() - last.len()];
+    }
+    // Interior literals must appear in order.
+    for mid in &parts[1..parts.len().saturating_sub(1)] {
+        if mid.is_empty() {
+            continue;
+        }
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The fns/methods in the tree whose last-segment name matches `pattern`.
+/// Returns (display_label, qpath, file, line), de-duplicated by qpath and
+/// sorted by qpath. Labels are bare names unless two cohort members share one,
+/// in which case all labels fall back to their qpath to stay unambiguous.
+fn cohort_members(index: &NameIndex, pattern: &str) -> Vec<(String, String, String, usize)> {
+    let mut members: Vec<(String, String, usize)> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for d in index.iter() {
+        if !matches!(d.kind, "fn" | "impl-fn" | "trait-fn") {
+            continue;
+        }
+        if !glob_match(pattern, &d.name) {
+            continue;
+        }
+        if seen.insert(d.qpath.clone()) {
+            members.push((d.qpath.clone(), d.file.clone(), d.line));
+        }
+    }
+    members.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Decide labels: bare last segment, or full qpath if names collide.
+    let mut name_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (qpath, _, _) in &members {
+        let last = qpath.rsplit("::").next().unwrap_or(qpath).to_string();
+        *name_counts.entry(last).or_insert(0) += 1;
+    }
+    members
+        .into_iter()
+        .map(|(qpath, file, line)| {
+            let last = qpath.rsplit("::").next().unwrap_or(&qpath);
+            let label = if name_counts.get(last).copied().unwrap_or(0) > 1 {
+                qpath.clone()
+            } else {
+                last.to_string()
+            };
+            (label, qpath, file, line)
+        })
+        .collect()
+}
+
+/// `callers <helper> --among <pattern>` — invert the callers query. For every
+/// fn in the name-pattern cohort, report whether it calls the helper (✓ + the
+/// call site) or not (✗). The ✗ rows are divergence candidates — but only a
+/// human can say whether a given sibling *should* have called the helper.
+pub fn run_callers_among(
+    files: &[ParsedFile],
+    index: &NameIndex,
+    sem: &Semantic,
+    query: &str,
+    pattern: &str,
+    summary: bool,
+) -> anyhow::Result<()> {
+    let members = cohort_members(index, pattern);
+    if members.is_empty() {
+        eprintln!("no fn/method matching cohort pattern `{}` found", pattern);
+        return Ok(());
+    }
+
+    let sites = collect_sites(files, sem, index);
+    // For each cohort member qpath, the first call site of `query` inside it.
+    let mut call_in: BTreeMap<&str, &CallSite> = BTreeMap::new();
+    for s in &sites {
+        let hits_query = matches_target(&s.target, query)
+            || s.target_resolved
+                .as_deref()
+                .map(|t| matches_target(t, query))
+                .unwrap_or(false);
+        if !hits_query {
+            continue;
+        }
+        let e = call_in.entry(s.caller.as_str());
+        e.or_insert(s);
+    }
+
+    let mut calls = 0usize;
+    if !summary {
+        for (label, qpath, _file, _line) in &members {
+            match call_in.get(qpath.as_str()) {
+                Some(site) => {
+                    calls += 1;
+                    println!("✓\t{}\t{}:{}", label, site.file, site.line);
+                }
+                None => println!("✗\t{}\t(no call site)", label),
+            }
+        }
+    } else {
+        calls = members
+            .iter()
+            .filter(|(_, q, _, _)| call_in.contains_key(q.as_str()))
+            .count();
+    }
+    eprintln!(
+        "({}/{} cohort member(s) call `{}`; {} do not)",
+        calls,
+        members.len(),
+        query,
+        members.len() - calls
+    );
+    Ok(())
+}
+
+/// `cohort-callees <pattern>` — a (callee × function) matrix for a name-pattern
+/// cohort. A callee present in most columns but missing from one is a
+/// divergence candidate: the sibling that forgot to call a shared helper.
+pub fn run_cohort_callees(
+    files: &[ParsedFile],
+    index: &NameIndex,
+    sem: &Semantic,
+    pattern: &str,
+    summary: bool,
+) -> anyhow::Result<()> {
+    let members = cohort_members(index, pattern);
+    if members.is_empty() {
+        eprintln!("no fn/method matching cohort pattern `{}` found", pattern);
+        return Ok(());
+    }
+
+    let sites = collect_sites(files, sem, index);
+    // qpath -> set of callee targets it makes.
+    let mut by_member: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (_, qpath, _, _) in &members {
+        by_member.insert(qpath.as_str(), BTreeSet::new());
+    }
+    for s in &sites {
+        if let Some(set) = by_member.get_mut(s.caller.as_str()) {
+            set.insert(s.target.clone());
+        }
+    }
+
+    // Union of every callee across the cohort = the matrix rows.
+    let mut all_callees: BTreeSet<String> = BTreeSet::new();
+    for set in by_member.values() {
+        all_callees.extend(set.iter().cloned());
+    }
+
+    let cols: Vec<(&str, &str)> = members
+        .iter()
+        .map(|(label, qpath, _, _)| (label.as_str(), qpath.as_str()))
+        .collect();
+    let n = cols.len();
+
+    let mut divergences: Vec<String> = Vec::new();
+    if !summary {
+        // Header row: leading "callee" column, then one column per cohort fn.
+        let mut header = String::from("callee");
+        for (label, _) in &cols {
+            header.push('\t');
+            header.push_str(label);
+        }
+        println!("{}", header);
+
+        for callee in &all_callees {
+            let present: Vec<bool> = cols
+                .iter()
+                .map(|(_, qpath)| by_member.get(qpath).map(|s| s.contains(callee)).unwrap_or(false))
+                .collect();
+            let present_count = present.iter().filter(|&&p| p).count();
+            let absent_count = n - present_count;
+            // Divergence: a minority dissents from a present majority.
+            let diverges = present_count > absent_count && absent_count > 0;
+            let mut row = callee.clone();
+            for &p in &present {
+                row.push('\t');
+                row.push(if p { '✓' } else { '·' });
+            }
+            if diverges {
+                row.push_str("\t<- divergence");
+                divergences.push(callee.clone());
+            }
+            println!("{}", row);
+        }
+    } else {
+        for callee in &all_callees {
+            let present_count = cols
+                .iter()
+                .filter(|(_, qpath)| {
+                    by_member.get(qpath).map(|s| s.contains(callee)).unwrap_or(false)
+                })
+                .count();
+            let absent_count = n - present_count;
+            if present_count > absent_count && absent_count > 0 {
+                divergences.push(callee.clone());
+            }
+        }
+    }
+    eprintln!(
+        "({} cohort member(s), {} distinct callee(s), {} divergence candidate(s))",
+        n,
+        all_callees.len(),
+        divergences.len()
+    );
+    Ok(())
+}
+
 pub fn run_callees(
     files: &[ParsedFile],
     index: &NameIndex,

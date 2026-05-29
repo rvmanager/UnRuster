@@ -169,6 +169,76 @@ fn callees_lists_calls_inside_fn() {
         .success();
 }
 
+// ─── callers --among / cohort-callees (sibling-cohort divergence) ──────────
+
+#[test]
+fn callers_among_marks_present_and_absent() {
+    // `wrap_in_group` / `wrap_in_composite` call `mark_pending`;
+    // `wrap_in_transform` (the defect) does not.
+    let out = ur_stdout(&[
+        "--root", FIXTURE, "callers", "mark_pending", "--among", "wrap_in_*",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("✓\twrap_in_group"), "expected ✓ for wrap_in_group:\n{}", s);
+    assert!(s.contains("✓\twrap_in_composite"), "expected ✓ for wrap_in_composite:\n{}", s);
+    assert!(
+        s.contains("✗\twrap_in_transform"),
+        "expected ✗ for wrap_in_transform (the divergence):\n{}",
+        s
+    );
+}
+
+#[test]
+fn callers_among_unknown_cohort_warns() {
+    ur().args(["--root", FIXTURE, "callers", "mark_pending", "--among", "no_such_cohort_*"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn callers_among_summary_mode() {
+    assert_summary_silent_stdout(&[
+        "--root", FIXTURE, "--summary", "callers", "mark_pending", "--among", "wrap_in_*",
+    ]);
+}
+
+#[test]
+fn cohort_callees_matrix_flags_divergence() {
+    let out = ur_stdout(&["--root", FIXTURE, "cohort-callees", "wrap_in_*"]);
+    let s = String::from_utf8_lossy(&out);
+    // Header lists the cohort columns.
+    assert!(s.contains("wrap_in_group"), "header should list cohort fns:\n{}", s);
+    // `mark_pending` is called by 2/3 → flagged as divergence.
+    let diverge_line = s
+        .lines()
+        .find(|l| l.contains("mark_pending"))
+        .unwrap_or("");
+    assert!(
+        diverge_line.contains("divergence"),
+        "mark_pending row should be flagged:\n{}",
+        s
+    );
+    // `arena_insert` is unanimous → NOT flagged.
+    let unanimous_line = s.lines().find(|l| l.contains("arena_insert")).unwrap_or("");
+    assert!(
+        !unanimous_line.contains("divergence"),
+        "unanimous callee must not be flagged:\n{}",
+        s
+    );
+}
+
+#[test]
+fn cohort_callees_unknown_cohort_warns() {
+    ur().args(["--root", FIXTURE, "cohort-callees", "no_such_cohort_*"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn cohort_callees_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "cohort-callees", "wrap_in_*"]);
+}
+
 // ─── field / fields ────────────────────────────────────────────────────────
 
 #[test]
@@ -507,6 +577,107 @@ fn parallel_matches_groups_match_sites() {
         .assert()
         .success()
         .stdout(contains("group"));
+}
+
+#[test]
+fn parallel_matches_partial_hides_exhaustive_group() {
+    // `dispatch` covers all four Token variants (exhaustive). Default output
+    // includes that group; --partial must drop it.
+    let full = ur_stdout(&["--root", FIXTURE, "parallel-matches", "Token"]);
+    let full = String::from_utf8_lossy(&full);
+    assert!(full.contains("Eof,Number,Resize,Word"), "exhaustive group expected by default");
+
+    let part = ur_stdout(&["--root", FIXTURE, "parallel-matches", "Token", "--partial"]);
+    let part = String::from_utf8_lossy(&part);
+    assert!(
+        !part.contains("Eof,Number,Resize,Word"),
+        "--partial should hide the exhaustive group, got:\n{}",
+        part
+    );
+    // Partial groups (with `_`) survive.
+    assert!(part.contains(" | _"), "partial groups should remain:\n{}", part);
+}
+
+#[test]
+fn parallel_matches_rank_by_gap_and_show_missing() {
+    let out = ur_stdout(&[
+        "--root", FIXTURE, "parallel-matches", "Token",
+        "--rank-by-gap", "--show-missing", "--partial",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    // rank-by-gap prefixes the [covered/total] ratio.
+    assert!(s.contains("[3/4]"), "expected [3/4] ratio prefix:\n{}", s);
+    // The 3/4 group must come before the 2/4 group (higher coverage = louder).
+    let i3 = s.find("[3/4]").unwrap();
+    let i2 = s.find("[2/4]").unwrap();
+    assert!(i3 < i2, "3/4 group should rank above 2/4:\n{}", s);
+    // show-missing names uncovered variants.
+    assert!(s.contains("missing: Resize"), "expected missing list:\n{}", s);
+}
+
+#[test]
+fn parallel_matches_include_matches_macro() {
+    // `matches_guard` uses `matches!(t, Token::Number(...))` — only surfaced
+    // with --include-matches-macro.
+    let without = ur_stdout(&["--root", FIXTURE, "parallel-matches", "Token"]);
+    assert!(!String::from_utf8_lossy(&without).contains("matches!"));
+
+    let with = ur_stdout(&[
+        "--root", FIXTURE, "parallel-matches", "Token", "--include-matches-macro",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&with).contains("matches!"),
+        "expected a (matches!) site with --include-matches-macro"
+    );
+}
+
+#[test]
+fn parallel_matches_summary_mode_with_flags() {
+    assert_summary_silent_stdout(&[
+        "--root", FIXTURE, "--summary", "parallel-matches", "Token",
+        "--partial", "--rank-by-gap", "--show-missing", "--include-matches-macro",
+    ]);
+}
+
+// ─── enum-coverage ─────────────────────────────────────────────────────────
+
+#[test]
+fn enum_coverage_ranks_partials_by_gap() {
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Token"]);
+    let s = String::from_utf8_lossy(&out);
+    // Highest-coverage partial (3/4) first, lowest (1/4) last.
+    assert!(s.contains("0.75"), "expected a 0.75 gap_score row:\n{}", s);
+    let i_high = s.find("0.75").unwrap();
+    let i_low = s.find("0.25").unwrap();
+    assert!(i_high < i_low, "rows must sort by gap_score desc:\n{}", s);
+    // matches!() is always included in enum-coverage.
+    assert!(s.contains("matches!"), "matches! must be included:\n{}", s);
+    // Exhaustive `dispatch` site must NOT appear.
+    assert!(
+        !s.contains("Eof,Number,Resize,Word"),
+        "exhaustive site must be hidden:\n{}",
+        s
+    );
+}
+
+#[test]
+fn enum_coverage_lists_missing_variants() {
+    ur().args(["--root", FIXTURE, "enum-coverage", "Token"])
+        .assert()
+        .success()
+        .stdout(contains("Resize")); // the variant missing from the 3/4 site
+}
+
+#[test]
+fn enum_coverage_unknown_enum_warns() {
+    ur().args(["--root", FIXTURE, "enum-coverage", "NotAnEnum"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn enum_coverage_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "enum-coverage", "Token"]);
 }
 
 // ─── error-swallows ────────────────────────────────────────────────────────

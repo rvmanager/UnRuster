@@ -291,6 +291,29 @@ fn main() {
     log_with_trace!("starting");
 }
 
+// ── Sibling-cohort divergence (callers --among / cohort-callees) ──────────
+// A `wrap_in_*` cohort where two siblings call `mark_pending` but the third
+// forgets it — the canonical cohort-divergence defect.
+pub struct Wrapper;
+impl Wrapper {
+    pub fn wrap_in_group(&mut self) {
+        self.arena_insert();
+        self.mark_pending();
+    }
+    pub fn wrap_in_composite(&mut self) {
+        self.arena_insert();
+        self.mark_pending();
+    }
+    pub fn wrap_in_transform(&mut self) {
+        self.arena_insert();
+        // Divergence: this sibling skips `mark_pending`.
+        self.refresh_world();
+    }
+    fn arena_insert(&mut self) {}
+    fn mark_pending(&mut self) {}
+    fn refresh_world(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
