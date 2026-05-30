@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string, print_grouped_counts, type_short};
+use crate::ast::{line_of, path_to_string, print_grouped_counts, type_short, ScopeTracker};
+use crate::context::AnalysisCtx;
 use crate::index::NameIndex;
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{Semantic, UseMap};
@@ -20,31 +21,13 @@ struct CallSite {
 
 struct CallVisitor<'a> {
     file: &'a str,
-    module: &'a str,
-    fn_stack: Vec<String>,
-    impl_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    scope: ScopeTracker,
     sites: Vec<CallSite>,
 }
 
 impl<'a> CallVisitor<'a> {
     fn enclosing(&self) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        if let Some(f) = self.fn_stack.last() {
-            path.push(f.clone());
-        } else if path.is_empty() {
-            return "<top-level>".to_string();
-        } else {
-            path.push("<top-level>".to_string());
-        }
-        path.join("::")
+        self.scope.enclosing_with_toplevel()
     }
 
     fn record(&mut self, target: String, line: usize) {
@@ -60,33 +43,33 @@ impl<'a> CallVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_impl_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_trait_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
@@ -119,10 +102,7 @@ fn collect_sites(files: &[ParsedFile], sem: &Semantic, index: &NameIndex) -> Vec
     for f in files {
         let mut v = CallVisitor {
             file: &display_path(&f.path),
-            module: &f.module,
-            fn_stack: Vec::new(),
-            impl_stack: Vec::new(),
-            mod_stack: Vec::new(),
+            scope: ScopeTracker::new(f.module.as_str()),
             sites: Vec::new(),
         };
         v.visit_file(&f.ast);
@@ -207,12 +187,9 @@ fn query_known(index: &NameIndex, query: &str) -> bool {
     if last.is_empty() {
         return false;
     }
-    !index
+    index
         .iter()
-        .filter(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn"))
-        .filter(|d| d.name == last)
-        .next()
-        .is_none()
+        .any(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn") && d.name == last)
         || index.knows_name(last)
 }
 
@@ -221,15 +198,16 @@ fn top_module(qpath: &str) -> &str {
 }
 
 pub fn run_callers(
-    files: &[ParsedFile],
-    index: &NameIndex,
-    sem: &Semantic,
+    ctx: &AnalysisCtx,
     query: &str,
     transitive: bool,
     depth: Option<usize>,
     by: Option<&str>,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let sem = ctx.sem;
+    let summary = ctx.summary;
     if !query_known(index, query) {
         eprintln!(
             "note: no fn/method matching `{}` is defined in the scanned tree \
@@ -441,13 +419,14 @@ fn cohort_members(index: &NameIndex, pattern: &str) -> Vec<(String, String, Stri
 /// call site) or not (✗). The ✗ rows are divergence candidates — but only a
 /// human can say whether a given sibling *should* have called the helper.
 pub fn run_callers_among(
-    files: &[ParsedFile],
-    index: &NameIndex,
-    sem: &Semantic,
+    ctx: &AnalysisCtx,
     query: &str,
     pattern: &str,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let sem = ctx.sem;
+    let summary = ctx.summary;
     let members = cohort_members(index, pattern);
     if members.is_empty() {
         eprintln!("no fn/method matching cohort pattern `{}` found", pattern);
@@ -500,13 +479,11 @@ pub fn run_callers_among(
 /// `cohort-callees <pattern>` — a (callee × function) matrix for a name-pattern
 /// cohort. A callee present in most columns but missing from one is a
 /// divergence candidate: the sibling that forgot to call a shared helper.
-pub fn run_cohort_callees(
-    files: &[ParsedFile],
-    index: &NameIndex,
-    sem: &Semantic,
-    pattern: &str,
-    summary: bool,
-) -> anyhow::Result<()> {
+pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let sem = ctx.sem;
+    let summary = ctx.summary;
     let members = cohort_members(index, pattern);
     if members.is_empty() {
         eprintln!("no fn/method matching cohort pattern `{}` found", pattern);
@@ -590,13 +567,109 @@ pub fn run_cohort_callees(
     Ok(())
 }
 
-pub fn run_callees(
-    files: &[ParsedFile],
-    index: &NameIndex,
-    sem: &Semantic,
-    query: &str,
-    summary: bool,
-) -> anyhow::Result<()> {
+/// `co-call <A> <B>` — paired-action invariant check. A and B are a coupled
+/// pair: calling one without the other leaks an invariant (e.g.
+/// `refresh_world_transforms` + `recompute_derived_geometry` — both must run to
+/// settle a `Document`). For every fn in the tree we test whether it calls A, B,
+/// both, or neither, and emit the *asymmetric* callers:
+///   `A-only`  — calls A, not B (suspect)
+///   `B-only`  — calls B, not A (suspect)
+/// Both-callers are the canonical pattern (counted on the summary line, not
+/// listed); neither-callers are irrelevant. Each row is a candidate — some
+/// asymmetries are correct (a gate that queues a mutation while a later commit
+/// runs B), so a human filters. A and B accept the same target forms as
+/// `callers` (bare name, `Type::method`, `.method`, `::name`, `name!`). The
+/// `via` column points at the call the fn *does* make, for quick navigation.
+pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let sem = ctx.sem;
+    let summary = ctx.summary;
+    for q in [a, b] {
+        if !query_known(index, q) {
+            eprintln!(
+                "note: no fn/method matching `{}` is defined in the scanned tree \
+                 (zero callers could mean the symbol doesn't exist; use --scope all if testing).",
+                q
+            );
+        }
+    }
+
+    let sites = collect_sites(files, sem, index);
+    let hits = |s: &CallSite, query: &str| -> bool {
+        matches_target(&s.target, query)
+            || s.target_resolved
+                .as_deref()
+                .map(|t| matches_target(t, query))
+                .unwrap_or(false)
+    };
+
+    #[derive(Default)]
+    struct Co {
+        calls_a: usize,
+        calls_b: usize,
+        via_a: Option<(String, usize)>,
+        via_b: Option<(String, usize)>,
+    }
+    let mut by_caller: BTreeMap<&str, Co> = BTreeMap::new();
+    for s in &sites {
+        let is_a = hits(s, a);
+        let is_b = hits(s, b);
+        if !is_a && !is_b {
+            continue;
+        }
+        let e = by_caller.entry(s.caller.as_str()).or_default();
+        if is_a {
+            e.calls_a += 1;
+            e.via_a.get_or_insert((s.file.clone(), s.line));
+        }
+        if is_b {
+            e.calls_b += 1;
+            e.via_b.get_or_insert((s.file.clone(), s.line));
+        }
+    }
+
+    // Partition. (true, true) = canonical, just counted. (false, false) can't
+    // occur here — only callers of A or B made it into the map.
+    let mut a_only: Vec<(&str, usize, &(String, usize))> = Vec::new();
+    let mut b_only: Vec<(&str, usize, &(String, usize))> = Vec::new();
+    let mut both = 0usize;
+    for (caller, co) in &by_caller {
+        match (co.calls_a > 0, co.calls_b > 0) {
+            (true, true) => both += 1,
+            (true, false) => a_only.push((caller, co.calls_a, co.via_a.as_ref().unwrap())),
+            (false, true) => b_only.push((caller, co.calls_b, co.via_b.as_ref().unwrap())),
+            (false, false) => {}
+        }
+    }
+    // High-traffic fns first: rank by matched-call count desc, then name.
+    a_only.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
+    b_only.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
+
+    if !summary {
+        for (caller, n, (file, line)) in &a_only {
+            println!("A-only\t{}\t{}\tvia {}:{}", n, caller, file, line);
+        }
+        for (caller, n, (file, line)) in &b_only {
+            println!("B-only\t{}\t{}\tvia {}:{}", n, caller, file, line);
+        }
+    }
+    eprintln!(
+        "({} call both `{}`+`{}`; {} call A-not-B; {} call B-not-A)",
+        both,
+        a,
+        b,
+        a_only.len(),
+        b_only.len()
+    );
+    Ok(())
+}
+
+pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let sem = ctx.sem;
+    let summary = ctx.summary;
     let sites = collect_sites(files, sem, index);
     let last = query.rsplit("::").next().unwrap_or(query);
 

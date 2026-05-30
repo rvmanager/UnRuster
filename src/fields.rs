@@ -1,8 +1,8 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_last, type_to_string, vis_str};
-use crate::index::NameIndex;
-use crate::parse::{display_path, ParsedFile};
+use crate::context::AnalysisCtx;
+use crate::parse::display_path;
 
 #[derive(Debug)]
 struct FieldDef {
@@ -167,7 +167,9 @@ impl<'ast, 'a> Visit<'ast> for CountVisitor<'a> {
     }
 }
 
-pub fn run(files: &[ParsedFile], _index: &NameIndex, ty: &str, summary: bool) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let summary = ctx.summary;
     // 1. Collect field definitions for the target type from all files.
     let mut defs: Vec<FieldDef> = Vec::new();
     for f in files {

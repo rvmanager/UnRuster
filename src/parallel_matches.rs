@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, type_short};
-use crate::index::NameIndex;
+use crate::ast::{line_of, type_short, ScopeTracker};
+use crate::context::AnalysisCtx;
 use crate::macro_scan::{macro_body, Body};
 use crate::parse::{display_path, ParsedFile};
 
@@ -20,6 +20,10 @@ struct Site {
     wildcard: bool,
     /// True if this site is a `matches!()` invocation rather than a `match` expr.
     is_macro: bool,
+    /// True if this site is an `if x == E::A { … } else if x == E::B { … }`
+    /// dispatch chain rather than a `match` / `matches!`. Same risk class: the
+    /// implicit (or explicit non-If) `else` silently re-bins a new variant.
+    is_if_chain: bool,
     /// True if the wildcard / catch-all arm routes through a method call on the
     /// matched scrutinee (e.g. `_ => node.paint_slots()`). Such sites are a
     /// structural false positive for the partial-enumeration defect: a new
@@ -34,33 +38,22 @@ struct ParaVisitor<'a> {
     target_enum: &'a str,
     variant_names: &'a [String],
     file: &'a str,
-    module: &'a str,
+    scope: ScopeTracker,
     /// Scan `matches!(scrutinee, PAT)` invocations in addition to `match` exprs.
     include_matches_macro: bool,
-    fn_stack: Vec<String>,
-    impl_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    /// Scan `if x == E::A { … } else if x == E::B { … }` dispatch chains.
+    include_if_chains: bool,
+    /// `(line, column)` of the `if` token of every `Expr::If` we have already
+    /// absorbed as a non-head arm of some chain. Keeps each chain reported once
+    /// from its head while still letting chains nested inside an arm's body be
+    /// discovered as their own heads.
+    consumed_if_spans: HashSet<(usize, usize)>,
     sites: Vec<Site>,
 }
 
 impl<'a> ParaVisitor<'a> {
     fn enclosing(&self) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        if let Some(f) = self.fn_stack.last() {
-            path.push(f.clone());
-        }
-        if path.is_empty() {
-            "<top-level>".into()
-        } else {
-            path.join("::")
-        }
+        self.scope.enclosing()
     }
 
     fn variant_in_pattern(&self, pat: &syn::Pat) -> Vec<String> {
@@ -86,23 +79,147 @@ impl<'a> ParaVisitor<'a> {
     }
 
     fn push_if_match(&self, p: &syn::Path, out: &mut Vec<String>) {
+        if let Some(v) = self.variant_from_path(p) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+
+    /// If `p` is `<EnumName>::<Variant>` where `EnumName` matches the target
+    /// enum (last-segment rule) and `Variant` is one of its variants, return
+    /// the variant ident. Otherwise `None`.
+    fn variant_from_path(&self, p: &syn::Path) -> Option<String> {
         let segs: Vec<&syn::PathSegment> = p.segments.iter().collect();
         if segs.len() < 2 {
-            return;
+            return None;
         }
         if segs[segs.len() - 2].ident != self.target_enum {
-            return;
+            return None;
         }
         let last = segs[segs.len() - 1].ident.to_string();
-        if self.variant_names.iter().any(|v| v == &last) && !out.contains(&last) {
-            out.push(last);
+        if self.variant_names.iter().any(|v| v == &last) {
+            Some(last)
+        } else {
+            None
         }
+    }
+
+    /// Pull the target-enum variant ident out of an `==` operand expression.
+    /// Handles a bare path (`E::Unit`) and a call to a variant constructor
+    /// (`E::Payload(expr)`), peeling borrows/parens. The variant identity is
+    /// what coverage scores; any payload is irrelevant.
+    fn variant_from_expr(&self, e: &syn::Expr) -> Option<String> {
+        match peel_expr(e) {
+            syn::Expr::Path(p) => self.variant_from_path(&p.path),
+            syn::Expr::Call(c) => match peel_expr(&c.func) {
+                syn::Expr::Path(p) => self.variant_from_path(&p.path),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// If `cond` is `scrutinee == E::Variant` (either operand order), return the
+    /// scrutinee expression and the covered variant ident. Skips `!=` and any
+    /// comparison where neither (or both) side names a target-enum variant.
+    fn eq_arm<'e>(&self, cond: &'e syn::Expr) -> Option<(&'e syn::Expr, String)> {
+        let syn::Expr::Binary(b) = peel_expr(cond) else {
+            return None;
+        };
+        if !matches!(b.op, syn::BinOp::Eq(_)) {
+            return None;
+        }
+        let lhs_v = self.variant_from_expr(&b.left);
+        let rhs_v = self.variant_from_expr(&b.right);
+        match (lhs_v, rhs_v) {
+            // Variant on the right: `x == E::A` (the canonical shape).
+            (None, Some(v)) => Some((&b.left, v)),
+            // Variant on the left: `E::A == x` (reversed).
+            (Some(v), None) => Some((&b.right, v)),
+            // Neither side is a variant, or both are (ambiguous) → not a dispatch arm.
+            _ => None,
+        }
+    }
+
+    /// Walk an `if x == E::A { … } else if x == E::B { … }` chain from its head,
+    /// collecting the covered variant idents. Stops at the first arm that isn't
+    /// `<same-scrutinee> == E::Variant` (an explicit non-If `else` marks a
+    /// catch-all). Returns a site only for chains of ≥ 2 covered variants;
+    /// shorter ones are a single guard, not a dispatch. Records every absorbed
+    /// else-if span so the chain is reported once, from its head.
+    fn collect_if_chain(&mut self, head: &syn::ExprIf) -> Option<Site> {
+        let (scrut_expr, first) = self.eq_arm(&head.cond)?;
+        let scrutinee = peel_expr(scrut_expr);
+        let mut variants: Vec<String> = vec![first];
+        let mut consumed: Vec<(usize, usize)> = Vec::new();
+        let mut has_catch_all = false;
+        let mut else_block: Option<&syn::Expr> = None;
+
+        let mut cur = head;
+        loop {
+            let Some((_, else_expr)) = cur.else_branch.as_ref() else {
+                break; // implicit `else` — chain terminates with no catch-all body
+            };
+            match else_expr.as_ref() {
+                syn::Expr::If(next) => match self.eq_arm(&next.cond) {
+                    Some((s2, v2)) if peel_expr(s2) == scrutinee => {
+                        consumed.push(span_key(&next.if_token));
+                        if !variants.contains(&v2) {
+                            variants.push(v2);
+                        }
+                        cur = next;
+                    }
+                    // Different scrutinee / negated / non-enum guard: the chain
+                    // ends here, and this tail is itself an `if` (not a catch-all
+                    // block), so `has_catch_all` stays false.
+                    _ => break,
+                },
+                other => {
+                    // Terminal non-If `else { … }` — the explicit catch-all.
+                    has_catch_all = true;
+                    else_block = Some(other);
+                    break;
+                }
+            }
+        }
+
+        if variants.len() < 2 {
+            return None;
+        }
+        for k in consumed {
+            self.consumed_if_spans.insert(k);
+        }
+
+        // A catch-all that routes through a method call on the scrutinee is
+        // structurally safe (a new variant must implement the trait method) —
+        // same false-positive class the match scanner already tags.
+        let trait_routed = else_block
+            .map(|b| arm_routes_through_scrutinee(b, scrutinee))
+            .unwrap_or(false);
+
+        variants.sort();
+        Some(Site {
+            file: self.file.to_string(),
+            line: line_of(&head.if_token),
+            context: self.enclosing(),
+            variants,
+            wildcard: has_catch_all,
+            is_macro: false,
+            is_if_chain: true,
+            trait_routed,
+        })
     }
 
     fn is_wildcard(pat: &syn::Pat) -> bool {
         matches!(pat, syn::Pat::Wild(_))
             || matches!(pat, syn::Pat::Ident(i) if i.subpat.is_none())
     }
+}
+
+fn span_key<T: syn::spanned::Spanned>(t: &T) -> (usize, usize) {
+    let s = t.span().start();
+    (s.line, s.column)
 }
 
 /// Peel borrows, derefs, parens, and groups so `&node` / `*node` / `(node)`
@@ -147,24 +264,24 @@ fn arm_routes_through_scrutinee(body: &syn::Expr, scrutinee: &syn::Expr) -> bool
 
 impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_impl_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_expr_match(&mut self, e: &'ast syn::ExprMatch) {
@@ -193,10 +310,23 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
                 variants,
                 wildcard,
                 is_macro: false,
+                is_if_chain: false,
                 trait_routed,
             });
         }
         visit::visit_expr_match(self, e);
+    }
+
+    fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
+        if self.include_if_chains && !self.consumed_if_spans.contains(&span_key(&e.if_token)) {
+            if let Some(site) = self.collect_if_chain(e) {
+                self.sites.push(site);
+            }
+        }
+        // Always recurse: chains nested inside a then-branch (or deeper) are
+        // discovered as their own heads; else-if arms we already absorbed are
+        // gated out above via `consumed_if_spans`.
+        visit::visit_expr_if(self, e);
     }
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
@@ -216,6 +346,7 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
                         variants,
                         wildcard: true,
                         is_macro: true,
+                        is_if_chain: false,
                         trait_routed: false,
                     });
                 }
@@ -248,6 +379,7 @@ fn collect_sites(
     enum_name: &str,
     variant_names: &[String],
     include_matches_macro: bool,
+    include_if_chains: bool,
 ) -> Vec<Site> {
     let mut all_sites: Vec<Site> = Vec::new();
     for f in files {
@@ -255,11 +387,10 @@ fn collect_sites(
             target_enum: enum_name,
             variant_names,
             file: &display_path(&f.path),
-            module: &f.module,
+            scope: ScopeTracker::new(f.module.as_str()),
             include_matches_macro,
-            fn_stack: Vec::new(),
-            impl_stack: Vec::new(),
-            mod_stack: Vec::new(),
+            include_if_chains,
+            consumed_if_spans: HashSet::new(),
             sites: Vec::new(),
         };
         v.visit_file(&f.ast);
@@ -277,16 +408,30 @@ fn missing_variants(covered: &[String], full: &[String]) -> Vec<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Flags controlling a `parallel-matches` scan. Grouped into one value so the
+/// entrypoint takes a single options argument instead of five positional bools.
+#[derive(Default, Clone, Copy)]
+pub struct ScanOpts {
+    /// Hide compiler-protected exhaustive groups.
+    pub partial_only: bool,
+    /// Order groups by coverage ratio (covered/total) instead of site count.
+    pub rank_by_gap: bool,
+    /// Annotate each group with the variants it leaves uncovered.
+    pub show_missing: bool,
+    /// Also scan `matches!()` invocations.
+    pub include_matches_macro: bool,
+    /// Also scan `if x == E::A { … } else if … ` dispatch chains.
+    pub include_if_chains: bool,
+}
+
 pub fn run(
-    files: &[ParsedFile],
-    index: &NameIndex,
+    ctx: &AnalysisCtx,
     enum_name: &str,
-    partial_only: bool,
-    rank_by_gap: bool,
-    show_missing: bool,
-    include_matches_macro: bool,
-    summary: bool,
+    opts: ScanOpts,
 ) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let summary = ctx.summary;
     let variant_names = variant_names_of(files, enum_name);
     if variant_names.is_empty() && !index.knows_name(enum_name) {
         eprintln!("no enum named `{}` found in scanned tree", enum_name);
@@ -294,7 +439,13 @@ pub fn run(
     }
     let total = variant_names.len();
 
-    let all_sites = collect_sites(files, enum_name, &variant_names, include_matches_macro);
+    let all_sites = collect_sites(
+        files,
+        enum_name,
+        &variant_names,
+        opts.include_matches_macro,
+        opts.include_if_chains,
+    );
 
     // Group by variant set (key = joined sorted variants + wildcard flag).
     let mut groups: BTreeMap<(Vec<String>, bool), Vec<&Site>> = BTreeMap::new();
@@ -309,14 +460,14 @@ pub fn run(
     // A group is "exhaustive" when it names every variant of the enum — those
     // are compiler-protected, so `--partial` drops them.
     let is_exhaustive = |variants: &[String]| total > 0 && variants.len() == total;
-    if partial_only {
+    if opts.partial_only {
         rows.retain(|((variants, _), _)| !is_exhaustive(variants));
     }
 
     // Default ordering: by group size descending (parallel-shot first). With
     // --rank-by-gap, order by coverage ratio descending instead — a 7/8 group
     // (one new variant silently mis-binds) is a louder defect signal than a 1/8.
-    if rank_by_gap && total > 0 {
+    if opts.rank_by_gap && total > 0 {
         rows.sort_by(|a, b| {
             let ga = a.0 .0.len() as f64 / total as f64;
             let gb = b.0 .0.len() as f64 / total as f64;
@@ -336,10 +487,10 @@ pub fn run(
                 variants.join(","),
                 if *wildcard { " | _" } else { "" }
             );
-            if rank_by_gap && total > 0 {
+            if opts.rank_by_gap && total > 0 {
                 key = format!("[{}/{}] {}", variants.len(), total, key);
             }
-            if show_missing && total > 0 {
+            if opts.show_missing && total > 0 {
                 let miss = missing_variants(variants, &variant_names);
                 let miss = if miss.is_empty() {
                     "(none)".to_string()
@@ -350,7 +501,13 @@ pub fn run(
             }
             println!("group\t{}\t{} site(s)", key, sites.len());
             for s in sites {
-                let tag = if s.is_macro { " (matches!)" } else { "" };
+                let tag = if s.is_macro {
+                    " (matches!)"
+                } else if s.is_if_chain {
+                    " (if-chain)"
+                } else {
+                    ""
+                };
                 println!("  {}{}\t{}:{}", s.context, tag, s.file, s.line);
             }
         }
@@ -360,7 +517,7 @@ pub fn run(
         all_sites.len(),
         rows.len(),
         enum_name,
-        if partial_only { "; exhaustive groups hidden" } else { "" }
+        if opts.partial_only { "; exhaustive groups hidden" } else { "" }
     );
     Ok(())
 }
@@ -371,12 +528,13 @@ pub fn run(
 /// descending. The top rows — predicates that cover almost every variant —
 /// are the sites most likely to silently mis-bind a newly-added variant.
 pub fn run_enum_coverage(
-    files: &[ParsedFile],
-    index: &NameIndex,
+    ctx: &AnalysisCtx,
     enum_name: &str,
     hide_trait_routed: bool,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let summary = ctx.summary;
     let variant_names = variant_names_of(files, enum_name);
     if variant_names.is_empty() {
         if index.knows_name(enum_name) {
@@ -392,9 +550,9 @@ pub fn run_enum_coverage(
     }
     let total = variant_names.len();
 
-    // matches!() is guaranteed-supported here — it's the primary vector for
-    // this defect, so enum-coverage always includes it.
-    let all_sites = collect_sites(files, enum_name, &variant_names, true);
+    // matches!() and `==`-if-chains are guaranteed-supported here — both are
+    // primary vectors for this defect, so enum-coverage always includes them.
+    let all_sites = collect_sites(files, enum_name, &variant_names, true, true);
 
     // One row per site; keep only partials (covered < total).
     struct Row<'s> {
@@ -434,10 +592,12 @@ pub fn run_enum_coverage(
 
     if !summary {
         for r in &rows {
-            let tag = if r.site.is_macro {
-                " (matches!)"
-            } else if r.site.trait_routed {
+            let tag = if r.site.trait_routed {
                 " (catchall→method; likely false positive)"
+            } else if r.site.is_macro {
+                " (matches!)"
+            } else if r.site.is_if_chain {
+                " (if-chain)"
             } else {
                 ""
             };

@@ -4,7 +4,7 @@ use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 use crate::ast::path_to_string;
-use crate::index::NameIndex;
+use crate::context::AnalysisCtx;
 use crate::parse::ParsedFile;
 
 /// Build a set of every "called" last-segment name we observe across the tree.
@@ -75,12 +75,13 @@ fn collect_idents(ts: &TokenStream, out: &mut BTreeSet<String>) {
 }
 
 pub fn run(
-    files: &[ParsedFile],
-    index: &NameIndex,
+    ctx: &AnalysisCtx,
     call_source: &[ParsedFile],
     pub_only: bool,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let summary = ctx.summary;
     let mut sink = CallSink {
         called: BTreeSet::new(),
     };

@@ -1,8 +1,8 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, type_short};
-use crate::index::NameIndex;
-use crate::parse::{display_path, ParsedFile};
+use crate::ast::{line_of, type_short, ScopeTracker};
+use crate::context::AnalysisCtx;
+use crate::parse::display_path;
 
 #[derive(Debug, Clone)]
 struct VariantDef {
@@ -52,32 +52,14 @@ struct SiteVisitor<'a> {
     variant_names: &'a [String],
     bare: bool,
     file: &'a str,
-    module: &'a str,
-    fn_stack: Vec<String>,
-    impl_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    scope: ScopeTracker,
     in_pat: bool,
     sites: Vec<Site>,
 }
 
 impl<'a> SiteVisitor<'a> {
     fn enclosing(&self) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        if let Some(f) = self.fn_stack.last() {
-            path.push(f.clone());
-        }
-        if path.is_empty() {
-            "<top-level>".into()
-        } else {
-            path.join("::")
-        }
+        self.scope.enclosing()
     }
 
     fn match_path(&self, p: &syn::Path) -> Option<String> {
@@ -122,24 +104,24 @@ impl<'a> SiteVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_impl_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_arm(&mut self, a: &'ast syn::Arm) {
@@ -245,13 +227,9 @@ impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
     }
 }
 
-pub fn run(
-    files: &[ParsedFile],
-    _index: &NameIndex,
-    enum_name: &str,
-    bare: bool,
-    summary: bool,
-) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let summary = ctx.summary;
     let mut defs: Vec<VariantDef> = Vec::new();
     for f in files {
         let mut v = VariantDefVisitor {
@@ -285,10 +263,7 @@ pub fn run(
             variant_names: &variant_names,
             bare,
             file: &display_path(&f.path),
-            module: &f.module,
-            fn_stack: Vec::new(),
-            impl_stack: Vec::new(),
-            mod_stack: Vec::new(),
+            scope: ScopeTracker::new(f.module.as_str()),
             in_pat: false,
             sites: Vec::new(),
         };

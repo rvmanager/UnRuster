@@ -1,7 +1,8 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{print_grouped_counts, top_module_of, type_short, type_to_string};
-use crate::parse::{display_path, ParsedFile};
+use crate::ast::{print_grouped_counts, top_module_of, type_short, type_to_string, ScopeTracker};
+use crate::context::AnalysisCtx;
+use crate::parse::display_path;
 use crate::semantic::{FnSigIndex, FnTypes};
 
 #[derive(Debug)]
@@ -16,10 +17,7 @@ struct Hit {
 
 struct CastVisitor<'a> {
     file: &'a str,
-    module: &'a str,
-    fn_stack: Vec<String>,
-    impl_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    scope: ScopeTracker,
     fn_types_stack: Vec<FnTypes>,
     fn_sigs: &'a FnSigIndex,
     hits: Vec<Hit>,
@@ -27,22 +25,7 @@ struct CastVisitor<'a> {
 
 impl<'a> CastVisitor<'a> {
     fn enclosing(&self) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        if let Some(f) = self.fn_stack.last() {
-            path.push(f.clone());
-        }
-        if path.is_empty() {
-            "<top-level>".into()
-        } else {
-            path.join("::")
-        }
+        self.scope.enclosing()
     }
 }
 
@@ -119,30 +102,30 @@ fn classify(src: Option<&str>, dst: &str) -> &'static str {
 
 impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         self.fn_types_stack
             .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
         visit::visit_item_fn(self, i);
         self.fn_types_stack.pop();
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         self.fn_types_stack
             .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
         visit::visit_impl_item_fn(self, i);
         self.fn_types_stack.pop();
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_expr_cast(&mut self, e: &'ast syn::ExprCast) {
@@ -171,21 +154,19 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
 }
 
 pub fn run(
-    files: &[ParsedFile],
-    fn_sigs: &FnSigIndex,
+    ctx: &AnalysisCtx,
     class_filter: Option<&str>,
     by: Option<&str>,
     no_widen: bool,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let fn_sigs = &ctx.sem.fn_sigs;
+    let summary = ctx.summary;
     let mut all: Vec<Hit> = Vec::new();
     for f in files {
         let mut v = CastVisitor {
             file: &display_path(&f.path),
-            module: &f.module,
-            fn_stack: Vec::new(),
-            impl_stack: Vec::new(),
-            mod_stack: Vec::new(),
+            scope: ScopeTracker::new(f.module.as_str()),
             fn_types_stack: Vec::new(),
             fn_sigs,
             hits: Vec::new(),

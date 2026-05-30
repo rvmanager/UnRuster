@@ -3,6 +3,10 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 
 /// Structured parse of a macro body, when we can recognize the shape.
+// `Body` is a transient per-macro return value, consumed immediately and never
+// stored in bulk, so the variant size gap doesn't matter — boxing would only
+// add indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum Body {
     /// Best-effort parse of macro args as a list of expressions.
     Exprs(Vec<syn::Expr>),

@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::ast::line_of;
+use crate::ast::{line_of, ScopeTracker};
+use crate::context::AnalysisCtx;
 use crate::parse::{display_path, ParsedFile};
 
 #[derive(Debug)]
@@ -31,24 +32,13 @@ struct TestInfo {
 
 struct TestVisitor<'a> {
     file: &'a str,
-    module: &'a str,
-    mod_stack: Vec<String>,
-    impl_stack: Vec<String>,
+    scope: ScopeTracker,
     out: Vec<TestInfo>,
 }
 
 impl<'a> TestVisitor<'a> {
     fn qualify(&self, name: &str) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        path.push(name.to_string());
-        path.join("::")
+        self.scope.qualify(name)
     }
 
     fn handle_fn(&mut self, attrs: &[syn::Attribute], sig: &syn::Signature, body: &syn::Block) {
@@ -73,9 +63,9 @@ impl<'a> TestVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for TestVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
@@ -83,10 +73,9 @@ impl<'ast, 'a> Visit<'ast> for TestVisitor<'a> {
     }
 
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack
-            .push(crate::ast::type_short(&i.self_ty));
+        self.scope.enter_impl(crate::ast::type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
@@ -188,7 +177,7 @@ fn detect_subcommand(lits: &[String]) -> Option<String> {
     let mut i = 0;
     while i < lits.len() {
         let cur = &lits[i];
-        if VALUE_FLAGS.iter().any(|f| *f == cur.as_str()) {
+        if VALUE_FLAGS.contains(&cur.as_str()) {
             i += 2; // skip flag + its value
             continue;
         }
@@ -198,7 +187,7 @@ fn detect_subcommand(lits: &[String]) -> Option<String> {
         }
         // First non-flag string. Match against the known list to avoid
         // misreading flag values that happen to look subcommand-shaped.
-        if KNOWN_SUBCOMMANDS.iter().any(|s| *s == cur.as_str()) {
+        if KNOWN_SUBCOMMANDS.contains(&cur.as_str()) {
             return Some(cur.clone());
         }
         // Looks subcommand-shaped but unknown — bail rather than guess.
@@ -317,18 +306,17 @@ fn build_hint(lits: &[String]) -> Option<String> {
 }
 
 pub fn run(
+    ctx: &AnalysisCtx,
     files: &[ParsedFile],
     with_hint: bool,
     by_subcommand: bool,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let summary = ctx.summary;
     let mut all: Vec<TestInfo> = Vec::new();
     for f in files {
         let mut v = TestVisitor {
             file: &display_path(&f.path),
-            module: &f.module,
-            mod_stack: Vec::new(),
-            impl_stack: Vec::new(),
+            scope: ScopeTracker::new(f.module.as_str()),
             out: Vec::new(),
         };
         v.visit_file(&f.ast);

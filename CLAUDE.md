@@ -1,5 +1,21 @@
 # UnRuster — collaboration notes for Claude
 
+## Lint workflow
+
+After every compile (`cargo build`, `cargo build --release`, or `cargo check`),
+**run `cargo clippy` and clean up any issues it reports** before considering the
+work done.
+
+- Treat clippy findings as part of "does it build" — a green `cargo build` with
+  outstanding clippy warnings is not finished work.
+- Prefer `cargo clippy --fix --allow-dirty --allow-staged` for the mechanical
+  suggestions, then resolve the rest by hand.
+- This applies to pre-existing warnings you encounter too: if you touched the
+  area or ran a build, leave clippy clean. If a lint is a deliberate false
+  positive, silence it narrowly with a scoped `#[allow(...)]` and a one-line
+  comment saying why — don't blanket-allow at the crate root.
+- Goal state: `cargo clippy` reports zero warnings.
+
 ## Release build workflow
 
 When the user asks for a release build (`cargo build --release`, "build the

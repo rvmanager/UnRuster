@@ -41,6 +41,155 @@ pub fn path_to_string(p: &syn::Path) -> String {
     out
 }
 
+/// Shared item-path prefix: `module::mods::(impl|trait)`. The type segment is
+/// the innermost `impl` self-type, falling back to the innermost `trait`.
+fn type_prefix(
+    module: &str,
+    mod_stack: &[String],
+    impl_stack: &[String],
+    trait_stack: &[String],
+) -> Vec<String> {
+    let mut path: Vec<String> = Vec::new();
+    if !module.is_empty() {
+        path.push(module.to_string());
+    }
+    path.extend(mod_stack.iter().cloned());
+    if let Some(t) = impl_stack.last() {
+        path.push(t.clone());
+    } else if let Some(t) = trait_stack.last() {
+        path.push(t.clone());
+    }
+    path
+}
+
+/// Fully-qualified name of a defined item: `module::mods::Type::name`. Pass an
+/// empty `trait_stack` for visitors that don't distinguish trait context.
+pub fn qualify(
+    module: &str,
+    mod_stack: &[String],
+    impl_stack: &[String],
+    trait_stack: &[String],
+    name: &str,
+) -> String {
+    let mut path = type_prefix(module, mod_stack, impl_stack, trait_stack);
+    path.push(name.to_string());
+    path.join("::")
+}
+
+/// Label for the fn enclosing a call/site: `module::mods::Type::fn`. With no
+/// enclosing fn the prefix alone is returned (or `<top-level>` if empty). When
+/// `toplevel_segment` is true, a missing fn inside a non-empty prefix renders as
+/// a trailing `<top-level>` segment — the `callers` convention, which marks
+/// call sites that sit at module/impl top level rather than inside a fn.
+pub fn enclosing(
+    module: &str,
+    mod_stack: &[String],
+    impl_stack: &[String],
+    fn_stack: &[String],
+    toplevel_segment: bool,
+) -> String {
+    let mut path = type_prefix(module, mod_stack, impl_stack, &[]);
+    if let Some(f) = fn_stack.last() {
+        path.push(f.clone());
+    } else if toplevel_segment {
+        if path.is_empty() {
+            return "<top-level>".to_string();
+        }
+        path.push("<top-level>".to_string());
+    }
+    if path.is_empty() {
+        "<top-level>".to_string()
+    } else {
+        path.join("::")
+    }
+}
+
+/// Tracks the lexical scope a `syn` visitor is currently inside — the file's
+/// top-level module, plus stacks of nested `mod`s, `impl`/`trait` blocks, and
+/// `fn`s. Every analysis visitor needs this to qualify the items and call sites
+/// it finds; embedding one `ScopeTracker` replaces the four parallel stacks
+/// (and their push/pop boilerplate) that were previously copy-pasted per
+/// visitor. Visitors `enter_*` on the way down and `leave_*` on the way back
+/// up, then call `qualify`/`enclosing` to render a path.
+#[derive(Default)]
+pub struct ScopeTracker {
+    pub module: String,
+    pub mod_stack: Vec<String>,
+    pub impl_stack: Vec<String>,
+    pub trait_stack: Vec<String>,
+    pub fn_stack: Vec<String>,
+}
+
+impl ScopeTracker {
+    pub fn new(module: impl Into<String>) -> Self {
+        Self {
+            module: module.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn enter_mod(&mut self, name: impl Into<String>) {
+        self.mod_stack.push(name.into());
+    }
+    pub fn leave_mod(&mut self) {
+        self.mod_stack.pop();
+    }
+    pub fn enter_impl(&mut self, ty: impl Into<String>) {
+        self.impl_stack.push(ty.into());
+    }
+    pub fn leave_impl(&mut self) {
+        self.impl_stack.pop();
+    }
+    pub fn enter_trait(&mut self, name: impl Into<String>) {
+        self.trait_stack.push(name.into());
+    }
+    pub fn leave_trait(&mut self) {
+        self.trait_stack.pop();
+    }
+    pub fn enter_fn(&mut self, name: impl Into<String>) {
+        self.fn_stack.push(name.into());
+    }
+    pub fn leave_fn(&mut self) {
+        self.fn_stack.pop();
+    }
+
+    /// `module::mods::Type::name` for a defined item in the current scope.
+    pub fn qualify(&self, name: &str) -> String {
+        qualify(
+            &self.module,
+            &self.mod_stack,
+            &self.impl_stack,
+            &self.trait_stack,
+            name,
+        )
+    }
+
+    /// Label for the fn enclosing the current site: `module::mods::Type::fn`,
+    /// or the prefix alone / `<top-level>` when not inside a fn.
+    pub fn enclosing(&self) -> String {
+        enclosing(
+            &self.module,
+            &self.mod_stack,
+            &self.impl_stack,
+            &self.fn_stack,
+            false,
+        )
+    }
+
+    /// Like [`enclosing`](Self::enclosing) but renders a module/impl top-level
+    /// site (no enclosing fn) as a trailing `<top-level>` segment — the
+    /// `callers` convention for labelling call sites.
+    pub fn enclosing_with_toplevel(&self) -> String {
+        enclosing(
+            &self.module,
+            &self.mod_stack,
+            &self.impl_stack,
+            &self.fn_stack,
+            true,
+        )
+    }
+}
+
 pub fn path_to_string_with_args(p: &syn::Path) -> String {
     let mut s = String::new();
     if p.leading_colon.is_some() {

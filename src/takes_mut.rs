@@ -1,8 +1,8 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{is_mut_ref, line_of, type_last_segment, type_short, type_to_string};
-use crate::index::NameIndex;
-use crate::parse::{display_path, ParsedFile};
+use crate::ast::{is_mut_ref, line_of, type_last_segment, type_short, type_to_string, ScopeTracker};
+use crate::context::AnalysisCtx;
+use crate::parse::display_path;
 
 #[derive(Debug)]
 struct Hit {
@@ -15,24 +15,13 @@ struct Hit {
 struct TakesMutVisitor<'a> {
     target: &'a str,
     file: &'a str,
-    module: &'a str,
-    impl_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    scope: ScopeTracker,
     out: Vec<Hit>,
 }
 
 impl<'a> TakesMutVisitor<'a> {
     fn qualify(&self, name: &str) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        path.push(name.to_string());
-        path.join("::")
+        self.scope.qualify(name)
     }
 
     fn check_sig(&mut self, sig: &syn::Signature) {
@@ -66,6 +55,7 @@ impl<'a> TakesMutVisitor<'a> {
             return None;
         }
         let in_target = self
+            .scope
             .impl_stack
             .last()
             .map(|t| t == self.target)
@@ -95,14 +85,14 @@ impl<'a> TakesMutVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for TakesMutVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.check_sig(&i.sig);
@@ -115,7 +105,10 @@ impl<'ast, 'a> Visit<'ast> for TakesMutVisitor<'a> {
     }
 }
 
-pub fn run(files: &[ParsedFile], index: &NameIndex, ty: &str, summary: bool) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let summary = ctx.summary;
     if !index.knows_name(ty) {
         eprintln!(
             "note: `{}` is not a known struct/enum/trait/type-alias in this tree; \
@@ -128,9 +121,7 @@ pub fn run(files: &[ParsedFile], index: &NameIndex, ty: &str, summary: bool) -> 
         let mut v = TakesMutVisitor {
             target: ty,
             file: &display_path(&f.path),
-            module: &f.module,
-            impl_stack: Vec::new(),
-            mod_stack: Vec::new(),
+            scope: ScopeTracker::new(f.module.as_str()),
             out: Vec::new(),
         };
         v.visit_file(&f.ast);

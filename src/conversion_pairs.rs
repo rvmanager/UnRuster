@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of_span, type_last_segment};
-use crate::parse::{display_path, ParsedFile};
+use crate::context::AnalysisCtx;
+use crate::parse::display_path;
 
 #[derive(Debug, Clone)]
 struct FromImpl {
@@ -52,7 +53,9 @@ impl<'ast, 'a> Visit<'ast> for FromVisitor<'a> {
     }
 }
 
-pub fn run(files: &[ParsedFile], summary: bool) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let summary = ctx.summary;
     let mut impls: Vec<FromImpl> = Vec::new();
     for f in files {
         let mut v = FromVisitor {

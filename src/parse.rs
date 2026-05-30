@@ -99,11 +99,8 @@ pub fn display_path(p: &Path) -> String {
 
 fn build_cfg_env(scope: Scope, user_cfgs: &[String]) -> CfgEnv {
     let mut env = CfgEnv::new();
-    match scope {
-        Scope::Tests => {
-            env.bools.insert("test".to_string());
-        }
-        _ => {}
+    if scope == Scope::Tests {
+        env.bools.insert("test".to_string());
     }
     for raw in user_cfgs {
         env.add(raw);

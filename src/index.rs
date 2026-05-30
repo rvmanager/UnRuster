@@ -4,7 +4,7 @@ use syn::visit::{self, Visit};
 
 use crate::ast::{
     has_allow_dead_code, line_of, line_of_span, path_to_string, type_short, type_to_string,
-    vis_str,
+    vis_str, ScopeTracker,
 };
 use crate::parse::{display_path, ParsedFile};
 
@@ -47,10 +47,7 @@ impl NameIndex {
         for f in files {
             let mut v = IndexVisitor {
                 file: &display_path(&f.path),
-                module: &f.module,
-                impl_stack: Vec::new(),
-                trait_stack: Vec::new(),
-                mod_stack: Vec::new(),
+                scope: ScopeTracker::new(f.module.as_str()),
                 out: &mut defns,
             };
             v.visit_file(&f.ast);
@@ -99,27 +96,13 @@ impl NameIndex {
 
 struct IndexVisitor<'a> {
     file: &'a str,
-    module: &'a str,
-    impl_stack: Vec<String>,
-    trait_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    scope: ScopeTracker,
     out: &'a mut Vec<Defn>,
 }
 
 impl<'a> IndexVisitor<'a> {
     fn qualify(&self, name: &str) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        } else if let Some(t) = self.trait_stack.last() {
-            path.push(t.clone());
-        }
-        path.push(name.to_string());
-        path.join("::")
+        self.scope.qualify(name)
     }
 
     // `push()` is only invoked for top-level items (struct/enum/trait/fn/etc.),
@@ -131,10 +114,10 @@ impl<'a> IndexVisitor<'a> {
 
     fn current_module(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            parts.push(self.module.to_string());
+        if !self.scope.module.is_empty() {
+            parts.push(self.scope.module.clone());
         }
-        parts.extend(self.mod_stack.iter().cloned());
+        parts.extend(self.scope.mod_stack.iter().cloned());
         parts.join("::")
     }
 
@@ -171,9 +154,9 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
         let name = i.ident.to_string();
         self.push("mod", name.clone(), vis_str(&i.vis), line_of(&i.ident));
-        self.mod_stack.push(name);
+        self.scope.enter_mod(name);
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
 
     fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
@@ -197,7 +180,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
     fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
         let name = i.ident.to_string();
         self.push("trait", name.clone(), vis_str(&i.vis), line_of(&i.ident));
-        self.trait_stack.push(name);
+        self.scope.enter_trait(name);
         for item in &i.items {
             if let syn::TraitItem::Fn(f) = item {
                 let fname = f.sig.ident.to_string();
@@ -210,14 +193,14 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                     line: line_of(&f.sig.ident),
                     vis: "pub",
                     module: self.current_module(),
-                    owner: self.trait_stack.last().cloned(),
+                    owner: self.scope.trait_stack.last().cloned(),
                     trait_name: None,
                     in_trait_impl: false,
                     allow_dead: has_allow_dead_code(&f.attrs),
                 });
             }
         }
-        self.trait_stack.pop();
+        self.scope.leave_trait();
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
@@ -290,7 +273,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
             in_trait_impl: false,
             allow_dead: impl_block_allow,
         });
-        self.impl_stack.push(self_ty);
+        self.scope.enter_impl(self_ty);
         for item in &i.items {
             if let syn::ImplItem::Fn(f) = item {
                 let fname = f.sig.ident.to_string();
@@ -303,13 +286,13 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                     line: line_of(&f.sig.ident),
                     vis: vis_str(&f.vis),
                     module: module.clone(),
-                    owner: self.impl_stack.last().cloned(),
+                    owner: self.scope.impl_stack.last().cloned(),
                     trait_name: None,
                     in_trait_impl: is_trait_impl,
                     allow_dead: impl_block_allow || has_allow_dead_code(&f.attrs),
                 });
             }
         }
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
 }

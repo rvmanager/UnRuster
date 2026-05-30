@@ -1,9 +1,8 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string_with_args, type_short};
-use crate::index::NameIndex;
-use crate::parse::{display_path, ParsedFile};
-use crate::semantic::AliasGraph;
+use crate::ast::{line_of, path_to_string_with_args, type_short, ScopeTracker};
+use crate::context::AnalysisCtx;
+use crate::parse::display_path;
 
 #[derive(Debug)]
 struct Ref {
@@ -19,31 +18,13 @@ struct RefVisitor<'a> {
     targets: &'a [String], // primary name + all alias-equivalent names
     primary: &'a str,
     file: &'a str,
-    module: &'a str,
-    fn_stack: Vec<String>,
-    impl_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    scope: ScopeTracker,
     out: Vec<Ref>,
 }
 
 impl<'a> RefVisitor<'a> {
     fn enclosing(&self) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        if let Some(f) = self.fn_stack.last() {
-            path.push(f.clone());
-        }
-        if path.is_empty() {
-            "<top-level>".into()
-        } else {
-            path.join("::")
-        }
+        self.scope.enclosing()
     }
 
     fn matches_path_last(&self, p: &syn::Path) -> Option<&'static str> {
@@ -72,24 +53,24 @@ impl<'a> RefVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_impl_item_fn(self, i);
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_type_path(&mut self, t: &'ast syn::TypePath) {
@@ -168,13 +149,11 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     }
 }
 
-pub fn run(
-    files: &[ParsedFile],
-    index: &NameIndex,
-    aliases: &AliasGraph,
-    ty: &str,
-    summary: bool,
-) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let index = ctx.idx;
+    let aliases = &ctx.sem.aliases;
+    let summary = ctx.summary;
     if !index.knows_name(ty) {
         eprintln!(
             "note: `{}` is not a known struct/enum/trait/type-alias in this tree; \
@@ -202,10 +181,7 @@ pub fn run(
             targets: &targets,
             primary: ty,
             file: &display_path(&f.path),
-            module: &f.module,
-            fn_stack: Vec::new(),
-            impl_stack: Vec::new(),
-            mod_stack: Vec::new(),
+            scope: ScopeTracker::new(f.module.as_str()),
             out: Vec::new(),
         };
         v.visit_file(&f.ast);

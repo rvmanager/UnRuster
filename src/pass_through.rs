@@ -2,7 +2,8 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_to_string, type_short};
-use crate::parse::{display_path, ParsedFile};
+use crate::context::AnalysisCtx;
+use crate::parse::display_path;
 
 #[derive(Debug)]
 struct Hit {
@@ -66,17 +67,11 @@ impl<'a> PTVisitor<'a> {
 ///   { return g(args); }
 fn single_call_in_body(body: &syn::Block) -> Option<syn::Expr> {
     let stmts = &body.stmts;
-    match stmts.len() {
-        1 => match &stmts[0] {
-            syn::Stmt::Expr(e, _) => {
-                if is_call_like(e) {
-                    return Some(e.clone());
-                }
-            }
-            _ => {}
-        },
-        _ => {}
-    }
+    if stmts.len() == 1 { if let syn::Stmt::Expr(e, _) = &stmts[0] {
+        if is_call_like(e) {
+            return Some(e.clone());
+        }
+    } }
     None
 }
 
@@ -120,7 +115,9 @@ impl<'ast, 'a> Visit<'ast> for PTVisitor<'a> {
     }
 }
 
-pub fn run(files: &[ParsedFile], max_loc: usize, summary: bool) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let summary = ctx.summary;
     let mut all: Vec<Hit> = Vec::new();
     for f in files {
         let mut v = PTVisitor {

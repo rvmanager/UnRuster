@@ -1,6 +1,7 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_last, path_to_string, type_short};
+use crate::ast::{line_of, path_last, path_to_string, type_short, ScopeTracker};
+use crate::context::AnalysisCtx;
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{FnSigIndex, FnTypes};
 
@@ -21,19 +22,16 @@ struct FieldHit {
 
 struct FieldVisitor<'a> {
     file: &'a str,
-    module: &'a str,
     target_type: &'a str,
     target_field: &'a str,
     /// strict: only emit "self" / "init" / "ti" hits.
     /// non-strict (candidates): also emit "?" hits.
     strict: bool,
 
-    impl_stack: Vec<String>,
-    fn_stack: Vec<String>,
+    scope: ScopeTracker,
     /// Per-fn-body type maps. Pushed on fn entry, popped on exit. The last
     /// entry is the currently-enclosing fn.
     fn_types_stack: Vec<FnTypes>,
-    mod_stack: Vec<String>,
     in_write_lhs: bool,
 
     fn_sigs: &'a FnSigIndex,
@@ -42,26 +40,12 @@ struct FieldVisitor<'a> {
 
 impl<'a> FieldVisitor<'a> {
     fn enclosing(&self) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        if let Some(f) = self.fn_stack.last() {
-            path.push(f.clone());
-        }
-        if path.is_empty() {
-            "<top-level>".into()
-        } else {
-            path.join("::")
-        }
+        self.scope.enclosing()
     }
 
     fn in_target_impl(&self) -> bool {
-        self.impl_stack
+        self.scope
+            .impl_stack
             .last()
             .map(|t| t == self.target_type)
             .unwrap_or(false)
@@ -100,7 +84,7 @@ impl<'a> FieldVisitor<'a> {
                 if self.strict {
                     return None;
                 }
-                let owner = self.impl_stack.last().cloned().unwrap_or_default();
+                let owner = self.scope.impl_stack.last().cloned().unwrap_or_default();
                 return Some(("?", format!("self (in impl {})", owner)));
             }
         }
@@ -123,33 +107,33 @@ fn recv_display(base: &syn::Expr) -> String {
 
 impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         self.fn_types_stack
             .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
         visit::visit_item_fn(self, i);
         self.fn_types_stack.pop();
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.fn_stack.push(i.sig.ident.to_string());
+        self.scope.enter_fn(i.sig.ident.to_string());
         self.fn_types_stack
             .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
         visit::visit_impl_item_fn(self, i);
         self.fn_types_stack.pop();
-        self.fn_stack.pop();
+        self.scope.leave_fn();
     }
 
     fn visit_expr_assign(&mut self, e: &'ast syn::ExprAssign) {
@@ -219,7 +203,8 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     fn visit_expr_struct(&mut self, e: &'ast syn::ExprStruct) {
         let lit_ty = path_last(&e.path);
         let resolved_ty = if lit_ty == "Self" {
-            self.impl_stack
+            self.scope
+                .impl_stack
                 .last()
                 .cloned()
                 .unwrap_or_else(|| lit_ty.clone())
@@ -257,14 +242,11 @@ fn collect(
     for f in files {
         let mut v = FieldVisitor {
             file: &display_path(&f.path),
-            module: &f.module,
+            scope: ScopeTracker::new(f.module.as_str()),
             target_type: ty,
             target_field: field,
             strict,
-            impl_stack: Vec::new(),
-            fn_stack: Vec::new(),
             fn_types_stack: Vec::new(),
-            mod_stack: Vec::new(),
             in_write_lhs: false,
             fn_sigs,
             hits: Vec::new(),
@@ -276,15 +258,16 @@ fn collect(
 }
 
 pub fn run(
-    files: &[ParsedFile],
-    fn_sigs: &FnSigIndex,
+    ctx: &AnalysisCtx,
     ty: &str,
     field: &str,
     strict: bool,
     kinds: &[&str],
     via_receiver: Option<&str>,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let fn_sigs = &ctx.sem.fn_sigs;
+    let summary = ctx.summary;
     let mut all = collect(files, ty, field, strict, fn_sigs);
 
     if !kinds.is_empty() {

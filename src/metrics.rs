@@ -1,8 +1,9 @@
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, type_short};
-use crate::parse::{display_path, ParsedFile};
+use crate::ast::{line_of, type_short, ScopeTracker};
+use crate::context::AnalysisCtx;
+use crate::parse::display_path;
 
 #[derive(Debug)]
 struct FnMetric {
@@ -33,9 +34,7 @@ struct EnumMetric {
 
 struct MetricsVisitor<'a> {
     file: &'a str,
-    module: &'a str,
-    impl_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    scope: ScopeTracker,
     fns: &'a mut Vec<FnMetric>,
     structs: &'a mut Vec<StructMetric>,
     enums: &'a mut Vec<EnumMetric>,
@@ -43,16 +42,7 @@ struct MetricsVisitor<'a> {
 
 impl<'a> MetricsVisitor<'a> {
     fn qualify(&self, name: &str) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        path.push(name.to_string());
-        path.join("::")
+        self.scope.qualify(name)
     }
 
     fn record_fn(&mut self, sig: &syn::Signature, body: &syn::Block) {
@@ -80,14 +70,14 @@ impl<'a> MetricsVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for MetricsVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
@@ -244,21 +234,20 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
 // ─── run ────────────────────────────────────────────────────────────────────
 
 pub fn run(
-    files: &[ParsedFile],
+    ctx: &AnalysisCtx,
     sort: &str,
     top: usize,
     threshold: Option<usize>,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let files = ctx.files;
+    let summary = ctx.summary;
     let mut fns: Vec<FnMetric> = Vec::new();
     let mut structs: Vec<StructMetric> = Vec::new();
     let mut enums: Vec<EnumMetric> = Vec::new();
     for f in files {
         let mut v = MetricsVisitor {
             file: &display_path(&f.path),
-            module: &f.module,
-            impl_stack: Vec::new(),
-            mod_stack: Vec::new(),
+            scope: ScopeTracker::new(f.module.as_str()),
             fns: &mut fns,
             structs: &mut structs,
             enums: &mut enums,

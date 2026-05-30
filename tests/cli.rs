@@ -239,6 +239,60 @@ fn cohort_callees_summary_mode() {
     assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "cohort-callees", "wrap_in_*"]);
 }
 
+// ─── co-call (paired-action invariant) ─────────────────────────────────────
+
+#[test]
+fn co_call_flags_asymmetric_caller() {
+    // `wrap_in_group` / `wrap_in_composite` call both `arena_insert` and
+    // `mark_pending`; `wrap_in_transform` (the defect) calls A but not B.
+    let out = ur_stdout(&["--root", FIXTURE, "co-call", "arena_insert", "mark_pending"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.lines().any(|l| l.starts_with("A-only") && l.contains("wrap_in_transform")),
+        "expected wrap_in_transform flagged as A-only (calls A, not B):\n{}",
+        s
+    );
+    // The canonical both-callers must NOT be listed as suspects.
+    assert!(
+        !s.contains("wrap_in_group") && !s.contains("wrap_in_composite"),
+        "both-callers should not appear as rows:\n{}",
+        s
+    );
+    // Each suspect row carries a `via file:line` pointer.
+    assert!(s.contains("via "), "expected a `via` pointer:\n{}", s);
+}
+
+#[test]
+fn co_call_flags_b_only_direction() {
+    // Reverse the pair: now `mark_pending` is A and `arena_insert` is B, so
+    // `wrap_in_transform` (calls arena_insert, not mark_pending) is B-only.
+    let out = ur_stdout(&["--root", FIXTURE, "co-call", "mark_pending", "arena_insert"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.lines().any(|l| l.starts_with("B-only") && l.contains("wrap_in_transform")),
+        "expected wrap_in_transform flagged as B-only (calls B, not A):\n{}",
+        s
+    );
+}
+
+#[test]
+fn co_call_summary_counts_both_callers() {
+    // Summary goes to stderr; with --summary stdout is silent.
+    ur().args(["--root", FIXTURE, "--summary", "co-call", "arena_insert", "mark_pending"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr(predicates::str::contains("call both"));
+}
+
+#[test]
+fn co_call_unknown_symbol_warns_but_succeeds() {
+    ur().args(["--root", FIXTURE, "co-call", "no_such_fn_xyz", "mark_pending"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("no fn/method matching"));
+}
+
 // ─── field / fields ────────────────────────────────────────────────────────
 
 #[test]
@@ -732,6 +786,126 @@ fn enum_coverage_flags_and_hides_trait_routed_catchalls() {
         "trait-routed catch-all must be hidden:\n{}",
         s
     );
+}
+
+// ─── if-chains (== / if-else-if dispatch) ───────────────────────────────────
+
+/// The whole `if-chain` row for a given enclosing fn, or "" if absent.
+fn coverage_row_for(out: &[u8], needle: &str) -> String {
+    String::from_utf8_lossy(out)
+        .lines()
+        .find(|l| l.contains(needle))
+        .unwrap_or("")
+        .to_string()
+}
+
+#[test]
+fn if_chain_two_arm_with_else_emitted() {
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Mode"]);
+    let row = coverage_row_for(&out, "two_arm_with_else");
+    assert!(row.contains("(if-chain)"), "expected if-chain tag:\n{}", row);
+    assert!(row.contains("2/4"), "expected 2 covered variants:\n{}", row);
+    assert!(row.contains("A,B"), "expected A,B covered:\n{}", row);
+}
+
+#[test]
+fn if_chain_no_trailing_else_still_emitted() {
+    // No catch-all `else`, but the missing variants are still missed → partial.
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Mode"]);
+    let row = coverage_row_for(&out, "two_arm_no_else");
+    assert!(row.contains("2/4"), "expected 2/4 site:\n{}", row);
+    assert!(row.contains("(if-chain)"), "expected if-chain tag:\n{}", row);
+}
+
+#[test]
+fn if_chain_three_arm_counts_all_variants() {
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Mode"]);
+    let row = coverage_row_for(&out, "three_arm");
+    assert!(row.contains("3/4"), "expected 3 covered variants:\n{}", row);
+    assert!(row.contains("A,B,C"), "expected A,B,C:\n{}", row);
+}
+
+#[test]
+fn if_chain_reversed_operand_order_emitted() {
+    // `Mode::A == *m` (variant on the left) is detected too.
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Mode"]);
+    let row = coverage_row_for(&out, "reversed");
+    assert!(row.contains("2/4"), "reversed chain must emit:\n{}", row);
+}
+
+#[test]
+fn if_chain_mixed_scrutinee_negated_and_single_not_emitted() {
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Mode"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("mixed_scrutinee"), "mixed scrutinee must be skipped:\n{}", s);
+    assert!(!s.contains("negated"), "`!=` chain must be skipped:\n{}", s);
+    assert!(!s.contains("single_guard"), "single `if` must be skipped:\n{}", s);
+}
+
+#[test]
+fn if_chain_nested_emits_outer_and_inner() {
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Mode"]);
+    let s = String::from_utf8_lossy(&out);
+    // Outer chain covers A,B; inner chain (in the first arm's body) covers C,D.
+    let nested: Vec<&str> = s.lines().filter(|l| l.contains("::nested ")).collect();
+    assert_eq!(nested.len(), 2, "expected outer + inner site:\n{}", s);
+    assert!(nested.iter().any(|l| l.contains("A,B\t")), "outer A,B:\n{}", s);
+    assert!(nested.iter().any(|l| l.contains("C,D\t")), "inner C,D:\n{}", s);
+}
+
+#[test]
+fn if_chain_trait_routed_else_tagged_and_hidden() {
+    // The `else { m.rank() }` arm routes through a method on the scrutinee.
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Mode"]);
+    let row = coverage_row_for(&out, "trait_routed_else");
+    assert!(
+        row.contains("catchall→method"),
+        "trait-routed else must be tagged:\n{}",
+        row
+    );
+
+    let hidden = ur_stdout(&[
+        "--root", FIXTURE, "enum-coverage", "Mode", "--hide-trait-routed-catchalls",
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&hidden).contains("trait_routed_else"),
+        "trait-routed else must be dropped by the flag"
+    );
+}
+
+#[test]
+fn if_chain_vectorian_dispatcher_two_of_seventeen() {
+    // Mirrors apply_static_handle_drag_to_doc's pre-fix shape: 2/17 coverage,
+    // Center+Rotation covered, Start/End among the missing.
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "DragHandle"]);
+    let row = coverage_row_for(&out, "apply_static_handle_drag");
+    assert!(row.contains("2/17"), "expected 2/17 coverage:\n{}", row);
+    assert!(row.contains("Center,Rotation"), "expected Center,Rotation:\n{}", row);
+    assert!(row.contains("Start") && row.contains("End"), "Start/End missing:\n{}", row);
+    assert!(row.contains("(if-chain)"), "expected if-chain tag:\n{}", row);
+}
+
+#[test]
+fn parallel_matches_include_if_chains_toggle() {
+    let without = ur_stdout(&["--root", FIXTURE, "parallel-matches", "Mode"]);
+    assert!(
+        !String::from_utf8_lossy(&without).contains("if-chain"),
+        "if-chains must be off by default in parallel-matches"
+    );
+    let with = ur_stdout(&[
+        "--root", FIXTURE, "parallel-matches", "Mode", "--include-if-chains",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&with).contains("(if-chain)"),
+        "expected (if-chain) sites with --include-if-chains"
+    );
+}
+
+#[test]
+fn parallel_matches_include_if_chains_summary_silent() {
+    assert_summary_silent_stdout(&[
+        "--root", FIXTURE, "--summary", "parallel-matches", "Mode", "--include-if-chains",
+    ]);
 }
 
 // ─── error-swallows ────────────────────────────────────────────────────────

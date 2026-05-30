@@ -8,6 +8,7 @@ mod callers;
 mod casts;
 mod catch_all;
 mod cfg_eval;
+mod context;
 mod conversion_pairs;
 mod conversions;
 mod dead_code;
@@ -29,6 +30,7 @@ mod tests_cmd;
 mod type_refs;
 mod variants;
 
+use context::AnalysisCtx;
 use parse::Scope;
 
 #[derive(Parser)]
@@ -42,7 +44,7 @@ use parse::Scope;
         PRECISE (raw AST shape — trustworthy):\n\
         - Item inventory, impl blocks, struct fields, enum variants.\n\
         - self.field accesses inside `impl Type`.\n\
-        - Match-site / pattern shapes (catch-all-arms, parallel-matches).\n\
+        - Match-site / pattern shapes (catch-all-arms, parallel-matches, if-chains).\n\
         - Free-fn / method / macro call sites by last-segment name.\n\
         \n\
         APPROXIMATE (semantic-lite, may have false positives/negatives):\n\
@@ -167,14 +169,19 @@ use parse::Scope;
           unruster enum-coverage <Enum>                   # the one-stop synthesis\n\
           unruster parallel-matches <Enum> --partial --rank-by-gap --show-missing\n\
           unruster parallel-matches <Enum> --include-matches-macro\n\
-          Signal: `enum-coverage` lists every PARTIAL match / `matches!` site —\n\
-          one row per (gap_score, covered, missing, file:line), sorted by\n\
-          gap_score = covered/total descending. The top rows are predicates\n\
-          covering almost every variant (e.g. 7/8): a new variant falls into\n\
-          their `_`/`matches!`-false arm with zero compiler warning. Exhaustive\n\
-          sites are compiler-protected and hidden. `matches!()` is\n\
-          guaranteed-supported (always on in enum-coverage; opt-in elsewhere via\n\
-          --include-matches-macro) — its implicit no-match arm IS the risk.\n\
+          unruster parallel-matches <Enum> --include-if-chains\n\
+          Signal: `enum-coverage` lists every PARTIAL match / `matches!` /\n\
+          `==`-if-chain site — one row per (gap_score, covered, missing,\n\
+          file:line), sorted by gap_score = covered/total descending. The top\n\
+          rows are predicates covering almost every variant (e.g. 7/8): a new\n\
+          variant falls into their `_` / `matches!`-false / dispatch-`else` arm\n\
+          with zero compiler warning. Exhaustive sites are compiler-protected\n\
+          and hidden. `matches!()` is guaranteed-supported (always on in\n\
+          enum-coverage; opt-in elsewhere via --include-matches-macro).\n\
+          `if x == E::A { … } else if x == E::B …` chains are scanned the same\n\
+          way (always on in enum-coverage; opt-in elsewhere via\n\
+          --include-if-chains) — their implicit `else` IS the risk that `match`\n\
+          would force you to handle.\n\
           \n\
           Strongest smell — ASYMMETRIC DIVERGENCE between sibling sites. When\n\
           two sites with similar names / intent (e.g. `as_paintable`,\n\
@@ -217,6 +224,34 @@ use parse::Scope;
           flagged `<- divergence`. The tool finds the asymmetry; you decide\n\
           whether that sibling SHOULD have made the call (some omissions are\n\
           correct — not every sibling wraps an expandable kind).\n\
+        \n\
+        ◇ CO-CALL INVARIANT (paired actions — calling one without the other\n\
+          leaks an invariant; e.g. `refresh_world_transforms` +\n\
+          `recompute_derived_geometry` both must run to settle a `Document`,\n\
+          so any fn that calls one alone may leave stale state behind)\n\
+          unruster co-call <A> <B>                          # asymmetric callers\n\
+          When to reach for it: you know two ops form a couple (mutate +\n\
+          reindex, lock + unlock, begin + commit, invalidate + recompute) and\n\
+          want every site that does one but forgot the other. Unlike\n\
+          `--among`/`cohort-callees` (which need a NAME cohort like `wrap_in_*`),\n\
+          co-call needs no naming convention — it partitions ALL fns by the two\n\
+          calls. A and B take the same target forms as `callers` (bare name,\n\
+          `Type::method`, `.method`, `::name`, `name!`).\n\
+          Output: two row kinds, ranked by matched-call count (high-traffic\n\
+          first), each with a `via file:line` pointer to the call it DOES make:\n\
+            A-only <n> <fn> via f:L   # calls A, not B — forgot B?\n\
+            B-only <n> <fn> via f:L   # calls B, not A — redundant A, or B alone\n\
+          (grep `^A-only` / `^B-only` to split the streams). The stderr summary\n\
+          counts the canonical both-callers, which are not listed.\n\
+          Signal: each row is a latent stale-state candidate. Some asymmetries\n\
+          are correct and you dismiss them — e.g. a typed gate that only QUEUES\n\
+          a mutation (the later `commit` runs B), an orchestrator that dispatches\n\
+          to actions that run B internally, or a solver path where the omission\n\
+          is intentional. Expect a minority of true positives (the tool surfaces\n\
+          candidates; you filter) — same working style as `enum-coverage`.\n\
+          Tip: one pair only checks one invariant. Re-run with a different pair\n\
+          to police a different couple (e.g. `co-call invalidate_cache\n\
+          recompute_derived_geometry` for cache sites that skip the recompute).\n\
         \n\
         ◇ STRINGLY-TYPED CODE (logic branches on string literals)\n\
           unruster stringly                               # ==, .eq, match, assert_eq!\n\
@@ -314,6 +349,12 @@ enum Cmd {
     Callers(CallersArgs),
     /// List callees made from inside a function or method.
     Callees(CalleesArgs),
+    /// Paired-action invariant check: for a coupled pair (A, B) where calling
+    /// one without the other leaks an invariant, list the asymmetric callers —
+    /// fns that call A but not B (`A-only`) or B but not A (`B-only`). Both-
+    /// callers are the canonical pattern (counted, not listed). Each row is a
+    /// candidate; some asymmetries are correct, so a human filters.
+    CoCall(CoCallArgs),
     /// Find read/write sites of a field on a given type.
     FieldUses(FieldArgs),
 
@@ -377,11 +418,12 @@ enum Cmd {
     /// Catches `x == "lit"`, `x.eq("lit")`, `match x { "lit" => ... }`,
     /// `assert_eq!(x, "lit")`. Each row = candidate for an enum or newtype.
     Stringly(StringlyArgs),
-    /// List `#[test]`/`#[bench]`/`#[tokio::test]` fns with `file:start-end`
-    /// + name. Always scans the full tree (ignores --scope) since test code
-    /// is the whole point. Use `--with-hint` to include the `args(...)` body
-    /// fingerprint; use `--by subcommand` to group tests by which CLI
-    /// subcommand they invoke (assert_cmd-style: looks at `.args([...])`).
+    /// List `#[test]`/`#[bench]`/`#[tokio::test]` fns with their
+    /// `file:start-end` and name. Always scans the full tree (ignores --scope)
+    /// since test code is the whole point. Use `--with-hint` to include the
+    /// `args(...)` body fingerprint; use `--by subcommand` to group tests by
+    /// which CLI subcommand they invoke (assert_cmd-style: looks at
+    /// `.args([...])`).
     Tests(TestsArgs),
 }
 
@@ -429,6 +471,15 @@ struct CallersArgs {
 struct CalleesArgs {
     /// Containing function (last-segment match: `translate` or `Doc::translate`).
     name: String,
+}
+
+#[derive(Args)]
+struct CoCallArgs {
+    /// First half of the coupled pair (the "A" action). Same target forms as
+    /// `callers`: bare name, `Type::method`, `.method`, `::name`, `name!`.
+    a: String,
+    /// Second half of the coupled pair (the "B" action). Same forms as `a`.
+    b: String,
 }
 
 #[derive(Args)]
@@ -545,6 +596,13 @@ struct ParallelMatchesArgs {
     /// supported (not best-effort) when set. `enum-coverage` always includes it.
     #[arg(long)]
     include_matches_macro: bool,
+    /// Also scan `if x == Enum::A { … } else if x == Enum::B { … }` dispatch
+    /// chains (length ≥ 2). The implicit/explicit `else` silently re-bins a
+    /// newly-added variant, exactly like a `match` with `_` or a partial
+    /// `matches!`. Off by default for back-compat; guaranteed-supported when
+    /// set. `enum-coverage` always includes it.
+    #[arg(long)]
+    include_if_chains: bool,
 }
 
 #[derive(Args)]
@@ -641,6 +699,23 @@ struct ConversionsArgs {
     top: Option<usize>,
 }
 
+/// Some subcommands (`dead-code`, `tests`) must reason over the FULL tree —
+/// tests and `cfg(test)` items — regardless of the user's `--scope`. Re-parse
+/// the tree under `Scope::All`, but skip the work when the production scan was
+/// already `Scope::All` (the caller falls back to its own `files`). Returns
+/// `None` in that case so the caller can reuse what it has.
+fn full_tree_if_needed(
+    root: &std::path::Path,
+    scope: Scope,
+    cfg: &[String],
+) -> Result<Option<Vec<parse::ParsedFile>>> {
+    if scope == Scope::All {
+        Ok(None)
+    } else {
+        Ok(Some(parse::parse_dir(root, Scope::All, cfg)?))
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let scope = cli.scope;
@@ -654,26 +729,23 @@ fn main() -> Result<()> {
     }
     let idx = index::NameIndex::build(&files);
     let sem = semantic::Semantic::build(&files);
-    let summary = cli.summary;
+    let ctx = AnalysisCtx {
+        files: &files,
+        idx: &idx,
+        sem: &sem,
+        summary: cli.summary,
+    };
     match cli.cmd {
-        Cmd::Inventory(a) => inventory::run(&files, a.kind.as_deref(), a.vis.as_deref(), a.tree, summary),
+        Cmd::Inventory(a) => inventory::run(&ctx, a.kind.as_deref(), a.vis.as_deref(), a.tree),
         Cmd::Callers(a) => {
             if let Some(pattern) = a.among.as_deref() {
-                callers::run_callers_among(&files, &idx, &sem, &a.name, pattern, summary)
+                callers::run_callers_among(&ctx, &a.name, pattern)
             } else {
-                callers::run_callers(
-                    &files,
-                    &idx,
-                    &sem,
-                    &a.name,
-                    a.transitive,
-                    a.depth,
-                    a.by.as_deref(),
-                    summary,
-                )
+                callers::run_callers(&ctx, &a.name, a.transitive, a.depth, a.by.as_deref())
             }
         }
-        Cmd::Callees(a) => callers::run_callees(&files, &idx, &sem, &a.name, summary),
+        Cmd::Callees(a) => callers::run_callees(&ctx, &a.name),
+        Cmd::CoCall(a) => callers::run_co_call(&ctx, &a.a, &a.b),
         Cmd::FieldUses(a) => {
             let mut kinds: Vec<&str> = Vec::new();
             if a.reads_only {
@@ -686,95 +758,62 @@ fn main() -> Result<()> {
                 kinds.push("init");
             }
             field::run(
-                &files,
-                &sem.fn_sigs,
+                &ctx,
                 &a.ty,
                 &a.field,
                 !a.candidates,
                 &kinds,
                 a.via_receiver.as_deref(),
-                summary,
             )
         }
-        Cmd::Fields(a) => fields::run(&files, &idx, &a.ty, summary),
-        Cmd::Variants(a) => variants::run(&files, &idx, &a.name, a.bare, summary),
-        Cmd::Impls(a) => impls::run(&idx, a.of.as_deref(), a.trait_.as_deref(), summary),
-        Cmd::TypeRefs(a) => type_refs::run(&files, &idx, &sem.aliases, &a.ty, summary),
-        Cmd::TakesMut(a) => takes_mut::run(&files, &idx, &a.ty, summary),
-        Cmd::Metrics(a) => metrics::run(&files, &a.sort, a.top, a.threshold, summary),
+        Cmd::Fields(a) => fields::run(&ctx, &a.ty),
+        Cmd::Variants(a) => variants::run(&ctx, &a.name, a.bare),
+        Cmd::Impls(a) => impls::run(&ctx, a.of.as_deref(), a.trait_.as_deref()),
+        Cmd::TypeRefs(a) => type_refs::run(&ctx, &a.ty),
+        Cmd::TakesMut(a) => takes_mut::run(&ctx, &a.ty),
+        Cmd::Metrics(a) => metrics::run(&ctx, &a.sort, a.top, a.threshold),
         Cmd::DeadCode(a) => {
-            // Build the call-set from the FULL tree (including tests + cfg(test))
-            // regardless of the user's --scope, so production items called only
-            // from tests aren't false-flagged. Skip the re-parse if the user
-            // already asked for --scope all.
-            let all_files_owned: Option<Vec<parse::ParsedFile>> = if scope == Scope::All {
-                None
-            } else {
-                Some(parse::parse_dir(&cli.root, Scope::All, &cli.cfg)?)
-            };
-            let call_source: &[parse::ParsedFile] = match &all_files_owned {
-                Some(v) => v,
-                None => &files,
-            };
-            dead_code::run(&files, &idx, call_source, a.pub_only, summary)
+            // Build the call-set from the FULL tree so production items called
+            // only from tests aren't false-flagged as dead.
+            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg)?;
+            let call_source = all_files.as_deref().unwrap_or(&files);
+            dead_code::run(&ctx, call_source, a.pub_only)
         }
-        Cmd::CatchAllArms(a) => catch_all::run(&files, &idx, &a.name, summary),
+        Cmd::CatchAllArms(a) => catch_all::run(&ctx, &a.name),
         Cmd::ParallelMatches(a) => parallel_matches::run(
-            &files,
-            &idx,
+            &ctx,
             &a.name,
-            a.partial,
-            a.rank_by_gap,
-            a.show_missing,
-            a.include_matches_macro,
-            summary,
+            parallel_matches::ScanOpts {
+                partial_only: a.partial,
+                rank_by_gap: a.rank_by_gap,
+                show_missing: a.show_missing,
+                include_matches_macro: a.include_matches_macro,
+                include_if_chains: a.include_if_chains,
+            },
         ),
-        Cmd::EnumCoverage(a) => parallel_matches::run_enum_coverage(
-            &files,
-            &idx,
-            &a.name,
-            a.hide_trait_routed_catchalls,
-            summary,
-        ),
-        Cmd::CohortCallees(a) => callers::run_cohort_callees(&files, &idx, &sem, &a.pattern, summary),
-        Cmd::ErrorSwallows(a) => error_swallows::run(&files, a.include_unwrap_or, summary),
-        Cmd::PassThrough(a) => pass_through::run(&files, a.max_loc, summary),
-        Cmd::Casts(a) => casts::run(
-            &files,
-            &sem.fn_sigs,
-            a.class.as_deref(),
-            a.by.as_deref(),
-            a.no_widen,
-            summary,
-        ),
-        Cmd::Conversions(a) => conversions::run(
-            &files,
-            a.kind.as_deref(),
-            a.by.as_deref(),
-            a.top,
-            summary,
-        ),
-        Cmd::ConversionPairs => conversion_pairs::run(&files, summary),
+        Cmd::EnumCoverage(a) => {
+            parallel_matches::run_enum_coverage(&ctx, &a.name, a.hide_trait_routed_catchalls)
+        }
+        Cmd::CohortCallees(a) => callers::run_cohort_callees(&ctx, &a.pattern),
+        Cmd::ErrorSwallows(a) => error_swallows::run(&ctx, a.include_unwrap_or),
+        Cmd::PassThrough(a) => pass_through::run(&ctx, a.max_loc),
+        Cmd::Casts(a) => casts::run(&ctx, a.class.as_deref(), a.by.as_deref(), a.no_widen),
+        Cmd::Conversions(a) => {
+            conversions::run(&ctx, a.kind.as_deref(), a.by.as_deref(), a.top)
+        }
+        Cmd::ConversionPairs => conversion_pairs::run(&ctx),
         Cmd::Stringly(a) => stringly::run(
-            &files,
+            &ctx,
             a.include_substring,
             a.include_map_keys,
             a.by.as_deref(),
-            summary,
         ),
         Cmd::Tests(a) => {
-            // Always scan the full tree — under --scope production the
-            // tests we want to enumerate would be stripped.
-            let all_files = if scope == Scope::All {
-                None
-            } else {
-                Some(parse::parse_dir(&cli.root, Scope::All, &cli.cfg)?)
-            };
-            let source: &[parse::ParsedFile] = match &all_files {
-                Some(v) => v,
-                None => &files,
-            };
-            tests_cmd::run(source, a.with_hint, a.by_subcommand, summary)
+            // Always scan the full tree — under --scope production the tests we
+            // want to enumerate would be stripped.
+            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg)?;
+            let source = all_files.as_deref().unwrap_or(&files);
+            tests_cmd::run(&ctx, source, a.with_hint, a.by_subcommand)
         }
     }
 }

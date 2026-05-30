@@ -1,11 +1,12 @@
-use crate::index::NameIndex;
+use crate::context::AnalysisCtx;
 
 pub fn run(
-    index: &NameIndex,
+    ctx: &AnalysisCtx,
     of_type: Option<&str>,
     of_trait: Option<&str>,
-    summary: bool,
 ) -> anyhow::Result<()> {
+    let index = ctx.idx;
+    let summary = ctx.summary;
     let mut hits: Vec<_> = index
         .iter()
         .filter(|d| d.kind == "impl")
