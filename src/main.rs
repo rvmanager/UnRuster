@@ -160,6 +160,10 @@ use parse::Scope;
         ◇ PARTIAL-ENUMERATION DEFECT (a predicate that silently mis-bins a NEW\n\
           variant — run BEFORE adding a variant to find every site that won't\n\
           force-update)\n\
+          Also run AFTER adding / promoting / splitting a variant, and after any\n\
+          \"extract variant to its own type\" refactor. The pre-refactor sites\n\
+          that matched on the old variant set are the candidates: they didn't\n\
+          break compilation but may now silently drop the new variant.\n\
           unruster enum-coverage <Enum>                   # the one-stop synthesis\n\
           unruster parallel-matches <Enum> --partial --rank-by-gap --show-missing\n\
           unruster parallel-matches <Enum> --include-matches-macro\n\
@@ -171,6 +175,36 @@ use parse::Scope;
           sites are compiler-protected and hidden. `matches!()` is\n\
           guaranteed-supported (always on in enum-coverage; opt-in elsewhere via\n\
           --include-matches-macro) — its implicit no-match arm IS the risk.\n\
+          \n\
+          Strongest smell — ASYMMETRIC DIVERGENCE between sibling sites. When\n\
+          two sites with similar names / intent (e.g. `as_paintable`,\n\
+          `paint_slots`, `collect_world_transforms`) have overlapping but\n\
+          non-equal coverage sets, the smaller one is almost always the bug:\n\
+          both meant the same conceptual filter, one drifted when a variant was\n\
+          added. Pick out divergent-coverage clusters with:\n\
+            unruster -r src enum-coverage <Enum> | sort -k4 | uniq -f3 -D\n\
+          (sorts on the covered-set column to group near-identical predicates).\n\
+          \n\
+          False positives to skip — TRAIT-ROUTED CATCH-ALLS. A row whose `_` /\n\
+          catchall arm calls a no-default trait classifier on the scrutinee\n\
+          (`node.kind()`, `node.as_paintable()`, `node.capabilities()`) is\n\
+          structurally safe: a new variant must implement the trait method, so\n\
+          the catch-all picks up its behavior automatically. The tool can't see\n\
+          through the method call, so it tags such rows\n\
+          `(catchall→method; likely false positive)` and\n\
+          `--hide-trait-routed-catchalls` drops them entirely. Read the `_` arm.\n\
+          \n\
+          Two repair shapes:\n\
+          - Trait-classifier replacement (preferred). Add a no-default method on\n\
+            the enum's primary trait (`fn classification(&self) -> Class;`).\n\
+            Every existing variant must declare it; the buggy site routes through\n\
+            it; future variants can't compile until they declare it. A partial\n\
+            `matches!(node, BaseShape | CompositeShape | ConstraintDerivedShape)`\n\
+            becomes `node.paintable_kind() == PaintableKind::Path`.\n\
+          - Exhaustive match. If the dispatch genuinely differs per variant,\n\
+            replace `matches!(.., A | B | C)` with a full\n\
+            `match { A => .., B => .., C => .., D | E | F => .. }` — exhaustive,\n\
+            so a new variant forces a compile error at this site.\n\
         \n\
         ◇ SIBLING-COHORT DIVERGENCE (one sibling in a `do_x_*` family forgot a\n\
           call its cohort-mates all make — e.g. `wrap_in_transform` skipped\n\
@@ -312,6 +346,8 @@ enum Cmd {
     /// predicates closest to exhaustive — the ones a newly-added variant would
     /// silently mis-bind. Synthesis of `parallel-matches --partial
     /// --rank-by-gap --show-missing --include-matches-macro`.
+    /// `--hide-trait-routed-catchalls` drops rows whose `_` arm calls a method
+    /// on the scrutinee (structurally-safe false positives).
     EnumCoverage(EnumCoverageArgs),
     /// Cohort divergence matrix: for a name-pattern cohort of fns (e.g.
     /// `wrap_in_*`), show a (callee × function) grid. A callee called by most
@@ -515,6 +551,14 @@ struct ParallelMatchesArgs {
 struct EnumCoverageArgs {
     /// Enum name (last segment).
     name: String,
+    /// Hide rows whose catch-all / `_` arm routes through a method call on the
+    /// matched scrutinee (e.g. `_ => node.paint_slots()`). Those sites are
+    /// structurally safe — a newly-added variant must implement the trait
+    /// method, so the catch-all picks up its behavior automatically — but the
+    /// tool can't see through the call and would otherwise flag them. Cuts the
+    /// noise; read the remaining rows' `_` arms to confirm.
+    #[arg(long)]
+    hide_trait_routed_catchalls: bool,
 }
 
 #[derive(Args)]
@@ -685,7 +729,13 @@ fn main() -> Result<()> {
             a.include_matches_macro,
             summary,
         ),
-        Cmd::EnumCoverage(a) => parallel_matches::run_enum_coverage(&files, &idx, &a.name, summary),
+        Cmd::EnumCoverage(a) => parallel_matches::run_enum_coverage(
+            &files,
+            &idx,
+            &a.name,
+            a.hide_trait_routed_catchalls,
+            summary,
+        ),
         Cmd::CohortCallees(a) => callers::run_cohort_callees(&files, &idx, &sem, &a.pattern, summary),
         Cmd::ErrorSwallows(a) => error_swallows::run(&files, a.include_unwrap_or, summary),
         Cmd::PassThrough(a) => pass_through::run(&files, a.max_loc, summary),

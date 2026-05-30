@@ -680,6 +680,60 @@ fn enum_coverage_summary_mode() {
     assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "enum-coverage", "Token"]);
 }
 
+// A partial match whose `_` arm calls a method on the scrutinee is a structural
+// false positive: it's tagged, and --hide-trait-routed-catchalls drops it.
+#[test]
+fn enum_coverage_flags_and_hides_trait_routed_catchalls() {
+    let tmp = std::env::temp_dir().join("unruster-trait-routed");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(
+        tmp.join("src/main.rs"),
+        "pub enum Shape { Base, Composite, Constraint, Text }\n\
+         trait Paint { fn paintable_kind(&self) -> u8; }\n\
+         // Real defect: partial matches! with a plain false arm.\n\
+         pub fn is_path(s: &Shape) -> bool {\n\
+             matches!(s, Shape::Base | Shape::Composite | Shape::Constraint)\n\
+         }\n\
+         // False positive: catch-all routes through a method on the scrutinee.\n\
+         pub fn classify(node: &Shape) -> u8 {\n\
+             match node {\n\
+                 Shape::Base => 1,\n\
+                 Shape::Composite => 2,\n\
+                 _ => node.paintable_kind(),\n\
+             }\n\
+         }\n",
+    )
+    .unwrap();
+    let root = tmp.to_str().unwrap();
+
+    // Without the flag: both rows show; the routed one carries the tag.
+    let out = ur_stdout(&["--root", root, "enum-coverage", "Shape"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("is_path"), "real defect must show:\n{}", s);
+    assert!(
+        s.contains("classify") && s.contains("catchall→method"),
+        "trait-routed catch-all must be tagged:\n{}",
+        s
+    );
+
+    // With the flag: the routed row is dropped, the real defect stays.
+    let out = ur_stdout(&[
+        "--root",
+        root,
+        "enum-coverage",
+        "Shape",
+        "--hide-trait-routed-catchalls",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("is_path"), "real defect must still show:\n{}", s);
+    assert!(
+        !s.contains("classify"),
+        "trait-routed catch-all must be hidden:\n{}",
+        s
+    );
+}
+
 // ─── error-swallows ────────────────────────────────────────────────────────
 
 #[test]

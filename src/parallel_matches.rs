@@ -20,6 +20,14 @@ struct Site {
     wildcard: bool,
     /// True if this site is a `matches!()` invocation rather than a `match` expr.
     is_macro: bool,
+    /// True if the wildcard / catch-all arm routes through a method call on the
+    /// matched scrutinee (e.g. `_ => node.paint_slots()`). Such sites are a
+    /// structural false positive for the partial-enumeration defect: a new
+    /// variant must implement the trait method, so the catch-all picks up its
+    /// behavior automatically. The tool can't see through the method call, so
+    /// it would otherwise flag them. Always `false` for `matches!()` (no arm
+    /// body to inspect).
+    trait_routed: bool,
 }
 
 struct ParaVisitor<'a> {
@@ -97,6 +105,46 @@ impl<'a> ParaVisitor<'a> {
     }
 }
 
+/// Peel borrows, derefs, parens, and groups so `&node` / `*node` / `(node)`
+/// all compare structurally equal to the bare `node`. Relies on syn's
+/// `extra-traits` `PartialEq`, which ignores spans.
+fn peel_expr(mut e: &syn::Expr) -> &syn::Expr {
+    loop {
+        e = match e {
+            syn::Expr::Reference(r) => &r.expr,
+            syn::Expr::Paren(p) => &p.expr,
+            syn::Expr::Group(g) => &g.expr,
+            syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => &u.expr,
+            other => return other,
+        };
+    }
+}
+
+/// Does `body` contain a method call whose receiver is the match scrutinee
+/// (e.g. the catch-all arm `_ => node.paintable_kind() == Path` where the
+/// scrutinee was `node`)? If so, the site routes new-variant behavior through
+/// a trait method and is a false positive for the partial-enumeration defect.
+fn arm_routes_through_scrutinee(body: &syn::Expr, scrutinee: &syn::Expr) -> bool {
+    struct V<'s> {
+        scrutinee: &'s syn::Expr,
+        found: bool,
+    }
+    impl<'ast, 's> Visit<'ast> for V<'s> {
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            if peel_expr(&c.receiver) == self.scrutinee {
+                self.found = true;
+            }
+            visit::visit_expr_method_call(self, c);
+        }
+    }
+    let mut v = V {
+        scrutinee: peel_expr(scrutinee),
+        found: false,
+    };
+    v.visit_expr(body);
+    v.found
+}
+
 impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
         self.mod_stack.push(i.ident.to_string());
@@ -122,6 +170,7 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
     fn visit_expr_match(&mut self, e: &'ast syn::ExprMatch) {
         let mut variants: Vec<String> = Vec::new();
         let mut wildcard = false;
+        let mut trait_routed = false;
         for arm in &e.arms {
             for v in self.variant_in_pattern(&arm.pat) {
                 if !variants.contains(&v) {
@@ -130,6 +179,9 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
             }
             if Self::is_wildcard(&arm.pat) {
                 wildcard = true;
+                if arm_routes_through_scrutinee(&arm.body, &e.expr) {
+                    trait_routed = true;
+                }
             }
         }
         if !variants.is_empty() {
@@ -141,6 +193,7 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
                 variants,
                 wildcard,
                 is_macro: false,
+                trait_routed,
             });
         }
         visit::visit_expr_match(self, e);
@@ -163,6 +216,7 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
                         variants,
                         wildcard: true,
                         is_macro: true,
+                        trait_routed: false,
                     });
                 }
             }
@@ -320,6 +374,7 @@ pub fn run_enum_coverage(
     files: &[ParsedFile],
     index: &NameIndex,
     enum_name: &str,
+    hide_trait_routed: bool,
     summary: bool,
 ) -> anyhow::Result<()> {
     let variant_names = variant_names_of(files, enum_name);
@@ -347,9 +402,21 @@ pub fn run_enum_coverage(
         site: &'s Site,
         missing: Vec<String>,
     }
+    let mut hidden_trait_routed = 0usize;
     let mut rows: Vec<Row> = all_sites
         .iter()
         .filter(|s| s.variants.len() < total)
+        .filter(|s| {
+            // A catch-all that routes through a method call on the scrutinee is
+            // structurally safe (a new variant must implement the trait method).
+            // With the flag set, drop those rows; count them for the summary.
+            if hide_trait_routed && s.trait_routed {
+                hidden_trait_routed += 1;
+                false
+            } else {
+                true
+            }
+        })
         .map(|s| Row {
             gap: s.variants.len() as f64 / total as f64,
             site: s,
@@ -367,7 +434,13 @@ pub fn run_enum_coverage(
 
     if !summary {
         for r in &rows {
-            let tag = if r.site.is_macro { " (matches!)" } else { "" };
+            let tag = if r.site.is_macro {
+                " (matches!)"
+            } else if r.site.trait_routed {
+                " (catchall→method; likely false positive)"
+            } else {
+                ""
+            };
             println!(
                 "{:.2}\t{}/{}\t{}\t{}\t{}:{}\t{}{}",
                 r.gap,
@@ -383,10 +456,15 @@ pub fn run_enum_coverage(
         }
     }
     eprintln!(
-        "({} partial site(s) on `{}`; {} total variant(s); exhaustive sites hidden)",
+        "({} partial site(s) on `{}`; {} total variant(s); exhaustive sites hidden{})",
         rows.len(),
         enum_name,
-        total
+        total,
+        if hide_trait_routed {
+            format!("; {} trait-routed catch-all(s) hidden", hidden_trait_routed)
+        } else {
+            String::new()
+        }
     );
     Ok(())
 }
