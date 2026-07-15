@@ -98,7 +98,7 @@ use parse::Scope;
           unruster takes-mut String\n\
           unruster callers <fn-taking-primitive> --by module\n\
           Signal: same primitive returned/accepted across unrelated APIs →\n\
-          wrap each role (`UserId(u32)`, `Pixels(u32)`) so the compiler catches\n\
+          wrap each role (`UserId(u32)`, `Cents(u64)`) so the compiler catches\n\
           mix-ups.\n\
         \n\
         ◇ SPLIT A STRUCT (low-cohesion / god-struct)\n\
