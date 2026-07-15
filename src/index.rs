@@ -92,6 +92,20 @@ impl NameIndex {
     pub fn knows_name(&self, last: &str) -> bool {
         self.by_last.contains_key(last)
     }
+
+    /// Sorted, deduplicated names of every enum defined in the tree.
+    /// Used by the `--all` modes of the enum-target commands.
+    pub fn enum_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .defns
+            .iter()
+            .filter(|d| d.kind == "enum")
+            .map(|d| d.name.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
 }
 
 struct IndexVisitor<'a> {

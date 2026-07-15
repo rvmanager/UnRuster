@@ -81,7 +81,8 @@ pub fn run(
     ctx: &AnalysisCtx,
     call_source: &[ParsedFile],
     pub_only: bool,
-) -> anyhow::Result<()> {
+    include_trait_impls: bool,
+) -> anyhow::Result<usize> {
     let index = ctx.idx;
     let summary = ctx.summary;
     let mut sink = CallSink {
@@ -103,7 +104,10 @@ pub fn run(
         if matches!(d.name.as_str(), "main" | "start") {
             continue;
         }
-        if d.kind == "trait-fn" || d.in_trait_impl {
+        // Trait-impl methods are skipped by default (dyn dispatch is
+        // invisible to us); --include-trait-impls reports them when their
+        // method name is never called anywhere in the tree.
+        if d.kind == "trait-fn" || (d.in_trait_impl && !include_trait_impls) {
             continue;
         }
         if d.allow_dead {
@@ -115,19 +119,22 @@ pub fn run(
         hits.push((d.kind, d));
     }
 
+    ctx.retain_changed(&mut hits, |h| &h.1.file);
     hits.sort_by(|a, b| a.1.file.cmp(&b.1.file).then_with(|| a.1.line.cmp(&b.1.line)));
 
     if !summary {
         for (kind, d) in &hits {
             println!("{}\t{}\t{}\t{}:{}", kind, d.vis, d.qpath, d.file, d.line);
+            ctx.print_context(&d.file, d.line);
         }
     }
     eprintln!(
-        "({} candidate dead fn(s); pub_only={}; heuristic — call-set built from full tree \
-         incl. tests; trait impls + `#[allow(dead_code)]` skipped; pub items may still have \
-         external callers we can't see.)",
+        "({} candidate dead fn(s); pub_only={}; include_trait_impls={}; heuristic — call-set \
+         built from full tree incl. tests; `#[allow(dead_code)]` skipped; pub items may still \
+         have external callers we can't see.)",
         hits.len(),
-        pub_only
+        pub_only,
+        include_trait_impls
     );
-    Ok(())
+    Ok(hits.len())
 }

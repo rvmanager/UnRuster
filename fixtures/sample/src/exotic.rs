@@ -155,3 +155,22 @@ impl HasDefault for [u8; 4] {
 // ── pass-through wrappers in all describe_call shapes ──────────────────
 pub fn wrap_method(d: super::Document) -> String { d.render() }
 pub fn wrap_macro_call() -> String { format!("x") }
+
+// ── sealed-enum contract marker (unruster: sealed) ──────────────────────
+/// Gear states for the sealed-marker tests.
+/// unruster: sealed
+pub enum SealedGear {
+    Park,
+    Drive,
+    Reverse,
+}
+
+/// A partial predicate on a sealed enum — must be tagged SEALED.
+pub fn gear_is_moving(g: &SealedGear) -> bool {
+    matches!(g, SealedGear::Drive | SealedGear::Reverse)
+}
+
+/// Keeps the variants constructed so `variants` sees ctor sites too.
+pub fn all_gears() -> Vec<SealedGear> {
+    vec![SealedGear::Park, SealedGear::Drive, SealedGear::Reverse]
+}

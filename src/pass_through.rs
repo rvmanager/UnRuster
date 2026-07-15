@@ -114,7 +114,7 @@ impl<'ast, 'a> Visit<'ast> for PTVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     let mut all: Vec<Hit> = Vec::new();
@@ -128,6 +128,7 @@ pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<()> {
         v.visit_file(&f.ast);
         all.extend(v.hits);
     }
+    ctx.retain_changed(&mut all, |h| &h.file);
     all.sort_by(|a, b| a.qpath.cmp(&b.qpath));
     if !summary {
         for h in &all {
@@ -135,8 +136,9 @@ pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<()> {
                 "{}\t->\t{}\tloc:{}\t{}:{}",
                 h.qpath, h.forwarded_to, h.loc, h.file, h.line
             );
+            ctx.print_context(&h.file, h.line);
         }
     }
     eprintln!("({} pass-through fn(s); max_loc={})", all.len(), max_loc);
-    Ok(())
+    Ok(all.len())
 }

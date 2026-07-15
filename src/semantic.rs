@@ -184,6 +184,9 @@ pub struct FnSigIndex {
     /// fn last-name → return-type last segment. If a name has multiple defns
     /// with conflicting return types, the entry is removed (ambiguous).
     pub by_last: BTreeMap<String, Option<String>>,
+    /// (struct last-name, field name) → field-type last segment. Lets the
+    /// local inferencer resolve `x.field` / `self.field` receivers.
+    pub field_types: BTreeMap<(String, String), String>,
 }
 
 impl FnSigIndex {
@@ -192,6 +195,8 @@ impl FnSigIndex {
         for f in files {
             let mut v = SigVisitor { out: &mut idx.by_last };
             v.visit_file(&f.ast);
+            let mut fv = FieldTypeVisitor { out: &mut idx.field_types };
+            fv.visit_file(&f.ast);
         }
         // Drop ambiguous entries (Some(None) means conflict).
         idx.by_last.retain(|_, v| v.is_some());
@@ -200,6 +205,30 @@ impl FnSigIndex {
 
     pub fn return_type(&self, fn_last: &str) -> Option<&str> {
         self.by_last.get(fn_last).and_then(|v| v.as_deref())
+    }
+
+    /// Field type (last segment) of `ty_last.field`, if that struct is known.
+    pub fn field_type(&self, ty_last: &str, field: &str) -> Option<&str> {
+        self.field_types
+            .get(&(ty_last.to_string(), field.to_string()))
+            .map(String::as_str)
+    }
+}
+
+struct FieldTypeVisitor<'a> {
+    out: &'a mut BTreeMap<(String, String), String>,
+}
+
+impl<'ast, 'a> Visit<'ast> for FieldTypeVisitor<'a> {
+    fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
+        if let syn::Fields::Named(fs) = &i.fields {
+            for f in &fs.named {
+                if let (Some(id), Some(ty)) = (&f.ident, type_last_segment(&f.ty)) {
+                    self.out
+                        .insert((i.ident.to_string(), id.to_string()), ty);
+                }
+            }
+        }
     }
 }
 
@@ -242,8 +271,24 @@ pub struct FnTypes {
 }
 
 impl FnTypes {
-    pub fn build(sig: &syn::Signature, body: &syn::Block, sigs: &FnSigIndex) -> Self {
+    pub fn build(
+        sig: &syn::Signature,
+        body: &syn::Block,
+        sigs: &FnSigIndex,
+        self_ty: Option<&str>,
+    ) -> Self {
         let mut ft = FnTypes::default();
+        // `self` receiver: typed by the enclosing impl block, when known.
+        if let Some(t) = self_ty {
+            if sig
+                .inputs
+                .first()
+                .map(|i| matches!(i, syn::FnArg::Receiver(_)))
+                .unwrap_or(false)
+            {
+                ft.bindings.insert("self".to_string(), t.to_string());
+            }
+        }
         // Parameters.
         for input in &sig.inputs {
             if let syn::FnArg::Typed(t) = input {
@@ -342,6 +387,19 @@ fn infer_expr_type(
             None
         }
         syn::Expr::Struct(s) => s.path.segments.last().map(|seg| seg.ident.to_string()),
+        // `base.field` — resolve through the struct-field type map.
+        syn::Expr::Field(f) => {
+            let base = infer_expr_type(&f.base, sigs, bindings)?;
+            if let syn::Member::Named(id) = &f.member {
+                sigs.field_type(&base, &id.to_string()).map(str::to_string)
+            } else {
+                None
+            }
+        }
+        // `expr.method()` — best-effort by unique method return type.
+        syn::Expr::MethodCall(mc) => {
+            sigs.return_type(&mc.method.to_string()).map(str::to_string)
+        }
         syn::Expr::Cast(c) => type_last_segment(&c.ty),
         syn::Expr::Reference(r) => infer_expr_type(&r.expr, sigs, bindings),
         syn::Expr::Paren(p) => infer_expr_type(&p.expr, sigs, bindings),

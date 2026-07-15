@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ast;
+mod audit;
 mod callers;
 mod casts;
 mod catch_all;
@@ -13,6 +14,7 @@ mod conversion_pairs;
 mod conversions;
 mod dead_code;
 mod error_swallows;
+mod explain;
 mod field_uses;
 mod fields;
 mod impls;
@@ -56,9 +58,36 @@ struct Cli {
     #[arg(long, global = true)]
     cfg: Vec<String>,
 
+    /// Exclude files matching this glob, relative to the root (repeatable),
+    /// e.g. `--exclude 'fixtures/**'`. Applied on top of .gitignore.
+    #[arg(long, global = true)]
+    exclude: Vec<String>,
+
     /// Skip per-row output; print only the summary line on stderr.
     #[arg(long, global = true)]
     summary: bool,
+
+    /// Render each row's enclosing-fn label as `name@start-end` source lines,
+    /// so the relevant body can be read directly (`sed -n 'start,endp'`).
+    #[arg(long, global = true)]
+    spans: bool,
+
+    /// Keep only rows in files changed vs this git ref (e.g. `HEAD~1`,
+    /// `main`); untracked files count as changed. Applies to site-listing
+    /// commands (incl. everything `audit` runs); git is the only state read.
+    #[arg(long, global = true, value_name = "GIT_REF")]
+    changed_since: Option<String>,
+
+    /// Print ±N source lines beneath each finding row (`>` marks the site),
+    /// so small findings need no follow-up file reads.
+    #[arg(long, global = true, value_name = "N")]
+    context: Option<usize>,
+
+    /// Exit 1 when the command reports one or more findings (0 = clean,
+    /// 2 = error/unknown target). For scripted/agent loops:
+    /// `until unruster --fail-on-findings <cmd>; do fix; done`.
+    #[arg(long, global = true)]
+    fail_on_findings: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -66,6 +95,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// One-shot ranked sweep: run the whole check battery (enum-coverage
+    /// --all, dead-code, conversion-pairs, error-swallows, data-loss casts,
+    /// stringly, god fns, pass-through) as severity-ordered sections. Exits 1
+    /// while any finding remains — the agent-loop entry point:
+    /// `until unruster audit; do <fix>; done`.
+    Audit(AuditArgs),
     /// List all top-level items (struct, enum, trait, fn, impl, ...).
     Inventory(InventoryArgs),
     /// Find call sites of a function, method, or macro.
@@ -127,6 +162,10 @@ enum Cmd {
     ErrorSwallows(ErrorSwallowsArgs),
     /// Find pass-through wrappers: fns whose body is a single call/expression.
     PassThrough(PassThroughArgs),
+    /// Print one design-audit playbook section (repair recipe) by topic,
+    /// e.g. `explain partial-enumeration`, `explain stringly`. Without a
+    /// topic, lists all topics. Cheaper than the full --help for agent loops.
+    Explain(ExplainArgs),
 
     /// Find `as` casts; classifies narrowing / signed-flip / pointer / float-int /
     /// usize-cross. Many casts in one fn = shape-juggling design smell:
@@ -154,6 +193,48 @@ enum Cmd {
     /// which CLI subcommand they invoke (assert_cmd-style: looks at
     /// `.args([...])`).
     Tests(TestsArgs),
+}
+
+impl Cmd {
+    /// Commands that imply `--fail-on-findings`. Exhaustive (no `_`) so a new
+    /// command must declare its agent-loop semantics — `unruster enum-coverage
+    /// Cmd` flagged the previous `matches!(…, Cmd::Audit(_))` shortcut.
+    fn implies_fail_on_findings(&self) -> bool {
+        match self {
+            Cmd::Audit(_) => true,
+            Cmd::Inventory(_)
+            | Cmd::Callers(_)
+            | Cmd::Callees(_)
+            | Cmd::CoCall(_)
+            | Cmd::FieldUses(_)
+            | Cmd::Fields(_)
+            | Cmd::Variants(_)
+            | Cmd::Impls(_)
+            | Cmd::TypeRefs(_)
+            | Cmd::TakesMut(_)
+            | Cmd::Metrics(_)
+            | Cmd::DeadCode(_)
+            | Cmd::CatchAllArms(_)
+            | Cmd::ParallelMatches(_)
+            | Cmd::EnumCoverage(_)
+            | Cmd::CohortCallees(_)
+            | Cmd::ErrorSwallows(_)
+            | Cmd::PassThrough(_)
+            | Cmd::Explain(_)
+            | Cmd::Casts(_)
+            | Cmd::Conversions(_)
+            | Cmd::ConversionPairs
+            | Cmd::Stringly(_)
+            | Cmd::Tests(_) => false,
+        }
+    }
+}
+
+#[derive(Args)]
+struct AuditArgs {
+    /// Cap per-section rows where the underlying check supports it.
+    #[arg(long)]
+    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -187,6 +268,10 @@ struct CallersArgs {
     /// Group results by file (path) or module (top-level module).
     #[arg(long, value_enum)]
     by: Option<callers::CallersBy>,
+    /// Keep only rows at or above this confidence tier
+    /// (heuristic < inferred < resolved < exact).
+    #[arg(long, value_enum)]
+    min_confidence: Option<context::Confidence>,
     /// Cohort mode: invert the query. Instead of listing call sites, show which
     /// functions in this name-pattern cohort (last-segment glob, `*` = any run,
     /// e.g. `wrap_in_*`) call the named helper (✓) and which don't (✗). The ✗
@@ -228,6 +313,10 @@ struct FieldUsesArgs {
     /// drops `node.transform`.
     #[arg(long)]
     via_receiver: Option<String>,
+    /// Keep only rows at or above this confidence tier: `via` self/init =
+    /// exact, ti = inferred, ? = heuristic.
+    #[arg(long, value_enum)]
+    min_confidence: Option<context::Confidence>,
 }
 
 #[derive(Args)]
@@ -260,6 +349,11 @@ struct ImplsArgs {
 struct TypeRefsArgs {
     /// Type name (last segment).
     ty: String,
+    /// Keep only rows at or above this confidence tier (alias matches are
+    /// `inferred`; name matches are `resolved` when the name has exactly one
+    /// definition in the tree, else `heuristic`).
+    #[arg(long, value_enum)]
+    min_confidence: Option<context::Confidence>,
 }
 
 #[derive(Args)]
@@ -288,18 +382,31 @@ struct DeadCodeArgs {
     /// Only list pub items.
     #[arg(long)]
     pub_only: bool,
+    /// Also report trait-impl methods whose name is never called anywhere.
+    /// Off by default: dyn-dispatch and generic calls are invisible to a
+    /// syntactic scan, so these rows need per-site review.
+    #[arg(long)]
+    include_trait_impls: bool,
 }
 
 #[derive(Args)]
 struct CatchAllArgs {
-    /// Enum name (last segment).
-    name: String,
+    /// Enum name (last segment). Omit with --all.
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    name: Option<String>,
+    /// Scan every enum defined in the tree; rows gain a leading enum column.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
 struct ParallelMatchesArgs {
-    /// Enum name (last segment).
-    name: String,
+    /// Enum name (last segment). Omit with --all.
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    name: Option<String>,
+    /// Scan every enum defined in the tree; group rows gain a leading enum column.
+    #[arg(long)]
+    all: bool,
     /// Hide exhaustive groups (variant set == the full enum). Exhaustive
     /// matches are compiler-protected; only partials can silently mis-bind a
     /// newly-added variant.
@@ -330,8 +437,12 @@ struct ParallelMatchesArgs {
 
 #[derive(Args)]
 struct EnumCoverageArgs {
-    /// Enum name (last segment).
-    name: String,
+    /// Enum name (last segment). Omit with --all.
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    name: Option<String>,
+    /// Scan every enum defined in the tree; rows gain a leading enum column.
+    #[arg(long)]
+    all: bool,
     /// Hide rows whose catch-all / `_` arm routes through a method call on the
     /// matched scrutinee (e.g. `_ => node.paint_slots()`). Those sites are
     /// structurally safe — a newly-added variant must implement the trait
@@ -354,6 +465,13 @@ struct ErrorSwallowsArgs {
     /// Include `.unwrap_or(...)` (any arg). Noisy; off by default.
     #[arg(long)]
     include_unwrap_or: bool,
+}
+
+#[derive(Args)]
+struct ExplainArgs {
+    /// Topic words matched against playbook headings (e.g. `stringly`,
+    /// `partial-enumeration`, `god function`). Omit to list topics.
+    topic: Option<String>,
 }
 
 #[derive(Args)]
@@ -473,18 +591,37 @@ fn full_tree_if_needed(
     root: &std::path::Path,
     scope: Scope,
     cfg: &[String],
+    excludes: &[String],
 ) -> Result<Option<Vec<parse::ParsedFile>>> {
     if scope == Scope::All {
         Ok(None)
     } else {
-        Ok(Some(parse::parse_dir(root, Scope::All, cfg)?))
+        Ok(Some(parse::parse_dir(root, Scope::All, cfg, excludes)?))
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `explain` reads only the embedded playbook — skip the tree scan.
+    if let Cmd::Explain(a) = &cli.cmd {
+        let result = explain::run(a.topic.as_deref());
+        if let Err(e) = &result {
+            if e.downcast_ref::<context::TargetNotFound>().is_some() {
+                std::process::exit(2);
+            }
+        }
+        result?;
+        return Ok(());
+    }
     let scope = cli.scope;
-    let files = parse::parse_dir(&cli.root, scope, &cli.cfg)?;
+    // Exit-code contract: any setup error (bad glob, bad git ref, IO) is 2.
+    let files = match parse::parse_dir(&cli.root, scope, &cli.cfg, &cli.exclude) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {:#}", e);
+            std::process::exit(2);
+        }
+    };
     if files.is_empty() {
         eprintln!(
             "warning: no .rs files found under {} (scope={:?})",
@@ -494,19 +631,39 @@ fn main() -> Result<()> {
     }
     let idx = index::NameIndex::build(&files);
     let sem = semantic::Semantic::build(&files);
+    let changed = match cli.changed_since.as_deref() {
+        Some(r) => match context::changed_set(r) {
+            Ok(set) => Some(set),
+            Err(e) => {
+                eprintln!("error: {:#}", e);
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
     let ctx = AnalysisCtx {
         files: &files,
         idx: &idx,
         sem: &sem,
         summary: cli.summary,
+        spans: cli.spans,
+        changed,
+        context_lines: cli.context,
     };
+    let fail_on_findings = cli.fail_on_findings || cli.cmd.implies_fail_on_findings();
     let result = match cli.cmd {
+        Cmd::Audit(a) => {
+            // Like dead-code, the call-set must come from the FULL tree.
+            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg, &cli.exclude)?;
+            let call_source = all_files.as_deref().unwrap_or(&files);
+            audit::run(&ctx, call_source, a.top)
+        }
         Cmd::Inventory(a) => inventory::run(&ctx, a.kind, a.vis, a.tree),
         Cmd::Callers(a) => {
             if let Some(pattern) = a.among.as_deref() {
                 callers::run_callers_among(&ctx, &a.name, pattern)
             } else {
-                callers::run_callers(&ctx, &a.name, a.transitive, a.depth, a.by)
+                callers::run_callers(&ctx, &a.name, a.transitive, a.depth, a.by, a.min_confidence)
             }
         }
         Cmd::Callees(a) => callers::run_callees(&ctx, &a.name),
@@ -518,24 +675,25 @@ fn main() -> Result<()> {
             !a.candidates,
             &a.kind,
             a.via_receiver.as_deref(),
+            a.min_confidence,
         ),
         Cmd::Fields(a) => fields::run(&ctx, &a.ty),
         Cmd::Variants(a) => variants::run(&ctx, &a.name, a.bare),
         Cmd::Impls(a) => impls::run(&ctx, a.of.as_deref(), a.trait_.as_deref()),
-        Cmd::TypeRefs(a) => type_refs::run(&ctx, &a.ty),
+        Cmd::TypeRefs(a) => type_refs::run(&ctx, &a.ty, a.min_confidence),
         Cmd::TakesMut(a) => takes_mut::run(&ctx, &a.ty),
-        Cmd::Metrics(a) => metrics::run(&ctx, a.sort, a.top, a.threshold),
+        Cmd::Metrics(a) => metrics::run(&ctx, a.sort, a.top, a.threshold, false),
         Cmd::DeadCode(a) => {
             // Build the call-set from the FULL tree so production items called
             // only from tests aren't false-flagged as dead.
-            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg)?;
+            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg, &cli.exclude)?;
             let call_source = all_files.as_deref().unwrap_or(&files);
-            dead_code::run(&ctx, call_source, a.pub_only)
+            dead_code::run(&ctx, call_source, a.pub_only, a.include_trait_impls)
         }
-        Cmd::CatchAllArms(a) => catch_all::run(&ctx, &a.name),
+        Cmd::CatchAllArms(a) => catch_all::run(&ctx, a.name.as_deref()),
         Cmd::ParallelMatches(a) => parallel_matches::run(
             &ctx,
-            &a.name,
+            a.name.as_deref(),
             parallel_matches::ScanOpts {
                 partial_only: a.hide_exhaustive,
                 rank_by_gap: a.rank_by_gap,
@@ -545,11 +703,12 @@ fn main() -> Result<()> {
             },
         ),
         Cmd::EnumCoverage(a) => {
-            parallel_matches::run_enum_coverage(&ctx, &a.name, a.hide_trait_routed_catchalls)
+            parallel_matches::run_enum_coverage(&ctx, a.name.as_deref(), a.hide_trait_routed_catchalls)
         }
         Cmd::CohortCallees(a) => callers::run_cohort_callees(&ctx, &a.pattern),
         Cmd::ErrorSwallows(a) => error_swallows::run(&ctx, a.include_unwrap_or),
         Cmd::PassThrough(a) => pass_through::run(&ctx, a.max_loc),
+        Cmd::Explain(_) => unreachable!("handled before the tree scan"),
         Cmd::Casts(a) => casts::run(&ctx, &a.class, a.by, a.hide_widen, a.top),
         Cmd::Conversions(a) => conversions::run(&ctx, &a.kind, a.by, a.top),
         Cmd::ConversionPairs => conversion_pairs::run(&ctx),
@@ -559,7 +718,7 @@ fn main() -> Result<()> {
         Cmd::Tests(a) => {
             // Always scan the full tree — under --scope production the tests we
             // want to enumerate would be stripped.
-            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg)?;
+            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg, &cli.exclude)?;
             let source = all_files.as_deref().unwrap_or(&files);
             tests_cmd::run(
                 &ctx,
@@ -570,12 +729,29 @@ fn main() -> Result<()> {
             )
         }
     };
-    if let Err(e) = &result {
-        if e.downcast_ref::<context::TargetNotFound>().is_some() {
-            // The command already printed the warning (and its summary line);
-            // exit 2 distinguishes "unknown target" from "no findings" (exit 0).
+    let findings = match result {
+        Ok(n) => n,
+        // Exit-code contract: 0 = clean, 1 = findings (with --fail-on-findings
+        // or `audit`), 2 = any error. TargetNotFound already printed its
+        // warning; other errors print here.
+        Err(e) => {
+            if e.downcast_ref::<context::TargetNotFound>().is_none() {
+                eprintln!("error: {:#}", e);
+            }
             std::process::exit(2);
         }
+    };
+    let blind = macro_scan::blind_spots();
+    if blind > 0 {
+        eprintln!(
+            "(blind spots: {} macro body(ies) could not be parsed as expressions — \
+             code inside them was not analyzed)",
+            blind
+        );
     }
-    result
+    // `audit` is the agent-loop entry point: findings always fail it.
+    if fail_on_findings && findings > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }

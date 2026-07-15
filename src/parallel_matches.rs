@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{enum_variant_of_path, line_of, type_short, ScopeTracker};
+use crate::ast::{fn_span, trait_fn_span, enum_variant_of_path, line_of, type_short, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::macro_scan::{macro_body, Body};
 use crate::parse::{display_path, ParsedFile};
@@ -267,7 +267,8 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
         self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -277,7 +278,8 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
         self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_impl_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -287,7 +289,8 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
         self.scope.leave_trait();
     }
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
         visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -397,6 +400,7 @@ pub(crate) fn collect_sites(
     variant_names: &[String],
     include_matches_macro: bool,
     include_if_chains: bool,
+    spans: bool,
 ) -> Vec<Site> {
     let mut all_sites: Vec<Site> = Vec::new();
     for f in files {
@@ -404,7 +408,7 @@ pub(crate) fn collect_sites(
             target_enum: enum_name,
             variant_names,
             file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
+            scope: ScopeTracker::new(f.module.as_str()).with_spans(spans),
             include_matches_macro,
             include_if_chains,
             consumed_if_spans: HashSet::new(),
@@ -443,36 +447,98 @@ pub struct ScanOpts {
 
 pub fn run(
     ctx: &AnalysisCtx,
-    enum_name: &str,
+    target: Option<&str>,
     opts: ScanOpts,
-) -> anyhow::Result<()> {
-    let files = ctx.files;
-    let index = ctx.idx;
-    let summary = ctx.summary;
-    let variant_names = variant_names_of(files, enum_name);
-    if variant_names.is_empty() {
-        if index.knows_name(enum_name) {
+) -> anyhow::Result<usize> {
+    match target {
+        Some(enum_name) => {
+            let variant_names = variant_names_of(ctx.files, enum_name);
+            if variant_names.is_empty() {
+                if ctx.idx.knows_name(enum_name) {
+                    eprintln!(
+                        "note: `{}` is named in the tree but no enum definition with variants \
+                         was found under --scope; nothing to scan",
+                        enum_name
+                    );
+                    eprintln!(
+                        "(0 match site(s) across 0 variant-set group(s) on `{}`)",
+                        enum_name
+                    );
+                    return Ok(0);
+                }
+                warn_unknown_target("enum", enum_name);
+                eprintln!(
+                    "(0 match site(s) across 0 variant-set group(s) on `{}`)",
+                    enum_name
+                );
+                return Err(TargetNotFound::err("enum", enum_name));
+            }
+            let (sites, groups) = scan_groups(ctx, enum_name, &variant_names, opts, false);
             eprintln!(
-                "note: `{}` is named in the tree but no enum definition with variants \
-                 was found under --scope; nothing to scan",
-                enum_name
+                "({} match site(s) across {} variant-set group(s) on `{}`{})",
+                sites,
+                groups,
+                enum_name,
+                if opts.partial_only {
+                    "; exhaustive groups hidden"
+                } else {
+                    ""
+                }
             );
-            eprintln!("(0 match site(s) across 0 variant-set group(s) on `{}`)", enum_name);
-            return Ok(());
+            Ok(groups)
         }
-        warn_unknown_target("enum", enum_name);
-        eprintln!("(0 match site(s) across 0 variant-set group(s) on `{}`)", enum_name);
-        return Err(TargetNotFound::err("enum", enum_name));
+        // `--all`: every enum in the index; group rows gain a leading enum column.
+        None => {
+            let mut total_sites = 0usize;
+            let mut total_groups = 0usize;
+            let mut scanned = 0usize;
+            for name in ctx.idx.enum_names() {
+                let variant_names = variant_names_of(ctx.files, &name);
+                if variant_names.is_empty() {
+                    continue;
+                }
+                scanned += 1;
+                let (sites, groups) = scan_groups(ctx, &name, &variant_names, opts, true);
+                total_sites += sites;
+                total_groups += groups;
+            }
+            eprintln!(
+                "({} match site(s) across {} group(s) on {} enum(s); --all{})",
+                total_sites,
+                total_groups,
+                scanned,
+                if opts.partial_only {
+                    "; exhaustive groups hidden"
+                } else {
+                    ""
+                }
+            );
+            Ok(total_groups)
+        }
     }
-    let total = variant_names.len();
+}
 
-    let all_sites = collect_sites(
-        files,
+/// Group, sort, and print the match sites of one enum. With `prefixed`
+/// (--all mode) each group row carries a leading enum-name column. Returns
+/// (site count, group count shown).
+fn scan_groups(
+    ctx: &AnalysisCtx,
+    enum_name: &str,
+    variant_names: &[String],
+    opts: ScanOpts,
+    prefixed: bool,
+) -> (usize, usize) {
+    let summary = ctx.summary;
+    let total = variant_names.len();
+    let mut all_sites = collect_sites(
+        ctx.files,
         enum_name,
-        &variant_names,
+        variant_names,
         opts.include_matches_macro,
         opts.include_if_chains,
+        ctx.spans,
     );
+    ctx.retain_changed(&mut all_sites, |s| &s.file);
 
     // Group by variant set (key = joined sorted variants + wildcard flag).
     let mut groups: BTreeMap<(Vec<String>, bool), Vec<&Site>> = BTreeMap::new();
@@ -485,7 +551,7 @@ pub fn run(
     let mut rows: Vec<_> = groups.into_iter().collect();
 
     // A group is "exhaustive" when it names every variant of the enum — those
-    // are compiler-protected, so `--partial` drops them.
+    // are compiler-protected, so `--hide-exhaustive` drops them.
     let is_exhaustive = |variants: &[String]| total > 0 && variants.len() == total;
     if opts.partial_only {
         rows.retain(|((variants, _), _)| !is_exhaustive(variants));
@@ -519,7 +585,7 @@ pub fn run(
                 key = format!("[{}/{}] {}", variants.len(), total, key);
             }
             if opts.show_missing && total > 0 {
-                let miss = missing_variants(variants, &variant_names);
+                let miss = missing_variants(variants, variant_names);
                 let miss = if miss.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -527,7 +593,11 @@ pub fn run(
                 };
                 key = format!("{}\tmissing: {}", key, miss);
             }
-            println!("group\t{}\t{} site(s)", key, sites.len());
+            if prefixed {
+                println!("group\t{}\t{}\t{} site(s)", enum_name, key, sites.len());
+            } else {
+                println!("group\t{}\t{} site(s)", key, sites.len());
+            }
             for s in sites {
                 let tag = if s.is_macro {
                     " (matches!)"
@@ -540,14 +610,48 @@ pub fn run(
             }
         }
     }
-    eprintln!(
-        "({} match site(s) across {} variant-set group(s) on `{}`{})",
-        all_sites.len(),
-        rows.len(),
-        enum_name,
-        if opts.partial_only { "; exhaustive groups hidden" } else { "" }
-    );
-    Ok(())
+    (all_sites.len(), rows.len())
+}
+
+/// True if any definition of `enum_name` carries the in-source contract
+/// marker `unruster: sealed` in its doc comments. Sealed enums must never
+/// appear in partial dispatch — `enum-coverage` / `catch-all-arms` tag their
+/// findings SEALED and `audit` treats them as highest severity. The marker
+/// lives with the code; there is no config file.
+pub(crate) fn enum_sealed(files: &[ParsedFile], enum_name: &str) -> bool {
+    struct V<'a> {
+        target: &'a str,
+        sealed: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
+        fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
+            if e.ident != self.target {
+                return;
+            }
+            for a in &e.attrs {
+                if !a.path().is_ident("doc") {
+                    continue;
+                }
+                if let syn::Meta::NameValue(nv) = &a.meta {
+                    if let syn::Expr::Lit(l) = &nv.value {
+                        if let syn::Lit::Str(s) = &l.lit {
+                            if s.value().contains("unruster: sealed") {
+                                self.sealed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut v = V {
+        target: enum_name,
+        sealed: false,
+    };
+    for f in files {
+        v.visit_file(&f.ast);
+    }
+    v.sealed
 }
 
 /// `enum-coverage <Enum>` — synthesis of the partial-enumeration defect class.
@@ -557,38 +661,107 @@ pub fn run(
 /// are the sites most likely to silently mis-bind a newly-added variant.
 pub fn run_enum_coverage(
     ctx: &AnalysisCtx,
-    enum_name: &str,
+    target: Option<&str>,
     hide_trait_routed: bool,
-) -> anyhow::Result<()> {
-    let files = ctx.files;
-    let index = ctx.idx;
-    let summary = ctx.summary;
-    let variant_names = variant_names_of(files, enum_name);
-    if variant_names.is_empty() {
-        let summary_line = || {
+) -> anyhow::Result<usize> {
+    match target {
+        Some(enum_name) => {
+            let variant_names = variant_names_of(ctx.files, enum_name);
+            if variant_names.is_empty() {
+                let summary_line = || {
+                    eprintln!(
+                        "(0 partial site(s) on `{}`; 0 total variant(s); exhaustive sites hidden)",
+                        enum_name
+                    );
+                };
+                if ctx.idx.knows_name(enum_name) {
+                    eprintln!(
+                        "note: `{}` is named in the tree but no enum definition with variants \
+                         was found under --scope; nothing to score",
+                        enum_name
+                    );
+                    summary_line();
+                    return Ok(0);
+                }
+                warn_unknown_target("enum", enum_name);
+                summary_line();
+                return Err(TargetNotFound::err("enum", enum_name));
+            }
+            let (shown, hidden, sealed_rows) =
+                coverage_one(ctx, enum_name, &variant_names, hide_trait_routed, false);
             eprintln!(
-                "(0 partial site(s) on `{}`; 0 total variant(s); exhaustive sites hidden)",
-                enum_name
+                "({} partial site(s) on `{}`; {} total variant(s); exhaustive sites hidden{}{}; explain: partial-enumeration)",
+                shown,
+                enum_name,
+                variant_names.len(),
+                if hide_trait_routed {
+                    format!("; {} trait-routed catch-all(s) hidden", hidden)
+                } else {
+                    String::new()
+                },
+                if sealed_rows > 0 {
+                    format!("; {} on a SEALED enum", sealed_rows)
+                } else {
+                    String::new()
+                }
             );
-        };
-        if index.knows_name(enum_name) {
-            eprintln!(
-                "note: `{}` is named in the tree but no enum definition with variants \
-                 was found under --scope; nothing to score",
-                enum_name
-            );
-            summary_line();
-            return Ok(());
+            Ok(shown)
         }
-        warn_unknown_target("enum", enum_name);
-        summary_line();
-        return Err(TargetNotFound::err("enum", enum_name));
+        // `--all`: every enum in the index; rows gain a leading enum column.
+        None => {
+            let mut shown = 0usize;
+            let mut hidden = 0usize;
+            let mut sealed_rows = 0usize;
+            let mut scanned = 0usize;
+            for name in ctx.idx.enum_names() {
+                let variant_names = variant_names_of(ctx.files, &name);
+                if variant_names.is_empty() {
+                    continue;
+                }
+                scanned += 1;
+                let (s, h, sl) = coverage_one(ctx, &name, &variant_names, hide_trait_routed, true);
+                shown += s;
+                hidden += h;
+                sealed_rows += sl;
+            }
+            eprintln!(
+                "({} partial site(s) across {} enum(s); --all; exhaustive sites hidden{}{}; explain: partial-enumeration)",
+                shown,
+                scanned,
+                if hide_trait_routed {
+                    format!("; {} trait-routed catch-all(s) hidden", hidden)
+                } else {
+                    String::new()
+                },
+                if sealed_rows > 0 {
+                    format!("; {} on SEALED enums", sealed_rows)
+                } else {
+                    String::new()
+                }
+            );
+            Ok(shown)
+        }
     }
+}
+
+/// Score one enum's partial sites and print its rows. With `prefixed`
+/// (--all mode) each row carries a leading enum-name column. Returns
+/// (rows shown, trait-routed rows hidden, rows on a sealed enum).
+fn coverage_one(
+    ctx: &AnalysisCtx,
+    enum_name: &str,
+    variant_names: &[String],
+    hide_trait_routed: bool,
+    prefixed: bool,
+) -> (usize, usize, usize) {
+    let summary = ctx.summary;
     let total = variant_names.len();
+    let sealed = enum_sealed(ctx.files, enum_name);
 
     // matches!() and `==`-if-chains are guaranteed-supported here — both are
     // primary vectors for this defect, so enum-coverage always includes them.
-    let all_sites = collect_sites(files, enum_name, &variant_names, true, true);
+    let mut all_sites = collect_sites(ctx.files, enum_name, variant_names, true, true, ctx.spans);
+    ctx.retain_changed(&mut all_sites, |s| &s.file);
 
     // One row per site; keep only partials (covered < total).
     struct Row<'s> {
@@ -614,7 +787,7 @@ pub fn run_enum_coverage(
         .map(|s| Row {
             gap: s.variants.len() as f64 / total as f64,
             site: s,
-            missing: missing_variants(&s.variants, &variant_names),
+            missing: missing_variants(&s.variants, variant_names),
         })
         .collect();
     // Highest coverage ratio (smallest gap to full) first — loudest signal on
@@ -631,16 +804,19 @@ pub fn run_enum_coverage(
 
     if !summary {
         for r in &rows {
-            let tag = if r.site.trait_routed {
-                " (catchall→method; likely false positive)"
+            let mut tag = if r.site.trait_routed {
+                " (catchall→method; likely false positive)".to_string()
             } else if r.site.is_macro {
-                " (matches!)"
+                " (matches!)".to_string()
             } else if r.site.is_if_chain {
-                " (if-chain)"
+                " (if-chain)".to_string()
             } else {
-                ""
+                String::new()
             };
-            println!(
+            if sealed {
+                tag.push_str(" SEALED");
+            }
+            let body = format!(
                 "{:.2}\t{}/{}\t{}\t{}\t{}:{}\t{}{}",
                 r.gap,
                 r.site.variants.len(),
@@ -652,18 +828,14 @@ pub fn run_enum_coverage(
                 r.site.context,
                 tag
             );
+            if prefixed {
+                println!("{}\t{}", enum_name, body);
+            } else {
+                println!("{}", body);
+            }
+            ctx.print_context(&r.site.file, r.site.line);
         }
     }
-    eprintln!(
-        "({} partial site(s) on `{}`; {} total variant(s); exhaustive sites hidden{})",
-        rows.len(),
-        enum_name,
-        total,
-        if hide_trait_routed {
-            format!("; {} trait-routed catch-all(s) hidden", hidden_trait_routed)
-        } else {
-            String::new()
-        }
-    );
-    Ok(())
+    let sealed_rows = if sealed { rows.len() } else { 0 };
+    (rows.len(), hidden_trait_routed, sealed_rows)
 }

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string, print_grouped_counts, type_short, ScopeTracker};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::ast::{fn_span, trait_fn_span, line_of, path_to_string, print_grouped_counts, type_short, ScopeTracker};
+use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
 
 /// `--by` grouping for `callers`. `fn` is not offered — the default listing is
 /// already one row per call site labelled with its caller fn.
@@ -57,7 +57,8 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -69,13 +70,15 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     }
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_impl_item_fn(self, i);
         self.scope.leave_fn();
     }
 
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
         visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -105,12 +108,17 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     }
 }
 
-fn collect_sites(files: &[ParsedFile], sem: &Semantic, index: &NameIndex) -> Vec<CallSite> {
+fn collect_sites(
+    files: &[ParsedFile],
+    sem: &Semantic,
+    index: &NameIndex,
+    spans: bool,
+) -> Vec<CallSite> {
     let mut all = Vec::new();
     for f in files {
         let mut v = CallVisitor {
             file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
+            scope: ScopeTracker::new(f.module.as_str()).with_spans(spans),
             sites: Vec::new(),
         };
         v.visit_file(&f.ast);
@@ -205,13 +213,49 @@ fn top_module(qpath: &str) -> &str {
     qpath.split("::").next().unwrap_or(qpath)
 }
 
+/// Confidence of one call-site match against the query:
+/// - resolved through the calling file's use-map → `resolved`
+/// - qualified query (`Type::method`) matching a qualified call path → `resolved`
+/// - bare-name query whose last segment has exactly one defn in the tree → `resolved`
+/// - plain last-segment match → `heuristic`
+fn site_confidence(s: &CallSite, query: &str, unique_name: bool) -> Confidence {
+    let via_resolved = s
+        .target_resolved
+        .as_deref()
+        .map(|t| matches_target(t, query))
+        .unwrap_or(false);
+    if via_resolved || query.contains("::") || unique_name {
+        Confidence::Resolved
+    } else {
+        Confidence::Heuristic
+    }
+}
+
+/// True when the query's last segment names exactly one fn/method definition
+/// in the tree — a bare-name match then can't be a same-named impostor.
+fn query_unique(index: &NameIndex, query: &str) -> bool {
+    let last = query
+        .trim_start_matches('.')
+        .trim_start_matches("::")
+        .trim_end_matches('!')
+        .rsplit("::")
+        .next()
+        .unwrap_or(query);
+    index
+        .iter()
+        .filter(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn") && d.name == last)
+        .count()
+        == 1
+}
+
 pub fn run_callers(
     ctx: &AnalysisCtx,
     query: &str,
     transitive: bool,
     depth: Option<usize>,
     by: Option<CallersBy>,
-) -> anyhow::Result<()> {
+    min_confidence: Option<Confidence>,
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
     let sem = ctx.sem;
@@ -221,9 +265,10 @@ pub fn run_callers(
         warn_unknown_target("fn, method, or macro matching", query);
     }
 
-    let sites = collect_sites(files, sem, index);
+    let sites = collect_sites(files, sem, index, ctx.spans);
 
-    let direct: Vec<&CallSite> = sites
+    let unique_name = query_unique(index, query);
+    let mut direct: Vec<&CallSite> = sites
         .iter()
         .filter(|s| {
             matches_target(&s.target, query)
@@ -233,9 +278,13 @@ pub fn run_callers(
                     .unwrap_or(false)
         })
         .collect();
+    if let Some(min) = min_confidence {
+        direct.retain(|s| site_confidence(s, query, unique_name) >= min);
+    }
+    ctx.retain_changed(&mut direct, |s| &s.file);
 
     if !transitive {
-        emit_caller_rows(&direct, by, summary);
+        emit_caller_rows(ctx, &direct, by, query, unique_name);
         let unique = direct
             .iter()
             .map(|s| s.caller.as_str())
@@ -248,7 +297,7 @@ pub fn run_callers(
         if !known && direct.is_empty() {
             return Err(TargetNotFound::err("fn, method, or macro matching", query));
         }
-        return Ok(());
+        return Ok(direct.len());
     }
 
     // Transitive: BFS from query outwards through the call graph.
@@ -322,11 +371,17 @@ pub fn run_callers(
     if !known && direct.is_empty() && rows.is_empty() {
         return Err(TargetNotFound::err("fn, method, or macro matching", query));
     }
-    Ok(())
+    Ok(direct.len() + rows.len())
 }
 
-fn emit_caller_rows(hits: &[&CallSite], by: Option<CallersBy>, summary: bool) {
-    if summary {
+fn emit_caller_rows(
+    ctx: &AnalysisCtx,
+    hits: &[&CallSite],
+    by: Option<CallersBy>,
+    query: &str,
+    unique_name: bool,
+) {
+    if ctx.summary {
         return;
     }
     match by {
@@ -343,7 +398,15 @@ fn emit_caller_rows(hits: &[&CallSite], by: Option<CallersBy>, summary: bool) {
                     .then_with(|| a.line.cmp(&b.line))
             });
             for s in sorted {
-                println!("{}\t{}\t{}:{}", s.caller, s.target, s.file, s.line);
+                println!(
+                    "{}\t{}\t{}\t{}:{}",
+                    s.caller,
+                    s.target,
+                    site_confidence(s, query, unique_name).as_str(),
+                    s.file,
+                    s.line
+                );
+                ctx.print_context(&s.file, s.line);
             }
         }
     }
@@ -433,7 +496,7 @@ pub fn run_callers_among(
     ctx: &AnalysisCtx,
     query: &str,
     pattern: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
     let sem = ctx.sem;
@@ -448,7 +511,7 @@ pub fn run_callers_among(
         ));
     }
 
-    let sites = collect_sites(files, sem, index);
+    let sites = collect_sites(files, sem, index, ctx.spans);
     // For each cohort member qpath, the first call site of `query` inside it.
     let mut call_in: BTreeMap<&str, &CallSite> = BTreeMap::new();
     for s in &sites {
@@ -488,13 +551,13 @@ pub fn run_callers_among(
         query,
         members.len() - calls
     );
-    Ok(())
+    Ok(members.len() - calls)
 }
 
 /// `cohort-callees <pattern>` — a (callee × function) matrix for a name-pattern
 /// cohort. A callee present in most columns but missing from one is a
 /// divergence candidate: the sibling that forgot to call a shared helper.
-pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<()> {
+pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
     let sem = ctx.sem;
@@ -509,7 +572,7 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<()
         ));
     }
 
-    let sites = collect_sites(files, sem, index);
+    let sites = collect_sites(files, sem, index, ctx.spans);
     // qpath -> set of callee targets it makes.
     let mut by_member: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (_, qpath, _, _) in &members {
@@ -578,12 +641,12 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<()
         }
     }
     eprintln!(
-        "({} cohort member(s), {} distinct callee(s), {} divergence candidate(s))",
+        "({} cohort member(s), {} distinct callee(s), {} divergence candidate(s); explain: sibling)",
         n,
         all_callees.len(),
         divergences.len()
     );
-    Ok(())
+    Ok(divergences.len())
 }
 
 /// `co-call <A> <B>` — paired-action invariant check. A and B are a coupled
@@ -599,7 +662,7 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<()
 /// runs B), so a human filters. A and B accept the same target forms as
 /// `callers` (bare name, `Type::method`, `.method`, `::name`, `name!`). The
 /// `via` column points at the call the fn *does* make, for quick navigation.
-pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<()> {
+pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
     let sem = ctx.sem;
@@ -612,7 +675,7 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<()> {
         }
     }
 
-    let sites = collect_sites(files, sem, index);
+    let sites = collect_sites(files, sem, index, ctx.spans);
     let hits = |s: &CallSite, query: &str| -> bool {
         matches_target(&s.target, query)
             || s.target_resolved
@@ -672,7 +735,7 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<()> {
         }
     }
     eprintln!(
-        "({} call both `{}`+`{}`; {} call A-not-B; {} call B-not-A)",
+        "({} call both `{}`+`{}`; {} call A-not-B; {} call B-not-A; explain: co-call)",
         both,
         a,
         b,
@@ -687,15 +750,15 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<()> {
     if !known_b && !b_hit {
         return Err(TargetNotFound::err("fn, method, or macro matching", b));
     }
-    Ok(())
+    Ok(a_only.len() + b_only.len())
 }
 
-pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<()> {
+pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
     let sem = ctx.sem;
     let summary = ctx.summary;
-    let sites = collect_sites(files, sem, index);
+    let sites = collect_sites(files, sem, index, ctx.spans);
     let last = query.rsplit("::").next().unwrap_or(query);
 
     let in_target = |caller: &str| -> bool {
@@ -718,7 +781,7 @@ pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<()> {
         if !known {
             return Err(TargetNotFound::err("fn or method matching", query));
         }
-        return Ok(());
+        return Ok(0);
     }
 
     let mut counts = BTreeMap::<String, (usize, String, usize)>::new();
@@ -736,5 +799,5 @@ pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<()> {
         }
     }
     eprintln!("({} distinct callees)", rows.len());
-    Ok(())
+    Ok(rows.len())
 }

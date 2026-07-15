@@ -1,6 +1,6 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{enum_variant_of_path, line_of, type_short, ScopeTracker};
+use crate::ast::{fn_span, trait_fn_span, enum_variant_of_path, line_of, type_short, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parse::display_path;
 
@@ -92,7 +92,8 @@ impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
         self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -102,7 +103,8 @@ impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
         self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_impl_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -112,7 +114,8 @@ impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
         self.scope.leave_trait();
     }
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
         visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -220,7 +223,7 @@ impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     let mut defs: Vec<VariantDef> = Vec::new();
@@ -257,7 +260,7 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<()>
             variant_names: &variant_names,
             bare,
             file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
+            scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
             in_pat: false,
             sites: Vec::new(),
         };
@@ -265,6 +268,7 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<()>
         sites.extend(v.sites);
     }
 
+    ctx.retain_changed(&mut sites, |s| &s.file);
     sites.sort_by(|a, b| {
         a.variant
             .cmp(&b.variant)
@@ -279,6 +283,7 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<()>
                 "{}\t{}::{}\t{}\t{}:{}",
                 s.kind, enum_name, s.variant, s.context, s.file, s.line
             );
+            ctx.print_context(&s.file, s.line);
         }
     }
 
@@ -298,5 +303,5 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<()>
         matches,
         bare
     );
-    Ok(())
+    Ok(sites.len())
 }

@@ -31,6 +31,20 @@ Top-level flags:
 - --cfg KEY[=VALUE]: repeatable. Items whose cfg evaluates to definitively
   False under this env are stripped. Unknown keys leave items in.
 - --summary: skip per-row output, keep summary line.
+- --exclude GLOB: repeatable; drop files matching the glob (e.g. 'fixtures/**').
+- --fail-on-findings: exit 1 when findings remain (0 = clean, 2 = error).
+- --spans: enclosing-fn labels become `name@start-end` (fetch the body via
+  `sed -n 'start,endp' file`).
+- --changed-since GIT_REF: keep only rows in files changed vs that ref
+  (untracked files count); git is the only state read.
+- --context N: print ±N source lines beneath each finding row.
+
+Agent loop: `unruster audit` runs the whole battery as severity-ranked
+sections and exits 1 while any finding remains —
+  until unruster audit; do <fix the top finding>; done
+`unruster explain <topic>` prints one repair recipe instead of this whole
+text. Mark contract enums with a `/// unruster: sealed` doc line: partial
+dispatch on them is tagged SEALED by enum-coverage / catch-all-arms.
 
 ══════════════════════════════════════════════════════════════════════
 DESIGN AUDIT PLAYBOOK — pick the theme matching your concern.

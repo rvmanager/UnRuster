@@ -173,7 +173,7 @@ pub fn run(
     kind_filter: Option<ItemKind>,
     vis_filter: Option<VisFilter>,
     tree: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     let mut all = Vec::new();
@@ -213,7 +213,7 @@ pub fn run(
         }
     }
     eprintln!("({} items)", all.len());
-    Ok(())
+    Ok(all.len())
 }
 
 fn print_tree(items: &[Item], summary: bool) {

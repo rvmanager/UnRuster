@@ -1,6 +1,6 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{print_grouped_counts, top_module_of, type_short, type_to_string, ScopeTracker};
+use crate::ast::{fn_span, print_grouped_counts, top_module_of, type_short, type_to_string, ScopeTracker};
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 use crate::semantic::{FnSigIndex, FnTypes};
@@ -141,9 +141,15 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         self.fn_types_stack
-            .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
+            .push(FnTypes::build(
+                &i.sig,
+                &i.block,
+                self.fn_sigs,
+                self.scope.impl_stack.last().map(String::as_str),
+            ));
         visit::visit_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
@@ -159,9 +165,15 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         self.scope.leave_trait();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         self.fn_types_stack
-            .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
+            .push(FnTypes::build(
+                &i.sig,
+                &i.block,
+                self.fn_sigs,
+                self.scope.impl_stack.last().map(String::as_str),
+            ));
         visit::visit_impl_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
@@ -169,9 +181,10 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
         // Trait default-method bodies count like any other fn body.
         let Some(body) = &i.default else { return };
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, body));
         self.fn_types_stack
-            .push(FnTypes::build(&i.sig, body, self.fn_sigs));
+            .push(FnTypes::build(&i.sig, body, self.fn_sigs, None));
         visit::visit_trait_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
@@ -208,7 +221,7 @@ pub fn run(
     by: Option<GroupBy>,
     hide_widen: bool,
     top: Option<usize>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let fn_sigs = &ctx.sem.fn_sigs;
     let summary = ctx.summary;
@@ -216,7 +229,7 @@ pub fn run(
     for f in files {
         let mut v = CastVisitor {
             file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
+            scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
             fn_types_stack: Vec::new(),
             fn_sigs,
             hits: Vec::new(),
@@ -225,6 +238,7 @@ pub fn run(
         all.extend(v.hits);
     }
 
+    ctx.retain_changed(&mut all, |h| &h.file);
     if !class_filter.is_empty() {
         let wanted: Vec<&str> = class_filter.iter().map(|c| c.as_str()).collect();
         all.retain(|h| wanted.contains(&h.class));
@@ -258,6 +272,7 @@ pub fn run(
                         "{}\t{}\t{}\t{}\t{}:{}",
                         h.class, h.src, h.dst, h.context, h.file, h.line
                     );
+                    ctx.print_context(&h.file, h.line);
                 }
             }
         }
@@ -270,10 +285,10 @@ pub fn run(
     }
     let break_str: Vec<String> = by_class.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     eprintln!(
-        "({} cast(s); {}; hide_widen={})",
+        "({} cast(s); {}; hide_widen={}; explain: casts)",
         all.len(),
         break_str.join(", "),
         hide_widen
     );
-    Ok(())
+    Ok(all.len())
 }

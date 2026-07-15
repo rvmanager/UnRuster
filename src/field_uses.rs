@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_last, path_to_string, type_short, ScopeTracker};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::ast::{fn_span, line_of, path_last, path_to_string, type_short, ScopeTracker};
+use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{FnSigIndex, FnTypes};
 
@@ -113,9 +113,15 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     }
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         self.fn_types_stack
-            .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
+            .push(FnTypes::build(
+                &i.sig,
+                &i.block,
+                self.fn_sigs,
+                self.scope.impl_stack.last().map(String::as_str),
+            ));
         visit::visit_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
@@ -128,9 +134,15 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     }
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         self.fn_types_stack
-            .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
+            .push(FnTypes::build(
+                &i.sig,
+                &i.block,
+                self.fn_sigs,
+                self.scope.impl_stack.last().map(String::as_str),
+            ));
         visit::visit_impl_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
@@ -144,9 +156,10 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
 
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
         let Some(body) = &i.default else { return };
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, body));
         self.fn_types_stack
-            .push(FnTypes::build(&i.sig, body, self.fn_sigs));
+            .push(FnTypes::build(&i.sig, body, self.fn_sigs, None));
         visit::visit_trait_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
@@ -275,7 +288,7 @@ pub fn count_kinds(
     fn_sigs: &FnSigIndex,
 ) -> (usize, usize, usize) {
     let (mut reads, mut writes, mut inits) = (0, 0, 0);
-    for h in collect(files, ty, field, true, fn_sigs) {
+    for h in collect(files, ty, field, true, fn_sigs, false) {
         match h.kind {
             FieldKind::Read => reads += 1,
             FieldKind::Write => writes += 1,
@@ -291,12 +304,13 @@ fn collect(
     field: &str,
     strict: bool,
     fn_sigs: &FnSigIndex,
+    spans: bool,
 ) -> Vec<FieldHit> {
     let mut all = Vec::new();
     for f in files {
         let mut v = FieldVisitor {
             file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
+            scope: ScopeTracker::new(f.module.as_str()).with_spans(spans),
             target_type: ty,
             target_field: field,
             strict,
@@ -311,6 +325,16 @@ fn collect(
     all
 }
 
+/// Confidence tier of a `via` label: `self`/`init` are structurally certain,
+/// `ti` came from local type inference, `?` is receiver-unknown.
+fn conf_of_via(via: &str) -> Confidence {
+    match via {
+        "self" | "init" => Confidence::Exact,
+        "ti" => Confidence::Inferred,
+        _ => Confidence::Heuristic,
+    }
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
     ty: &str,
@@ -318,7 +342,8 @@ pub fn run(
     strict: bool,
     kinds: &[FieldKind],
     via_receiver: Option<&str>,
-) -> anyhow::Result<()> {
+    min_confidence: Option<Confidence>,
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let fn_sigs = &ctx.sem.fn_sigs;
     let summary = ctx.summary;
@@ -326,7 +351,7 @@ pub fn run(
     if !known {
         warn_unknown_target("type", ty);
     }
-    let mut all = collect(files, ty, field, strict, fn_sigs);
+    let mut all = collect(files, ty, field, strict, fn_sigs, ctx.spans);
 
     if !kinds.is_empty() {
         all.retain(|h| kinds.contains(&h.kind));
@@ -334,6 +359,10 @@ pub fn run(
     if let Some(pat) = via_receiver {
         all.retain(|h| h.receiver.contains(pat));
     }
+    if let Some(min) = min_confidence {
+        all.retain(|h| conf_of_via(h.via) >= min);
+    }
+    ctx.retain_changed(&mut all, |h| &h.file);
 
     all.sort_by(|a, b| {
         a.kind
@@ -370,6 +399,7 @@ pub fn run(
                 h.file,
                 h.line
             );
+            ctx.print_context(&h.file, h.line);
         }
     }
     eprintln!(
@@ -378,7 +408,7 @@ pub fn run(
     );
 
     if strict && all.is_empty() && via_receiver.is_none() && kinds.is_empty() {
-        let cand = collect(files, ty, field, false, fn_sigs);
+        let cand = collect(files, ty, field, false, fn_sigs, false);
         if !cand.is_empty() {
             eprintln!(
                 "hint: strict matched 0; --candidates would report {} hit(s) (mostly unknown receivers). \
@@ -390,5 +420,5 @@ pub fn run(
     if !known && all.is_empty() {
         return Err(TargetNotFound::err("type", ty));
     }
-    Ok(())
+    Ok(all.len())
 }

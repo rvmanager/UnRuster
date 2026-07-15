@@ -1,6 +1,6 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, line_of_span, type_short, ScopeTracker};
+use crate::ast::{fn_span, trait_fn_span, line_of, line_of_span, type_short, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
 
@@ -97,7 +97,8 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -107,7 +108,8 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_impl_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -117,7 +119,8 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         self.scope.leave_trait();
     }
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
         visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -198,7 +201,7 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     let mut all: Vec<Hit> = Vec::new();
@@ -206,12 +209,13 @@ pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<()> {
         let mut v = SwallowVisitor {
             include_unwrap_or,
             file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
+            scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
             hits: Vec::new(),
         };
         v.visit_file(&f.ast);
         all.extend(v.hits);
     }
+    ctx.retain_changed(&mut all, |h| &h.file);
     all.sort_by(|a, b| {
         a.kind
             .cmp(b.kind)
@@ -221,6 +225,7 @@ pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<()> {
     if !summary {
         for h in &all {
             println!("{}\t{}\t{}:{}", h.kind, h.context, h.file, h.line);
+            ctx.print_context(&h.file, h.line);
         }
     }
     use std::collections::BTreeMap;
@@ -233,10 +238,10 @@ pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<()> {
         .map(|(k, n)| format!("{}={}", k, n))
         .collect();
     eprintln!(
-        "({} swallow site(s); {}; include_unwrap_or={})",
+        "({} swallow site(s); {}; include_unwrap_or={}; explain: silent-fallbacks)",
         all.len(),
         breakdown.join(", "),
         include_unwrap_or
     );
-    Ok(())
+    Ok(all.len())
 }

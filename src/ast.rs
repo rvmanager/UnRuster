@@ -118,6 +118,12 @@ pub struct ScopeTracker {
     pub impl_stack: Vec<String>,
     pub trait_stack: Vec<String>,
     pub fn_stack: Vec<String>,
+    /// (start, end) source lines of each fn on the stack; parallel to
+    /// `fn_stack`. Rendered as `@start-end` when `spans` is set.
+    fn_span_stack: Vec<(usize, usize)>,
+    /// Render the enclosing fn as `name@start-end` (the global `--spans`
+    /// flag) so a reader can fetch exactly the relevant body.
+    spans: bool,
 }
 
 impl ScopeTracker {
@@ -126,6 +132,12 @@ impl ScopeTracker {
             module: module.into(),
             ..Default::default()
         }
+    }
+
+    /// Enable `@start-end` span rendering on the enclosing-fn label.
+    pub fn with_spans(mut self, on: bool) -> Self {
+        self.spans = on;
+        self
     }
 
     pub fn enter_mod(&mut self, name: impl Into<String>) {
@@ -146,11 +158,13 @@ impl ScopeTracker {
     pub fn leave_trait(&mut self) {
         self.trait_stack.pop();
     }
-    pub fn enter_fn(&mut self, name: impl Into<String>) {
+    pub fn enter_fn(&mut self, name: impl Into<String>, span: (usize, usize)) {
         self.fn_stack.push(name.into());
+        self.fn_span_stack.push(span);
     }
     pub fn leave_fn(&mut self) {
         self.fn_stack.pop();
+        self.fn_span_stack.pop();
     }
 
     /// `module::mods::Type::name` for a defined item in the current scope.
@@ -164,15 +178,31 @@ impl ScopeTracker {
         )
     }
 
+    /// With `--spans`, `@start-end` of the innermost enclosing fn.
+    fn span_suffix(&self) -> String {
+        if !self.spans {
+            return String::new();
+        }
+        match (self.fn_stack.last(), self.fn_span_stack.last()) {
+            (Some(_), Some((s, e))) => format!("@{}-{}", s, e),
+            _ => String::new(),
+        }
+    }
+
     /// Label for the fn enclosing the current site: `module::mods::Type::fn`,
-    /// or the prefix alone / `<top-level>` when not inside a fn.
+    /// or the prefix alone / `<top-level>` when not inside a fn. With
+    /// `--spans` the fn segment carries `@start-end` source lines.
     pub fn enclosing(&self) -> String {
-        enclosing(
-            &self.module,
-            &self.mod_stack,
-            &self.impl_stack,
-            &self.fn_stack,
-            false,
+        format!(
+            "{}{}",
+            enclosing(
+                &self.module,
+                &self.mod_stack,
+                &self.impl_stack,
+                &self.fn_stack,
+                false,
+            ),
+            self.span_suffix()
         )
     }
 
@@ -180,13 +210,36 @@ impl ScopeTracker {
     /// site (no enclosing fn) as a trailing `<top-level>` segment — the
     /// `callers` convention for labelling call sites.
     pub fn enclosing_with_toplevel(&self) -> String {
-        enclosing(
-            &self.module,
-            &self.mod_stack,
-            &self.impl_stack,
-            &self.fn_stack,
-            true,
+        format!(
+            "{}{}",
+            enclosing(
+                &self.module,
+                &self.mod_stack,
+                &self.impl_stack,
+                &self.fn_stack,
+                true,
+            ),
+            self.span_suffix()
         )
+    }
+}
+
+/// (start, end) source lines of a fn: signature ident line through body end.
+pub fn fn_span(sig: &syn::Signature, block: &syn::Block) -> (usize, usize) {
+    let start = line_of(&sig.ident);
+    let end = block.span().end().line.max(start);
+    (start, end)
+}
+
+/// Span of a trait fn: through its default body if present, else the
+/// signature line alone.
+pub fn trait_fn_span(f: &syn::TraitItemFn) -> (usize, usize) {
+    match &f.default {
+        Some(b) => fn_span(&f.sig, b),
+        None => {
+            let l = line_of(&f.sig.ident);
+            (l, l)
+        }
     }
 }
 

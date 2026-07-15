@@ -110,7 +110,7 @@ impl<'ast, 'a> Visit<'ast> for TakesMutVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
     let summary = ctx.summary;
@@ -129,16 +129,18 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
         v.visit_file(&f.ast);
         all.extend(v.out);
     }
+    ctx.retain_changed(&mut all, |h| &h.file);
     all.sort_by(|a, b| a.qpath.cmp(&b.qpath).then_with(|| a.file.cmp(&b.file)));
 
     if !summary {
         for h in &all {
             println!("{}\t{}\t{}:{}", h.qpath, h.params.join(", "), h.file, h.line);
+            ctx.print_context(&h.file, h.line);
         }
     }
     eprintln!("({} fn(s) take `&mut {}`)", all.len(), ty);
     if !known && all.is_empty() {
         return Err(TargetNotFound::err("type", ty));
     }
-    Ok(())
+    Ok(all.len())
 }

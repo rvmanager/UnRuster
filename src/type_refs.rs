@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string_with_args, type_short, ScopeTracker};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::ast::{fn_span, trait_fn_span, line_of, path_to_string_with_args, type_short, ScopeTracker};
+use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
 use crate::parse::display_path;
 
 #[derive(Debug)]
@@ -58,7 +58,8 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
         self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -68,7 +69,8 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
         self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_impl_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -78,7 +80,8 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
         self.scope.leave_trait();
     }
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
         visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -159,7 +162,11 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
+pub fn run(
+    ctx: &AnalysisCtx,
+    ty: &str,
+    min_confidence: Option<Confidence>,
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
     let aliases = &ctx.sem.aliases;
@@ -182,19 +189,39 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
         );
     }
 
+    // A name with exactly one definition in the tree can't be confused with
+    // a same-named type elsewhere — its matches are resolved, not heuristic.
+    let unique_name = index
+        .lookup(ty)
+        .iter()
+        .filter(|d| matches!(d.kind, "struct" | "enum" | "trait" | "type"))
+        .count()
+        == 1;
+    let conf_of = |via: &str| -> Confidence {
+        match via {
+            "alias" => Confidence::Inferred,
+            _ if unique_name => Confidence::Resolved,
+            _ => Confidence::Heuristic,
+        }
+    };
+
     let mut all: Vec<Ref> = Vec::new();
     for f in files {
         let mut v = RefVisitor {
             targets: &targets,
             primary: ty,
             file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
+            scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
             out: Vec::new(),
         };
         v.visit_file(&f.ast);
         all.extend(v.out);
     }
 
+    if let Some(min) = min_confidence {
+        all.retain(|r| conf_of(r.matched_via) >= min);
+    }
+    ctx.retain_changed(&mut all, |r| &r.file);
     all.sort_by(|a, b| {
         a.role
             .cmp(b.role)
@@ -210,9 +237,16 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
                 alias_hits += 1;
             }
             println!(
-                "{}\t{}\t{}\t{}\t{}:{}",
-                r.role, r.matched_via, r.written, r.context, r.file, r.line
+                "{}\t{}\t{}\t{}\t{}\t{}:{}",
+                r.role,
+                r.matched_via,
+                conf_of(r.matched_via).as_str(),
+                r.written,
+                r.context,
+                r.file,
+                r.line
             );
+            ctx.print_context(&r.file, r.line);
         }
     } else {
         alias_hits = all.iter().filter(|r| r.matched_via == "alias").count();
@@ -237,5 +271,5 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
     if !known && all.is_empty() {
         return Err(TargetNotFound::err("type", ty));
     }
-    Ok(())
+    Ok(all.len())
 }

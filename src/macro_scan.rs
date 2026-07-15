@@ -1,6 +1,38 @@
+use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Mutex;
+
 use proc_macro2::{TokenStream, TokenTree};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
+
+/// Macro bodies whose tokens could not be parsed as expressions this run —
+/// code inside them was NOT analyzed. Surfaced by main as a blind-spot count
+/// so "0 findings" is never silently mistaken for "0 findings in code we
+/// couldn't see". Keyed by (line, column, token hash) so a macro visited by
+/// several checks in one run counts once. (Quoting macros like `quote!` are
+/// skipped on purpose and not counted.)
+static UNPARSED_MACRO_BODIES: Mutex<Option<HashSet<(usize, usize, u64)>>> = Mutex::new(None);
+
+fn record_blind_spot(m: &syn::Macro) {
+    let start = m.path.span().start();
+    let mut h = DefaultHasher::new();
+    m.tokens.to_string().hash(&mut h);
+    let key = (start.line, start.column, h.finish());
+    let mut guard = UNPARSED_MACRO_BODIES.lock().unwrap();
+    guard.get_or_insert_with(HashSet::new).insert(key);
+}
+
+/// Number of distinct macro bodies that resisted expression parsing this run.
+pub fn blind_spots() -> usize {
+    UNPARSED_MACRO_BODIES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.len())
+        .unwrap_or(0)
+}
 
 /// Structured parse of a macro body, when we can recognize the shape.
 // `Body` is a transient per-macro return value, consumed immediately and never
@@ -35,7 +67,11 @@ pub fn macro_body(m: &syn::Macro) -> Body {
             return Body::Matches { scrutinee: e, pat: p };
         }
     }
-    Body::Exprs(parse_exprs(&m.tokens))
+    let exprs = parse_exprs(&m.tokens);
+    if exprs.is_empty() && !m.tokens.is_empty() {
+        record_blind_spot(m);
+    }
+    Body::Exprs(exprs)
 }
 
 /// Backwards-compatible convenience: returns just expressions, ignoring any

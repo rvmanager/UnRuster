@@ -24,13 +24,25 @@ pub fn parse_dir(
     root: &Path,
     scope: Scope,
     user_cfgs: &[String],
+    excludes: &[String],
 ) -> anyhow::Result<Vec<ParsedFile>> {
     let cfg_env = build_cfg_env(scope, user_cfgs);
     let mut files = Vec::new();
     let mut walk_errs = 0usize;
     let mut read_errs = 0usize;
     let mut parse_errs = 0usize;
-    for entry in ignore::WalkBuilder::new(root).standard_filters(true).build() {
+    let mut walker = ignore::WalkBuilder::new(root);
+    walker.standard_filters(true);
+    if !excludes.is_empty() {
+        let mut ov = ignore::overrides::OverrideBuilder::new(root);
+        for glob in excludes {
+            // In override semantics a `!`-prefixed glob is an exclusion.
+            ov.add(&format!("!{}", glob))
+                .map_err(|e| anyhow::anyhow!("bad --exclude glob `{}`: {}", glob, e))?;
+        }
+        walker.overrides(ov.build()?);
+    }
+    for entry in walker.build() {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {

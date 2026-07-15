@@ -270,7 +270,8 @@ pub fn run(
     sort: SortKey,
     top: usize,
     threshold: Option<usize>,
-) -> anyhow::Result<()> {
+    fns_only: bool,
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     let mut fns: Vec<FnMetric> = Vec::new();
@@ -286,6 +287,10 @@ pub fn run(
         };
         v.visit_file(&f.ast);
     }
+
+    ctx.retain_changed(&mut fns, |m| &m.file);
+    ctx.retain_changed(&mut structs, |m| &m.file);
+    ctx.retain_changed(&mut enums, |m| &m.file);
 
     // Apply threshold filter on the sort metric.
     if let Some(t) = threshold {
@@ -324,14 +329,15 @@ pub fn run(
                 "fn\tloc:{}\tparams:{}\tcyclo:{}\tnesting:{}\t{}\t{}:{}",
                 m.loc, m.params, m.cyclo, m.nesting, m.qpath, m.file, m.line
             );
+            ctx.print_context(&m.file, m.line);
         }
-        for m in structs.iter().take(top) {
+        for m in structs.iter().take(if fns_only { 0 } else { top }) {
             println!(
                 "struct\tfields:{}\t{}\t{}:{}",
                 m.fields, m.qpath, m.file, m.line
             );
         }
-        for m in enums.iter().take(top) {
+        for m in enums.iter().take(if fns_only { 0 } else { top }) {
             println!(
                 "enum\tvariants:{}\t{}\t{}:{}",
                 m.variants, m.qpath, m.file, m.line
@@ -350,5 +356,10 @@ pub fn run(
             .map(|t| format!("; threshold={}", t))
             .unwrap_or_default()
     );
-    Ok(())
+    // With --threshold the fn table is the findings set; otherwise everything shown counts.
+    Ok(if threshold.is_some() || fns_only {
+        fns.len()
+    } else {
+        fns.len() + structs.len() + enums.len()
+    })
 }

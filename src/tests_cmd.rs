@@ -279,7 +279,7 @@ pub fn run(
     with_hint: bool,
     by_subcommand: bool,
     grammar: &CliGrammar,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let summary = ctx.summary;
     let mut all: Vec<TestInfo> = Vec::new();
     for f in full_files {
@@ -322,7 +322,7 @@ pub fn run(
                 String::new()
             }
         );
-        return Ok(());
+        return Ok(all.len());
     }
 
     all.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line_start.cmp(&b.line_start)));
@@ -346,5 +346,5 @@ pub fn run(
     }
     let parts: Vec<String> = by_attr.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     eprintln!("({} test fn(s); {})", all.len(), parts.join(", "));
-    Ok(())
+    Ok(all.len())
 }

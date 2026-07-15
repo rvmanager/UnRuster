@@ -1959,3 +1959,216 @@ fn playbook_field_bleed_audit() {
     // At least one strict-confirmed and one inferred or candidate hit.
     assert!(!rows_of(&cand).is_empty(), "no candidate field uses");
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Agent-loop surface: exit codes, --all, sealed, --spans, explain, audit,
+//  --exclude, --min-confidence, --changed-since, --context, blind spots.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn fail_on_findings_exits_1_when_findings() {
+    ur().args(["--root", FIXTURE, "--fail-on-findings", "error-swallows"])
+        .assert()
+        .failure()
+        .code(1);
+}
+
+#[test]
+fn fail_on_findings_exits_0_when_clean() {
+    // SealedGear has no `match` wildcard arms (only a matches! site, which
+    // catch-all-arms doesn't scan) → zero findings → exit 0.
+    ur().args(["--root", FIXTURE, "--fail-on-findings", "catch-all-arms", "SealedGear"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn exclude_glob_drops_files() {
+    // Excluding the whole fixture src leaves nothing to scan.
+    let out = ur()
+        .args(["--root", FIXTURE, "--exclude", "src/**", "inventory"])
+        .output()
+        .unwrap();
+    assert!(rows_of(&out.stdout).is_empty(), "expected no rows with src/** excluded");
+}
+
+#[test]
+fn enum_coverage_all_scans_every_enum() {
+    ur().args(["--root", FIXTURE, "enum-coverage", "--all"])
+        .assert()
+        .success()
+        .stdout(contains("SealedGear"))
+        .stdout(contains("Token"));
+}
+
+#[test]
+fn enum_coverage_all_conflicts_with_name() {
+    ur().args(["--root", FIXTURE, "enum-coverage", "Token", "--all"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn catch_all_arms_all_prefixes_enum_column() {
+    let out = ur_stdout(&["--root", FIXTURE, "catch-all-arms", "--all"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.lines().any(|l| l.starts_with("Token\t")),
+        "expected enum-name column in --all rows:\n{}",
+        s
+    );
+}
+
+#[test]
+fn parallel_matches_all_mode() {
+    ur().args(["--root", FIXTURE, "parallel-matches", "--all"])
+        .assert()
+        .success()
+        .stdout(contains("group"));
+}
+
+#[test]
+fn sealed_enum_partial_site_tagged() {
+    ur().args(["--root", FIXTURE, "enum-coverage", "SealedGear"])
+        .assert()
+        .success()
+        .stdout(contains("SEALED"))
+        .stdout(contains("gear_is_moving"));
+}
+
+#[test]
+fn spans_flag_adds_fn_ranges() {
+    let out = ur_stdout(&["--root", FIXTURE, "--spans", "error-swallows"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.lines().any(|l| l.contains('@') && l.contains('-')),
+        "expected @start-end spans in context labels:\n{}",
+        s
+    );
+}
+
+#[test]
+fn explain_prints_one_topic() {
+    ur().args(["explain", "stringly"])
+        .assert()
+        .success()
+        .stdout(contains("STRINGLY-TYPED CODE"));
+}
+
+#[test]
+fn explain_lists_topics_without_arg() {
+    ur().args(["explain"])
+        .assert()
+        .success()
+        .stdout(contains("PARTIAL-ENUMERATION"));
+}
+
+#[test]
+fn explain_unknown_topic_exits_2() {
+    ur().args(["explain", "nosuchtopiczzz"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn audit_runs_all_sections_and_exits_1_on_findings() {
+    let out = ur()
+        .args(["--root", FIXTURE, "audit"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "fixtures have findings → exit 1");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("## [high]"), "expected severity section headers:\n{}", s);
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("(audit:"), "expected audit summary:\n{}", e);
+}
+
+#[test]
+fn audit_summary_mode_silent_stdout() {
+    let out = ur()
+        .args(["--root", FIXTURE, "--summary", "audit"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.trim().is_empty(), "expected --summary to silence stdout:\n{}", s);
+}
+
+#[test]
+fn callers_rows_carry_confidence_column() {
+    let out = ur_stdout(&["--root", FIXTURE, "callers", "mark_pending"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.lines().all(|l| l.contains("\tresolved\t") || l.contains("\theuristic\t")),
+        "every callers row should carry a confidence column:\n{}",
+        s
+    );
+}
+
+#[test]
+fn field_uses_min_confidence_exact_drops_inferred() {
+    // Document.transform has 1 ti (inferred) hit; exact-only must drop it.
+    let all = ur_stdout(&["--root", FIXTURE, "field-uses", "Document", "transform"]);
+    let exact = ur_stdout(&[
+        "--root", FIXTURE, "field-uses", "Document", "transform",
+        "--min-confidence", "exact",
+    ]);
+    assert!(
+        rows_of(&exact).len() < rows_of(&all).len(),
+        "exact filter should drop the type-inferred row"
+    );
+}
+
+#[test]
+fn changed_since_invalid_ref_exits_2() {
+    ur().args(["--root", FIXTURE, "--changed-since", "no-such-ref-zzz", "dead-code"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("git"));
+}
+
+#[test]
+fn changed_since_head_runs() {
+    ur().args(["--root", FIXTURE, "--changed-since", "HEAD", "dead-code"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn context_flag_prints_snippets() {
+    let out = ur_stdout(&["--root", FIXTURE, "--context", "1", "casts"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.lines().any(|l| l.trim_start().starts_with('>')),
+        "expected `>`-marked snippet lines:\n{}",
+        s
+    );
+}
+
+#[test]
+fn blind_spots_reported_on_stderr() {
+    // The fixture contains a macro whose tokens don't parse as expressions.
+    let out = ur()
+        .args(["--root", FIXTURE, "callers", "println"])
+        .output()
+        .unwrap();
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("blind spots:"), "expected blind-spot count:\n{}", e);
+}
+
+#[test]
+fn dead_code_include_trait_impls_reports_more() {
+    let base = ur()
+        .args(["--root", FIXTURE, "dead-code"])
+        .output()
+        .unwrap();
+    let more = ur()
+        .args(["--root", FIXTURE, "dead-code", "--include-trait-impls"])
+        .output()
+        .unwrap();
+    assert!(
+        rows_of(&more.stdout).len() >= rows_of(&base.stdout).len(),
+        "trait-impl mode must be a superset"
+    );
+}

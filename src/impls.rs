@@ -4,7 +4,7 @@ pub fn run(
     ctx: &AnalysisCtx,
     of_type: Option<&str>,
     of_trait: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let index = ctx.idx;
     let summary = ctx.summary;
     let mut hits: Vec<_> = index
@@ -43,5 +43,5 @@ pub fn run(
         }
     }
     eprintln!("({} impl block(s))", hits.len());
-    Ok(())
+    Ok(hits.len())
 }

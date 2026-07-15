@@ -53,7 +53,7 @@ impl<'ast, 'a> Visit<'ast> for FromVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     let mut impls: Vec<FromImpl> = Vec::new();
@@ -124,6 +124,6 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<()> {
             );
         }
     }
-    eprintln!("({} bidirectional pair(s))", pairs.len());
-    Ok(())
+    eprintln!("({} bidirectional pair(s); explain: replication)", pairs.len());
+    Ok(pairs.len())
 }

@@ -40,7 +40,7 @@ impl<'ast, 'a> Visit<'ast> for FieldDefVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
+pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     // 1. Collect field definitions for the target type from all files.
@@ -79,5 +79,5 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
         ty,
         ty
     );
-    Ok(())
+    Ok(defs.len())
 }

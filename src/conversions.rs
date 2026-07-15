@@ -1,6 +1,6 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, print_grouped_counts, top_module_of, type_short, ScopeTracker};
+use crate::ast::{fn_span, trait_fn_span, line_of, print_grouped_counts, top_module_of, type_short, ScopeTracker};
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 
@@ -105,7 +105,8 @@ impl<'ast, 'a> Visit<'ast> for ConvVisitor<'a> {
         self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -115,7 +116,8 @@ impl<'ast, 'a> Visit<'ast> for ConvVisitor<'a> {
         self.scope.leave_impl();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         visit::visit_impl_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -125,7 +127,8 @@ impl<'ast, 'a> Visit<'ast> for ConvVisitor<'a> {
         self.scope.leave_trait();
     }
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope.enter_fn(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
         visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -202,20 +205,21 @@ pub fn run(
     kind_filter: &[ConvKind],
     by: Option<GroupBy>,
     top: Option<usize>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     let mut all: Vec<Hit> = Vec::new();
     for f in files {
         let mut v = ConvVisitor {
             file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
+            scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
             hits: Vec::new(),
         };
         v.visit_file(&f.ast);
         all.extend(v.hits);
     }
 
+    ctx.retain_changed(&mut all, |h| &h.file);
     if !kind_filter.is_empty() {
         let wanted: Vec<&str> = kind_filter.iter().map(|k| k.as_str()).collect();
         all.retain(|h| wanted.contains(&h.kind));
@@ -238,6 +242,7 @@ pub fn run(
                 let rows: &[Hit] = if let Some(n) = top { &all[..all.len().min(n)] } else { &all };
                 for h in rows {
                     println!("{}\t{}\t{}\t{}:{}", h.kind, h.target, h.context, h.file, h.line);
+                    ctx.print_context(&h.file, h.line);
                 }
             }
         }
@@ -250,5 +255,5 @@ pub fn run(
     }
     let break_str: Vec<String> = by_kind.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     eprintln!("({} conversion call(s); {})", all.len(), break_str.join(", "));
-    Ok(())
+    Ok(all.len())
 }
