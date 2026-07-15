@@ -607,6 +607,7 @@ fn scan_groups(
                     ""
                 };
                 println!("  {}{}\t{}:{}", s.context, tag, s.file, s.line);
+                ctx.print_context(&s.file, s.line);
             }
         }
     }

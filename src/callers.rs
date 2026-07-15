@@ -326,6 +326,12 @@ pub fn run_callers(
 
     let mut visited: BTreeMap<String, usize> = BTreeMap::new();
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    // Names already enqueued. BFS reaches every name at its minimum depth on
+    // first visit, so each name is expanded exactly once — without this set a
+    // cyclic call graph (any recursion) re-enqueued forever and `--transitive`
+    // with unlimited depth never terminated.
+    let mut seen_names: BTreeSet<String> = BTreeSet::new();
+    seen_names.insert(seed_last.clone());
     queue.push_back((seed_last, 0));
 
     while let Some((name, d)) = queue.pop_front() {
@@ -341,12 +347,8 @@ pub fn run_callers(
                 .next()
                 .unwrap_or(caller)
                 .to_string();
-            let entry = visited.entry(caller.clone()).or_insert(d + 1);
-            if *entry > d + 1 {
-                *entry = d + 1;
-            }
-            // Only enqueue if depth not yet reached.
-            if d + 1 < max_depth {
+            visited.entry(caller.clone()).or_insert(d + 1);
+            if d + 1 < max_depth && seen_names.insert(caller_last.clone()) {
                 queue.push_back((caller_last, d + 1));
             }
         }

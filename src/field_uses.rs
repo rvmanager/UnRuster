@@ -335,14 +335,24 @@ fn conf_of_via(via: &str) -> Confidence {
     }
 }
 
+/// Options for a `field-uses` query, grouped per the `ScanOpts` precedent —
+/// its own `metrics --sort params` flagged the previous 7-param signature.
+pub struct FieldUsesOpts<'a> {
+    /// Strict mode (self/init/ti only); false = --candidates.
+    pub strict: bool,
+    /// `--kind` filter; empty = all kinds.
+    pub kinds: &'a [FieldKind],
+    /// `--via-receiver` substring filter.
+    pub via_receiver: Option<&'a str>,
+    /// `--min-confidence` tier filter.
+    pub min_confidence: Option<Confidence>,
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
     ty: &str,
     field: &str,
-    strict: bool,
-    kinds: &[FieldKind],
-    via_receiver: Option<&str>,
-    min_confidence: Option<Confidence>,
+    opts: FieldUsesOpts,
 ) -> anyhow::Result<usize> {
     let files = ctx.files;
     let fn_sigs = &ctx.sem.fn_sigs;
@@ -351,15 +361,15 @@ pub fn run(
     if !known {
         warn_unknown_target("type", ty);
     }
-    let mut all = collect(files, ty, field, strict, fn_sigs, ctx.spans);
+    let mut all = collect(files, ty, field, opts.strict, fn_sigs, ctx.spans);
 
-    if !kinds.is_empty() {
-        all.retain(|h| kinds.contains(&h.kind));
+    if !opts.kinds.is_empty() {
+        all.retain(|h| opts.kinds.contains(&h.kind));
     }
-    if let Some(pat) = via_receiver {
+    if let Some(pat) = opts.via_receiver {
         all.retain(|h| h.receiver.contains(pat));
     }
-    if let Some(min) = min_confidence {
+    if let Some(min) = opts.min_confidence {
         all.retain(|h| conf_of_via(h.via) >= min);
     }
     ctx.retain_changed(&mut all, |h| &h.file);
@@ -404,10 +414,10 @@ pub fn run(
     }
     eprintln!(
         "({} reads, {} writes, {} inits; via: {} type-inferred, {} unknown receiver; strict={})",
-        reads, writes, inits, ti_count, q_count, strict
+        reads, writes, inits, ti_count, q_count, opts.strict
     );
 
-    if strict && all.is_empty() && via_receiver.is_none() && kinds.is_empty() {
+    if opts.strict && all.is_empty() && opts.via_receiver.is_none() && opts.kinds.is_empty() {
         let cand = collect(files, ty, field, false, fn_sigs, false);
         if !cand.is_empty() {
             eprintln!(

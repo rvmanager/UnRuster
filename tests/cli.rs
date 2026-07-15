@@ -2172,3 +2172,13 @@ fn dead_code_include_trait_impls_reports_more() {
         "trait-impl mode must be a superset"
     );
 }
+
+#[test]
+fn callers_transitive_unlimited_depth_terminates() {
+    // Regression: the BFS re-enqueued names forever on cyclic call graphs, so
+    // `--transitive` WITHOUT `--depth` hung. Found by the full-option sweep.
+    ur().args(["--root", FIXTURE, "callers", "--transitive", "Document::new"])
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success();
+}
