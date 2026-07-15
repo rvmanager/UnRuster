@@ -80,11 +80,23 @@ impl<'ast, 'a> Visit<'ast> for MetricsVisitor<'a> {
         self.scope.leave_impl();
     }
 
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
+
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.record_fn(&i.sig, &i.block);
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.record_fn(&i.sig, &i.block);
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        // Trait default-method bodies are measurable fns like any other.
+        if let Some(body) = &i.default {
+            self.record_fn(&i.sig, body);
+        }
     }
 
     fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
@@ -233,9 +245,29 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
 
 // ─── run ────────────────────────────────────────────────────────────────────
 
+/// `--sort` key for the fn table. Parsed by clap (value_enum).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum SortKey {
+    Loc,
+    Params,
+    Cyclo,
+    Nesting,
+}
+
+impl SortKey {
+    fn as_str(self) -> &'static str {
+        match self {
+            SortKey::Loc => "loc",
+            SortKey::Params => "params",
+            SortKey::Cyclo => "cyclo",
+            SortKey::Nesting => "nesting",
+        }
+    }
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
-    sort: &str,
+    sort: SortKey,
     top: usize,
     threshold: Option<usize>,
 ) -> anyhow::Result<()> {
@@ -258,33 +290,30 @@ pub fn run(
     // Apply threshold filter on the sort metric.
     if let Some(t) = threshold {
         match sort {
-            "loc" => fns.retain(|m| m.loc >= t),
-            "params" => fns.retain(|m| m.params >= t),
-            "cyclo" => fns.retain(|m| m.cyclo >= t),
-            "nesting" => fns.retain(|m| m.nesting >= t),
-            _ => {}
+            SortKey::Loc => fns.retain(|m| m.loc >= t),
+            SortKey::Params => fns.retain(|m| m.params >= t),
+            SortKey::Cyclo => fns.retain(|m| m.cyclo >= t),
+            SortKey::Nesting => fns.retain(|m| m.nesting >= t),
         }
     }
 
     match sort {
-        "loc" => fns.sort_by(|a, b| b.loc.cmp(&a.loc).then_with(|| b.cyclo.cmp(&a.cyclo))),
-        "params" => fns.sort_by(|a, b| b.params.cmp(&a.params).then_with(|| b.loc.cmp(&a.loc))),
-        "cyclo" => fns.sort_by(|a, b| {
+        SortKey::Loc => fns.sort_by(|a, b| b.loc.cmp(&a.loc).then_with(|| b.cyclo.cmp(&a.cyclo))),
+        SortKey::Params => {
+            fns.sort_by(|a, b| b.params.cmp(&a.params).then_with(|| b.loc.cmp(&a.loc)))
+        }
+        SortKey::Cyclo => fns.sort_by(|a, b| {
             b.cyclo
                 .cmp(&a.cyclo)
                 .then_with(|| b.nesting.cmp(&a.nesting))
                 .then_with(|| b.loc.cmp(&a.loc))
         }),
-        "nesting" => fns.sort_by(|a, b| {
+        SortKey::Nesting => fns.sort_by(|a, b| {
             b.nesting
                 .cmp(&a.nesting)
                 .then_with(|| b.cyclo.cmp(&a.cyclo))
                 .then_with(|| b.loc.cmp(&a.loc))
         }),
-        _ => {
-            eprintln!("unknown --sort `{}`; using `loc`", sort);
-            fns.sort_by(|a, b| b.loc.cmp(&a.loc));
-        }
     }
     structs.sort_by(|a, b| b.fields.cmp(&a.fields));
     enums.sort_by(|a, b| b.variants.cmp(&a.variants));
@@ -316,7 +345,7 @@ pub fn run(
         structs.len(),
         enums.len(),
         top,
-        sort,
+        sort.as_str(),
         threshold
             .map(|t| format!("; threshold={}", t))
             .unwrap_or_default()

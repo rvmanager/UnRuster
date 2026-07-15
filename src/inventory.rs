@@ -15,6 +15,58 @@ pub struct Item {
     pub line: usize,
 }
 
+/// `--kind` filter values. Kebab-cased by clap (TraitFn → `trait-fn`).
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ItemKind {
+    Struct,
+    Enum,
+    Trait,
+    Fn,
+    Impl,
+    Mod,
+    Const,
+    Static,
+    Type,
+    TraitFn,
+    ImplFn,
+}
+
+impl ItemKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ItemKind::Struct => "struct",
+            ItemKind::Enum => "enum",
+            ItemKind::Trait => "trait",
+            ItemKind::Fn => "fn",
+            ItemKind::Impl => "impl",
+            ItemKind::Mod => "mod",
+            ItemKind::Const => "const",
+            ItemKind::Static => "static",
+            ItemKind::Type => "type",
+            ItemKind::TraitFn => "trait-fn",
+            ItemKind::ImplFn => "impl-fn",
+        }
+    }
+}
+
+/// `--vis` filter values.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum VisFilter {
+    Pub,
+    Crate,
+    Priv,
+}
+
+impl VisFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            VisFilter::Pub => "pub",
+            VisFilter::Crate => "pub(crate)",
+            VisFilter::Priv => "priv",
+        }
+    }
+}
+
 struct InventoryVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
@@ -108,7 +160,8 @@ impl<'ast, 'a> Visit<'ast> for InventoryVisitor<'a> {
         for item in &i.items {
             if let syn::ImplItem::Fn(f) = item {
                 let qn = self.qualify(&f.sig.ident.to_string());
-                self.push("fn", qn, vis_str(&f.vis), line_of(&f.sig.ident));
+                // "impl-fn", matching the NameIndex kind — `fn` means free fns.
+                self.push("impl-fn", qn, vis_str(&f.vis), line_of(&f.sig.ident));
             }
         }
         self.scope.leave_impl();
@@ -117,8 +170,8 @@ impl<'ast, 'a> Visit<'ast> for InventoryVisitor<'a> {
 
 pub fn run(
     ctx: &AnalysisCtx,
-    kind_filter: Option<&str>,
-    vis_filter: Option<&str>,
+    kind_filter: Option<ItemKind>,
+    vis_filter: Option<VisFilter>,
     tree: bool,
 ) -> anyhow::Result<()> {
     let files = ctx.files;
@@ -135,19 +188,10 @@ pub fn run(
     }
 
     if let Some(k) = kind_filter {
-        all.retain(|i| i.kind == k);
+        all.retain(|i| i.kind == k.as_str());
     }
     if let Some(v) = vis_filter {
-        let want: &[&str] = match v {
-            "pub" => &["pub"],
-            "crate" => &["pub(crate)"],
-            "priv" => &["priv"],
-            other => {
-                eprintln!("warning: unknown --vis {:?}; expected pub|crate|priv", other);
-                &[]
-            }
-        };
-        all.retain(|i| want.contains(&i.vis));
+        all.retain(|i| i.vis == v.as_str());
     }
 
     if tree {

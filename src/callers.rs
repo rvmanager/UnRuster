@@ -3,7 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_to_string, print_grouped_counts, type_short, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+
+/// `--by` grouping for `callers`. `fn` is not offered — the default listing is
+/// already one row per call site labelled with its caller fn.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum CallersBy {
+    File,
+    Module,
+}
 use crate::index::NameIndex;
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{Semantic, UseMap};
@@ -202,18 +210,15 @@ pub fn run_callers(
     query: &str,
     transitive: bool,
     depth: Option<usize>,
-    by: Option<&str>,
+    by: Option<CallersBy>,
 ) -> anyhow::Result<()> {
     let files = ctx.files;
     let index = ctx.idx;
     let sem = ctx.sem;
     let summary = ctx.summary;
-    if !query_known(index, query) {
-        eprintln!(
-            "note: no fn/method matching `{}` is defined in the scanned tree \
-             (zero callers could mean the symbol doesn't exist; use --scope all if testing).",
-            query
-        );
+    let known = query_known(index, query);
+    if !known {
+        warn_unknown_target("fn, method, or macro matching", query);
     }
 
     let sites = collect_sites(files, sem, index);
@@ -240,6 +245,9 @@ pub fn run_callers(
             direct.len(),
             unique.len()
         );
+        if !known && direct.is_empty() {
+            return Err(TargetNotFound::err("fn, method, or macro matching", query));
+        }
         return Ok(());
     }
 
@@ -311,19 +319,22 @@ pub fn run_callers(
             .map(|d| d.to_string())
             .unwrap_or_else(|| "∞".to_string())
     );
+    if !known && direct.is_empty() && rows.is_empty() {
+        return Err(TargetNotFound::err("fn, method, or macro matching", query));
+    }
     Ok(())
 }
 
-fn emit_caller_rows(hits: &[&CallSite], by: Option<&str>, summary: bool) {
+fn emit_caller_rows(hits: &[&CallSite], by: Option<CallersBy>, summary: bool) {
     if summary {
         return;
     }
     match by {
-        Some("file") => print_grouped_counts(hits, None, |h| h.file.clone()),
-        Some("module") => {
+        Some(CallersBy::File) => print_grouped_counts(hits, None, |h| h.file.clone()),
+        Some(CallersBy::Module) => {
             print_grouped_counts(hits, None, |h| top_module(&h.caller).to_string())
         }
-        _ => {
+        None => {
             let mut sorted: Vec<&&CallSite> = hits.iter().collect();
             sorted.sort_by(|a, b| {
                 a.caller
@@ -429,8 +440,12 @@ pub fn run_callers_among(
     let summary = ctx.summary;
     let members = cohort_members(index, pattern);
     if members.is_empty() {
-        eprintln!("no fn/method matching cohort pattern `{}` found", pattern);
-        return Ok(());
+        warn_unknown_target("fn or method matching cohort pattern", pattern);
+        eprintln!("(0/0 cohort member(s) call `{}`; 0 do not)", query);
+        return Err(TargetNotFound::err(
+            "fn or method matching cohort pattern",
+            pattern,
+        ));
     }
 
     let sites = collect_sites(files, sem, index);
@@ -486,8 +501,12 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<()
     let summary = ctx.summary;
     let members = cohort_members(index, pattern);
     if members.is_empty() {
-        eprintln!("no fn/method matching cohort pattern `{}` found", pattern);
-        return Ok(());
+        warn_unknown_target("fn or method matching cohort pattern", pattern);
+        eprintln!("(0 cohort member(s), 0 distinct callee(s), 0 divergence candidate(s))");
+        return Err(TargetNotFound::err(
+            "fn or method matching cohort pattern",
+            pattern,
+        ));
     }
 
     let sites = collect_sites(files, sem, index);
@@ -585,13 +604,11 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<()> {
     let index = ctx.idx;
     let sem = ctx.sem;
     let summary = ctx.summary;
-    for q in [a, b] {
-        if !query_known(index, q) {
-            eprintln!(
-                "note: no fn/method matching `{}` is defined in the scanned tree \
-                 (zero callers could mean the symbol doesn't exist; use --scope all if testing).",
-                q
-            );
+    let known_a = query_known(index, a);
+    let known_b = query_known(index, b);
+    for (known, q) in [(known_a, a), (known_b, b)] {
+        if !known {
+            warn_unknown_target("fn, method, or macro matching", q);
         }
     }
 
@@ -662,6 +679,14 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<()> {
         a_only.len(),
         b_only.len()
     );
+    let a_hit = by_caller.values().any(|c| c.calls_a > 0);
+    let b_hit = by_caller.values().any(|c| c.calls_b > 0);
+    if !known_a && !a_hit {
+        return Err(TargetNotFound::err("fn, method, or macro matching", a));
+    }
+    if !known_b && !b_hit {
+        return Err(TargetNotFound::err("fn, method, or macro matching", b));
+    }
     Ok(())
 }
 
@@ -683,7 +708,16 @@ pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<()> {
 
     let hits: Vec<&CallSite> = sites.iter().filter(|s| in_target(&s.caller)).collect();
     if hits.is_empty() {
-        eprintln!("no fn matching `{}` found (or it makes no calls)", query);
+        let known = query_known(index, query);
+        if !known {
+            warn_unknown_target("fn or method matching", query);
+        } else {
+            eprintln!("note: `{}` makes no calls", query);
+        }
+        eprintln!("(0 distinct callees)");
+        if !known {
+            return Err(TargetNotFound::err("fn or method matching", query));
+        }
         return Ok(());
     }
 

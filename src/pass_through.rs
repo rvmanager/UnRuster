@@ -1,7 +1,7 @@
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string, type_short};
+use crate::ast::{line_of, path_to_string, type_short, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
 
@@ -17,24 +17,13 @@ struct Hit {
 struct PTVisitor<'a> {
     max_loc: usize,
     file: &'a str,
-    module: &'a str,
-    impl_stack: Vec<String>,
-    mod_stack: Vec<String>,
+    scope: ScopeTracker,
     hits: Vec<Hit>,
 }
 
 impl<'a> PTVisitor<'a> {
     fn qualify(&self, name: &str) -> String {
-        let mut path: Vec<String> = Vec::new();
-        if !self.module.is_empty() {
-            path.push(self.module.to_string());
-        }
-        path.extend(self.mod_stack.iter().cloned());
-        if let Some(t) = self.impl_stack.last() {
-            path.push(t.clone());
-        }
-        path.push(name.to_string());
-        path.join("::")
+        self.scope.qualify(name)
     }
 
     fn check(&mut self, sig: &syn::Signature, body: &syn::Block) {
@@ -98,20 +87,30 @@ fn describe_call(e: &syn::Expr) -> String {
 
 impl<'ast, 'a> Visit<'ast> for PTVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.mod_stack.push(i.ident.to_string());
+        self.scope.enter_mod(i.ident.to_string());
         visit::visit_item_mod(self, i);
-        self.mod_stack.pop();
+        self.scope.leave_mod();
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.impl_stack.push(type_short(&i.self_ty));
+        self.scope.enter_impl(type_short(&i.self_ty));
         visit::visit_item_impl(self, i);
-        self.impl_stack.pop();
+        self.scope.leave_impl();
+    }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.check(&i.sig, &i.block);
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.check(&i.sig, &i.block);
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        if let Some(body) = &i.default {
+            self.check(&i.sig, body);
+        }
     }
 }
 
@@ -123,9 +122,7 @@ pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<()> {
         let mut v = PTVisitor {
             max_loc,
             file: &display_path(&f.path),
-            module: &f.module,
-            impl_stack: Vec::new(),
-            mod_stack: Vec::new(),
+            scope: ScopeTracker::new(f.module.as_str()),
             hits: Vec::new(),
         };
         v.visit_file(&f.ast);

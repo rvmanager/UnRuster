@@ -225,6 +225,33 @@ pub fn path_to_string_with_args(p: &syn::Path) -> String {
     s
 }
 
+/// If `p` is `<Enum>::<Variant>` — the penultimate segment equals
+/// `target_enum` (last-segment rule) and the final segment names one of
+/// `variant_names` — return the variant ident. With `allow_bare`, a
+/// single-segment path naming a variant also matches (for callers that
+/// `use Enum::*;` — noisier). Single shared implementation for every
+/// enum-site scanner (`variants`, `catch-all-arms`, `parallel-matches`,
+/// `enum-coverage`) so the matching rule can't drift between them.
+pub fn enum_variant_of_path(
+    p: &syn::Path,
+    target_enum: &str,
+    variant_names: &[String],
+    allow_bare: bool,
+) -> Option<String> {
+    let segs: Vec<&syn::PathSegment> = p.segments.iter().collect();
+    let last = segs.last()?.ident.to_string();
+    if !variant_names.iter().any(|v| v == &last) {
+        return None;
+    }
+    if segs.len() >= 2 && segs[segs.len() - 2].ident == target_enum {
+        return Some(last);
+    }
+    if allow_bare && segs.len() == 1 {
+        return Some(last);
+    }
+    None
+}
+
 pub fn path_last(p: &syn::Path) -> String {
     p.segments
         .last()

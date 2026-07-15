@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_to_string_with_args, type_short, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parse::display_path;
 
 #[derive(Debug)]
@@ -70,6 +70,16 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_impl_item_fn(self, i);
+        self.scope.leave_fn();
+    }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        self.scope.enter_fn(i.sig.ident.to_string());
+        visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
 
@@ -154,12 +164,9 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
     let index = ctx.idx;
     let aliases = &ctx.sem.aliases;
     let summary = ctx.summary;
-    if !index.knows_name(ty) {
-        eprintln!(
-            "note: `{}` is not a known struct/enum/trait/type-alias in this tree; \
-             reporting matches anyway",
-            ty
-        );
+    let known = index.knows_name(ty);
+    if !known {
+        warn_unknown_target("type", ty);
     }
 
     let targets = aliases.synonyms(ty);
@@ -227,5 +234,8 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
         by_module.len(),
         alias_hits
     );
+    if !known && all.is_empty() {
+        return Err(TargetNotFound::err("type", ty));
+    }
     Ok(())
 }

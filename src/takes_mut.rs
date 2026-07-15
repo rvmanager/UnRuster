@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{is_mut_ref, line_of, type_last_segment, type_short, type_to_string, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parse::display_path;
 
 #[derive(Debug)]
@@ -94,6 +94,11 @@ impl<'ast, 'a> Visit<'ast> for TakesMutVisitor<'a> {
         visit::visit_item_impl(self, i);
         self.scope.leave_impl();
     }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.check_sig(&i.sig);
     }
@@ -109,12 +114,9 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
     let files = ctx.files;
     let index = ctx.idx;
     let summary = ctx.summary;
-    if !index.knows_name(ty) {
-        eprintln!(
-            "note: `{}` is not a known struct/enum/trait/type-alias in this tree; \
-             reporting matches anyway",
-            ty
-        );
+    let known = index.knows_name(ty);
+    if !known {
+        warn_unknown_target("type", ty);
     }
     let mut all: Vec<Hit> = Vec::new();
     for f in files {
@@ -135,5 +137,8 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<()> {
         }
     }
     eprintln!("({} fn(s) take `&mut {}`)", all.len(), ty);
+    if !known && all.is_empty() {
+        return Err(TargetNotFound::err("type", ty));
+    }
     Ok(())
 }

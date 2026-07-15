@@ -81,11 +81,6 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<()> {
         std::collections::BTreeSet::new();
     let mut pairs: Vec<(FromImpl, FromImpl)> = Vec::new();
     for fi in &impls {
-        let key_forward = (
-            fi.trait_name.clone(),
-            fi.src.clone(),
-            fi.dst.clone(),
-        );
         let key_reverse = (
             fi.trait_name.clone(),
             fi.dst.clone(),
@@ -106,7 +101,6 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<()> {
                 pairs.push((a, b));
             }
         }
-        let _ = key_forward; // suppress unused warning
     }
 
     pairs.sort_by(|x, y| {
@@ -130,9 +124,6 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<()> {
             );
         }
     }
-    eprintln!(
-        "({} bidirectional pair(s); design-smell hint: two types with mutual From impls are usually the same logical concept wearing two shapes — collapse to one type, or make one a view (`AsRef`) of the other.)",
-        pairs.len()
-    );
+    eprintln!("({} bidirectional pair(s))", pairs.len());
     Ok(())
 }

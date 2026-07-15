@@ -2,7 +2,7 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
 use crate::ast::{print_grouped_counts, top_module_of, type_short, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 
 #[derive(Debug)]
@@ -99,6 +99,16 @@ impl<'ast, 'a> Visit<'ast> for StringlyVisitor<'a> {
         visit::visit_impl_item_fn(self, i);
         self.scope.leave_fn();
     }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        self.scope.enter_fn(i.sig.ident.to_string());
+        visit::visit_trait_item_fn(self, i);
+        self.scope.leave_fn();
+    }
 
     fn visit_expr_binary(&mut self, e: &'ast syn::ExprBinary) {
         if matches!(e.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
@@ -186,7 +196,8 @@ pub fn run(
     ctx: &AnalysisCtx,
     include_substring: bool,
     include_map_keys: bool,
-    by: Option<&str>,
+    by: Option<GroupBy>,
+    top: Option<usize>,
 ) -> anyhow::Result<()> {
     let files = ctx.files;
     let summary = ctx.summary;
@@ -212,13 +223,18 @@ pub fn run(
 
     if !summary {
         match by {
-            Some("fn") => print_grouped_counts(&all, None, |h| h.context.clone()),
-            Some("file") => print_grouped_counts(&all, None, |h| h.file.clone()),
-            Some("module") => {
-                print_grouped_counts(&all, None, |h| top_module_of(&h.context).to_string())
+            Some(GroupBy::Fn) => print_grouped_counts(&all, top, |h| h.context.clone()),
+            Some(GroupBy::File) => print_grouped_counts(&all, top, |h| h.file.clone()),
+            Some(GroupBy::Module) => {
+                print_grouped_counts(&all, top, |h| top_module_of(&h.context).to_string())
             }
-            _ => {
-                for h in &all {
+            None => {
+                let rows: &[Hit] = if let Some(n) = top {
+                    &all[..all.len().min(n)]
+                } else {
+                    &all
+                };
+                for h in rows {
                     println!(
                         "{}\t{}\t{}\t{}:{}",
                         h.class, h.literal, h.context, h.file, h.line
@@ -238,9 +254,11 @@ pub fn run(
         .map(|(k, n)| format!("{}={}", k, n))
         .collect();
     eprintln!(
-        "({} stringly hit(s); {}; design-smell hint: branching on string literals couples logic to spelling — replace with an enum (or a newtype like `pub struct ActionId(&'static str)`) so the compiler catches typos and missing cases.)",
+        "({} stringly hit(s); {}; include_substring={}, include_map_keys={})",
         all.len(),
-        break_str.join(", ")
+        break_str.join(", "),
+        include_substring,
+        include_map_keys
     );
     Ok(())
 }

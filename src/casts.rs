@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{print_grouped_counts, top_module_of, type_short, type_to_string, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 use crate::semantic::{FnSigIndex, FnTypes};
 
@@ -26,6 +26,40 @@ struct CastVisitor<'a> {
 impl<'a> CastVisitor<'a> {
     fn enclosing(&self) -> String {
         self.scope.enclosing()
+    }
+}
+
+/// `--class` filter values, kebab-cased by clap (NarrowInt → `narrow-int`).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CastClass {
+    NarrowInt,
+    WidenInt,
+    SignedFlip,
+    FloatInt,
+    IntFloat,
+    NarrowFloat,
+    WidenFloat,
+    Ptr,
+    UsizeCross,
+    Unknown,
+    Other,
+}
+
+impl CastClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            CastClass::NarrowInt => "narrow-int",
+            CastClass::WidenInt => "widen-int",
+            CastClass::SignedFlip => "signed-flip",
+            CastClass::FloatInt => "float-int",
+            CastClass::IntFloat => "int-float",
+            CastClass::NarrowFloat => "narrow-float",
+            CastClass::WidenFloat => "widen-float",
+            CastClass::Ptr => "ptr",
+            CastClass::UsizeCross => "usize-cross",
+            CastClass::Unknown => "unknown",
+            CastClass::Other => "other",
+        }
     }
 }
 
@@ -119,11 +153,26 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         visit::visit_item_impl(self, i);
         self.scope.leave_impl();
     }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.scope.enter_fn(i.sig.ident.to_string());
         self.fn_types_stack
             .push(FnTypes::build(&i.sig, &i.block, self.fn_sigs));
         visit::visit_impl_item_fn(self, i);
+        self.fn_types_stack.pop();
+        self.scope.leave_fn();
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        // Trait default-method bodies count like any other fn body.
+        let Some(body) = &i.default else { return };
+        self.scope.enter_fn(i.sig.ident.to_string());
+        self.fn_types_stack
+            .push(FnTypes::build(&i.sig, body, self.fn_sigs));
+        visit::visit_trait_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
     }
@@ -155,9 +204,10 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
 
 pub fn run(
     ctx: &AnalysisCtx,
-    class_filter: Option<&str>,
-    by: Option<&str>,
-    no_widen: bool,
+    class_filter: &[CastClass],
+    by: Option<GroupBy>,
+    hide_widen: bool,
+    top: Option<usize>,
 ) -> anyhow::Result<()> {
     let files = ctx.files;
     let fn_sigs = &ctx.sem.fn_sigs;
@@ -175,11 +225,11 @@ pub fn run(
         all.extend(v.hits);
     }
 
-    if let Some(cf) = class_filter {
-        let wanted: Vec<&str> = cf.split(',').map(str::trim).collect();
+    if !class_filter.is_empty() {
+        let wanted: Vec<&str> = class_filter.iter().map(|c| c.as_str()).collect();
         all.retain(|h| wanted.contains(&h.class));
     }
-    if no_widen {
+    if hide_widen {
         all.retain(|h| !matches!(h.class, "widen-int" | "widen-float"));
     }
 
@@ -192,13 +242,18 @@ pub fn run(
 
     if !summary {
         match by {
-            Some("fn") => print_grouped_counts(&all, None, |h| h.context.clone()),
-            Some("file") => print_grouped_counts(&all, None, |h| h.file.clone()),
-            Some("module") => {
-                print_grouped_counts(&all, None, |h| top_module_of(&h.context).to_string())
+            Some(GroupBy::Fn) => print_grouped_counts(&all, top, |h| h.context.clone()),
+            Some(GroupBy::File) => print_grouped_counts(&all, top, |h| h.file.clone()),
+            Some(GroupBy::Module) => {
+                print_grouped_counts(&all, top, |h| top_module_of(&h.context).to_string())
             }
-            _ => {
-                for h in &all {
+            None => {
+                let rows: &[Hit] = if let Some(n) = top {
+                    &all[..all.len().min(n)]
+                } else {
+                    &all
+                };
+                for h in rows {
                     println!(
                         "{}\t{}\t{}\t{}\t{}:{}",
                         h.class, h.src, h.dst, h.context, h.file, h.line
@@ -215,9 +270,10 @@ pub fn run(
     }
     let break_str: Vec<String> = by_class.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     eprintln!(
-        "({} cast(s); {}; design-smell hint: a hot fn with many casts is usually shape-juggling — pick one type at the boundary, do the cast once, then pass the typed value through.)",
+        "({} cast(s); {}; hide_widen={})",
         all.len(),
-        break_str.join(", ")
+        break_str.join(", "),
+        hide_widen
     );
     Ok(())
 }

@@ -74,12 +74,14 @@ fn collect_idents(ts: &TokenStream, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Candidate defns come from `ctx.idx` (built over the user-scoped files);
+/// `call_source` is the FULL tree so production items called only from tests
+/// aren't false-flagged as dead.
 pub fn run(
     ctx: &AnalysisCtx,
     call_source: &[ParsedFile],
     pub_only: bool,
 ) -> anyhow::Result<()> {
-    let files = ctx.files;
     let index = ctx.idx;
     let summary = ctx.summary;
     let mut sink = CallSink {
@@ -88,11 +90,6 @@ pub fn run(
     for f in call_source {
         sink.visit_file(&f.ast);
     }
-    // `files` is the source of candidate defns; `index` is the canonical view
-    // of those. (When `call_source != files`, the index would be the wrong
-    // shape for filtering by file presence; but we only need it for kind/owner
-    // info per candidate, and rebuilding it for `files` is what main.rs does.)
-    let _ = files;
 
     let mut hits: Vec<(&str, &crate::index::Defn)> = Vec::new();
     for d in index.iter() {

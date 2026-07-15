@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ast;
 mod callers;
@@ -13,7 +13,7 @@ mod conversion_pairs;
 mod conversions;
 mod dead_code;
 mod error_swallows;
-mod field;
+mod field_uses;
 mod fields;
 mod impls;
 mod index;
@@ -37,284 +37,7 @@ use parse::Scope;
 #[command(
     name = "unruster",
     about = "Query a Rust codebase: inventory, callers/callees, field uses, variants, impls, metrics, dead-code.",
-    long_about = "Query a Rust codebase via syntactic (syn) analysis.\n\
-        \n\
-        Precision tiers (look for the `via` column on results to see which fired):\n\
-        \n\
-        PRECISE (raw AST shape — trustworthy):\n\
-        - Item inventory, impl blocks, struct fields, enum variants.\n\
-        - self.field accesses inside `impl Type`.\n\
-        - Match-site / pattern shapes (catch-all-arms, parallel-matches, if-chains).\n\
-        - Free-fn / method / macro call sites by last-segment name.\n\
-        \n\
-        APPROXIMATE (semantic-lite, may have false positives/negatives):\n\
-        - field-uses `via=ti`: receiver type inferred from local lets, params,\n\
-          and obvious constructors. Misses method-chain results, generics,\n\
-          trait dispatch, closure captures.\n\
-        - type-refs `via=alias`: walks `type X = Y;` chains. Misses associated-\n\
-          type re-exports (`impl Foo { type Out = Bar; }`).\n\
-        - callers `Type::method`: also matches paths where the head segment is\n\
-          renamed by `use foo::Type as Other`. Misses dyn-dispatch and generics.\n\
-        - dead-code: last-segment name matching; pub items may have external\n\
-          callers we don't see; trait methods are skipped to cut false positives.\n\
-        \n\
-        BEST-EFFORT (heuristic — flag and verify):\n\
-        - field-uses `via=?` (--candidates only): receiver type unknown.\n\
-        - Macro body scanning: token streams parsed speculatively as expressions.\n\
-        - Custom macros and DSLs whose args aren't expressions are missed.\n\
-        \n\
-        Top-level flags:\n\
-        - --scope production (default) / tests / all: controls test-code inclusion.\n\
-        - --cfg KEY[=VALUE]: repeatable. Items whose cfg evaluates to definitively\n\
-          False under this env are stripped. Unknown keys leave items in.\n\
-        - --summary: skip per-row output, keep summary line.\n\
-        \n\
-        ══════════════════════════════════════════════════════════════════════\n\
-        DESIGN AUDIT PLAYBOOK — pick the theme matching your concern.\n\
-        The tool finds candidates; you decide whether to act.\n\
-        \n\
-        INDEX (five themes, jump to the one you need):\n\
-          1. TYPE & DATA DESIGN     — when types should change shape\n\
-          2. ENCAPSULATION & API    — what's leaking, hidden, or expensive to change\n\
-          3. DISPATCH & CONTROL FLOW — branching smells: scattered logic, god fns\n\
-          4. CORRECTNESS & SAFETY   — silent errors, silent data loss\n\
-          5. AUDIT META             — auditing the test suite itself\n\
-        \n\
-        ──── 1. TYPE & DATA DESIGN ──────────────────────────────────────────\n\
-        When concrete types should become traits, primitives become newtypes,\n\
-        structs should split, or duplicate concepts should merge.\n\
-        \n\
-        ◇ EXTRACT A TRAIT (concrete type → interface)\n\
-          unruster takes-mut <Type>                       # mutation surface\n\
-          unruster type-refs <Type>                       # modules naming it\n\
-          unruster callers --by module <Type>::<method>   # per-method caller spread\n\
-          unruster inventory --kind impl-fn | grep '<Type>::'   # method count\n\
-          Signal: many `&mut Type` fns + many naming modules + most callers\n\
-          touch only a subset → extract trait(s); callers depend on interface.\n\
-        \n\
-        ◇ NEWTYPE (primitive overloaded across roles — `String`/`u32` as both id\n\
-          and value)\n\
-          unruster type-refs String                       # often huge\n\
-          unruster takes-mut String\n\
-          unruster callers <fn-taking-primitive> --by module\n\
-          Signal: same primitive returned/accepted across unrelated APIs →\n\
-          wrap each role (`UserId(u32)`, `Cents(u64)`) so the compiler catches\n\
-          mix-ups.\n\
-        \n\
-        ◇ SPLIT A STRUCT (low-cohesion / god-struct)\n\
-          unruster fields <Type>                          # field count\n\
-          unruster metrics --top 10                       # top structs by field count\n\
-          unruster field-uses <Type> <field> --candidates # field-to-callers map\n\
-          Signal: disjoint sets of fns touch disjoint sets of fields → split.\n\
-        \n\
-        ◇ DEAD ENUM VARIANTS\n\
-          unruster variants <Enum>\n\
-          Signal: 0 ctor sites + only seen in `_ =>` arms → drop the variant.\n\
-        \n\
-        ◇ REDUCE DATA REPLICATION / REPETITION / CONVERSION\n\
-          unruster impls --trait From / Into / TryFrom / AsRef\n\
-          unruster fields <A> ; unruster fields <B>       # shape overlap\n\
-          unruster conversion-pairs                       # mutual From pairs\n\
-          unruster pass-through                           # thin wrapper layers\n\
-          unruster callers .clone                         # clone hotspots\n\
-          unruster callers .to_string / .to_owned / .into # conversion hotspots\n\
-          unruster inventory --kind fn | grep '::(from|to|as|into)_'\n\
-          Signals: bidirectional `A ↔ B` From + overlapping fields = same\n\
-          concept in two shapes (merge); heavy `.clone()` on one type =\n\
-          fragmented ownership (Rc/Arc/borrow); sprawling `to_*`/`from_*`\n\
-          namespaces on one type = collapse to standard trait impls.\n\
-        \n\
-        ──── 2. ENCAPSULATION & API SURFACE ─────────────────────────────────\n\
-        What's leaking out, what should be hidden, what's the cost of changing\n\
-        a published signature.\n\
-        \n\
-        ◇ PRIVATIZE A FIELD (stop external write bleeding)\n\
-          unruster fields <Type>                          # pub/priv breakdown\n\
-          unruster field-uses <Type> <field> --candidates\n\
-          Signal: writes from contexts outside `Type::*` → make field private,\n\
-          expose a method that enforces the invariant.\n\
-        \n\
-        ◇ SHRINK A PUB SURFACE (internal API hygiene)\n\
-          unruster inventory --vis pub --kind impl-fn\n\
-          unruster dead-code --pub-only\n\
-          unruster callers --by module <Type>::<method>\n\
-          Signal: pub fn with 0 callers → privatize. pub fn called from 1\n\
-          module → consider `pub(crate)` or `pub(super)`.\n\
-        \n\
-        ◇ BREAKING-CHANGE BLAST RADIUS (before renaming/changing a signature)\n\
-          unruster callers <Type>::<method>\n\
-          unruster callers --transitive <Type>::<method>\n\
-          unruster type-refs <Type>\n\
-          Signal: direct + transitive caller count + coupling footprint tells\n\
-          you the change cost.\n\
-        \n\
-        ──── 3. DISPATCH & CONTROL FLOW ─────────────────────────────────────\n\
-        Branching design smells: scattered per-variant logic, brittle string\n\
-        dispatch, oversized functions that should split.\n\
-        \n\
-        ◇ REPLACE ENUM-MATCH WITH POLYMORPHISM\n\
-          unruster parallel-matches <Enum>                # match sites by variant set\n\
-          unruster variants <Enum>                        # ctor + match per variant\n\
-          unruster catch-all-arms <Enum>                  # `_ =>` arms (knowledge leak)\n\
-          Signal: ≥2 match sites cover the same variant set → push behavior\n\
-          into a trait method per variant; callers stop knowing the variants.\n\
-        \n\
-        ◇ PARTIAL-ENUMERATION DEFECT (a predicate that silently mis-bins a NEW\n\
-          variant — run BEFORE adding a variant to find every site that won't\n\
-          force-update)\n\
-          Also run AFTER adding / promoting / splitting a variant, and after any\n\
-          \"extract variant to its own type\" refactor. The pre-refactor sites\n\
-          that matched on the old variant set are the candidates: they didn't\n\
-          break compilation but may now silently drop the new variant.\n\
-          unruster enum-coverage <Enum>                   # the one-stop synthesis\n\
-          unruster parallel-matches <Enum> --partial --rank-by-gap --show-missing\n\
-          unruster parallel-matches <Enum> --include-matches-macro\n\
-          unruster parallel-matches <Enum> --include-if-chains\n\
-          Signal: `enum-coverage` lists every PARTIAL match / `matches!` /\n\
-          `==`-if-chain site — one row per (gap_score, covered, missing,\n\
-          file:line), sorted by gap_score = covered/total descending. The top\n\
-          rows are predicates covering almost every variant (e.g. 7/8): a new\n\
-          variant falls into their `_` / `matches!`-false / dispatch-`else` arm\n\
-          with zero compiler warning. Exhaustive sites are compiler-protected\n\
-          and hidden. `matches!()` is guaranteed-supported (always on in\n\
-          enum-coverage; opt-in elsewhere via --include-matches-macro).\n\
-          `if x == E::A { … } else if x == E::B …` chains are scanned the same\n\
-          way (always on in enum-coverage; opt-in elsewhere via\n\
-          --include-if-chains) — their implicit `else` IS the risk that `match`\n\
-          would force you to handle.\n\
-          \n\
-          Strongest smell — ASYMMETRIC DIVERGENCE between sibling sites. When\n\
-          two sites with similar names / intent (e.g. `as_paintable`,\n\
-          `paint_slots`, `collect_world_transforms`) have overlapping but\n\
-          non-equal coverage sets, the smaller one is almost always the bug:\n\
-          both meant the same conceptual filter, one drifted when a variant was\n\
-          added. Pick out divergent-coverage clusters with:\n\
-            unruster -r src enum-coverage <Enum> | sort -k4 | uniq -f3 -D\n\
-          (sorts on the covered-set column to group near-identical predicates).\n\
-          \n\
-          False positives to skip — TRAIT-ROUTED CATCH-ALLS. A row whose `_` /\n\
-          catchall arm calls a no-default trait classifier on the scrutinee\n\
-          (`node.kind()`, `node.as_paintable()`, `node.capabilities()`) is\n\
-          structurally safe: a new variant must implement the trait method, so\n\
-          the catch-all picks up its behavior automatically. The tool can't see\n\
-          through the method call, so it tags such rows\n\
-          `(catchall→method; likely false positive)` and\n\
-          `--hide-trait-routed-catchalls` drops them entirely. Read the `_` arm.\n\
-          \n\
-          Two repair shapes:\n\
-          - Trait-classifier replacement (preferred). Add a no-default method on\n\
-            the enum's primary trait (`fn classification(&self) -> Class;`).\n\
-            Every existing variant must declare it; the buggy site routes through\n\
-            it; future variants can't compile until they declare it. A partial\n\
-            `matches!(node, BaseShape | CompositeShape | ConstraintDerivedShape)`\n\
-            becomes `node.paintable_kind() == PaintableKind::Path`.\n\
-          - Exhaustive match. If the dispatch genuinely differs per variant,\n\
-            replace `matches!(.., A | B | C)` with a full\n\
-            `match { A => .., B => .., C => .., D | E | F => .. }` — exhaustive,\n\
-            so a new variant forces a compile error at this site.\n\
-        \n\
-        ◇ SIBLING-COHORT DIVERGENCE (one sibling in a `do_x_*` family forgot a\n\
-          call its cohort-mates all make — e.g. `wrap_in_transform` skipped\n\
-          `mark_pending` that `wrap_in_group`/`_composite` both call)\n\
-          unruster callers <helper> --among '<name-glob>'  # who calls it / who doesn't\n\
-          unruster cohort-callees '<name-glob>'             # (callee × fn) matrix\n\
-          Signal: `--among` lists each cohort fn ✓ (calls helper) or ✗ (doesn't);\n\
-          the ✗ rows are candidates. `cohort-callees` shows the whole grid —\n\
-          a callee present in the majority of columns but missing from one is\n\
-          flagged `<- divergence`. The tool finds the asymmetry; you decide\n\
-          whether that sibling SHOULD have made the call (some omissions are\n\
-          correct — not every sibling wraps an expandable kind).\n\
-        \n\
-        ◇ CO-CALL INVARIANT (paired actions — calling one without the other\n\
-          leaks an invariant; e.g. `refresh_world_transforms` +\n\
-          `recompute_derived_geometry` both must run to settle a `Document`,\n\
-          so any fn that calls one alone may leave stale state behind)\n\
-          unruster co-call <A> <B>                          # asymmetric callers\n\
-          When to reach for it: you know two ops form a couple (mutate +\n\
-          reindex, lock + unlock, begin + commit, invalidate + recompute) and\n\
-          want every site that does one but forgot the other. Unlike\n\
-          `--among`/`cohort-callees` (which need a NAME cohort like `wrap_in_*`),\n\
-          co-call needs no naming convention — it partitions ALL fns by the two\n\
-          calls. A and B take the same target forms as `callers` (bare name,\n\
-          `Type::method`, `.method`, `::name`, `name!`).\n\
-          Output: two row kinds, ranked by matched-call count (high-traffic\n\
-          first), each with a `via file:line` pointer to the call it DOES make:\n\
-            A-only <n> <fn> via f:L   # calls A, not B — forgot B?\n\
-            B-only <n> <fn> via f:L   # calls B, not A — redundant A, or B alone\n\
-          (grep `^A-only` / `^B-only` to split the streams). The stderr summary\n\
-          counts the canonical both-callers, which are not listed.\n\
-          Signal: each row is a latent stale-state candidate. Some asymmetries\n\
-          are correct and you dismiss them — e.g. a typed gate that only QUEUES\n\
-          a mutation (the later `commit` runs B), an orchestrator that dispatches\n\
-          to actions that run B internally, or a solver path where the omission\n\
-          is intentional. Expect a minority of true positives (the tool surfaces\n\
-          candidates; you filter) — same working style as `enum-coverage`.\n\
-          Tip: one pair only checks one invariant. Re-run with a different pair\n\
-          to police a different couple (e.g. `co-call invalidate_cache\n\
-          recompute_derived_geometry` for cache sites that skip the recompute).\n\
-        \n\
-        ◇ STRINGLY-TYPED CODE (logic branches on string literals)\n\
-          unruster stringly                               # ==, .eq, match, assert_eq!\n\
-          unruster stringly --include-substring           # also .starts_with/.contains\n\
-          unruster stringly --include-map-keys            # also map.get(\"lit\")\n\
-          unruster stringly --by fn                       # rank worst offenders\n\
-          Signals: multiple `match-lit` arms in one fn → replace with enum\n\
-          (compiler catches typos); `cmp-eq`/`cmp-method` hits → newtype the id\n\
-          (e.g. `pub struct ActionId(&'static str)`); `map-lit-key` →\n\
-          `HashMap<MyEnumKey, V>` instead of `HashMap<String, V>`.\n\
-        \n\
-        ◇ GOD FUNCTION TO SPLIT (long / complex / deeply-nested)\n\
-          unruster metrics --sort loc --top 20            # by line count\n\
-          unruster metrics --sort cyclo --top 20          # by cyclomatic complexity\n\
-          unruster metrics --sort nesting --top 20        # by max nesting depth\n\
-          unruster metrics --sort cyclo --threshold 15    # above-threshold\n\
-          unruster metrics --sort nesting --threshold 4   # deeply-indented\n\
-          unruster callees <Type>::<fn>                   # helper-call clustering\n\
-          Signals: high LOC + low cyclo → extract named sections, not split;\n\
-          high cyclo (≥15) → split decision logic into focused helpers, or\n\
-          trait-dispatch (theme 3); high nesting (≥4) → flatten with early\n\
-          returns / guard clauses; all three high → genuine god fn, split first.\n\
-        \n\
-        ──── 4. CORRECTNESS & SAFETY ────────────────────────────────────────\n\
-        Runtime risks hidden in the code: silent error-swallowing, silent data\n\
-        loss from casts and conversions.\n\
-        \n\
-        ◇ SILENT FALLBACKS (Result/Option error swallowing)\n\
-          unruster error-swallows [--include-unwrap-or]\n\
-          Signal: `match-err-wild` / `if-let-ok` / `let-_` / `.map_err(|_|)` /\n\
-          `.unwrap_or_default()` hits. Some are intentional (parse cascades,\n\
-          drop guards) — review per site.\n\
-        \n\
-        ◇ EXCESSIVE CASTS / SHAPE-JUGGLING (the same value renamed/reshaped\n\
-          repeatedly because the wrong type was chosen at the boundary)\n\
-          unruster casts                                  # all `as` casts, classified\n\
-          unruster casts --class narrow-int,signed-flip,float-int,ptr\n\
-          unruster casts --by fn                          # rank cast-heavy fns\n\
-          unruster casts --no-widen                       # hide safe widenings\n\
-          unruster conversions --by fn --top 10           # conversion-heavy fns\n\
-          unruster conversions --kind .into,.to_string,::from\n\
-          Signals: one fn doing many casts → wrong-typed input, cast once at\n\
-          boundary; `narrow-int`/`signed-flip`/`float-int` → silent data-loss\n\
-          candidates (prove safe or use checked helper); fn with 5+ conversion\n\
-          calls = surrounding API wants the wrong type.\n\
-        \n\
-        ──── 5. AUDIT META ─────────────────────────────────────────────────\n\
-        Auditing the test suite itself — coverage imbalance, near-duplicates,\n\
-        missing flag combos.\n\
-        \n\
-        ◇ TEST-SUITE AUDIT\n\
-          unruster tests                                  # list #[test] fns + file:start-end\n\
-          unruster tests --with-hint                      # add args() fingerprint per test\n\
-          unruster tests --by-subcommand                  # histogram by CLI subcommand\n\
-          Signals: `--by-subcommand` exposes coverage imbalance (5 tests vs 1);\n\
-          `--with-hint` exposes near-duplicates (same args fingerprint = same\n\
-          test in disguise); `file:start-end` lets an agent read just the\n\
-          relevant body via `sed -n start,endp file`.\n\
-        \n\
-        ─────────────────────────────────────────────────────────────────────\n\
-        Closing principle: the tool finds candidates. The decision \"extract a\n\
-        trait\" / \"newtype that primitive\" / \"split that fn\" / \"merge these\n\
-        two types\" stays with the person reading the output.",
+    long_about = include_str!("playbook.txt"),
     version
 )]
 struct Cli {
@@ -356,7 +79,7 @@ enum Cmd {
     /// candidate; some asymmetries are correct, so a human filters.
     CoCall(CoCallArgs),
     /// Find read/write sites of a field on a given type.
-    FieldUses(FieldArgs),
+    FieldUses(FieldUsesArgs),
 
     /// List fields of a struct with read/write/init counts per field.
     Fields(FieldsArgs),
@@ -378,14 +101,14 @@ enum Cmd {
     /// Find match sites on a given enum that contain a wildcard `_ =>` arm.
     CatchAllArms(CatchAllArgs),
     /// Group match sites on an enum by which variants they cover (shotgun-surgery candidates).
-    /// `--partial` hides compiler-protected exhaustive groups; `--rank-by-gap`
+    /// `--hide-exhaustive` hides compiler-protected exhaustive groups; `--rank-by-gap`
     /// sorts by coverage ratio; `--show-missing` lists uncovered variants;
     /// `--include-matches-macro` also scans `matches!()`.
     ParallelMatches(ParallelMatchesArgs),
     /// Score every PARTIAL match / `matches!` site on an enum by coverage
     /// (gap_score = covered/total), sorted descending. Top rows are the
     /// predicates closest to exhaustive — the ones a newly-added variant would
-    /// silently mis-bind. Synthesis of `parallel-matches --partial
+    /// silently mis-bind. Synthesis of `parallel-matches --hide-exhaustive
     /// --rank-by-gap --show-missing --include-matches-macro`.
     /// `--hide-trait-routed-catchalls` drops rows whose `_` arm calls a method
     /// on the scrutinee (structurally-safe false positives).
@@ -406,17 +129,23 @@ enum Cmd {
     PassThrough(PassThroughArgs),
 
     /// Find `as` casts; classifies narrowing / signed-flip / pointer / float-int /
-    /// usize-cross. Many casts in one fn = shape-juggling design smell.
+    /// usize-cross. Many casts in one fn = shape-juggling design smell:
+    /// pick one type at the boundary, cast once, pass the typed value through.
     Casts(CastsArgs),
     /// Find conversion method/fn calls (.into / .to_string / Type::from / ...).
-    /// Use `--by fn --top 10` to find conversion-heavy fns.
+    /// Use `--by fn --top 10` to find conversion-heavy fns — a fn with many
+    /// conversion calls is reshaping the same value repeatedly, usually a sign
+    /// the wrong type was chosen at the boundary.
     Conversions(ConversionsArgs),
     /// Find bidirectional `From<A> for B` + `From<B> for A` pairs — same
-    /// concept in two shapes, prime merge candidates.
+    /// concept in two shapes, prime merge candidates: collapse to one type,
+    /// or make one a view (`AsRef`) of the other.
     ConversionPairs,
     /// Find stringly-typed code: branching/matching on string literals.
     /// Catches `x == "lit"`, `x.eq("lit")`, `match x { "lit" => ... }`,
-    /// `assert_eq!(x, "lit")`. Each row = candidate for an enum or newtype.
+    /// `assert_eq!(x, "lit")`. Each row = candidate for an enum or newtype
+    /// (e.g. `pub struct ActionId(&'static str)`) so the compiler catches
+    /// typos and missing cases.
     Stringly(StringlyArgs),
     /// List `#[test]`/`#[bench]`/`#[tokio::test]` fns with their
     /// `file:start-end` and name. Always scans the full tree (ignores --scope)
@@ -429,12 +158,12 @@ enum Cmd {
 
 #[derive(Args)]
 struct InventoryArgs {
-    /// Filter to one kind: struct, enum, trait, fn, impl, mod, const, static, type, trait-fn, impl-fn.
-    #[arg(long, short = 'k')]
-    kind: Option<String>,
-    /// Filter by visibility: pub, crate, priv.
-    #[arg(long)]
-    vis: Option<String>,
+    /// Filter to one kind (`fn` = free fns; methods are `impl-fn`).
+    #[arg(long, short = 'k', value_enum)]
+    kind: Option<inventory::ItemKind>,
+    /// Filter by visibility.
+    #[arg(long, value_enum)]
+    vis: Option<inventory::VisFilter>,
     /// Render as a module tree instead of a flat list.
     #[arg(long)]
     tree: bool,
@@ -455,9 +184,9 @@ struct CallersArgs {
     /// Maximum transitive depth (default: unlimited).
     #[arg(long)]
     depth: Option<usize>,
-    /// Group results: `file` (path) or `module` (top-level module).
-    #[arg(long)]
-    by: Option<String>,
+    /// Group results by file (path) or module (top-level module).
+    #[arg(long, value_enum)]
+    by: Option<callers::CallersBy>,
     /// Cohort mode: invert the query. Instead of listing call sites, show which
     /// functions in this name-pattern cohort (last-segment glob, `*` = any run,
     /// e.g. `wrap_in_*`) call the named helper (✓) and which don't (✗). The ✗
@@ -483,7 +212,7 @@ struct CoCallArgs {
 }
 
 #[derive(Args)]
-struct FieldArgs {
+struct FieldUsesArgs {
     /// Type name (last segment only, e.g. `Document`).
     ty: String,
     /// Field name.
@@ -491,15 +220,9 @@ struct FieldArgs {
     /// Also report non-self field accesses (noisier; no type inference).
     #[arg(long)]
     candidates: bool,
-    /// Filter to reads only.
-    #[arg(long)]
-    reads_only: bool,
-    /// Filter to writes only.
-    #[arg(long)]
-    writes_only: bool,
-    /// Filter to inits only.
-    #[arg(long)]
-    inits_only: bool,
+    /// Filter to one or more comma-separated access kinds (e.g. `read,write`).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    kind: Vec<field_uses::FieldKind>,
     /// (With --candidates) restrict hits to a substring of the receiver
     /// expression — e.g. `--via-receiver common` keeps `x.common.transform` but
     /// drops `node.transform`.
@@ -549,8 +272,8 @@ struct TakesMutArgs {
 struct MetricsArgs {
     /// Sort fns by: `loc` (lines), `params`, `cyclo` (cyclomatic complexity),
     /// `nesting` (max control-flow nesting depth).
-    #[arg(long, default_value = "loc")]
-    sort: String,
+    #[arg(long, value_enum, default_value = "loc")]
+    sort: metrics::SortKey,
     /// Top N per category to print.
     #[arg(long, default_value_t = 20)]
     top: usize,
@@ -580,8 +303,8 @@ struct ParallelMatchesArgs {
     /// Hide exhaustive groups (variant set == the full enum). Exhaustive
     /// matches are compiler-protected; only partials can silently mis-bind a
     /// newly-added variant.
-    #[arg(long)]
-    partial: bool,
+    #[arg(long, alias = "partial")]
+    hide_exhaustive: bool,
     /// Sort groups by coverage ratio (covered/total) descending instead of by
     /// site count. A 7/8 predicate is a louder defect signal than a 1/8 one.
     /// Prefixes each group with `[covered/total]`.
@@ -642,17 +365,18 @@ struct PassThroughArgs {
 
 #[derive(Args)]
 struct CastsArgs {
-    /// Filter to one or more comma-separated classes:
-    /// narrow-int, widen-int, signed-flip, float-int, int-float,
-    /// narrow-float, widen-float, ptr, usize-cross, unknown, other.
-    #[arg(long)]
-    class: Option<String>,
+    /// Filter to one or more comma-separated classes.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    class: Vec<casts::CastClass>,
     /// Group + count: fn, file, or module.
+    #[arg(long, value_enum)]
+    by: Option<context::GroupBy>,
+    /// Hide safe-widening rows (widen-int / widen-float).
+    #[arg(long, alias = "no-widen")]
+    hide_widen: bool,
+    /// Show only the top N rows (applies after --by grouping if set).
     #[arg(long)]
-    by: Option<String>,
-    /// Suppress safe-widening rows (widen-int / widen-float).
-    #[arg(long)]
-    no_widen: bool,
+    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -661,11 +385,17 @@ struct TestsArgs {
     /// call (the `--root <path>` / `--scope <val>` prefix is stripped).
     #[arg(long)]
     with_hint: bool,
-    /// Group + count tests by which CLI subcommand they invoke (heuristic:
-    /// scans `.args([...])` calls in the body for a known-subcommand-shaped
-    /// string literal). Drops the per-test list, prints a histogram.
-    #[arg(long)]
-    by_subcommand: bool,
+    /// Group + count tests by a dimension. `subcommand`: which CLI subcommand
+    /// each test invokes (heuristic: scans `.args([...])` calls in the body
+    /// for a known-subcommand-shaped string literal). Drops the per-test
+    /// list, prints a histogram.
+    #[arg(long, value_enum)]
+    by: Option<TestsBy>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TestsBy {
+    Subcommand,
 }
 
 #[derive(Args)]
@@ -679,24 +409,59 @@ struct StringlyArgs {
     #[arg(long)]
     include_map_keys: bool,
     /// Group + count: fn, file, or module.
+    #[arg(long, value_enum)]
+    by: Option<context::GroupBy>,
+    /// Show only the top N rows (applies after --by grouping if set).
     #[arg(long)]
-    by: Option<String>,
+    top: Option<usize>,
 }
 
 #[derive(Args)]
 struct ConversionsArgs {
-    /// Filter to one or more comma-separated kinds:
-    /// `.into`, `.try_into`, `.to_string`, `.to_owned`, `.to_vec`,
-    /// `.as_str`, `.as_bytes`, `.as_ref`, `.as_mut`, `.parse`,
-    /// `.cloned`, `.copied`, `.collect`, `::from`, `::try_from`.
-    #[arg(long)]
-    kind: Option<String>,
+    /// Filter to one or more comma-separated kinds (e.g. `.into,::from`).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    kind: Vec<conversions::ConvKind>,
     /// Group + count: fn, file, or module. Without --by, lists every site.
-    #[arg(long)]
-    by: Option<String>,
+    #[arg(long, value_enum)]
+    by: Option<context::GroupBy>,
     /// Show only the top N rows (applies after --by grouping if set).
     #[arg(long)]
     top: Option<usize>,
+}
+
+/// Derive the CLI's own grammar (subcommand names + which flags consume a
+/// value) from clap introspection. `tests` uses this to classify test bodies
+/// by the subcommand they invoke; deriving it here means the lists can never
+/// drift when a subcommand or flag is added.
+fn cli_grammar() -> tests_cmd::CliGrammar {
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    let subcommands: Vec<String> = cmd
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
+    let mut value_flags = std::collections::BTreeSet::new();
+    let mut collect = |c: &clap::Command| {
+        for a in c.get_arguments() {
+            if !a.get_action().takes_values() {
+                continue;
+            }
+            if let Some(l) = a.get_long() {
+                value_flags.insert(format!("--{}", l));
+            }
+            if let Some(s) = a.get_short() {
+                value_flags.insert(format!("-{}", s));
+            }
+        }
+    };
+    collect(&cmd);
+    for sc in cmd.get_subcommands() {
+        collect(sc);
+    }
+    tests_cmd::CliGrammar {
+        subcommands,
+        value_flags,
+    }
 }
 
 /// Some subcommands (`dead-code`, `tests`) must reason over the FULL tree —
@@ -735,43 +500,31 @@ fn main() -> Result<()> {
         sem: &sem,
         summary: cli.summary,
     };
-    match cli.cmd {
-        Cmd::Inventory(a) => inventory::run(&ctx, a.kind.as_deref(), a.vis.as_deref(), a.tree),
+    let result = match cli.cmd {
+        Cmd::Inventory(a) => inventory::run(&ctx, a.kind, a.vis, a.tree),
         Cmd::Callers(a) => {
             if let Some(pattern) = a.among.as_deref() {
                 callers::run_callers_among(&ctx, &a.name, pattern)
             } else {
-                callers::run_callers(&ctx, &a.name, a.transitive, a.depth, a.by.as_deref())
+                callers::run_callers(&ctx, &a.name, a.transitive, a.depth, a.by)
             }
         }
         Cmd::Callees(a) => callers::run_callees(&ctx, &a.name),
         Cmd::CoCall(a) => callers::run_co_call(&ctx, &a.a, &a.b),
-        Cmd::FieldUses(a) => {
-            let mut kinds: Vec<&str> = Vec::new();
-            if a.reads_only {
-                kinds.push("read");
-            }
-            if a.writes_only {
-                kinds.push("write");
-            }
-            if a.inits_only {
-                kinds.push("init");
-            }
-            field::run(
-                &ctx,
-                &a.ty,
-                &a.field,
-                !a.candidates,
-                &kinds,
-                a.via_receiver.as_deref(),
-            )
-        }
+        Cmd::FieldUses(a) => field_uses::run(
+            &ctx,
+            &a.ty,
+            &a.field,
+            !a.candidates,
+            &a.kind,
+            a.via_receiver.as_deref(),
+        ),
         Cmd::Fields(a) => fields::run(&ctx, &a.ty),
         Cmd::Variants(a) => variants::run(&ctx, &a.name, a.bare),
         Cmd::Impls(a) => impls::run(&ctx, a.of.as_deref(), a.trait_.as_deref()),
         Cmd::TypeRefs(a) => type_refs::run(&ctx, &a.ty),
         Cmd::TakesMut(a) => takes_mut::run(&ctx, &a.ty),
-        Cmd::Metrics(a) => metrics::run(&ctx, &a.sort, a.top, a.threshold),
+        Cmd::Metrics(a) => metrics::run(&ctx, a.sort, a.top, a.threshold),
         Cmd::DeadCode(a) => {
             // Build the call-set from the FULL tree so production items called
             // only from tests aren't false-flagged as dead.
@@ -784,7 +537,7 @@ fn main() -> Result<()> {
             &ctx,
             &a.name,
             parallel_matches::ScanOpts {
-                partial_only: a.partial,
+                partial_only: a.hide_exhaustive,
                 rank_by_gap: a.rank_by_gap,
                 show_missing: a.show_missing,
                 include_matches_macro: a.include_matches_macro,
@@ -797,23 +550,32 @@ fn main() -> Result<()> {
         Cmd::CohortCallees(a) => callers::run_cohort_callees(&ctx, &a.pattern),
         Cmd::ErrorSwallows(a) => error_swallows::run(&ctx, a.include_unwrap_or),
         Cmd::PassThrough(a) => pass_through::run(&ctx, a.max_loc),
-        Cmd::Casts(a) => casts::run(&ctx, a.class.as_deref(), a.by.as_deref(), a.no_widen),
-        Cmd::Conversions(a) => {
-            conversions::run(&ctx, a.kind.as_deref(), a.by.as_deref(), a.top)
-        }
+        Cmd::Casts(a) => casts::run(&ctx, &a.class, a.by, a.hide_widen, a.top),
+        Cmd::Conversions(a) => conversions::run(&ctx, &a.kind, a.by, a.top),
         Cmd::ConversionPairs => conversion_pairs::run(&ctx),
-        Cmd::Stringly(a) => stringly::run(
-            &ctx,
-            a.include_substring,
-            a.include_map_keys,
-            a.by.as_deref(),
-        ),
+        Cmd::Stringly(a) => {
+            stringly::run(&ctx, a.include_substring, a.include_map_keys, a.by, a.top)
+        }
         Cmd::Tests(a) => {
             // Always scan the full tree — under --scope production the tests we
             // want to enumerate would be stripped.
             let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg)?;
             let source = all_files.as_deref().unwrap_or(&files);
-            tests_cmd::run(&ctx, source, a.with_hint, a.by_subcommand)
+            tests_cmd::run(
+                &ctx,
+                source,
+                a.with_hint,
+                matches!(a.by, Some(TestsBy::Subcommand)),
+                &cli_grammar(),
+            )
+        }
+    };
+    if let Err(e) = &result {
+        if e.downcast_ref::<context::TargetNotFound>().is_some() {
+            // The command already printed the warning (and its summary line);
+            // exit 2 distinguishes "unknown target" from "no findings" (exit 0).
+            std::process::exit(2);
         }
     }
+    result
 }

@@ -100,7 +100,7 @@ fn inventory_kind_enum() {
 
 #[test]
 fn inventory_vis_pub() {
-    ur().args(["--root", FIXTURE, "inventory", "--vis", "pub", "--kind", "fn"])
+    ur().args(["--root", FIXTURE, "inventory", "--vis", "pub", "--kind", "impl-fn"])
         .assert()
         .success()
         .stdout(contains("Document::new"));
@@ -189,10 +189,12 @@ fn callers_among_marks_present_and_absent() {
 }
 
 #[test]
-fn callers_among_unknown_cohort_warns() {
+fn callers_among_unknown_cohort_exits_2() {
     ur().args(["--root", FIXTURE, "callers", "mark_pending", "--among", "no_such_cohort_*"])
         .assert()
-        .success();
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("no fn or method matching cohort pattern"));
 }
 
 #[test]
@@ -228,10 +230,12 @@ fn cohort_callees_matrix_flags_divergence() {
 }
 
 #[test]
-fn cohort_callees_unknown_cohort_warns() {
+fn cohort_callees_unknown_cohort_exits_2() {
     ur().args(["--root", FIXTURE, "cohort-callees", "no_such_cohort_*"])
         .assert()
-        .success();
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("no fn or method matching cohort pattern"));
 }
 
 #[test]
@@ -286,11 +290,12 @@ fn co_call_summary_counts_both_callers() {
 }
 
 #[test]
-fn co_call_unknown_symbol_warns_but_succeeds() {
+fn co_call_unknown_symbol_warns_and_exits_2() {
     ur().args(["--root", FIXTURE, "co-call", "no_such_fn_xyz", "mark_pending"])
         .assert()
-        .success()
-        .stderr(predicates::str::contains("no fn/method matching"));
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("no fn, method, or macro matching"));
 }
 
 // ─── field / fields ────────────────────────────────────────────────────────
@@ -325,7 +330,7 @@ fn field_uses_writes_only_filter() {
         "field-uses",
         "Document",
         "transform",
-        "--writes-only",
+        "--kind", "write",
     ])
     .assert()
     .success();
@@ -448,10 +453,12 @@ fn type_refs_via_alias() {
 }
 
 #[test]
-fn type_refs_unknown_warns() {
+fn type_refs_unknown_warns_and_exits_2() {
     ur().args(["--root", FIXTURE, "type-refs", "NotAType"])
         .assert()
-        .success();
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("no type `NotAType` found"));
 }
 
 #[test]
@@ -490,25 +497,27 @@ fn takes_mut_with_u8_param() {
 }
 
 #[test]
-fn takes_mut_unknown_type_warns() {
-    // Exercises the knows_name false branch (note about unknown type).
+fn takes_mut_unknown_type_warns_and_exits_2() {
+    // Exercises the knows_name false branch (warning + exit 2 on zero hits).
     let out = ur()
         .args(["--root", FIXTURE, "takes-mut", "NoSuchType"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not a known"));
+    assert!(stderr.contains("no type `NoSuchType` found"));
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
-fn callees_no_calls_message() {
-    // Exercises "no fn matching" path.
+fn callees_unknown_fn_warns_and_exits_2() {
     let out = ur()
         .args(["--root", FIXTURE, "callees", "no_such_fn_xyz"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no fn matching") || stderr.contains("0 distinct"));
+    assert!(stderr.contains("no fn or method matching"));
+    assert!(stderr.contains("0 distinct callees"));
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
@@ -641,7 +650,7 @@ fn parallel_matches_partial_hides_exhaustive_group() {
     let full = String::from_utf8_lossy(&full);
     assert!(full.contains("Eof,Number,Resize,Word"), "exhaustive group expected by default");
 
-    let part = ur_stdout(&["--root", FIXTURE, "parallel-matches", "Token", "--partial"]);
+    let part = ur_stdout(&["--root", FIXTURE, "parallel-matches", "Token", "--hide-exhaustive"]);
     let part = String::from_utf8_lossy(&part);
     assert!(
         !part.contains("Eof,Number,Resize,Word"),
@@ -656,7 +665,7 @@ fn parallel_matches_partial_hides_exhaustive_group() {
 fn parallel_matches_rank_by_gap_and_show_missing() {
     let out = ur_stdout(&[
         "--root", FIXTURE, "parallel-matches", "Token",
-        "--rank-by-gap", "--show-missing", "--partial",
+        "--rank-by-gap", "--show-missing", "--hide-exhaustive",
     ]);
     let s = String::from_utf8_lossy(&out);
     // rank-by-gap prefixes the [covered/total] ratio.
@@ -689,7 +698,7 @@ fn parallel_matches_include_matches_macro() {
 fn parallel_matches_summary_mode_with_flags() {
     assert_summary_silent_stdout(&[
         "--root", FIXTURE, "--summary", "parallel-matches", "Token",
-        "--partial", "--rank-by-gap", "--show-missing", "--include-matches-macro",
+        "--hide-exhaustive", "--rank-by-gap", "--show-missing", "--include-matches-macro",
     ]);
 }
 
@@ -723,10 +732,12 @@ fn enum_coverage_lists_missing_variants() {
 }
 
 #[test]
-fn enum_coverage_unknown_enum_warns() {
+fn enum_coverage_unknown_enum_warns_and_exits_2() {
     ur().args(["--root", FIXTURE, "enum-coverage", "NotAnEnum"])
         .assert()
-        .success();
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("no enum `NotAnEnum` found"));
 }
 
 #[test]
@@ -1061,10 +1072,11 @@ fn type_refs_summary_mode() {
 }
 
 #[test]
-fn metrics_invalid_sort_falls_back_to_loc() {
+fn metrics_invalid_sort_rejected_by_clap() {
     ur().args(["--root", FIXTURE, "metrics", "--sort", "bogus"])
         .assert()
-        .success();
+        .failure()
+        .stderr(contains("invalid value 'bogus'"));
 }
 
 #[test]
@@ -1078,24 +1090,30 @@ fn callers_unknown_symbol_emits_note() {
 }
 
 #[test]
-fn variants_unknown_enum_warns() {
+fn variants_unknown_enum_warns_and_exits_2() {
     ur().args(["--root", FIXTURE, "variants", "NotAnEnum"])
         .assert()
-        .success();
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("no enum `NotAnEnum` found"));
 }
 
 #[test]
-fn catch_all_unknown_enum_warns() {
+fn catch_all_unknown_enum_warns_and_exits_2() {
     ur().args(["--root", FIXTURE, "catch-all-arms", "NotAnEnum"])
         .assert()
-        .success();
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("no enum `NotAnEnum` found"));
 }
 
 #[test]
-fn parallel_matches_unknown_enum_warns() {
+fn parallel_matches_unknown_enum_warns_and_exits_2() {
     ur().args(["--root", FIXTURE, "parallel-matches", "NotAnEnum"])
         .assert()
-        .success();
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("no enum `NotAnEnum` found"));
 }
 
 #[test]
@@ -1142,7 +1160,7 @@ fn casts_by_fn_groups() {
 
 #[test]
 fn casts_no_widen() {
-    ur().args(["--root", FIXTURE, "casts", "--no-widen"])
+    ur().args(["--root", FIXTURE, "casts", "--hide-widen"])
         .assert()
         .success();
 }
@@ -1585,13 +1603,11 @@ fn inventory_vis_priv() {
 }
 
 #[test]
-fn inventory_vis_unknown_warns() {
-    let out = ur()
-        .args(["--root", FIXTURE, "inventory", "--vis", "bogus"])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("unknown --vis"), "expected unknown --vis warning");
+fn inventory_vis_unknown_rejected_by_clap() {
+    ur().args(["--root", FIXTURE, "inventory", "--vis", "bogus"])
+        .assert()
+        .failure()
+        .stderr(contains("invalid value 'bogus'"));
 }
 
 #[test]
@@ -1663,14 +1679,14 @@ fn inventory_tree_with_vis() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  field-uses kind filters: all three should be tested, not just --writes-only.
+//  field-uses kind filters: all three should be tested, not just --kind write.
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn field_uses_reads_only_filter() {
     // Only the read rows should appear; writes/inits filtered out.
     let out = ur_stdout(&[
-        "--root", FIXTURE, "field-uses", "Document", "transform", "--reads-only",
+        "--root", FIXTURE, "field-uses", "Document", "transform", "--kind", "read",
     ]);
     for line in rows_of(&out) {
         let first_col = line.split('\t').next().unwrap_or("");
@@ -1681,7 +1697,7 @@ fn field_uses_reads_only_filter() {
 #[test]
 fn field_uses_inits_only_filter() {
     let out = ur_stdout(&[
-        "--root", FIXTURE, "field-uses", "Document", "transform", "--inits-only",
+        "--root", FIXTURE, "field-uses", "Document", "transform", "--kind", "init",
     ]);
     for line in rows_of(&out) {
         let first_col = line.split('\t').next().unwrap_or("");
@@ -1690,12 +1706,14 @@ fn field_uses_inits_only_filter() {
 }
 
 #[test]
-fn field_uses_unknown_type_no_results() {
-    // Querying a non-existent type should produce zero hits but exit success.
-    let out = ur_stdout(&[
-        "--root", FIXTURE, "field-uses", "NoSuchType", "no_field",
-    ]);
-    assert!(rows_of(&out).is_empty(), "expected no rows for unknown type");
+fn field_uses_unknown_type_no_results_exits_2() {
+    // Querying a non-existent type: zero rows, warning, exit code 2.
+    let out = ur()
+        .args(["--root", FIXTURE, "field-uses", "NoSuchType", "no_field"])
+        .output()
+        .unwrap();
+    assert!(rows_of(&out.stdout).is_empty(), "expected no rows for unknown type");
+    assert_eq!(out.status.code(), Some(2));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1727,17 +1745,18 @@ fn metrics_top_truncates() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn fields_unknown_type_warns() {
+fn fields_unknown_type_warns_and_exits_2() {
     let out = ur()
         .args(["--root", FIXTURE, "fields", "NoSuchStruct"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no struct named"),
+        stderr.contains("no struct with named fields `NoSuchStruct` found"),
         "expected unknown-struct warning, got:\n{}",
         stderr
     );
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
@@ -1819,7 +1838,7 @@ fn casts_class_filter_excludes_others() {
 
 #[test]
 fn casts_no_widen_excludes_widen_classes() {
-    let out = ur_stdout(&["--root", FIXTURE, "casts", "--no-widen"]);
+    let out = ur_stdout(&["--root", FIXTURE, "casts", "--hide-widen"]);
     for line in rows_of(&out) {
         let c = line.split('\t').next().unwrap_or("");
         assert!(c != "widen-int" && c != "widen-float", "widening leaked: {:?}", line);
@@ -1841,7 +1860,7 @@ fn playbook_extract_trait_audit() {
     assert!(!rows_of(&refs).is_empty(), "no Document type refs");
 
     let methods = ur_stdout(&[
-        "--root", FIXTURE, "inventory", "--kind", "fn",
+        "--root", FIXTURE, "inventory", "--kind", "impl-fn",
     ]);
     let doc_methods: Vec<_> = rows_of(&methods)
         .into_iter()
@@ -1901,7 +1920,7 @@ fn tests_with_hint_includes_args() {
 #[test]
 fn tests_by_subcommand_groups() {
     // Histogram should mention inventory (heavily tested subcommand).
-    ur().args(["--root", ".", "tests", "--by-subcommand"])
+    ur().args(["--root", ".", "tests", "--by", "subcommand"])
         .assert()
         .success()
         .stdout(contains("inventory"));

@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_last, path_to_string, type_short, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{FnSigIndex, FnTypes};
 
@@ -136,6 +136,22 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
         self.scope.leave_fn();
     }
 
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
+
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        let Some(body) = &i.default else { return };
+        self.scope.enter_fn(i.sig.ident.to_string());
+        self.fn_types_stack
+            .push(FnTypes::build(&i.sig, body, self.fn_sigs));
+        visit::visit_trait_item_fn(self, i);
+        self.fn_types_stack.pop();
+        self.scope.leave_fn();
+    }
+
     fn visit_expr_assign(&mut self, e: &'ast syn::ExprAssign) {
         self.in_write_lhs = true;
         self.visit_expr(&e.left);
@@ -231,6 +247,45 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     }
 }
 
+/// `--kind` filter values for `field-uses`.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum FieldKind {
+    Read,
+    Write,
+    Init,
+}
+
+impl FieldKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldKind::Read => "read",
+            FieldKind::Write => "write",
+            FieldKind::Init => "init",
+        }
+    }
+}
+
+/// Strict-mode (self / init / type-inferred) read/write/init counts for one
+/// (Type, field) pair. `fields` aggregates with this, so its per-field counts
+/// always equal the sum of `field-uses` strict rows for the same field.
+pub fn count_kinds(
+    files: &[ParsedFile],
+    ty: &str,
+    field: &str,
+    fn_sigs: &FnSigIndex,
+) -> (usize, usize, usize) {
+    let (mut reads, mut writes, mut inits) = (0, 0, 0);
+    for h in collect(files, ty, field, true, fn_sigs) {
+        match h.kind {
+            "read" => reads += 1,
+            "write" => writes += 1,
+            "init" => inits += 1,
+            _ => {}
+        }
+    }
+    (reads, writes, inits)
+}
+
 fn collect(
     files: &[ParsedFile],
     ty: &str,
@@ -262,16 +317,21 @@ pub fn run(
     ty: &str,
     field: &str,
     strict: bool,
-    kinds: &[&str],
+    kinds: &[FieldKind],
     via_receiver: Option<&str>,
 ) -> anyhow::Result<()> {
     let files = ctx.files;
     let fn_sigs = &ctx.sem.fn_sigs;
     let summary = ctx.summary;
+    let known = ctx.idx.knows_name(ty);
+    if !known {
+        warn_unknown_target("type", ty);
+    }
     let mut all = collect(files, ty, field, strict, fn_sigs);
 
     if !kinds.is_empty() {
-        all.retain(|h| kinds.contains(&h.kind));
+        let wanted: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        all.retain(|h| wanted.contains(&h.kind));
     }
     if let Some(pat) = via_receiver {
         all.retain(|h| h.receiver.contains(pat));
@@ -323,6 +383,9 @@ pub fn run(
                 cand.len()
             );
         }
+    }
+    if !known && all.is_empty() {
+        return Err(TargetNotFound::err("type", ty));
     }
     Ok(())
 }

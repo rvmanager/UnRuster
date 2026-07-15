@@ -111,6 +111,16 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         visit::visit_impl_item_fn(self, i);
         self.scope.leave_fn();
     }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        self.scope.enter_fn(i.sig.ident.to_string());
+        visit::visit_trait_item_fn(self, i);
+        self.scope.leave_fn();
+    }
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         let m = e.method.to_string();

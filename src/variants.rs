@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, type_short, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::ast::{enum_variant_of_path, line_of, type_short, ScopeTracker};
+use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parse::display_path;
 
 #[derive(Debug, Clone)]
@@ -63,24 +63,7 @@ impl<'a> SiteVisitor<'a> {
     }
 
     fn match_path(&self, p: &syn::Path) -> Option<String> {
-        let segs: Vec<&syn::PathSegment> = p.segments.iter().collect();
-        if segs.is_empty() {
-            return None;
-        }
-        let last = segs[segs.len() - 1].ident.to_string();
-        if !self.variant_names.iter().any(|v| v == &last) {
-            return None;
-        }
-        if segs.len() >= 2 {
-            let pen = segs[segs.len() - 2].ident.to_string();
-            if pen == self.target_enum {
-                return Some(last);
-            }
-        }
-        if self.bare && segs.len() == 1 {
-            return Some(last);
-        }
-        None
+        enum_variant_of_path(p, self.target_enum, self.variant_names, self.bare)
     }
 
     fn record(&mut self, kind: &'static str, variant: String, line: usize) {
@@ -121,6 +104,16 @@ impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_impl_item_fn(self, i);
+        self.scope.leave_fn();
+    }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        self.scope.enter_fn(i.sig.ident.to_string());
+        visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
 
@@ -241,8 +234,9 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<()>
         defs.extend(v.out);
     }
     if defs.is_empty() {
-        eprintln!("no enum named `{}` found", enum_name);
-        return Ok(());
+        warn_unknown_target("enum", enum_name);
+        eprintln!("(0 variants; 0 ctor sites, 0 match sites; bare={})", bare);
+        return Err(TargetNotFound::err("enum", enum_name));
     }
 
     let variant_names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();

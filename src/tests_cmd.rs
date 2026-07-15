@@ -33,6 +33,7 @@ struct TestInfo {
 struct TestVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
+    grammar: &'a CliGrammar,
     out: Vec<TestInfo>,
 }
 
@@ -48,7 +49,7 @@ impl<'a> TestVisitor<'a> {
         let line_start = line_of(&sig.ident);
         let line_end = body.span().end().line.max(line_start);
         let qpath = self.qualify(&sig.ident.to_string());
-        let (subcommand, hint) = scan_body_for_args(body);
+        let (subcommand, hint) = scan_body_for_args(body, self.grammar);
         self.out.push(TestInfo {
             attr: attr_kind,
             qpath,
@@ -107,9 +108,19 @@ fn classify_test_attr(attrs: &[syn::Attribute]) -> Option<&'static str> {
     None
 }
 
+/// The CLI's own grammar, derived from clap introspection in `main.rs` (never
+/// hand-maintained — a hand-written copy of this list once drifted and left the
+/// three newest subcommands undetected). `subcommands` are the known
+/// subcommand names; `value_flags` are the flags that consume the next
+/// argument as their value.
+pub struct CliGrammar {
+    pub subcommands: Vec<String>,
+    pub value_flags: std::collections::BTreeSet<String>,
+}
+
 /// Walk a test body for the first `.args([...])` method call (or `.arg(...)`)
 /// and extract the embedded subcommand + compact hint.
-fn scan_body_for_args(body: &syn::Block) -> (Option<String>, Option<String>) {
+fn scan_body_for_args(body: &syn::Block, grammar: &CliGrammar) -> (Option<String>, Option<String>) {
     let mut s = ArgScanner {
         first_args_literals: None,
         seen: false,
@@ -122,62 +133,16 @@ fn scan_body_for_args(body: &syn::Block) -> (Option<String>, Option<String>) {
     // First non-flag, non-value lit is the candidate subcommand. Cross-check
     // against the known list to filter false positives ("all" / "production"
     // / "unix" / cfg values that happen to look subcommand-shaped).
-    let subcommand = detect_subcommand(&lits);
+    let subcommand = detect_subcommand(&lits, grammar);
     let hint = build_hint(&lits);
     (subcommand, hint)
 }
 
-/// Flags that take a value as the next argument. Used by both the subcommand
-/// detector and the hint builder to skip flag-value pairs correctly.
-const VALUE_FLAGS: &[&str] = &[
-    "--root", "-r",
-    "--scope",
-    "--cfg",
-    "--kind", "-k",
-    "--vis",
-    "--by",
-    "--sort",
-    "--top",
-    "--threshold",
-    "--max-loc",
-    "--class",
-    "--depth",
-    "--of",
-    "--trait",
-    "--via-receiver",
-];
-
-/// All `Cmd` variants from main.rs, normalized to kebab-case. Update when
-/// adding a subcommand. Cross-checked by `detect_subcommand` so flag values
-/// like "all" / "production" don't get mis-classified as subcommands.
-const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "inventory",
-    "callers",
-    "callees",
-    "field-uses",
-    "fields",
-    "variants",
-    "impls",
-    "type-refs",
-    "takes-mut",
-    "metrics",
-    "dead-code",
-    "catch-all-arms",
-    "parallel-matches",
-    "error-swallows",
-    "pass-through",
-    "casts",
-    "conversions",
-    "conversion-pairs",
-    "stringly",
-    "tests",
-];
-
-fn detect_subcommand(lits: &[String]) -> Option<String> {
+fn detect_subcommand(lits: &[String], grammar: &CliGrammar) -> Option<String> {
     let mut i = 0;
     while i < lits.len() {
         let cur = &lits[i];
-        if VALUE_FLAGS.contains(&cur.as_str()) {
+        if grammar.value_flags.contains(cur.as_str()) {
             i += 2; // skip flag + its value
             continue;
         }
@@ -187,7 +152,7 @@ fn detect_subcommand(lits: &[String]) -> Option<String> {
         }
         // First non-flag string. Match against the known list to avoid
         // misreading flag values that happen to look subcommand-shaped.
-        if KNOWN_SUBCOMMANDS.contains(&cur.as_str()) {
+        if grammar.subcommands.iter().any(|s| s == cur) {
             return Some(cur.clone());
         }
         // Looks subcommand-shaped but unknown — bail rather than guess.
@@ -305,18 +270,23 @@ fn build_hint(lits: &[String]) -> Option<String> {
     }
 }
 
+/// `full_files` is the FULL tree (tests included) — under `--scope production`
+/// the tests this command enumerates would be stripped from `ctx.files`, so
+/// never read files from `ctx` here.
 pub fn run(
     ctx: &AnalysisCtx,
-    files: &[ParsedFile],
+    full_files: &[ParsedFile],
     with_hint: bool,
     by_subcommand: bool,
+    grammar: &CliGrammar,
 ) -> anyhow::Result<()> {
     let summary = ctx.summary;
     let mut all: Vec<TestInfo> = Vec::new();
-    for f in files {
+    for f in full_files {
         let mut v = TestVisitor {
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()),
+            grammar,
             out: Vec::new(),
         };
         v.visit_file(&f.ast);

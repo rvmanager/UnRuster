@@ -2,28 +2,30 @@ use std::collections::{BTreeMap, HashSet};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, type_short, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::ast::{enum_variant_of_path, line_of, type_short, ScopeTracker};
+use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::macro_scan::{macro_body, Body};
 use crate::parse::{display_path, ParsedFile};
 
+/// One scanned enum-dispatch site. `pub(crate)` because `catch-all-arms` is a
+/// filtered view over the same scanner (see `catch_all::run`).
 #[derive(Debug)]
-struct Site {
-    file: String,
-    line: usize,
-    context: String,
+pub(crate) struct Site {
+    pub(crate) file: String,
+    pub(crate) line: usize,
+    pub(crate) context: String,
     /// Names of the target enum's variants that appear in this match site.
-    variants: Vec<String>,
+    pub(crate) variants: Vec<String>,
     /// Did this site have a wildcard arm? `matches!()` always counts as having
     /// one — the implicit "no-match" branch is exactly the silent-misclassify
     /// risk this tool hunts for.
-    wildcard: bool,
+    pub(crate) wildcard: bool,
     /// True if this site is a `matches!()` invocation rather than a `match` expr.
-    is_macro: bool,
+    pub(crate) is_macro: bool,
     /// True if this site is an `if x == E::A { … } else if x == E::B { … }`
     /// dispatch chain rather than a `match` / `matches!`. Same risk class: the
     /// implicit (or explicit non-If) `else` silently re-bins a new variant.
-    is_if_chain: bool,
+    pub(crate) is_if_chain: bool,
     /// True if the wildcard / catch-all arm routes through a method call on the
     /// matched scrutinee (e.g. `_ => node.paint_slots()`). Such sites are a
     /// structural false positive for the partial-enumeration defect: a new
@@ -31,7 +33,7 @@ struct Site {
     /// behavior automatically. The tool can't see through the method call, so
     /// it would otherwise flag them. Always `false` for `matches!()` (no arm
     /// body to inspect).
-    trait_routed: bool,
+    pub(crate) trait_routed: bool,
 }
 
 struct ParaVisitor<'a> {
@@ -90,19 +92,7 @@ impl<'a> ParaVisitor<'a> {
     /// enum (last-segment rule) and `Variant` is one of its variants, return
     /// the variant ident. Otherwise `None`.
     fn variant_from_path(&self, p: &syn::Path) -> Option<String> {
-        let segs: Vec<&syn::PathSegment> = p.segments.iter().collect();
-        if segs.len() < 2 {
-            return None;
-        }
-        if segs[segs.len() - 2].ident != self.target_enum {
-            return None;
-        }
-        let last = segs[segs.len() - 1].ident.to_string();
-        if self.variant_names.iter().any(|v| v == &last) {
-            Some(last)
-        } else {
-            None
-        }
+        enum_variant_of_path(p, self.target_enum, self.variant_names, false)
     }
 
     /// Pull the target-enum variant ident out of an `==` operand expression.
@@ -211,9 +201,17 @@ impl<'a> ParaVisitor<'a> {
         })
     }
 
+    /// Wildcard / catch-all arm: `_`, a plain ident binding, or either of
+    /// those inside `|`-cases, references, or parens (`A | B | _`, `&_`).
     fn is_wildcard(pat: &syn::Pat) -> bool {
-        matches!(pat, syn::Pat::Wild(_))
-            || matches!(pat, syn::Pat::Ident(i) if i.subpat.is_none())
+        match pat {
+            syn::Pat::Wild(_) => true,
+            syn::Pat::Ident(i) => i.subpat.is_none(),
+            syn::Pat::Or(o) => o.cases.iter().any(Self::is_wildcard),
+            syn::Pat::Reference(r) => Self::is_wildcard(&r.pat),
+            syn::Pat::Paren(p) => Self::is_wildcard(&p.pat),
+            _ => false,
+        }
     }
 }
 
@@ -281,6 +279,16 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_impl_item_fn(self, i);
+        self.scope.leave_fn();
+    }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        self.scope.enter_fn(i.sig.ident.to_string());
+        visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
 
@@ -357,24 +365,33 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
 }
 
 /// Read the target enum's variant names from any definition in the tree.
-fn variant_names_of(files: &[ParsedFile], enum_name: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for f in files {
-        for item in &f.ast.items {
-            if let syn::Item::Enum(e) = item {
-                if e.ident == enum_name {
-                    for v in &e.variants {
-                        names.push(v.ident.to_string());
-                    }
-                }
+/// Uses a visitor so enums declared inside nested inline modules are found
+/// too (a plain loop over `f.ast.items` would miss them).
+pub(crate) fn variant_names_of(files: &[ParsedFile], enum_name: &str) -> Vec<String> {
+    struct V<'a> {
+        target: &'a str,
+        out: Vec<String>,
+    }
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
+        fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
+            if e.ident == self.target {
+                self.out
+                    .extend(e.variants.iter().map(|v| v.ident.to_string()));
             }
         }
     }
-    names
+    let mut v = V {
+        target: enum_name,
+        out: Vec::new(),
+    };
+    for f in files {
+        v.visit_file(&f.ast);
+    }
+    v.out
 }
 
 /// Walk every file and collect the match / `matches!` sites that mention the enum.
-fn collect_sites(
+pub(crate) fn collect_sites(
     files: &[ParsedFile],
     enum_name: &str,
     variant_names: &[String],
@@ -433,9 +450,19 @@ pub fn run(
     let index = ctx.idx;
     let summary = ctx.summary;
     let variant_names = variant_names_of(files, enum_name);
-    if variant_names.is_empty() && !index.knows_name(enum_name) {
-        eprintln!("no enum named `{}` found in scanned tree", enum_name);
-        return Ok(());
+    if variant_names.is_empty() {
+        if index.knows_name(enum_name) {
+            eprintln!(
+                "note: `{}` is named in the tree but no enum definition with variants \
+                 was found under --scope; nothing to scan",
+                enum_name
+            );
+            eprintln!("(0 match site(s) across 0 variant-set group(s) on `{}`)", enum_name);
+            return Ok(());
+        }
+        warn_unknown_target("enum", enum_name);
+        eprintln!("(0 match site(s) across 0 variant-set group(s) on `{}`)", enum_name);
+        return Err(TargetNotFound::err("enum", enum_name));
     }
     let total = variant_names.len();
 
@@ -537,16 +564,24 @@ pub fn run_enum_coverage(
     let summary = ctx.summary;
     let variant_names = variant_names_of(files, enum_name);
     if variant_names.is_empty() {
-        if index.knows_name(enum_name) {
+        let summary_line = || {
             eprintln!(
-                "enum `{}` is named in the tree but its definition (with variants) \
-                 wasn't found under --scope; nothing to score",
+                "(0 partial site(s) on `{}`; 0 total variant(s); exhaustive sites hidden)",
                 enum_name
             );
-        } else {
-            eprintln!("no enum named `{}` found in scanned tree", enum_name);
+        };
+        if index.knows_name(enum_name) {
+            eprintln!(
+                "note: `{}` is named in the tree but no enum definition with variants \
+                 was found under --scope; nothing to score",
+                enum_name
+            );
+            summary_line();
+            return Ok(());
         }
-        return Ok(());
+        warn_unknown_target("enum", enum_name);
+        summary_line();
+        return Err(TargetNotFound::err("enum", enum_name));
     }
     let total = variant_names.len();
 

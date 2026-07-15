@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, print_grouped_counts, top_module_of, type_short, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 
 #[derive(Debug)]
@@ -40,6 +40,64 @@ fn first_is_uppercase(s: &str) -> bool {
     s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
 }
 
+/// `--kind` filter values. Value names keep the sigil the row labels use
+/// (`.into`, `::from`) so filters read the same as the output.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConvKind {
+    #[value(name = ".into")]
+    Into,
+    #[value(name = ".try_into")]
+    TryInto,
+    #[value(name = ".to_string")]
+    ToString,
+    #[value(name = ".to_owned")]
+    ToOwned,
+    #[value(name = ".to_vec")]
+    ToVec,
+    #[value(name = ".as_str")]
+    AsStr,
+    #[value(name = ".as_bytes")]
+    AsBytes,
+    #[value(name = ".as_ref")]
+    AsRef,
+    #[value(name = ".as_mut")]
+    AsMut,
+    #[value(name = ".parse")]
+    Parse,
+    #[value(name = ".cloned")]
+    Cloned,
+    #[value(name = ".copied")]
+    Copied,
+    #[value(name = ".collect")]
+    Collect,
+    #[value(name = "::from")]
+    From,
+    #[value(name = "::try_from")]
+    TryFrom,
+}
+
+impl ConvKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ConvKind::Into => ".into",
+            ConvKind::TryInto => ".try_into",
+            ConvKind::ToString => ".to_string",
+            ConvKind::ToOwned => ".to_owned",
+            ConvKind::ToVec => ".to_vec",
+            ConvKind::AsStr => ".as_str",
+            ConvKind::AsBytes => ".as_bytes",
+            ConvKind::AsRef => ".as_ref",
+            ConvKind::AsMut => ".as_mut",
+            ConvKind::Parse => ".parse",
+            ConvKind::Cloned => ".cloned",
+            ConvKind::Copied => ".copied",
+            ConvKind::Collect => ".collect",
+            ConvKind::From => "::from",
+            ConvKind::TryFrom => "::try_from",
+        }
+    }
+}
+
 impl<'ast, 'a> Visit<'ast> for ConvVisitor<'a> {
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
         self.scope.enter_mod(i.ident.to_string());
@@ -59,6 +117,16 @@ impl<'ast, 'a> Visit<'ast> for ConvVisitor<'a> {
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         self.scope.enter_fn(i.sig.ident.to_string());
         visit::visit_impl_item_fn(self, i);
+        self.scope.leave_fn();
+    }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.scope.enter_trait(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+        self.scope.leave_trait();
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        self.scope.enter_fn(i.sig.ident.to_string());
+        visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
 
@@ -126,8 +194,8 @@ impl<'ast, 'a> Visit<'ast> for ConvVisitor<'a> {
 
 pub fn run(
     ctx: &AnalysisCtx,
-    kind_filter: Option<&str>,
-    by: Option<&str>,
+    kind_filter: &[ConvKind],
+    by: Option<GroupBy>,
     top: Option<usize>,
 ) -> anyhow::Result<()> {
     let files = ctx.files;
@@ -143,19 +211,19 @@ pub fn run(
         all.extend(v.hits);
     }
 
-    if let Some(k) = kind_filter {
-        let wanted: Vec<&str> = k.split(',').map(str::trim).collect();
+    if !kind_filter.is_empty() {
+        let wanted: Vec<&str> = kind_filter.iter().map(|k| k.as_str()).collect();
         all.retain(|h| wanted.contains(&h.kind));
     }
 
     if !summary {
         match by {
-            Some("fn") => print_grouped_counts(&all, top, |h| h.context.clone()),
-            Some("file") => print_grouped_counts(&all, top, |h| h.file.clone()),
-            Some("module") => {
+            Some(GroupBy::Fn) => print_grouped_counts(&all, top, |h| h.context.clone()),
+            Some(GroupBy::File) => print_grouped_counts(&all, top, |h| h.file.clone()),
+            Some(GroupBy::Module) => {
                 print_grouped_counts(&all, top, |h| top_module_of(&h.context).to_string())
             }
-            _ => {
+            None => {
                 all.sort_by(|a, b| {
                     a.kind
                         .cmp(b.kind)
@@ -176,10 +244,6 @@ pub fn run(
         *by_kind.entry(h.kind).or_insert(0) += 1;
     }
     let break_str: Vec<String> = by_kind.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
-    eprintln!(
-        "({} conversion call(s); {}; design-smell hint: a fn with many conversion calls is reshaping the same value repeatedly — usually a sign the wrong type was chosen at the boundary.)",
-        all.len(),
-        break_str.join(", ")
-    );
+    eprintln!("({} conversion call(s); {})", all.len(), break_str.join(", "));
     Ok(())
 }
