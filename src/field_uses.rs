@@ -7,7 +7,7 @@ use crate::semantic::{FnSigIndex, FnTypes};
 
 #[derive(Debug)]
 struct FieldHit {
-    kind: &'static str, // "read" | "write" | "init"
+    kind: FieldKind,
     /// Why we believe this hit refers to the target type:
     /// "self" — self in `impl Type`
     /// "init" — `Type { f: ... }` struct literal
@@ -51,7 +51,7 @@ impl<'a> FieldVisitor<'a> {
             .unwrap_or(false)
     }
 
-    fn record(&mut self, kind: &'static str, via: &'static str, line: usize, receiver: String) {
+    fn record(&mut self, kind: FieldKind, via: &'static str, line: usize, receiver: String) {
         self.hits.push(FieldHit {
             kind,
             via,
@@ -206,7 +206,7 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
         let is_write = self.in_write_lhs;
         let was_write = self.in_write_lhs;
         self.in_write_lhs = false;
-        let kind: &'static str = if is_write { "write" } else { "read" };
+        let kind = if is_write { FieldKind::Write } else { FieldKind::Read };
 
         if let Some((via, recv)) = self.classify_base(&e.base) {
             self.record(kind, via, line_of(id), recv);
@@ -232,7 +232,7 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
                 if let syn::Member::Named(id) = &fv.member {
                     if id == self.target_field {
                         let line = line_of(id);
-                        self.record("init", "init", line, resolved_ty.clone());
+                        self.record(FieldKind::Init, "init", line, resolved_ty.clone());
                     }
                 }
             }
@@ -248,7 +248,7 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
 }
 
 /// `--kind` filter values for `field-uses`.
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum FieldKind {
     Read,
     Write,
@@ -277,10 +277,9 @@ pub fn count_kinds(
     let (mut reads, mut writes, mut inits) = (0, 0, 0);
     for h in collect(files, ty, field, true, fn_sigs) {
         match h.kind {
-            "read" => reads += 1,
-            "write" => writes += 1,
-            "init" => inits += 1,
-            _ => {}
+            FieldKind::Read => reads += 1,
+            FieldKind::Write => writes += 1,
+            FieldKind::Init => inits += 1,
         }
     }
     (reads, writes, inits)
@@ -330,8 +329,7 @@ pub fn run(
     let mut all = collect(files, ty, field, strict, fn_sigs);
 
     if !kinds.is_empty() {
-        let wanted: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
-        all.retain(|h| wanted.contains(&h.kind));
+        all.retain(|h| kinds.contains(&h.kind));
     }
     if let Some(pat) = via_receiver {
         all.retain(|h| h.receiver.contains(pat));
@@ -339,7 +337,8 @@ pub fn run(
 
     all.sort_by(|a, b| {
         a.kind
-            .cmp(b.kind)
+            .as_str()
+            .cmp(b.kind.as_str())
             .then_with(|| a.via.cmp(b.via))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))
@@ -352,10 +351,9 @@ pub fn run(
     let mut q_count = 0usize;
     for h in &all {
         match h.kind {
-            "read" => reads += 1,
-            "write" => writes += 1,
-            "init" => inits += 1,
-            _ => {}
+            FieldKind::Read => reads += 1,
+            FieldKind::Write => writes += 1,
+            FieldKind::Init => inits += 1,
         }
         match h.via {
             "ti" => ti_count += 1,
@@ -365,7 +363,12 @@ pub fn run(
         if !summary {
             println!(
                 "{}\t{}\t{}\t{}\t{}:{}",
-                h.kind, h.via, h.receiver, h.context, h.file, h.line
+                h.kind.as_str(),
+                h.via,
+                h.receiver,
+                h.context,
+                h.file,
+                h.line
             );
         }
     }

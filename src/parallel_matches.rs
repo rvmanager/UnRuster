@@ -495,11 +495,12 @@ pub fn run(
     // --rank-by-gap, order by coverage ratio descending instead — a 7/8 group
     // (one new variant silently mis-binds) is a louder defect signal than a 1/8.
     if opts.rank_by_gap && total > 0 {
+        // Every group shares the denominator `total`, so ordering by
+        // covered/total is exactly ordering by covered-count — no floats.
         rows.sort_by(|a, b| {
-            let ga = a.0 .0.len() as f64 / total as f64;
-            let gb = b.0 .0.len() as f64 / total as f64;
-            gb.partial_cmp(&ga)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.0 .0
+                .len()
+                .cmp(&a.0 .0.len())
                 .then_with(|| b.1.len().cmp(&a.1.len()))
                 .then_with(|| a.0.cmp(&b.0))
         });
@@ -616,11 +617,14 @@ pub fn run_enum_coverage(
             missing: missing_variants(&s.variants, &variant_names),
         })
         .collect();
-    // Highest coverage ratio (smallest gap to full) first — loudest signal on top.
+    // Highest coverage ratio (smallest gap to full) first — loudest signal on
+    // top. The denominator `total` is shared, so covered-count ordering is
+    // exact; `gap` is computed only for display.
     rows.sort_by(|a, b| {
-        b.gap
-            .partial_cmp(&a.gap)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.site
+            .variants
+            .len()
+            .cmp(&a.site.variants.len())
             .then_with(|| a.site.file.cmp(&b.site.file))
             .then_with(|| a.site.line.cmp(&b.site.line))
     });

@@ -47,10 +47,12 @@ pub fn parse_dir(
             continue;
         }
         let is_test_file = is_under_test_dir(path);
+        // Exhaustive (no `_`) so adding a Scope variant forces a decision
+        // here — this site was `unruster enum-coverage Scope`'s top row.
         match scope {
             Scope::Production if is_test_file => continue,
             Scope::Tests if !is_test_file && !looks_like_test_named(path) => continue,
-            _ => {}
+            Scope::Production | Scope::Tests | Scope::All => {}
         }
 
         let source = match std::fs::read_to_string(path) {

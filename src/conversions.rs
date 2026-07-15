@@ -132,21 +132,26 @@ impl<'ast, 'a> Visit<'ast> for ConvVisitor<'a> {
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         let m = e.method.to_string();
-        let kind: Option<&'static str> = match m.as_str() {
-            "into" if e.args.is_empty() => Some(".into"),
-            "try_into" if e.args.is_empty() => Some(".try_into"),
-            "to_string" if e.args.is_empty() => Some(".to_string"),
-            "to_owned" if e.args.is_empty() => Some(".to_owned"),
-            "to_vec" if e.args.is_empty() => Some(".to_vec"),
-            "as_str" if e.args.is_empty() => Some(".as_str"),
-            "as_bytes" if e.args.is_empty() => Some(".as_bytes"),
-            "as_ref" if e.args.is_empty() => Some(".as_ref"),
-            "as_mut" if e.args.is_empty() => Some(".as_mut"),
-            "parse" if e.args.is_empty() => Some(".parse"),
-            "cloned" if e.args.is_empty() => Some(".cloned"),
-            "copied" if e.args.is_empty() => Some(".copied"),
-            "collect" if e.args.is_empty() => Some(".collect"),
-            _ => None,
+        // Every recognized conversion method is zero-arg; guard once.
+        let kind: Option<&'static str> = if !e.args.is_empty() {
+            None
+        } else {
+            match m.as_str() {
+                "into" => Some(".into"),
+                "try_into" => Some(".try_into"),
+                "to_string" => Some(".to_string"),
+                "to_owned" => Some(".to_owned"),
+                "to_vec" => Some(".to_vec"),
+                "as_str" => Some(".as_str"),
+                "as_bytes" => Some(".as_bytes"),
+                "as_ref" => Some(".as_ref"),
+                "as_mut" => Some(".as_mut"),
+                "parse" => Some(".parse"),
+                "cloned" => Some(".cloned"),
+                "copied" => Some(".copied"),
+                "collect" => Some(".collect"),
+                _ => None,
+            }
         };
         if let Some(k) = kind {
             // Extract turbofish target if present.
