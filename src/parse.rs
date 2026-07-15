@@ -20,17 +20,8 @@ pub enum Scope {
     All,
 }
 
-pub fn parse_dir(
-    root: &Path,
-    scope: Scope,
-    user_cfgs: &[String],
-    excludes: &[String],
-) -> anyhow::Result<Vec<ParsedFile>> {
-    let cfg_env = build_cfg_env(scope, user_cfgs);
-    let mut files = Vec::new();
-    let mut walk_errs = 0usize;
-    let mut read_errs = 0usize;
-    let mut parse_errs = 0usize;
+/// Directory walker honoring .gitignore plus the user's `--exclude` globs.
+fn build_walker(root: &Path, excludes: &[String]) -> anyhow::Result<ignore::Walk> {
     let mut walker = ignore::WalkBuilder::new(root);
     walker.standard_filters(true);
     if !excludes.is_empty() {
@@ -42,7 +33,32 @@ pub fn parse_dir(
         }
         walker.overrides(ov.build()?);
     }
-    for entry in walker.build() {
+    Ok(walker.build())
+}
+
+/// Should `path` be skipped entirely under this scope? Exhaustive (no `_`)
+/// so a new Scope variant forces a decision here.
+fn out_of_scope(path: &Path, scope: Scope) -> bool {
+    let is_test_file = is_under_test_dir(path);
+    match scope {
+        Scope::Production => is_test_file,
+        Scope::Tests => !is_test_file && !looks_like_test_named(path),
+        Scope::All => false,
+    }
+}
+
+pub fn parse_dir(
+    root: &Path,
+    scope: Scope,
+    user_cfgs: &[String],
+    excludes: &[String],
+) -> anyhow::Result<Vec<ParsedFile>> {
+    let cfg_env = build_cfg_env(scope, user_cfgs);
+    let mut files = Vec::new();
+    let mut walk_errs = 0usize;
+    let mut read_errs = 0usize;
+    let mut parse_errs = 0usize;
+    for entry in build_walker(root, excludes)? {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -58,13 +74,8 @@ pub fn parse_dir(
         if path.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
-        let is_test_file = is_under_test_dir(path);
-        // Exhaustive (no `_`) so adding a Scope variant forces a decision
-        // here — this site was `unruster enum-coverage Scope`'s top row.
-        match scope {
-            Scope::Production if is_test_file => continue,
-            Scope::Tests if !is_test_file && !looks_like_test_named(path) => continue,
-            Scope::Production | Scope::Tests | Scope::All => {}
+        if out_of_scope(path, scope) {
+            continue;
         }
 
         let source = match std::fs::read_to_string(path) {

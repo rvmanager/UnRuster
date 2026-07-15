@@ -235,6 +235,11 @@ struct AuditArgs {
     /// Cap per-section rows where the underlying check supports it.
     #[arg(long)]
     top: Option<usize>,
+    /// Advisory (candidate-class) findings gate the exit code too. By
+    /// default only [high] deterministic defect classes do, so the agent
+    /// loop converges on a healthy codebase.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args)]
@@ -656,7 +661,7 @@ fn main() -> Result<()> {
             // Like dead-code, the call-set must come from the FULL tree.
             let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg, &cli.exclude)?;
             let call_source = all_files.as_deref().unwrap_or(&files);
-            audit::run(&ctx, call_source, a.top)
+            audit::run(&ctx, call_source, a.top, a.strict)
         }
         Cmd::Inventory(a) => inventory::run(&ctx, a.kind, a.vis, a.tree),
         Cmd::Callers(a) => {
