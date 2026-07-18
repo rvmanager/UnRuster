@@ -320,8 +320,8 @@ pub fn run(
                 .then_with(|| b.loc.cmp(&a.loc))
         }),
     }
-    structs.sort_by(|a, b| b.fields.cmp(&a.fields));
-    enums.sort_by(|a, b| b.variants.cmp(&a.variants));
+    structs.sort_by_key(|s| std::cmp::Reverse(s.fields));
+    enums.sort_by_key(|e| std::cmp::Reverse(e.variants));
 
     if !summary {
         for m in fns.iter().take(top) {

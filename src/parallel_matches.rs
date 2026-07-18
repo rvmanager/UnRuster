@@ -67,8 +67,43 @@ impl<'a> ParaVisitor<'a> {
     fn collect_variants(&self, pat: &syn::Pat, out: &mut Vec<String>) {
         match pat {
             syn::Pat::Path(p) => self.push_if_match(&p.path, out),
-            syn::Pat::TupleStruct(p) => self.push_if_match(&p.path, out),
-            syn::Pat::Struct(p) => self.push_if_match(&p.path, out),
+            // Tuple-struct / struct patterns: check the pattern's own path,
+            // then recurse into the payload patterns. The enum dispatch this
+            // tool hunts for routinely hides one level down, inside an
+            // Option/Result wrapper produced by a lookup:
+            //   match doc.find_node(id) { Some(NodeContent::BaseShape(_)) => … }
+            // Without the recursion the site scores as "no variants" and the
+            // partial-enumeration scanner never sees it.
+            syn::Pat::TupleStruct(p) => {
+                self.push_if_match(&p.path, out);
+                for elem in &p.elems {
+                    self.collect_variants(elem, out);
+                }
+            }
+            syn::Pat::Struct(p) => {
+                self.push_if_match(&p.path, out);
+                for f in &p.fields {
+                    self.collect_variants(&f.pat, out);
+                }
+            }
+            // Plain tuple patterns: multi-scrutinee dispatch
+            // (`match (kind, other) { (E::A, _) => … }`).
+            syn::Pat::Tuple(t) => {
+                for elem in &t.elems {
+                    self.collect_variants(elem, out);
+                }
+            }
+            syn::Pat::Slice(s) => {
+                for elem in &s.elems {
+                    self.collect_variants(elem, out);
+                }
+            }
+            // `binding @ E::A(..)` — the subpattern carries the variant.
+            syn::Pat::Ident(i) => {
+                if let Some((_, sub)) = &i.subpat {
+                    self.collect_variants(sub, out);
+                }
+            }
             syn::Pat::Or(o) => {
                 for c in &o.cases {
                     self.collect_variants(c, out);
@@ -147,10 +182,9 @@ impl<'a> ParaVisitor<'a> {
         let mut else_block: Option<&syn::Expr> = None;
 
         let mut cur = head;
-        loop {
-            let Some((_, else_expr)) = cur.else_branch.as_ref() else {
-                break; // implicit `else` — chain terminates with no catch-all body
-            };
+        // Implicit `else` (no else_branch) terminates the chain with no
+        // catch-all body.
+        while let Some((_, else_expr)) = cur.else_branch.as_ref() {
             match else_expr.as_ref() {
                 syn::Expr::If(next) => match self.eq_arm(&next.cond) {
                     Some((s2, v2)) if peel_expr(s2) == scrutinee => {

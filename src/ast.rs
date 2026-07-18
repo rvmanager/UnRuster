@@ -400,11 +400,7 @@ fn tokens_contain_test(ts: &TokenStream) -> bool {
     for tt in ts.clone() {
         match tt {
             TokenTree::Ident(id) if id == "test" => return true,
-            TokenTree::Group(g) => {
-                if tokens_contain_test(&g.stream()) {
-                    return true;
-                }
-            }
+            TokenTree::Group(g) if tokens_contain_test(&g.stream()) => return true,
             _ => {}
         }
     }

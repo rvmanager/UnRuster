@@ -799,6 +799,82 @@ fn enum_coverage_flags_and_hides_trait_routed_catchalls() {
     );
 }
 
+// The enum dispatch routinely hides one pattern level down — inside the
+// `Some(...)` / `Ok(...)` wrapper a lookup returns, a tuple scrutinee, or a
+// `binding @ Variant` subpattern. The scanner must recurse into nested
+// patterns or these sites score as "no variants" and vanish from
+// enum-coverage / parallel-matches / catch-all-arms entirely (the
+// `Selection::reconcile` blind spot).
+#[test]
+fn enum_coverage_sees_variants_nested_in_wrapper_patterns() {
+    let tmp = std::env::temp_dir().join("unruster-nested-patterns");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(
+        tmp.join("src/main.rs"),
+        "pub enum Node { Base(u8), Composite(u8), Image, Text }\n\
+         // Option-wrapped scrutinee: `match lookup(id) { Some(Node::X) => … }`.\n\
+         pub fn via_option(n: Option<&Node>) -> bool {\n\
+             match n {\n\
+                 Some(Node::Base(_)) => true,\n\
+                 Some(Node::Image) => true,\n\
+                 _ => false,\n\
+             }\n\
+         }\n\
+         // Tuple scrutinee dispatching on the enum in one position.\n\
+         pub fn via_tuple(n: &Node, flag: bool) -> bool {\n\
+             match (n, flag) {\n\
+                 (Node::Base(_), true) => true,\n\
+                 (Node::Composite(_), _) => true,\n\
+                 _ => false,\n\
+             }\n\
+         }\n\
+         // `binding @ Variant` subpattern.\n\
+         pub fn via_binding(n: &Node) -> bool {\n\
+             match n {\n\
+                 b @ Node::Text => { let _ = b; true }\n\
+                 Node::Image => true,\n\
+                 _ => false,\n\
+             }\n\
+         }\n\
+         // matches! with an Option-wrapped pattern.\n\
+         pub fn via_matches(n: Option<&Node>) -> bool {\n\
+             matches!(n, Some(Node::Base(_) | Node::Text))\n\
+         }\n",
+    )
+    .unwrap();
+    let root = tmp.to_str().unwrap();
+
+    let out = ur_stdout(&["--root", root, "enum-coverage", "Node"]);
+    let s = String::from_utf8_lossy(&out);
+    let row = |f: &str| {
+        s.lines()
+            .find(|l| l.contains(f))
+            .unwrap_or_else(|| panic!("expected a row for `{}`:\n{}", f, s))
+            .to_string()
+    };
+    assert!(
+        row("via_option").contains("2/4") && row("via_option").contains("Base,Image"),
+        "Option-wrapped match must score its nested variants:\n{}",
+        s
+    );
+    assert!(
+        row("via_tuple").contains("Base,Composite"),
+        "tuple-scrutinee match must score per-position variants:\n{}",
+        s
+    );
+    assert!(
+        row("via_binding").contains("Image,Text"),
+        "`b @ Variant` subpattern must count:\n{}",
+        s
+    );
+    assert!(
+        row("via_matches").contains("Base,Text"),
+        "matches! with wrapped pattern must count:\n{}",
+        s
+    );
+}
+
 // ─── if-chains (== / if-else-if dispatch) ───────────────────────────────────
 
 /// The whole `if-chain` row for a given enclosing fn, or "" if absent.
