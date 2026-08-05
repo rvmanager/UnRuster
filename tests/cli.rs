@@ -2258,3 +2258,30 @@ fn callers_transitive_unlimited_depth_terminates() {
         .assert()
         .success();
 }
+
+#[test]
+fn audit_strict_gates_advisory_findings() {
+    ur().args(["--root", FIXTURE, "audit", "--strict"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("--strict: all gate"));
+}
+
+#[test]
+fn enum_coverage_all_tags_sealed_rows() {
+    ur().args(["--root", FIXTURE, "enum-coverage", "--all"])
+        .assert()
+        .stdout(contains("SEALED"));
+}
+
+#[test]
+fn explain_matches_multi_word_topic() {
+    ur().args(["explain", "god", "function"])
+        .assert()
+        .failure(); // clap: one positional — multi-word must be quoted
+    ur().args(["explain", "god function"])
+        .assert()
+        .success()
+        .stdout(contains("GOD FUNCTION TO SPLIT"));
+}

@@ -63,7 +63,7 @@ impl NameIndex {
     /// For bare names, returns all defns whose last segment matches.
     /// For qualified, returns defns whose qpath ends with the query.
     pub fn lookup(&self, query: &str) -> Vec<&Defn> {
-        let last = query.rsplit("::").next().unwrap_or(query);
+        let last = crate::ast::last_segment(query);
         let Some(ids) = self.by_last.get(last) else {
             return Vec::new();
         };

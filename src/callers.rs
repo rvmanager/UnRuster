@@ -158,8 +158,8 @@ fn matches_target(call_target: &str, query: &str) -> bool {
         let Some(target_macro) = call_target.strip_suffix('!') else {
             return false;
         };
-        let target_last = target_macro.rsplit("::").next().unwrap_or(target_macro);
-        let q_last = name.rsplit("::").next().unwrap_or(name);
+        let target_last = crate::ast::last_segment(target_macro);
+        let q_last = crate::ast::last_segment(name);
         return target_last == q_last;
     }
     if let Some(method) = query.strip_prefix('.') {
@@ -169,8 +169,8 @@ fn matches_target(call_target: &str, query: &str) -> bool {
         if call_target.starts_with('.') || call_target.ends_with('!') {
             return false;
         }
-        let last = rest.rsplit("::").next().unwrap_or(rest);
-        let target_last = call_target.rsplit("::").next().unwrap_or(call_target);
+        let last = crate::ast::last_segment(rest);
+        let target_last = crate::ast::last_segment(call_target);
         return target_last == last;
     }
     if query.contains("::") {
@@ -180,9 +180,9 @@ fn matches_target(call_target: &str, query: &str) -> bool {
     let target_last = if let Some(m) = call_target.strip_prefix('.') {
         m
     } else if let Some(m) = call_target.strip_suffix('!') {
-        m.rsplit("::").next().unwrap_or(m)
+        crate::ast::last_segment(m)
     } else {
-        call_target.rsplit("::").next().unwrap_or(call_target)
+        crate::ast::last_segment(call_target)
     };
     target_last == query
 }
@@ -338,9 +338,9 @@ fn transitive_callers(
         let last = if let Some(m) = s.target.strip_prefix('.') {
             m.to_string()
         } else if let Some(m) = s.target.strip_suffix('!') {
-            m.rsplit("::").next().unwrap_or(m).to_string()
+            crate::ast::last_segment(m).to_string()
         } else {
-            s.target.rsplit("::").next().unwrap_or(&s.target).to_string()
+            crate::ast::last_segment(&s.target).to_string()
         };
         rev.entry(last).or_default().insert(s.caller.clone());
     }
@@ -368,7 +368,7 @@ fn transitive_callers(
             continue;
         };
         for caller in callers {
-            let caller_last = caller.rsplit("::").next().unwrap_or(caller).to_string();
+            let caller_last = crate::ast::last_segment(caller).to_string();
             visited.entry(caller.clone()).or_insert(d + 1);
             if d + 1 < max_depth && seen_names.insert(caller_last.clone()) {
                 queue.push_back((caller_last, d + 1));
@@ -475,13 +475,13 @@ fn cohort_members(index: &NameIndex, pattern: &str) -> Vec<(String, String, Stri
     // Decide labels: bare last segment, or full qpath if names collide.
     let mut name_counts: BTreeMap<String, usize> = BTreeMap::new();
     for (qpath, _, _) in &members {
-        let last = qpath.rsplit("::").next().unwrap_or(qpath).to_string();
+        let last = crate::ast::last_segment(qpath).to_string();
         *name_counts.entry(last).or_insert(0) += 1;
     }
     members
         .into_iter()
         .map(|(qpath, file, line)| {
-            let last = qpath.rsplit("::").next().unwrap_or(&qpath);
+            let last = crate::ast::last_segment(qpath.as_str());
             let label = if name_counts.get(last).copied().unwrap_or(0) > 1 {
                 qpath.clone()
             } else {
@@ -781,13 +781,13 @@ pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<usize> {
     let sem = ctx.sem;
     let summary = ctx.summary;
     let sites = collect_sites(files, sem, index, ctx.spans);
-    let last = query.rsplit("::").next().unwrap_or(query);
+    let last = crate::ast::last_segment(query);
 
     let in_target = |caller: &str| -> bool {
         if query.contains("::") {
             caller == query || caller.ends_with(&format!("::{}", query))
         } else {
-            caller.rsplit("::").next().unwrap_or(caller) == last
+            crate::ast::last_segment(caller) == last
         }
     };
 

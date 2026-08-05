@@ -16,7 +16,7 @@ impl<'ast> Visit<'ast> for CallSink {
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*e.func {
             let s = path_to_string(&p.path);
-            let last = s.rsplit("::").next().unwrap_or(&s).to_string();
+            let last = crate::ast::last_segment(&s).to_string();
             self.called.insert(last);
         }
         visit::visit_expr_call(self, e);
@@ -30,7 +30,7 @@ impl<'ast> Visit<'ast> for CallSink {
     fn visit_expr_path(&mut self, e: &'ast syn::ExprPath) {
         // Track fn-references-as-values (`let f = some_fn; f();`) too.
         let s = path_to_string(&e.path);
-        let last = s.rsplit("::").next().unwrap_or(&s).to_string();
+        let last = crate::ast::last_segment(&s).to_string();
         self.called.insert(last);
         visit::visit_expr_path(self, e);
     }

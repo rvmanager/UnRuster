@@ -279,7 +279,9 @@ impl FnTypes {
     ) -> Self {
         let mut ft = FnTypes::default();
         // `self` receiver: typed by the enclosing impl block, when known.
+        // `Self` (the type) resolves there too, in any associated fn.
         if let Some(t) = self_ty {
+            ft.bindings.insert("Self".to_string(), t.to_string());
             if sig
                 .inputs
                 .first()
@@ -361,32 +363,16 @@ fn infer_expr_type(
             }
             None
         }
-        syn::Expr::Call(c) => {
-            if let syn::Expr::Path(p) = &*c.func {
-                let segs: Vec<&syn::PathSegment> = p.path.segments.iter().collect();
-                // `Type::new(...)` / `Type::default()` / `Type::from(...)` / `Type::with_capacity(...)`
-                if segs.len() >= 2 {
-                    let last = &segs[segs.len() - 1].ident;
-                    let pen = &segs[segs.len() - 2].ident;
-                    if first_is_uppercase(&pen.to_string())
-                        && matches!(
-                            last.to_string().as_str(),
-                            "new" | "default" | "from" | "with_capacity" | "from_str" | "empty"
-                        )
-                    {
-                        return Some(pen.to_string());
-                    }
-                }
-                // Bare `fn_name(...)`: look up return type.
-                if segs.len() == 1 {
-                    return sigs
-                        .return_type(&segs[0].ident.to_string())
-                        .map(str::to_string);
-                }
+        syn::Expr::Call(c) => infer_call_type(c, sigs, bindings),
+        // `Type { .. }` literal; `Self { .. }` resolves through the enclosing
+        // impl's type (the `Self` binding).
+        syn::Expr::Struct(s) => {
+            let last = s.path.segments.last().map(|seg| seg.ident.to_string())?;
+            if last == "Self" {
+                return bindings.get("Self").cloned();
             }
-            None
+            Some(last)
         }
-        syn::Expr::Struct(s) => s.path.segments.last().map(|seg| seg.ident.to_string()),
         // `base.field` — resolve through the struct-field type map.
         syn::Expr::Field(f) => {
             let base = infer_expr_type(&f.base, sigs, bindings)?;
@@ -407,6 +393,43 @@ fn infer_expr_type(
         syn::Expr::Try(t) => infer_expr_type(&t.expr, sigs, bindings),
         _ => None,
     }
+}
+
+/// Infer the type of a call expression: `Type::ctor(...)` associated
+/// constructors (incl. clap's `Type::parse()`), `Self::ctor(...)` through the
+/// enclosing impl, or a bare `fn_name(...)` via its indexed return type.
+fn infer_call_type(
+    c: &syn::ExprCall,
+    sigs: &FnSigIndex,
+    bindings: &BTreeMap<String, String>,
+) -> Option<String> {
+    let syn::Expr::Path(p) = &*c.func else {
+        return None;
+    };
+    let segs: Vec<&syn::PathSegment> = p.path.segments.iter().collect();
+    if segs.len() >= 2 {
+        let last = segs[segs.len() - 1].ident.to_string();
+        let pen = segs[segs.len() - 2].ident.to_string();
+        let is_ctor_name = matches!(
+            last.as_str(),
+            "new" | "default" | "from" | "with_capacity" | "from_str" | "empty" | "parse"
+        );
+        if is_ctor_name {
+            if pen == "Self" {
+                return bindings.get("Self").cloned();
+            }
+            if first_is_uppercase(&pen) {
+                return Some(pen);
+            }
+        }
+    }
+    // Bare `fn_name(...)`: look up return type.
+    if segs.len() == 1 {
+        return sigs
+            .return_type(&segs[0].ident.to_string())
+            .map(str::to_string);
+    }
+    None
 }
 
 fn first_is_uppercase(s: &str) -> bool {

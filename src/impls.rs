@@ -12,14 +12,14 @@ pub fn run(
         .filter(|d| d.kind == "impl")
         .filter(|d| match of_type {
             Some(t) => {
-                let last = t.rsplit("::").next().unwrap_or(t);
+                let last = crate::ast::last_segment(t);
                 d.name == last
             }
             None => true,
         })
         .filter(|d| match of_trait {
             Some(tr) => {
-                let last = tr.rsplit("::").next().unwrap_or(tr);
+                let last = crate::ast::last_segment(tr);
                 d.trait_name.as_deref() == Some(last)
             }
             None => true,

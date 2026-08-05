@@ -605,6 +605,113 @@ fn full_tree_if_needed(
     }
 }
 
+/// Print the macro blind-spot count, if any, on stderr.
+fn report_blind_spots() {
+    let blind = macro_scan::blind_spots();
+    if blind > 0 {
+        eprintln!(
+            "(blind spots: {} macro body(ies) could not be parsed as expressions — \
+             code inside them was not analyzed)",
+            blind
+        );
+    }
+}
+
+/// Route one parsed subcommand to its implementation. Pure jump table —
+/// extracted so `main` itself stays small (its own `metrics --sort cyclo`
+/// flagged the combined fn at 47).
+#[allow(clippy::too_many_arguments)]
+fn dispatch(
+    cmd: Cmd,
+    ctx: &AnalysisCtx,
+    files: &[parse::ParsedFile],
+    root: &std::path::Path,
+    scope: Scope,
+    cfg: &[String],
+    exclude: &[String],
+) -> Result<usize> {
+    match cmd {
+        Cmd::Audit(a) => {
+            // Like dead-code, the call-set must come from the FULL tree.
+            let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
+            let call_source = all_files.as_deref().unwrap_or(files);
+            audit::run(ctx, call_source, a.top, a.strict)
+        }
+        Cmd::Inventory(a) => inventory::run(ctx, a.kind, a.vis, a.tree),
+        Cmd::Callers(a) => {
+            if let Some(pattern) = a.among.as_deref() {
+                callers::run_callers_among(ctx, &a.name, pattern)
+            } else {
+                callers::run_callers(ctx, &a.name, a.transitive, a.depth, a.by, a.min_confidence)
+            }
+        }
+        Cmd::Callees(a) => callers::run_callees(ctx, &a.name),
+        Cmd::CoCall(a) => callers::run_co_call(ctx, &a.a, &a.b),
+        Cmd::FieldUses(a) => field_uses::run(
+            ctx,
+            &a.ty,
+            &a.field,
+            field_uses::FieldUsesOpts {
+                strict: !a.candidates,
+                kinds: &a.kind,
+                via_receiver: a.via_receiver.as_deref(),
+                min_confidence: a.min_confidence,
+            },
+        ),
+        Cmd::Fields(a) => fields::run(ctx, &a.ty),
+        Cmd::Variants(a) => variants::run(ctx, &a.name, a.bare),
+        Cmd::Impls(a) => impls::run(ctx, a.of.as_deref(), a.trait_.as_deref()),
+        Cmd::TypeRefs(a) => type_refs::run(ctx, &a.ty, a.min_confidence),
+        Cmd::TakesMut(a) => takes_mut::run(ctx, &a.ty),
+        Cmd::Metrics(a) => metrics::run(ctx, a.sort, a.top, a.threshold, false),
+        Cmd::DeadCode(a) => {
+            // Build the call-set from the FULL tree so production items called
+            // only from tests aren't false-flagged as dead.
+            let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
+            let call_source = all_files.as_deref().unwrap_or(files);
+            dead_code::run(ctx, call_source, a.pub_only, a.include_trait_impls)
+        }
+        Cmd::CatchAllArms(a) => catch_all::run(ctx, a.name.as_deref()),
+        Cmd::ParallelMatches(a) => parallel_matches::run(
+            ctx,
+            a.name.as_deref(),
+            parallel_matches::ScanOpts {
+                partial_only: a.hide_exhaustive,
+                rank_by_gap: a.rank_by_gap,
+                show_missing: a.show_missing,
+                include_matches_macro: a.include_matches_macro,
+                include_if_chains: a.include_if_chains,
+            },
+        ),
+        Cmd::EnumCoverage(a) => {
+            parallel_matches::run_enum_coverage(ctx, a.name.as_deref(), a.hide_trait_routed_catchalls)
+        }
+        Cmd::CohortCallees(a) => callers::run_cohort_callees(ctx, &a.pattern),
+        Cmd::ErrorSwallows(a) => error_swallows::run(ctx, a.include_unwrap_or),
+        Cmd::PassThrough(a) => pass_through::run(ctx, a.max_loc),
+        Cmd::Explain(_) => unreachable!("handled before the tree scan"),
+        Cmd::Casts(a) => casts::run(ctx, &a.class, a.by, a.hide_widen, a.top),
+        Cmd::Conversions(a) => conversions::run(ctx, &a.kind, a.by, a.top),
+        Cmd::ConversionPairs => conversion_pairs::run(ctx),
+        Cmd::Stringly(a) => {
+            stringly::run(ctx, a.include_substring, a.include_map_keys, a.by, a.top)
+        }
+        Cmd::Tests(a) => {
+            // Always scan the full tree — under --scope production the tests we
+            // want to enumerate would be stripped.
+            let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
+            let source = all_files.as_deref().unwrap_or(files);
+            tests_cmd::run(
+                ctx,
+                source,
+                a.with_hint,
+                matches!(a.by, Some(TestsBy::Subcommand)),
+                &cli_grammar(),
+            )
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // `explain` reads only the embedded playbook — skip the tree scan.
@@ -618,9 +725,20 @@ fn main() -> Result<()> {
         result?;
         return Ok(());
     }
-    let scope = cli.scope;
+    let Cli {
+        root,
+        scope,
+        cfg,
+        exclude,
+        summary,
+        spans,
+        changed_since,
+        context: context_lines,
+        fail_on_findings,
+        cmd,
+    } = cli;
     // Exit-code contract: any setup error (bad glob, bad git ref, IO) is 2.
-    let files = match parse::parse_dir(&cli.root, scope, &cli.cfg, &cli.exclude) {
+    let files = match parse::parse_dir(&root, scope, &cfg, &exclude) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: {:#}", e);
@@ -630,13 +748,13 @@ fn main() -> Result<()> {
     if files.is_empty() {
         eprintln!(
             "warning: no .rs files found under {} (scope={:?})",
-            cli.root.display(),
+            root.display(),
             scope
         );
     }
     let idx = index::NameIndex::build(&files);
     let sem = semantic::Semantic::build(&files);
-    let changed = match cli.changed_since.as_deref() {
+    let changed = match changed_since.as_deref() {
         Some(r) => match context::changed_set(r) {
             Ok(set) => Some(set),
             Err(e) => {
@@ -650,92 +768,16 @@ fn main() -> Result<()> {
         files: &files,
         idx: &idx,
         sem: &sem,
-        summary: cli.summary,
-        spans: cli.spans,
+        summary,
+        spans,
         changed,
-        context_lines: cli.context,
+        context_lines,
     };
-    let fail_on_findings = cli.fail_on_findings || cli.cmd.implies_fail_on_findings();
-    let result = match cli.cmd {
-        Cmd::Audit(a) => {
-            // Like dead-code, the call-set must come from the FULL tree.
-            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg, &cli.exclude)?;
-            let call_source = all_files.as_deref().unwrap_or(&files);
-            audit::run(&ctx, call_source, a.top, a.strict)
-        }
-        Cmd::Inventory(a) => inventory::run(&ctx, a.kind, a.vis, a.tree),
-        Cmd::Callers(a) => {
-            if let Some(pattern) = a.among.as_deref() {
-                callers::run_callers_among(&ctx, &a.name, pattern)
-            } else {
-                callers::run_callers(&ctx, &a.name, a.transitive, a.depth, a.by, a.min_confidence)
-            }
-        }
-        Cmd::Callees(a) => callers::run_callees(&ctx, &a.name),
-        Cmd::CoCall(a) => callers::run_co_call(&ctx, &a.a, &a.b),
-        Cmd::FieldUses(a) => field_uses::run(
-            &ctx,
-            &a.ty,
-            &a.field,
-            field_uses::FieldUsesOpts {
-                strict: !a.candidates,
-                kinds: &a.kind,
-                via_receiver: a.via_receiver.as_deref(),
-                min_confidence: a.min_confidence,
-            },
-        ),
-        Cmd::Fields(a) => fields::run(&ctx, &a.ty),
-        Cmd::Variants(a) => variants::run(&ctx, &a.name, a.bare),
-        Cmd::Impls(a) => impls::run(&ctx, a.of.as_deref(), a.trait_.as_deref()),
-        Cmd::TypeRefs(a) => type_refs::run(&ctx, &a.ty, a.min_confidence),
-        Cmd::TakesMut(a) => takes_mut::run(&ctx, &a.ty),
-        Cmd::Metrics(a) => metrics::run(&ctx, a.sort, a.top, a.threshold, false),
-        Cmd::DeadCode(a) => {
-            // Build the call-set from the FULL tree so production items called
-            // only from tests aren't false-flagged as dead.
-            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg, &cli.exclude)?;
-            let call_source = all_files.as_deref().unwrap_or(&files);
-            dead_code::run(&ctx, call_source, a.pub_only, a.include_trait_impls)
-        }
-        Cmd::CatchAllArms(a) => catch_all::run(&ctx, a.name.as_deref()),
-        Cmd::ParallelMatches(a) => parallel_matches::run(
-            &ctx,
-            a.name.as_deref(),
-            parallel_matches::ScanOpts {
-                partial_only: a.hide_exhaustive,
-                rank_by_gap: a.rank_by_gap,
-                show_missing: a.show_missing,
-                include_matches_macro: a.include_matches_macro,
-                include_if_chains: a.include_if_chains,
-            },
-        ),
-        Cmd::EnumCoverage(a) => {
-            parallel_matches::run_enum_coverage(&ctx, a.name.as_deref(), a.hide_trait_routed_catchalls)
-        }
-        Cmd::CohortCallees(a) => callers::run_cohort_callees(&ctx, &a.pattern),
-        Cmd::ErrorSwallows(a) => error_swallows::run(&ctx, a.include_unwrap_or),
-        Cmd::PassThrough(a) => pass_through::run(&ctx, a.max_loc),
-        Cmd::Explain(_) => unreachable!("handled before the tree scan"),
-        Cmd::Casts(a) => casts::run(&ctx, &a.class, a.by, a.hide_widen, a.top),
-        Cmd::Conversions(a) => conversions::run(&ctx, &a.kind, a.by, a.top),
-        Cmd::ConversionPairs => conversion_pairs::run(&ctx),
-        Cmd::Stringly(a) => {
-            stringly::run(&ctx, a.include_substring, a.include_map_keys, a.by, a.top)
-        }
-        Cmd::Tests(a) => {
-            // Always scan the full tree — under --scope production the tests we
-            // want to enumerate would be stripped.
-            let all_files = full_tree_if_needed(&cli.root, scope, &cli.cfg, &cli.exclude)?;
-            let source = all_files.as_deref().unwrap_or(&files);
-            tests_cmd::run(
-                &ctx,
-                source,
-                a.with_hint,
-                matches!(a.by, Some(TestsBy::Subcommand)),
-                &cli_grammar(),
-            )
-        }
-    };
+    let fail_on_findings = fail_on_findings || cmd.implies_fail_on_findings();
+    let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude);
+    // Report blind spots on every path — including error exits: an agent must
+    // know what was not analyzed regardless of how the run ended.
+    report_blind_spots();
     let findings = match result {
         Ok(n) => n,
         // Exit-code contract: 0 = clean, 1 = findings (with --fail-on-findings
@@ -748,14 +790,6 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
-    let blind = macro_scan::blind_spots();
-    if blind > 0 {
-        eprintln!(
-            "(blind spots: {} macro body(ies) could not be parsed as expressions — \
-             code inside them was not analyzed)",
-            blind
-        );
-    }
     // `audit` is the agent-loop entry point: findings always fail it.
     if fail_on_findings && findings > 0 {
         std::process::exit(1);

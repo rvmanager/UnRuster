@@ -305,6 +305,12 @@ pub fn enum_variant_of_path(
     None
 }
 
+/// Last `::`-segment of a path string (the bare name). One shared
+/// implementation for a pattern that had drifted into 18 copies.
+pub fn last_segment(path: &str) -> &str {
+    path.rsplit("::").next().unwrap_or(path)
+}
+
 pub fn path_last(p: &syn::Path) -> String {
     p.segments
         .last()

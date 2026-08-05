@@ -68,10 +68,21 @@ pub fn macro_body(m: &syn::Macro) -> Body {
         }
     }
     let exprs = parse_exprs(&m.tokens);
-    if exprs.is_empty() && !m.tokens.is_empty() {
+    if exprs.is_empty() && tokens_have_substance(&m.tokens) {
         record_blind_spot(m);
     }
     Body::Exprs(exprs)
+}
+
+/// True if the token stream contains any identifier or literal — pure
+/// punctuation (e.g. the type macro `Token![,]`) can never be an expression
+/// and must not count as a blind spot.
+fn tokens_have_substance(ts: &TokenStream) -> bool {
+    ts.clone().into_iter().any(|tt| match tt {
+        TokenTree::Ident(_) | TokenTree::Literal(_) => true,
+        TokenTree::Group(g) => tokens_have_substance(&g.stream()),
+        TokenTree::Punct(_) => false,
+    })
 }
 
 /// Backwards-compatible convenience: returns just expressions, ignoring any
