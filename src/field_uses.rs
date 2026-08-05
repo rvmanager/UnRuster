@@ -348,6 +348,38 @@ pub struct FieldUsesOpts<'a> {
     pub min_confidence: Option<Confidence>,
 }
 
+/// Print each hit row (unless --summary) and tally the summary counters:
+/// (reads, writes, inits, type-inferred, unknown-receiver).
+fn tally_and_print(ctx: &AnalysisCtx, all: &[FieldHit]) -> (usize, usize, usize, usize, usize) {
+    let (mut reads, mut writes, mut inits) = (0usize, 0usize, 0usize);
+    let (mut ti_count, mut q_count) = (0usize, 0usize);
+    for h in all {
+        match h.kind {
+            FieldKind::Read => reads += 1,
+            FieldKind::Write => writes += 1,
+            FieldKind::Init => inits += 1,
+        }
+        match h.via {
+            "ti" => ti_count += 1,
+            "?" => q_count += 1,
+            _ => {}
+        }
+        if !ctx.summary {
+            println!(
+                "{}\t{}\t{}\t{}\t{}:{}",
+                h.kind.as_str(),
+                h.via,
+                h.receiver,
+                h.context,
+                h.file,
+                h.line
+            );
+            ctx.print_context(&h.file, h.line);
+        }
+    }
+    (reads, writes, inits, ti_count, q_count)
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
     ty: &str,
@@ -356,7 +388,6 @@ pub fn run(
 ) -> anyhow::Result<usize> {
     let files = ctx.files;
     let fn_sigs = &ctx.sem.fn_sigs;
-    let summary = ctx.summary;
     let known = ctx.idx.knows_name(ty);
     if !known {
         warn_unknown_target("type", ty);
@@ -383,35 +414,7 @@ pub fn run(
             .then_with(|| a.line.cmp(&b.line))
     });
 
-    let mut reads = 0usize;
-    let mut writes = 0usize;
-    let mut inits = 0usize;
-    let mut ti_count = 0usize;
-    let mut q_count = 0usize;
-    for h in &all {
-        match h.kind {
-            FieldKind::Read => reads += 1,
-            FieldKind::Write => writes += 1,
-            FieldKind::Init => inits += 1,
-        }
-        match h.via {
-            "ti" => ti_count += 1,
-            "?" => q_count += 1,
-            _ => {}
-        }
-        if !summary {
-            println!(
-                "{}\t{}\t{}\t{}\t{}:{}",
-                h.kind.as_str(),
-                h.via,
-                h.receiver,
-                h.context,
-                h.file,
-                h.line
-            );
-            ctx.print_context(&h.file, h.line);
-        }
-    }
+    let (reads, writes, inits, ti_count, q_count) = tally_and_print(ctx, &all);
     eprintln!(
         "({} reads, {} writes, {} inits; via: {} type-inferred, {} unknown receiver; strict={})",
         reads, writes, inits, ti_count, q_count, opts.strict

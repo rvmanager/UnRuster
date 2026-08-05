@@ -27,15 +27,21 @@ impl<'a> RefVisitor<'a> {
         self.scope.enclosing()
     }
 
-    fn matches_path_last(&self, p: &syn::Path) -> Option<&'static str> {
-        let last = p.segments.last()?.ident.to_string();
-        if last == self.primary {
+    /// How `name` matches the queried type: directly, via a type alias, or
+    /// not at all. Single implementation for type positions and ctor paths.
+    fn via_of(&self, name: &str) -> Option<&'static str> {
+        if name == self.primary {
             Some("name")
-        } else if self.targets.iter().any(|t| t == &last) {
+        } else if self.targets.iter().any(|t| t == name) {
             Some("alias")
         } else {
             None
         }
+    }
+
+    fn matches_path_last(&self, p: &syn::Path) -> Option<&'static str> {
+        let last = p.segments.last()?.ident.to_string();
+        self.via_of(&last)
     }
 
     fn record(&mut self, role: &'static str, written: String, line: usize, via: &'static str) {
@@ -101,39 +107,20 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
 
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*e.func {
-            let segs = &p.path.segments;
-            // `Type(arg)` (tuple-struct ctor as call)
-            if segs.len() == 1 {
-                let id = &segs[0].ident.to_string();
-                let via = if id == self.primary {
-                    Some("name")
-                } else if self.targets.iter().any(|t| t == id) {
-                    Some("alias")
-                } else {
-                    None
-                };
-                if let Some(via) = via {
+            let segs: Vec<_> = p.path.segments.iter().collect();
+            // Ctor position: the sole segment (`Type(arg)` tuple-struct call)
+            // or the penultimate one (`Type::new(..)` associated ctor).
+            let ctor_seg = match segs.len() {
+                0 => None,
+                1 => Some(segs[0]),
+                n => Some(segs[n - 2]),
+            };
+            if let Some(seg) = ctor_seg {
+                if let Some(via) = self.via_of(&seg.ident.to_string()) {
                     self.record(
                         "ctor",
                         path_to_string_with_args(&p.path),
-                        line_of(&segs[0].ident),
-                        via,
-                    );
-                }
-            } else if segs.len() >= 2 {
-                let pen = &segs[segs.len() - 2].ident.to_string();
-                let via = if pen == self.primary {
-                    Some("name")
-                } else if self.targets.iter().any(|t| t == pen) {
-                    Some("alias")
-                } else {
-                    None
-                };
-                if let Some(via) = via {
-                    self.record(
-                        "ctor",
-                        path_to_string_with_args(&p.path),
-                        line_of(&segs[segs.len() - 2].ident),
+                        line_of(&seg.ident),
                         via,
                     );
                 }

@@ -300,62 +300,8 @@ pub fn run_callers(
         return Ok(direct.len());
     }
 
-    // Transitive: BFS from query outwards through the call graph.
-    // Build: target_last_name -> set of caller qpaths.
-    let mut rev: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for s in &sites {
-        let last = if let Some(m) = s.target.strip_prefix('.') {
-            m.to_string()
-        } else if let Some(m) = s.target.strip_suffix('!') {
-            m.rsplit("::").next().unwrap_or(m).to_string()
-        } else {
-            s.target.rsplit("::").next().unwrap_or(&s.target).to_string()
-        };
-        rev.entry(last).or_default().insert(s.caller.clone());
-    }
-
-    let max_depth = depth.unwrap_or(usize::MAX);
-    let seed_last = query
-        .trim_start_matches('.')
-        .trim_start_matches("::")
-        .trim_end_matches('!')
-        .rsplit("::")
-        .next()
-        .unwrap_or(query)
-        .to_string();
-
-    let mut visited: BTreeMap<String, usize> = BTreeMap::new();
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-    // Names already enqueued. BFS reaches every name at its minimum depth on
-    // first visit, so each name is expanded exactly once — without this set a
-    // cyclic call graph (any recursion) re-enqueued forever and `--transitive`
-    // with unlimited depth never terminated.
-    let mut seen_names: BTreeSet<String> = BTreeSet::new();
-    seen_names.insert(seed_last.clone());
-    queue.push_back((seed_last, 0));
-
-    while let Some((name, d)) = queue.pop_front() {
-        if d >= max_depth {
-            continue;
-        }
-        let Some(callers) = rev.get(&name) else {
-            continue;
-        };
-        for caller in callers {
-            let caller_last = caller
-                .rsplit("::")
-                .next()
-                .unwrap_or(caller)
-                .to_string();
-            visited.entry(caller.clone()).or_insert(d + 1);
-            if d + 1 < max_depth && seen_names.insert(caller_last.clone()) {
-                queue.push_back((caller_last, d + 1));
-            }
-        }
-    }
-
     // Emit transitive callers grouped by depth.
-    let mut rows: Vec<(String, usize)> = visited.into_iter().collect();
+    let mut rows = transitive_callers(&sites, query, depth.unwrap_or(usize::MAX));
     rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     if !summary {
         for (caller, d) in &rows {
@@ -374,6 +320,62 @@ pub fn run_callers(
         return Err(TargetNotFound::err("fn, method, or macro matching", query));
     }
     Ok(direct.len() + rows.len())
+}
+
+/// Breadth-first transitive callers of `query` through the last-segment call
+/// graph, each at its minimum depth. BFS reaches every name at its minimum
+/// depth on first visit, so each name is expanded exactly once — without the
+/// `seen_names` set a cyclic call graph (any recursion) re-enqueued forever
+/// and `--transitive` with unlimited depth never terminated.
+fn transitive_callers(
+    sites: &[CallSite],
+    query: &str,
+    max_depth: usize,
+) -> Vec<(String, usize)> {
+    // target_last_name -> set of caller qpaths.
+    let mut rev: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for s in sites {
+        let last = if let Some(m) = s.target.strip_prefix('.') {
+            m.to_string()
+        } else if let Some(m) = s.target.strip_suffix('!') {
+            m.rsplit("::").next().unwrap_or(m).to_string()
+        } else {
+            s.target.rsplit("::").next().unwrap_or(&s.target).to_string()
+        };
+        rev.entry(last).or_default().insert(s.caller.clone());
+    }
+
+    let seed_last = query
+        .trim_start_matches('.')
+        .trim_start_matches("::")
+        .trim_end_matches('!')
+        .rsplit("::")
+        .next()
+        .unwrap_or(query)
+        .to_string();
+
+    let mut visited: BTreeMap<String, usize> = BTreeMap::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut seen_names: BTreeSet<String> = BTreeSet::new();
+    seen_names.insert(seed_last.clone());
+    queue.push_back((seed_last, 0));
+
+    while let Some((name, d)) = queue.pop_front() {
+        if d >= max_depth {
+            continue;
+        }
+        let Some(callers) = rev.get(&name) else {
+            continue;
+        };
+        for caller in callers {
+            let caller_last = caller.rsplit("::").next().unwrap_or(caller).to_string();
+            visited.entry(caller.clone()).or_insert(d + 1);
+            if d + 1 < max_depth && seen_names.insert(caller_last.clone()) {
+                queue.push_back((caller_last, d + 1));
+            }
+        }
+    }
+    visited.into_iter().collect()
 }
 
 fn emit_caller_rows(
@@ -607,16 +609,11 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<us
             header.push_str(label);
         }
         println!("{}", header);
-
-        for callee in &all_callees {
-            let present: Vec<bool> = cols
-                .iter()
-                .map(|(_, qpath)| by_member.get(qpath).map(|s| s.contains(callee)).unwrap_or(false))
-                .collect();
-            let present_count = present.iter().filter(|&&p| p).count();
-            let absent_count = n - present_count;
-            // Divergence: a minority dissents from a present majority.
-            let diverges = present_count > absent_count && absent_count > 0;
+    }
+    for callee in &all_callees {
+        let present = presence_row(callee, &cols, &by_member);
+        let diverges = is_divergent(&present);
+        if !summary {
             let mut row = callee.clone();
             for &p in &present {
                 row.push('\t');
@@ -624,22 +621,11 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<us
             }
             if diverges {
                 row.push_str("\t<- divergence");
-                divergences.push(callee.clone());
             }
             println!("{}", row);
         }
-    } else {
-        for callee in &all_callees {
-            let present_count = cols
-                .iter()
-                .filter(|(_, qpath)| {
-                    by_member.get(qpath).map(|s| s.contains(callee)).unwrap_or(false)
-                })
-                .count();
-            let absent_count = n - present_count;
-            if present_count > absent_count && absent_count > 0 {
-                divergences.push(callee.clone());
-            }
+        if diverges {
+            divergences.push(callee.clone());
         }
     }
     eprintln!(
@@ -649,6 +635,62 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<us
         divergences.len()
     );
     Ok(divergences.len())
+}
+
+/// Per-caller tallies for one co-call pair: how often it calls A and B, and
+/// the first call site of each (the `via` pointer).
+#[derive(Default)]
+struct Co {
+    calls_a: usize,
+    calls_b: usize,
+    via_a: Option<(String, usize)>,
+    via_b: Option<(String, usize)>,
+}
+
+type CoRow<'a> = (&'a str, usize, &'a (String, usize));
+
+/// Partition callers into A-only / B-only rows — ranked by matched-call count
+/// descending (high-traffic fns first) — plus the count of canonical
+/// both-callers. (false, false) can't occur: only callers of A or B are in
+/// the map.
+fn partition_co<'a>(by_caller: &'a BTreeMap<&'a str, Co>) -> (Vec<CoRow<'a>>, Vec<CoRow<'a>>, usize) {
+    let mut a_only: Vec<CoRow<'a>> = Vec::new();
+    let mut b_only: Vec<CoRow<'a>> = Vec::new();
+    let mut both = 0usize;
+    for (caller, co) in by_caller {
+        match (co.calls_a > 0, co.calls_b > 0) {
+            (true, true) => both += 1,
+            (true, false) => a_only.push((caller, co.calls_a, co.via_a.as_ref().unwrap())),
+            (false, true) => b_only.push((caller, co.calls_b, co.via_b.as_ref().unwrap())),
+            (false, false) => {}
+        }
+    }
+    a_only.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
+    b_only.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
+    (a_only, b_only, both)
+}
+
+/// Which cohort members (columns) call `callee`.
+fn presence_row(
+    callee: &str,
+    cols: &[(&str, &str)],
+    by_member: &BTreeMap<&str, BTreeSet<String>>,
+) -> Vec<bool> {
+    cols.iter()
+        .map(|(_, qpath)| {
+            by_member
+                .get(qpath)
+                .map(|s| s.contains(callee))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Divergence: a minority dissents from a present majority.
+fn is_divergent(present: &[bool]) -> bool {
+    let p = present.iter().filter(|&&x| x).count();
+    let a = present.len() - p;
+    p > a && a > 0
 }
 
 /// `co-call <A> <B>` — paired-action invariant check. A and B are a coupled
@@ -686,13 +728,6 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<usize>
                 .unwrap_or(false)
     };
 
-    #[derive(Default)]
-    struct Co {
-        calls_a: usize,
-        calls_b: usize,
-        via_a: Option<(String, usize)>,
-        via_b: Option<(String, usize)>,
-    }
     let mut by_caller: BTreeMap<&str, Co> = BTreeMap::new();
     for s in &sites {
         let is_a = hits(s, a);
@@ -711,22 +746,7 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<usize>
         }
     }
 
-    // Partition. (true, true) = canonical, just counted. (false, false) can't
-    // occur here — only callers of A or B made it into the map.
-    let mut a_only: Vec<(&str, usize, &(String, usize))> = Vec::new();
-    let mut b_only: Vec<(&str, usize, &(String, usize))> = Vec::new();
-    let mut both = 0usize;
-    for (caller, co) in &by_caller {
-        match (co.calls_a > 0, co.calls_b > 0) {
-            (true, true) => both += 1,
-            (true, false) => a_only.push((caller, co.calls_a, co.via_a.as_ref().unwrap())),
-            (false, true) => b_only.push((caller, co.calls_b, co.via_b.as_ref().unwrap())),
-            (false, false) => {}
-        }
-    }
-    // High-traffic fns first: rank by matched-call count desc, then name.
-    a_only.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
-    b_only.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
+    let (a_only, b_only, both) = partition_co(&by_caller);
 
     if !summary {
         for (caller, n, (file, line)) in &a_only {

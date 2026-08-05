@@ -410,21 +410,35 @@ fn tokens_contain_test(ts: &TokenStream) -> bool {
 /// True if any attribute is `#[allow(dead_code)]` (possibly inside
 /// `#[allow(unused, dead_code)]` or `#[allow(dead_code, ...)]`).
 pub fn has_allow_dead_code(attrs: &[syn::Attribute]) -> bool {
-    for a in attrs {
+    attrs.iter().any(|a| {
         if !a.path().is_ident("allow") {
-            continue;
+            return false;
         }
-        if let syn::Meta::List(ml) = &a.meta {
-            for tt in ml.tokens.clone() {
-                if let TokenTree::Ident(id) = tt {
-                    if id == "dead_code" {
-                        return true;
-                    }
-                }
-            }
-        }
+        let syn::Meta::List(ml) = &a.meta else {
+            return false;
+        };
+        ml.tokens
+            .clone()
+            .into_iter()
+            .any(|tt| matches!(tt, TokenTree::Ident(id) if id == "dead_code"))
+    })
+}
+
+/// The string value of a `#[doc = "..."]` attribute (one doc-comment line).
+pub fn doc_text(attr: &syn::Attribute) -> Option<String> {
+    if !attr.path().is_ident("doc") {
+        return None;
     }
-    false
+    let syn::Meta::NameValue(nv) = &attr.meta else {
+        return None;
+    };
+    let syn::Expr::Lit(l) = &nv.value else {
+        return None;
+    };
+    match &l.lit {
+        syn::Lit::Str(s) => Some(s.value()),
+        _ => None,
+    }
 }
 
 /// Group `items` by `key`, sort by count desc, optionally truncate to top N,

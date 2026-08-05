@@ -241,6 +241,15 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
         self.cyclo += 1;
         visit::visit_expr_try(self, e);
     }
+
+    // Decision points inside macro args (`&&`, `?`, `if` in a `format!`)
+    // count too — flagged by `cohort-callees visit_macro`: every sibling
+    // scanner walks macro bodies.
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        for expr in crate::macro_scan::macro_exprs(m) {
+            self.visit_expr(&expr);
+        }
+    }
 }
 
 // ─── run ────────────────────────────────────────────────────────────────────
@@ -262,6 +271,38 @@ impl SortKey {
             SortKey::Cyclo => "cyclo",
             SortKey::Nesting => "nesting",
         }
+    }
+}
+
+/// Drop fns whose sort metric is below the threshold.
+fn apply_threshold(fns: &mut Vec<FnMetric>, sort: SortKey, t: usize) {
+    match sort {
+        SortKey::Loc => fns.retain(|m| m.loc >= t),
+        SortKey::Params => fns.retain(|m| m.params >= t),
+        SortKey::Cyclo => fns.retain(|m| m.cyclo >= t),
+        SortKey::Nesting => fns.retain(|m| m.nesting >= t),
+    }
+}
+
+/// Sort the fn table by the key, descending, with stable tie-breakers.
+fn sort_fns(fns: &mut [FnMetric], sort: SortKey) {
+    match sort {
+        SortKey::Loc => fns.sort_by(|a, b| b.loc.cmp(&a.loc).then_with(|| b.cyclo.cmp(&a.cyclo))),
+        SortKey::Params => {
+            fns.sort_by(|a, b| b.params.cmp(&a.params).then_with(|| b.loc.cmp(&a.loc)))
+        }
+        SortKey::Cyclo => fns.sort_by(|a, b| {
+            b.cyclo
+                .cmp(&a.cyclo)
+                .then_with(|| b.nesting.cmp(&a.nesting))
+                .then_with(|| b.loc.cmp(&a.loc))
+        }),
+        SortKey::Nesting => fns.sort_by(|a, b| {
+            b.nesting
+                .cmp(&a.nesting)
+                .then_with(|| b.cyclo.cmp(&a.cyclo))
+                .then_with(|| b.loc.cmp(&a.loc))
+        }),
     }
 }
 
@@ -292,34 +333,10 @@ pub fn run(
     ctx.retain_changed(&mut structs, |m| &m.file);
     ctx.retain_changed(&mut enums, |m| &m.file);
 
-    // Apply threshold filter on the sort metric.
     if let Some(t) = threshold {
-        match sort {
-            SortKey::Loc => fns.retain(|m| m.loc >= t),
-            SortKey::Params => fns.retain(|m| m.params >= t),
-            SortKey::Cyclo => fns.retain(|m| m.cyclo >= t),
-            SortKey::Nesting => fns.retain(|m| m.nesting >= t),
-        }
+        apply_threshold(&mut fns, sort, t);
     }
-
-    match sort {
-        SortKey::Loc => fns.sort_by(|a, b| b.loc.cmp(&a.loc).then_with(|| b.cyclo.cmp(&a.cyclo))),
-        SortKey::Params => {
-            fns.sort_by(|a, b| b.params.cmp(&a.params).then_with(|| b.loc.cmp(&a.loc)))
-        }
-        SortKey::Cyclo => fns.sort_by(|a, b| {
-            b.cyclo
-                .cmp(&a.cyclo)
-                .then_with(|| b.nesting.cmp(&a.nesting))
-                .then_with(|| b.loc.cmp(&a.loc))
-        }),
-        SortKey::Nesting => fns.sort_by(|a, b| {
-            b.nesting
-                .cmp(&a.nesting)
-                .then_with(|| b.cyclo.cmp(&a.cyclo))
-                .then_with(|| b.loc.cmp(&a.loc))
-        }),
-    }
+    sort_fns(&mut fns, sort);
     structs.sort_by_key(|s| std::cmp::Reverse(s.fields));
     enums.sort_by_key(|e| std::cmp::Reverse(e.variants));
 

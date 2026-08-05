@@ -87,6 +87,36 @@ fn is_usize_family(t: &str) -> bool {
     t == "usize" || t == "isize"
 }
 
+/// Integer-to-integer classification by width and signedness.
+fn classify_int_pair(sw: u16, sgn_s: bool, dw: u16, sgn_d: bool) -> &'static str {
+    if sw == dw && sgn_s != sgn_d {
+        "signed-flip"
+    } else if dw < sw {
+        "narrow-int"
+    } else {
+        // wider, or same width + same signedness (no-op-ish): bucket as widen.
+        "widen-int"
+    }
+}
+
+/// Float-involving classification; `None` when neither side is a float mix.
+fn classify_float_mix(s: &str, dst: &str) -> Option<&'static str> {
+    if is_float(s) && int_width_signed(dst).is_some() {
+        return Some("float-int");
+    }
+    if int_width_signed(s).is_some() && is_float(dst) {
+        return Some("int-float");
+    }
+    if is_float(s) && is_float(dst) {
+        return Some(if s == "f64" && dst == "f32" {
+            "narrow-float"
+        } else {
+            "widen-float"
+        });
+    }
+    None
+}
+
 fn classify(src: Option<&str>, dst: &str) -> &'static str {
     if dst.starts_with("*const") || dst.starts_with("*mut") {
         return "ptr";
@@ -102,31 +132,10 @@ fn classify(src: Option<&str>, dst: &str) -> &'static str {
     let dst_int = int_width_signed(dst);
     let src_int = src.and_then(int_width_signed);
     if let (Some((sw, sgn_s)), Some((dw, sgn_d))) = (src_int, dst_int) {
-        if sw == dw && sgn_s != sgn_d {
-            return "signed-flip";
-        }
-        if dw < sw {
-            return "narrow-int";
-        }
-        if dw > sw {
-            return "widen-int";
-        }
-        return "widen-int"; // same width, same signedness = no-op-ish; bucket as widen
+        return classify_int_pair(sw, sgn_s, dw, sgn_d);
     }
-    if let Some(s) = src {
-        if is_float(s) && dst_int.is_some() {
-            return "float-int";
-        }
-        if int_width_signed(s).is_some() && is_float(dst) {
-            return "int-float";
-        }
-        if is_float(s) && is_float(dst) {
-            return if s == "f64" && dst == "f32" {
-                "narrow-float"
-            } else {
-                "widen-float"
-            };
-        }
+    if let Some(class) = src.and_then(|s| classify_float_mix(s, dst)) {
+        return class;
     }
     if src.is_none() {
         return "unknown";

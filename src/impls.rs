@@ -28,9 +28,9 @@ pub fn run(
 
     hits.sort_by(|a, b| {
         a.trait_name
-            .clone()
-            .unwrap_or_default()
-            .cmp(&b.trait_name.clone().unwrap_or_default())
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.trait_name.as_deref().unwrap_or(""))
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))

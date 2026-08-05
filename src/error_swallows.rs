@@ -55,6 +55,15 @@ fn pat_is_discarded(p: &syn::Pat) -> bool {
     }
 }
 
+/// `.map_err(|_| …)` / `.map_err(|_e| …)` — the closure's first arg is a
+/// discard binding, so the error contents are intentionally dropped.
+fn map_err_discards(e: &syn::ExprMethodCall) -> bool {
+    let Some(syn::Expr::Closure(c)) = e.args.first() else {
+        return false;
+    };
+    c.inputs.first().map(pat_is_discarded).unwrap_or(false)
+}
+
 /// `Err(_)` / `Err(_e)` — the error contents are discarded by the pattern.
 /// `Err(e)` is NOT flagged because the body may reference `e`.
 fn pat_is_err_swallow(p: &syn::Pat) -> bool {
@@ -133,21 +142,7 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
             "unwrap_or_default" if e.args.is_empty() => Some(".unwrap_or_default"),
             "unwrap_or_else" => Some(".unwrap_or_else"),
             "unwrap_or" if self.include_unwrap_or => Some(".unwrap_or"),
-            "map_err" => {
-                // Flag only when the closure's first arg is `_` or `_name` —
-                // the error contents are intentionally discarded.
-                let mut discarded = false;
-                if let Some(syn::Expr::Closure(c)) = e.args.first() {
-                    if let Some(first) = c.inputs.first() {
-                        discarded = pat_is_discarded(first);
-                    }
-                }
-                if discarded {
-                    Some(".map_err(|_|)")
-                } else {
-                    None
-                }
-            }
+            "map_err" if map_err_discards(e) => Some(".map_err(|_|)"),
             _ => None,
         };
         if let Some(k) = kind {
@@ -185,6 +180,15 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
             }
         }
         visit::visit_expr_while(self, e);
+    }
+
+    // Every sibling site-scanner walks macro bodies; without this, swallows
+    // inside macro args (e.g. `.ok()` in a `writeln!`) were invisible —
+    // flagged by `cohort-callees visit_macro`.
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        for expr in crate::macro_scan::macro_exprs(m) {
+            self.visit_expr(&expr);
+        }
     }
 
     fn visit_local(&mut self, l: &'ast syn::Local) {

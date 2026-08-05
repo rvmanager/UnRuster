@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{fn_span, trait_fn_span, enum_variant_of_path, line_of, type_short, ScopeTracker};
+use crate::ast::{doc_text, enum_variant_of_path, fn_span, line_of, trait_fn_span, type_short, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::macro_scan::{macro_body, Body};
 use crate::parse::{display_path, ParsedFile};
@@ -610,42 +610,107 @@ fn scan_groups(
 
     if !summary {
         for ((variants, wildcard), sites) in &rows {
-            let mut key = format!(
-                "{}{}",
-                variants.join(","),
-                if *wildcard { " | _" } else { "" }
-            );
-            if opts.rank_by_gap && total > 0 {
-                key = format!("[{}/{}] {}", variants.len(), total, key);
-            }
-            if opts.show_missing && total > 0 {
-                let miss = missing_variants(variants, variant_names);
-                let miss = if miss.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    miss.join(",")
-                };
-                key = format!("{}\tmissing: {}", key, miss);
-            }
+            let key = group_label(variants, *wildcard, opts, total, variant_names);
             if prefixed {
                 println!("group\t{}\t{}\t{} site(s)", enum_name, key, sites.len());
             } else {
                 println!("group\t{}\t{} site(s)", key, sites.len());
             }
-            for s in sites {
-                let tag = if s.is_macro {
-                    " (matches!)"
-                } else if s.is_if_chain {
-                    " (if-chain)"
-                } else {
-                    ""
-                };
-                println!("  {}{}\t{}:{}", s.context, tag, s.file, s.line);
-                ctx.print_context(&s.file, s.line);
-            }
+            print_group_sites(ctx, sites);
         }
     }
     (all_sites.len(), rows.len())
+}
+
+/// One `enum-coverage` output row: a partial site, its gap score, and the
+/// variants it leaves uncovered.
+struct Row<'s> {
+    gap: f64,
+    site: &'s Site,
+    missing: Vec<String>,
+}
+
+/// Print one `enum-coverage` row (with kind/SEALED tags, optional enum-name
+/// prefix in --all mode, and the optional --context snippet).
+fn print_coverage_row(
+    ctx: &AnalysisCtx,
+    r: &Row,
+    total: usize,
+    sealed: bool,
+    prefixed: bool,
+    enum_name: &str,
+) {
+    let mut tag = if r.site.trait_routed {
+        " (catchall→method; likely false positive)".to_string()
+    } else if r.site.is_macro {
+        " (matches!)".to_string()
+    } else if r.site.is_if_chain {
+        " (if-chain)".to_string()
+    } else {
+        String::new()
+    };
+    if sealed {
+        tag.push_str(" SEALED");
+    }
+    let body = format!(
+        "{:.2}\t{}/{}\t{}\t{}\t{}:{}\t{}{}",
+        r.gap,
+        r.site.variants.len(),
+        total,
+        r.site.variants.join(","),
+        r.missing.join(","),
+        r.site.file,
+        r.site.line,
+        r.site.context,
+        tag
+    );
+    if prefixed {
+        println!("{}\t{}", enum_name, body);
+    } else {
+        println!("{}", body);
+    }
+    ctx.print_context(&r.site.file, r.site.line);
+}
+
+/// Print one group's indented site lines (with kind tag and optional
+/// --context snippet).
+fn print_group_sites(ctx: &AnalysisCtx, sites: &[&Site]) {
+    for s in sites {
+        let tag = if s.is_macro {
+            " (matches!)"
+        } else if s.is_if_chain {
+            " (if-chain)"
+        } else {
+            ""
+        };
+        println!("  {}{}\t{}:{}", s.context, tag, s.file, s.line);
+        ctx.print_context(&s.file, s.line);
+    }
+}
+
+/// Display label of one variant-set group: the covered variants, wildcard
+/// marker, and optional `[covered/total]` / `missing:` annotations.
+fn group_label(
+    variants: &[String],
+    wildcard: bool,
+    opts: ScanOpts,
+    total: usize,
+    variant_names: &[String],
+) -> String {
+    let mut key = format!("{}{}", variants.join(","), if wildcard { " | _" } else { "" });
+    if opts.rank_by_gap && total > 0 {
+        key = format!("[{}/{}] {}", variants.len(), total, key);
+    }
+    if opts.show_missing && total > 0 {
+        let miss = missing_variants(variants, variant_names);
+        let miss = if miss.is_empty() {
+            "(none)".to_string()
+        } else {
+            miss.join(",")
+        };
+        key = format!("{}\tmissing: {}", key, miss);
+    }
+    key
 }
 
 /// True if any definition of `enum_name` carries the in-source contract
@@ -660,22 +725,13 @@ pub(crate) fn enum_sealed(files: &[ParsedFile], enum_name: &str) -> bool {
     }
     impl<'ast, 'a> Visit<'ast> for V<'a> {
         fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
-            if e.ident != self.target {
-                return;
-            }
-            for a in &e.attrs {
-                if !a.path().is_ident("doc") {
-                    continue;
-                }
-                if let syn::Meta::NameValue(nv) = &a.meta {
-                    if let syn::Expr::Lit(l) = &nv.value {
-                        if let syn::Lit::Str(s) = &l.lit {
-                            if s.value().contains("unruster: sealed") {
-                                self.sealed = true;
-                            }
-                        }
-                    }
-                }
+            if e.ident == self.target
+                && e.attrs
+                    .iter()
+                    .filter_map(doc_text)
+                    .any(|d| d.contains("unruster: sealed"))
+            {
+                self.sealed = true;
             }
         }
     }
@@ -799,11 +855,6 @@ fn coverage_one(
     ctx.retain_changed(&mut all_sites, |s| &s.file);
 
     // One row per site; keep only partials (covered < total).
-    struct Row<'s> {
-        gap: f64,
-        site: &'s Site,
-        missing: Vec<String>,
-    }
     let mut hidden_trait_routed = 0usize;
     let mut rows: Vec<Row> = all_sites
         .iter()
@@ -839,36 +890,7 @@ fn coverage_one(
 
     if !summary {
         for r in &rows {
-            let mut tag = if r.site.trait_routed {
-                " (catchall→method; likely false positive)".to_string()
-            } else if r.site.is_macro {
-                " (matches!)".to_string()
-            } else if r.site.is_if_chain {
-                " (if-chain)".to_string()
-            } else {
-                String::new()
-            };
-            if sealed {
-                tag.push_str(" SEALED");
-            }
-            let body = format!(
-                "{:.2}\t{}/{}\t{}\t{}\t{}:{}\t{}{}",
-                r.gap,
-                r.site.variants.len(),
-                total,
-                r.site.variants.join(","),
-                r.missing.join(","),
-                r.site.file,
-                r.site.line,
-                r.site.context,
-                tag
-            );
-            if prefixed {
-                println!("{}\t{}", enum_name, body);
-            } else {
-                println!("{}", body);
-            }
-            ctx.print_context(&r.site.file, r.site.line);
+            print_coverage_row(ctx, r, total, sealed, prefixed, enum_name);
         }
     }
     let sealed_rows = if sealed { rows.len() } else { 0 };

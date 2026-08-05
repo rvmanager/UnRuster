@@ -89,41 +89,47 @@ impl CfgEnv {
                     Tri::Unknown
                 }
             }
-            Cfg::All(cs) => {
-                let mut any_unknown = false;
-                for c in cs {
-                    match self.eval(c) {
-                        Tri::False => return Tri::False,
-                        Tri::Unknown => any_unknown = true,
-                        Tri::True => {}
-                    }
-                }
-                if any_unknown {
-                    Tri::Unknown
-                } else {
-                    Tri::True
-                }
-            }
-            Cfg::Any(cs) => {
-                let mut any_unknown = false;
-                for c in cs {
-                    match self.eval(c) {
-                        Tri::True => return Tri::True,
-                        Tri::Unknown => any_unknown = true,
-                        Tri::False => {}
-                    }
-                }
-                if any_unknown {
-                    Tri::Unknown
-                } else {
-                    Tri::False
-                }
-            }
+            Cfg::All(cs) => self.eval_all(cs),
+            Cfg::Any(cs) => self.eval_any(cs),
             Cfg::Not(c) => match self.eval(c) {
                 Tri::True => Tri::False,
                 Tri::False => Tri::True,
                 Tri::Unknown => Tri::Unknown,
             },
+        }
+    }
+
+    /// `all(...)`: False dominates, then Unknown, else True.
+    fn eval_all(&self, cs: &[Cfg]) -> Tri {
+        let mut any_unknown = false;
+        for c in cs {
+            match self.eval(c) {
+                Tri::False => return Tri::False,
+                Tri::Unknown => any_unknown = true,
+                Tri::True => {}
+            }
+        }
+        if any_unknown {
+            Tri::Unknown
+        } else {
+            Tri::True
+        }
+    }
+
+    /// `any(...)`: True dominates, then Unknown, else False.
+    fn eval_any(&self, cs: &[Cfg]) -> Tri {
+        let mut any_unknown = false;
+        for c in cs {
+            match self.eval(c) {
+                Tri::True => return Tri::True,
+                Tri::Unknown => any_unknown = true,
+                Tri::False => {}
+            }
+        }
+        if any_unknown {
+            Tri::Unknown
+        } else {
+            Tri::False
         }
     }
 

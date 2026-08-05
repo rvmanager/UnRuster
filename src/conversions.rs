@@ -36,6 +36,25 @@ impl<'a> ConvVisitor<'a> {
     }
 }
 
+/// Recognized zero-arg conversion methods and their row labels — one data
+/// table instead of a 13-arm match (its own `metrics --sort cyclo` flagged
+/// the match form).
+const METHOD_LABELS: &[(&str, &str)] = &[
+    ("into", ".into"),
+    ("try_into", ".try_into"),
+    ("to_string", ".to_string"),
+    ("to_owned", ".to_owned"),
+    ("to_vec", ".to_vec"),
+    ("as_str", ".as_str"),
+    ("as_bytes", ".as_bytes"),
+    ("as_ref", ".as_ref"),
+    ("as_mut", ".as_mut"),
+    ("parse", ".parse"),
+    ("cloned", ".cloned"),
+    ("copied", ".copied"),
+    ("collect", ".collect"),
+];
+
 fn first_is_uppercase(s: &str) -> bool {
     s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
 }
@@ -135,26 +154,15 @@ impl<'ast, 'a> Visit<'ast> for ConvVisitor<'a> {
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         let m = e.method.to_string();
-        // Every recognized conversion method is zero-arg; guard once.
-        let kind: Option<&'static str> = if !e.args.is_empty() {
-            None
+        // Every recognized conversion method is zero-arg; guard once, then
+        // look the label up in the shared table.
+        let kind: Option<&'static str> = if e.args.is_empty() {
+            METHOD_LABELS
+                .iter()
+                .find(|(name, _)| *name == m)
+                .map(|(_, label)| *label)
         } else {
-            match m.as_str() {
-                "into" => Some(".into"),
-                "try_into" => Some(".try_into"),
-                "to_string" => Some(".to_string"),
-                "to_owned" => Some(".to_owned"),
-                "to_vec" => Some(".to_vec"),
-                "as_str" => Some(".as_str"),
-                "as_bytes" => Some(".as_bytes"),
-                "as_ref" => Some(".as_ref"),
-                "as_mut" => Some(".as_mut"),
-                "parse" => Some(".parse"),
-                "cloned" => Some(".cloned"),
-                "copied" => Some(".copied"),
-                "collect" => Some(".collect"),
-                _ => None,
-            }
+            None
         };
         if let Some(k) = kind {
             // Extract turbofish target if present.
