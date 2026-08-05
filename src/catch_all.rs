@@ -5,6 +5,7 @@
 
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parallel_matches::{collect_sites, enum_sealed, variant_names_of};
+use crate::emit::row;
 
 pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
     match target {
@@ -12,20 +13,26 @@ pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
             let variant_names = variant_names_of(ctx.files, enum_name);
             if variant_names.is_empty() {
                 if ctx.idx.knows_name(enum_name) {
-                    eprintln!(
+                    ctx.out.note(&format!(
                         "note: `{}` is named in the tree but no enum definition with variants \
                          was found under --scope; nothing to scan",
                         enum_name
-                    );
-                    eprintln!("(0 match site(s) on `{}` with a wildcard arm)", enum_name);
+                    ));
+                    ctx.out.summary(&format!(
+                        "(0 match site(s) on `{}` with a wildcard arm)",
+                        enum_name
+                    ));
                     return Ok(0);
                 }
                 warn_unknown_target("enum", enum_name);
-                eprintln!("(0 match site(s) on `{}` with a wildcard arm)", enum_name);
+                ctx.out.summary(&format!(
+                    "(0 match site(s) on `{}` with a wildcard arm)",
+                    enum_name
+                ));
                 return Err(TargetNotFound::err("enum", enum_name));
             }
             let (count, sealed_rows) = scan_one(ctx, enum_name, &variant_names, false);
-            eprintln!(
+            ctx.out.summary(&format!(
                 "({} match site(s) on `{}` with a wildcard arm{}; explain: partial-enumeration)",
                 count,
                 enum_name,
@@ -34,7 +41,7 @@ pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
                 } else {
                     String::new()
                 }
-            );
+            ));
             Ok(count)
         }
         // `--all`: every enum in the index; rows gain a leading enum column.
@@ -52,7 +59,7 @@ pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
                 count += c;
                 sealed_rows += s;
             }
-            eprintln!(
+            ctx.out.summary(&format!(
                 "({} match site(s) with a wildcard arm across {} enum(s); --all{}; explain: partial-enumeration)",
                 count,
                 scanned,
@@ -61,7 +68,7 @@ pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
                 } else {
                     String::new()
                 }
-            );
+            ));
             Ok(count)
         }
     }
@@ -89,18 +96,22 @@ fn scan_one(
     if !ctx.summary {
         for h in &all {
             let tag = if sealed { "\tSEALED" } else { "" };
-            let body = format!(
-                "{}\t{}\t{}:{}{}",
-                h.context,
-                h.variants.join(","),
-                h.file,
-                h.line,
-                tag
-            );
+            let at = format!("{}:{}{}", h.file, h.line, tag);
             if prefixed {
-                println!("{}\t{}", enum_name, body);
+                row!(
+                    ctx.out,
+                    "enum" => enum_name,
+                    "context" => h.context.clone(),
+                    "variants" => h.variants.join(","),
+                    "at" => at,
+                );
             } else {
-                println!("{}", body);
+                row!(
+                    ctx.out,
+                    "context" => h.context.clone(),
+                    "variants" => h.variants.join(","),
+                    "at" => at,
+                );
             }
             ctx.print_context(&h.file, h.line);
         }

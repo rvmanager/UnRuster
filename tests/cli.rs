@@ -47,6 +47,21 @@ fn assert_summary_silent_stdout(args: &[&str]) {
     assert!(out.status.success(), "expected success");
 }
 
+/// Run and return raw stdout, tolerating the exit-1 "findings remain" code.
+/// `audit` reports findings by failing, so asserting success on it would only
+/// pass against a fixture with nothing to find.
+fn ur_stdout_allow_findings(args: &[&str]) -> Vec<u8> {
+    let out = ur().args(args).output().unwrap();
+    let code = out.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "command errored (exit {:?}): {:?}",
+        code,
+        args
+    );
+    out.stdout
+}
+
 /// Run and assert success; return raw stdout bytes.
 fn ur_stdout(args: &[&str]) -> Vec<u8> {
     let out = ur().args(args).output().unwrap();
@@ -2284,4 +2299,334 @@ fn explain_matches_multi_word_topic() {
         .assert()
         .success()
         .stdout(contains("GOD FUNCTION TO SPLIT"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Divergence, waivers, output format, and the noise-reduction defaults.
+//  These assert the behaviours added after an audit of two real-codebase runs;
+//  each one corresponds to a failure mode observed in that transcript.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Second fixture, kept apart from `sample` so new cases here can't shift the
+/// row counts the sample-fixture tests assert on.
+const DIV: &str = "fixtures/divergence";
+
+#[test]
+fn audit_prints_each_section_header_before_its_rows() {
+    // The regression this guards: `section(title, gate, count)` evaluated
+    // `count` — which printed the rows — before the call that printed the
+    // header, so every header landed after its own section.
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "audit"]);
+    let s = String::from_utf8_lossy(&out);
+    let lines: Vec<&str> = s.lines().collect();
+    let first_header = lines
+        .iter()
+        .position(|l| l.starts_with("## "))
+        .expect("expected at least one section header");
+    assert_eq!(
+        first_header, 0,
+        "the first line of audit output must be a section header, got:\n{}",
+        lines[..5.min(lines.len())].join("\n")
+    );
+}
+
+#[test]
+fn audit_puts_each_sections_summary_in_the_section() {
+    // Rows on stdout and counts on stderr forced a re-run with split
+    // redirection just to read the output once.
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "audit"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("partial site(s)"),
+        "expected per-check summary lines on stdout:\n{}",
+        s
+    );
+}
+
+#[test]
+fn help_shows_the_command_list_within_the_first_screen() {
+    // The playbook used to occupy the first 296 lines of `--help`, so the
+    // command list was invisible to anyone piping through `head`.
+    let out = ur_stdout(&["--help"]);
+    let s = String::from_utf8_lossy(&out);
+    let idx = s
+        .lines()
+        .position(|l| l.starts_with("Commands:"))
+        .expect("expected a Commands: section in --help");
+    assert!(
+        idx < 60,
+        "Commands: must appear within the first 60 help lines, found at {}",
+        idx
+    );
+}
+
+#[test]
+fn playbook_subcommand_prints_the_full_text() {
+    ur().args(["playbook"])
+        .assert()
+        .success()
+        .stdout(contains("DESIGN AUDIT PLAYBOOK"))
+        .stdout(contains("GOD FUNCTION TO SPLIT"));
+}
+
+#[test]
+fn divergence_pairs_the_sibling_that_forgot_a_variant() {
+    let out = ur_stdout(&["--root", DIV, "divergence"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("handle_anchor_delete_anim") && s.contains("MiddleKnot"),
+        "expected the lean sibling and its missing variant:\n{}",
+        s
+    );
+    assert!(
+        s.contains("handle_anchor_delete "),
+        "expected the rich sibling named on the same row:\n{}",
+        s
+    );
+}
+
+#[test]
+fn divergence_handling_finds_the_careless_sibling() {
+    let out = ur_stdout(&["--root", DIV, "divergence", "--handling"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("handle_open_file") && s.contains("take_open_file"),
+        "expected both sides of the poisoned-lock divergence:\n{}",
+        s
+    );
+    assert!(
+        s.contains("lock"),
+        "expected the callee column to name what diverged:\n{}",
+        s
+    );
+}
+
+#[test]
+fn divergence_row_shape() {
+    // score, kin, missing, lean, at, vs, vs_at → 7 cols (8 with the enum
+    // prefix in all-enums mode, which is the default).
+    let out = ur_stdout(&["--root", DIV, "divergence"]);
+    assert!(!rows_of(&out).is_empty());
+    assert_tsv_cols(&out, 8);
+}
+
+#[test]
+fn enum_coverage_max_missing_isolates_the_forgot_one_shape() {
+    let all = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Token"]);
+    let one = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Token", "--max-missing", "1"]);
+    assert!(
+        rows_of(&one).len() < rows_of(&all).len(),
+        "--max-missing 1 should drop wider-gap rows"
+    );
+    for line in rows_of(&one) {
+        // Column 4 is the missing-variant list; exactly one entry.
+        let missing = line.split('\t').nth(3).unwrap_or("");
+        assert_eq!(
+            missing.split(',').count(),
+            1,
+            "row kept by --max-missing 1 has >1 missing variant: {:?}",
+            line
+        );
+    }
+}
+
+#[test]
+fn enum_coverage_reports_what_max_missing_hid() {
+    // A filter that silently shrinks the result set reads as a clean codebase.
+    ur().args(["--root", FIXTURE, "enum-coverage", "Token", "--max-missing", "1"])
+        .assert()
+        .success()
+        .stderr(contains("hidden by --max-missing"));
+}
+
+#[test]
+fn enum_coverage_rank_enums_gives_one_row_per_enum() {
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "--rank-enums"]);
+    let rows = rows_of(&out);
+    assert!(!rows.is_empty());
+    assert_tsv_cols(&out, 4);
+    let names: Vec<&str> = rows.iter().map(|l| l.split('\t').next().unwrap()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(names.len(), sorted.len(), "each enum should appear once");
+}
+
+#[test]
+fn enum_coverage_compact_drops_the_repeated_variant_columns() {
+    let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "Token", "--compact"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.starts_with("# Token ["),
+        "compact mode should state the variant set once, in a header:\n{}",
+        s
+    );
+    for line in rows_of(&out).into_iter().filter(|l| !l.starts_with('#')) {
+        assert_eq!(line.split('\t').count(), 4, "compact row shape: {:?}", line);
+    }
+}
+
+#[test]
+fn casts_hide_lossless_usize_widening_by_default() {
+    let out = ur_stdout(&["--root", DIV, "casts"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        !s.contains("usize-widen"),
+        "u32 as usize is lossless on 64-bit and should be off by default:\n{}",
+        s
+    );
+    assert!(
+        s.contains("usize-cross\tf64\tusize"),
+        "genuinely lossy f64 as usize must still be reported:\n{}",
+        s
+    );
+}
+
+#[test]
+fn casts_can_ask_for_the_widening_rows_by_name() {
+    ur().args(["--root", DIV, "casts", "--class", "usize-widen"])
+        .assert()
+        .success()
+        .stdout(contains("usize-widen\tu32\tusize"));
+}
+
+#[test]
+fn casts_never_state_a_guessed_source_type() {
+    // `Bitmap::width()` returns u32, but the fixture also defines
+    // `Rect::width() -> f64`. Resolving the method by bare name reported f64
+    // here — a confidently wrong type that cost the whole check its credibility.
+    let out = ur_stdout(&["--root", DIV, "casts"]);
+    let s = String::from_utf8_lossy(&out);
+    let stride_row = s
+        .lines()
+        .find(|l| l.contains("casting::stride"))
+        .expect("expected a cast row in casting::stride");
+    assert!(
+        stride_row.starts_with("unknown\t_\t"),
+        "an ungrounded source must render as `_`, not a guess: {:?}",
+        stride_row
+    );
+}
+
+#[test]
+fn error_swallows_keeps_benign_families_by_default_and_audit_drops_them() {
+    let default = ur_stdout(&["--root", DIV, "error-swallows"]);
+    let strict = ur_stdout(&[
+        "--root",
+        DIV,
+        "error-swallows",
+        "--include-infallible",
+        "false",
+        "--include-logged",
+        "false",
+    ]);
+    assert!(
+        rows_of(&strict).len() < rows_of(&default).len(),
+        "hiding infallible writes and logged fallbacks should shrink the set"
+    );
+    let s = String::from_utf8_lossy(&strict);
+    assert!(
+        !s.contains("swallows::render"),
+        "`let _ = write!(String, …)` is infallible and should be hidden:\n{}",
+        s
+    );
+}
+
+#[test]
+fn waiver_comment_suppresses_exactly_its_own_site() {
+    let with = ur_stdout(&["--root", DIV, "error-swallows"]);
+    let without = ur_stdout(&["--root", DIV, "--no-suppress", "error-swallows"]);
+    assert_eq!(
+        rows_of(&without).len(),
+        rows_of(&with).len() + 1,
+        "the single `// unruster: ok` waiver should hide exactly one row"
+    );
+}
+
+#[test]
+fn takes_mut_without_a_type_ranks_candidates_instead_of_erroring() {
+    let out = ur_stdout(&["--root", FIXTURE, "takes-mut"]);
+    let rows = rows_of(&out);
+    assert!(!rows.is_empty(), "expected candidate types, got nothing");
+    assert_tsv_cols(&out, 2);
+    let first = rows[0].split('\t').next().unwrap().parse::<usize>();
+    assert!(first.is_ok(), "first column should be a count: {:?}", rows[0]);
+}
+
+#[test]
+fn catch_all_arms_without_a_name_scans_every_enum() {
+    let out = ur_stdout(&["--root", FIXTURE, "catch-all-arms"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.lines().any(|l| l.starts_with("Token\t")),
+        "bare invocation should behave like --all:\n{}",
+        s
+    );
+}
+
+#[test]
+fn json_output_is_parseable_and_keeps_line_numbers_numeric() {
+    let out = ur_stdout(&["--root", FIXTURE, "--json", "enum-coverage", "Token"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.trim_start().starts_with('{') && s.trim_end().ends_with('}'));
+    assert!(s.contains("\"command\": \"enum-coverage\""));
+    assert!(
+        s.contains("\"line\": "),
+        "line must be a number field, not part of a file:line string:\n{}",
+        s
+    );
+    assert!(
+        !s.contains("\"line\": \""),
+        "line must not be quoted:\n{}",
+        s
+    );
+    // Balanced braces is a cheap structural check that catches a truncated or
+    // double-closed document without pulling in a JSON parser.
+    let opens = s.chars().filter(|c| *c == '{').count();
+    let closes = s.chars().filter(|c| *c == '}').count();
+    assert_eq!(opens, closes, "unbalanced braces in JSON output:\n{}", s);
+}
+
+#[test]
+fn json_output_survives_a_command_with_no_findings() {
+    let out = ur_stdout(&["--root", DIV, "--json", "pass-through"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\"rows\": []"), "expected an empty rows array:\n{}", s);
+}
+
+#[test]
+fn json_audit_labels_every_section() {
+    let out = ur()
+        .args(["--root", FIXTURE, "--json", "audit"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("\"title\": \"[high] divergence"), "sections need titles:\n{}", s);
+    assert!(s.contains("\"summary\": \""), "sections need summaries:\n{}", s);
+}
+
+#[test]
+fn all_stdout_moves_the_summary_line_off_stderr() {
+    let out = ur()
+        .args(["--root", FIXTURE, "--all-stdout", "inventory"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("items)"),
+        "expected the summary on stdout"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("items)"),
+        "summary should not be duplicated on stderr"
+    );
+}
+
+#[test]
+fn row_capped_checks_announce_what_they_dropped() {
+    // A capped list reads as the whole result set: "20 rows" gets treated as
+    // "20 hits". The cap has to say so.
+    ur().args(["--root", FIXTURE, "stringly", "--top", "1"])
+        .assert()
+        .success()
+        .stderr(contains("note: showing 1 of"));
 }

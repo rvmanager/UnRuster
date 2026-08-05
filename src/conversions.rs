@@ -3,6 +3,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{fn_span, trait_fn_span, line_of, print_grouped_counts, top_module_of, type_short, ScopeTracker};
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct Hit {
@@ -248,9 +249,24 @@ pub fn run(
                         .then_with(|| a.line.cmp(&b.line))
                 });
                 let rows: &[Hit] = if let Some(n) = top { &all[..all.len().min(n)] } else { &all };
+                let shown = rows.len();
+                if shown < all.len() {
+                    // Never truncate silently: a capped list reads as the whole
+                    // result set, and "20 rows" then gets treated as "20 hits".
+                    ctx.out.note(&format!(
+                        "(note: showing {} of {} row(s) — raise or drop --top for the rest)",
+                        shown,
+                        all.len()
+                    ));
+                }
                 for h in rows {
-                    println!("{}\t{}\t{}\t{}:{}", h.kind, h.target, h.context, h.file, h.line);
-                    ctx.print_context(&h.file, h.line);
+                    row!(
+                        ctx.out,
+                        "kind" => h.kind,
+                        "target" => h.target.clone(),
+                        "context" => h.context.clone(),
+                        "at" => site(&h.file, h.line),
+                    );
                 }
             }
         }
@@ -262,6 +278,10 @@ pub fn run(
         *by_kind.entry(h.kind).or_insert(0) += 1;
     }
     let break_str: Vec<String> = by_kind.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
-    eprintln!("({} conversion call(s); {})", all.len(), break_str.join(", "));
+    ctx.out.summary(&format!(
+        "({} conversion call(s); {})",
+        all.len(),
+        break_str.join(", ")
+    ));
     Ok(all.len())
 }

@@ -5,6 +5,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{line_of_span, type_last_segment};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug, Clone)]
 struct FromImpl {
@@ -112,18 +113,18 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
 
     if !summary {
         for (forward, reverse) in &pairs {
-            println!(
-                "{}\t{} ↔ {}\t{}:{}\t{}:{}",
-                forward.trait_name,
-                forward.src,
-                forward.dst,
-                forward.file,
-                forward.line,
-                reverse.file,
-                reverse.line,
+            row!(
+                ctx.out,
+                "trait" => forward.trait_name.clone(),
+                "pair" => format!("{} ↔ {}", forward.src, forward.dst),
+                "at" => site(&forward.file, forward.line),
+                "reverse_at" => site(&reverse.file, reverse.line),
             );
         }
     }
-    eprintln!("({} bidirectional pair(s); explain: replication)", pairs.len());
+    ctx.out.summary(&format!(
+        "({} bidirectional pair(s); explain: replication)",
+        pairs.len()
+    ));
     Ok(pairs.len())
 }

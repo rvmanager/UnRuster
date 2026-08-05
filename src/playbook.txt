@@ -40,22 +40,77 @@ Top-level flags:
 - --context N: print ±N source lines beneath each finding row.
 
 Agent loop: `unruster audit` runs the whole battery as severity-ranked
-sections and exits 1 while any finding remains —
+sections and exits 1 while gating findings remain —
   until unruster audit; do <fix the top finding>; done
 `unruster explain <topic>` prints one repair recipe instead of this whole
-text. Mark contract enums with a `/// unruster: sealed` doc line: partial
-dispatch on them is tagged SEALED by enum-coverage / catch-all-arms.
+text.
+
+Start with `unruster divergence` (see DISPATCH & CONTROL FLOW below), and
+scope to fresh code with `--changed-since HEAD~1`. Measured on a large
+real codebase: the volume checks (casts, conversions, pass-through)
+returned hundreds of rows and zero defects, while sibling-disagreement
+rows converted at a far higher rate, and the best single round of finds
+came entirely from the most recent commit.
+
+In-source markers (no config file — the marker lives with the code):
+  /// unruster: sealed        on an enum. Partial dispatch on it is tagged
+                              SEALED by enum-coverage / catch-all-arms /
+                              divergence, and ranked highest by audit.
+  // unruster: ok — <reason>  waive ONE finding. Placed at the end of the
+                              offending line, or on its own line directly
+                              above it. Always give the reason: it is what
+                              the next reader (or the next session) has to
+                              evaluate. `--no-suppress` ignores all waivers;
+                              every summary line reports how many were used.
+
+Output for machines: `--json` on any command keeps `file`/`line` and the
+numeric columns as real fields, so ranking and filtering across rows need
+no `awk`. `--all-stdout` puts summary/note lines on stdout too.
 
 ══════════════════════════════════════════════════════════════════════
 DESIGN AUDIT PLAYBOOK — pick the theme matching your concern.
 The tool finds candidates; you decide whether to act.
 
 INDEX (five themes, jump to the one you need):
+  0. SIBLING DIVERGENCE     — start here: two paths that should agree, don't
   1. TYPE & DATA DESIGN     — when types should change shape
   2. ENCAPSULATION & API    — what's leaking, hidden, or expensive to change
   3. DISPATCH & CONTROL FLOW — branching smells: scattered logic, god fns
   4. CORRECTNESS & SAFETY   — silent errors, silent data loss
   5. AUDIT META             — auditing the test suite itself
+
+──── 0. SIBLING DIVERGENCE ──────────────────────────────────────────
+The highest-yield shape in this tool, and the reason to run it first.
+Two pieces of code that should agree, and don't. It recurs at three
+levels, and all three have produced confirmed defects:
+  - enum coverage — a delete path matched 2 of 3 variants where its twin
+    matched 1; the variant it forgot was a live user action that silently
+    did nothing.
+  - error handling — one fn recovered from a poisoned lock with a
+    warning; its neighbour in the same file dropped the value.
+  - bounds discipline — one accessor bounds-checked an index; its two
+    siblings on the same table indexed unchecked.
+
+◇ DIVERGENCE (sibling paths that disagree)
+  unruster divergence                       # every enum, ranked
+  unruster divergence <Enum>                # one enum
+  unruster divergence --handling            # the error-handling axis
+  unruster divergence --changed-since HEAD~1   # your last commit only
+  Signal: each row pairs a LEAN site with a RICH one that looks like its
+  sibling (same scope and/or a shared distinctive word in the fn name)
+  and names exactly what the lean side is missing. Ranking favours the
+  "forgot one" shape: a one-variant gap between twins outranks a wide
+  gap, because a wide gap usually means the two sites do different jobs.
+  `--min-score` raises the bar; the `kin` column says how the pairing was
+  made (name+scope > scope > name) so a weak pairing can be discounted
+  without opening either file.
+  With `--handling`, rows compare how carefully one callee is treated:
+  `.expect` (4) > `.unwrap_or_else` (3) > `.unwrap_or_default` (2) >
+  `.unwrap` (1) > `.ok()` / `if let Ok(..)` with no else (0). The row is
+  written from the careless side, since that's the one to decide about.
+  Each row is a CANDIDATE. Divergence is often correct — a read path and
+  a write path legitimately handle different variant sets. What the tool
+  does is put the two sides on one line so the comparison is one read.
 
 ──── 1. TYPE & DATA DESIGN ──────────────────────────────────────────
 When concrete types should become traits, primitives become newtypes,
@@ -165,9 +220,17 @@ dispatch, oversized functions that should split.
   `paint_slots`, `collect_world_transforms`) have overlapping but
   non-equal coverage sets, the smaller one is almost always the bug:
   both meant the same conceptual filter, one drifted when a variant was
-  added. Pick out divergent-coverage clusters with:
-    unruster -r src enum-coverage <Enum> | sort -k4 | uniq -f3 -D
-  (sorts on the covered-set column to group near-identical predicates).
+  added. This has its own command — see theme 0:
+    unruster divergence <Enum>
+  
+  Narrowing this check's own output:
+    --max-missing 1   only sites one variant short of exhaustive (the
+                      "forgot one" shape, where its real defects live)
+    --rank-enums      one row per enum instead of per site: which enum to
+                      look at first, by partial-site count and worst gap
+    --compact         drop the covered/missing columns, print one header
+                      line per enum instead — on a wide enum those two
+                      columns restate the variant set on every row
   
   False positives to skip — TRAIT-ROUTED CATCH-ALLS. A row whose `_` /
   catchall arm calls a no-default trait classifier on the scrutinee
@@ -257,10 +320,32 @@ Runtime risks hidden in the code: silent error-swallowing, silent data
 loss from casts and conversions.
 
 ◇ SILENT FALLBACKS (Result/Option error swallowing)
+  Two families are idiomatic rather than defective, and dominated this
+  check's output before they were split out: `let _ = write!(buf, …)`
+  into an in-memory `String` (infallible, so the discard is the correct
+  spelling) and `.unwrap_or_else(|| { log!(…); default })` (the failure
+  is already observable, so the fallback is a policy). The dedicated
+  command shows them; `audit` hides them. Restore or hide with
+  `--include-infallible <bool>` / `--include-logged <bool>`.
+  For "one callee, two levels of care", use `divergence --handling`.
   unruster error-swallows [--include-unwrap-or]
   Signal: `match-err-wild` / `if-let-ok` / `let-_` / `.map_err(|_|)` /
   `.unwrap_or_default()` hits. Some are intentional (parse cascades,
   drop guards) — review per site.
+
+◇ CAST CLASSES — what is and isn't reported by default
+  `casts` reports data-loss classes. `usize-widen` (`u32 as usize`,
+  `u32 as u64` — lossless on a 64-bit target) is computed but hidden
+  unless you ask for it by name: bundled in, it was ~83% of this check's
+  output and none of it was ever acted on.
+    unruster casts --class usize-widen        # see the lossless ones
+    unruster casts --class narrow-int,float-int   # the lossy ones only
+  A `_` in the src column means the source type could not be *grounded* —
+  traced to an annotation, a parameter, a struct literal, a cast, or
+  arithmetic over those. Method return types are NOT guessed from the
+  bare method name: with two `width()` methods in a tree, one returning
+  f64, the guess is confidently wrong, and a wrong type in a row costs
+  more than a missing one.
 
 ◇ EXCESSIVE CASTS / SHAPE-JUGGLING (the same value renamed/reshaped
   repeatedly because the wrong type was chosen at the boundary)

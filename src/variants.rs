@@ -3,6 +3,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{fn_span, trait_fn_span, enum_variant_of_path, line_of, type_short, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug, Clone)]
 struct VariantDef {
@@ -238,7 +239,10 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<usi
     }
     if defs.is_empty() {
         warn_unknown_target("enum", enum_name);
-        eprintln!("(0 variants; 0 ctor sites, 0 match sites; bare={})", bare);
+        ctx.out.summary(&format!(
+            "(0 variants; 0 ctor sites, 0 match sites; bare={})",
+            bare
+        ));
         return Err(TargetNotFound::err("enum", enum_name));
     }
 
@@ -246,9 +250,12 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<usi
 
     if !summary {
         for d in &defs {
-            println!(
-                "def\t{}::{}\t{}\t{}:{}",
-                enum_name, d.name, d.shape, d.file, d.line
+            row!(
+                ctx.out,
+                "kind" => "def",
+                "variant" => format!("{}::{}", enum_name, d.name),
+                "shape" => d.shape,
+                "at" => site(&d.file, d.line),
             );
         }
     }
@@ -279,11 +286,13 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<usi
 
     if !summary {
         for s in &sites {
-            println!(
-                "{}\t{}::{}\t{}\t{}:{}",
-                s.kind, enum_name, s.variant, s.context, s.file, s.line
+            row!(
+                ctx.out,
+                "kind" => s.kind,
+                "variant" => format!("{}::{}", enum_name, s.variant),
+                "context" => s.context.clone(),
+                "at" => site(&s.file, s.line),
             );
-            ctx.print_context(&s.file, s.line);
         }
     }
 
@@ -296,12 +305,12 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<usi
             matches += 1;
         }
     }
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} variants; {} ctor sites, {} match sites; bare={})",
         defs.len(),
         ctors,
         matches,
         bare
-    );
+    ));
     Ok(sites.len())
 }

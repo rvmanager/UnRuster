@@ -4,6 +4,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{fn_span, trait_fn_span, print_grouped_counts, top_module_of, type_short, ScopeTracker};
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct Hit {
@@ -238,12 +239,24 @@ pub fn run(
                 } else {
                     &all
                 };
+                let shown = rows.len();
+                if shown < all.len() {
+                    // Never truncate silently: a capped list reads as the whole
+                    // result set, and "20 rows" then gets treated as "20 hits".
+                    ctx.out.note(&format!(
+                        "(note: showing {} of {} row(s) — raise or drop --top for the rest)",
+                        shown,
+                        all.len()
+                    ));
+                }
                 for h in rows {
-                    println!(
-                        "{}\t{}\t{}\t{}:{}",
-                        h.class, h.literal, h.context, h.file, h.line
+                    row!(
+                        ctx.out,
+                        "class" => h.class,
+                        "literal" => h.literal.clone(),
+                        "context" => h.context.clone(),
+                        "at" => site(&h.file, h.line),
                     );
-                    ctx.print_context(&h.file, h.line);
                 }
             }
         }
@@ -258,12 +271,12 @@ pub fn run(
         .iter()
         .map(|(k, n)| format!("{}={}", k, n))
         .collect();
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} stringly hit(s); {}; include_substring={}, include_map_keys={}; explain: stringly)",
         all.len(),
         break_str.join(", "),
         include_substring,
         include_map_keys
-    );
+    ));
     Ok(all.len())
 }

@@ -3,6 +3,7 @@ use syn::visit::Visit;
 use crate::ast::{line_of, type_to_string, vis_str};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct FieldDef {
@@ -57,7 +58,7 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
 
     if defs.is_empty() {
         warn_unknown_target("struct with named fields", ty);
-        eprintln!("(0 field(s) on `{}`)", ty);
+        ctx.out.summary(&format!("(0 field(s) on `{}`)", ty));
         return Err(TargetNotFound::err("struct with named fields", ty));
     }
 
@@ -67,17 +68,23 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
         let (reads, writes, inits) =
             crate::field_uses::count_kinds(files, ty, &fd.name, &ctx.sem.fn_sigs);
         if !summary {
-            println!(
-                "{}\t{}\t{}\tr:{}\tw:{}\ti:{}\t{}:{}",
-                fd.vis, fd.name, fd.ty, reads, writes, inits, fd.file, fd.line
+            row!(
+                ctx.out,
+                "vis" => fd.vis,
+                "name" => fd.name.clone(),
+                "type" => fd.ty.clone(),
+                "reads" => format!("r:{}", reads),
+                "writes" => format!("w:{}", writes),
+                "inits" => format!("i:{}", inits),
+                "at" => site(&fd.file, fd.line),
             );
         }
     }
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} field(s) on `{}`; use `unruster field-uses {} <field>` for site details)",
         defs.len(),
         ty,
         ty
-    );
+    ));
     Ok(defs.len())
 }

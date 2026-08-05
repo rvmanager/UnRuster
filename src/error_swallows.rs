@@ -3,6 +3,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{fn_span, trait_fn_span, line_of, line_of_span, type_short, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct Hit {
@@ -15,6 +16,11 @@ struct Hit {
     file: String,
     line: usize,
     context: String,
+    /// True when the site is one of the two families that are idiomatic rather
+    /// than defective: an infallible in-memory write, or a fallback that logs.
+    /// Kept as a flag rather than dropped at scan time so the summary can say
+    /// how many were filtered and `--include-*` can restore them.
+    benign: Option<&'static str>,
 }
 
 struct SwallowVisitor<'a> {
@@ -24,18 +30,85 @@ struct SwallowVisitor<'a> {
     hits: Vec<Hit>,
 }
 
+/// Macros whose `Result` is infallible when the target is an in-memory
+/// `String`/`Vec` — `write!`/`writeln!` into a `fmt::Write` buffer cannot fail,
+/// so `let _ = write!(s, …)` is the idiomatic spelling, not a swallowed error.
+/// These dominated the `let-_` bucket on a real codebase (a large majority of
+/// 116 rows) while producing no defects.
+const INFALLIBLE_WRITE_MACROS: &[&str] = &["write", "writeln"];
+
+/// Does this `let _ = …;` discard an infallible in-memory write?
+fn is_infallible_write(init: &syn::Expr) -> bool {
+    let syn::Expr::Macro(m) = init else {
+        return false;
+    };
+    let Some(name) = m.mac.path.segments.last() else {
+        return false;
+    };
+    INFALLIBLE_WRITE_MACROS.contains(&name.ident.to_string().as_str())
+}
+
+/// Does a fallback closure body make the failure observable — a log, a warn, a
+/// debug macro, an `eprintln!`? `\u{2e}unwrap_or_else(|| { log!(…); default })`
+/// is a *handled* fallback: the error was noticed and a policy applied. Rows
+/// like these were ~half the `.unwrap_or_else` bucket and none were defects.
+fn fallback_is_logged(e: &syn::ExprMethodCall) -> bool {
+    struct V {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if let Some(seg) = m.path.segments.last() {
+                let n = seg.ident.to_string().to_lowercase();
+                // Match by name shape rather than an allow-list: every project
+                // spells its logger differently (`dbg_log`, `macos_warn`,
+                // `tracing::warn`), and an allow-list would silently fail on
+                // the next one.
+                if n.contains("log")
+                    || n.contains("warn")
+                    || n.contains("err")
+                    || n.contains("trace")
+                    || n.contains("debug")
+                    || n.contains("panic")
+                    || n.starts_with("eprint")
+                {
+                    self.found = true;
+                }
+            }
+            visit::visit_macro(self, m);
+        }
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            let n = c.method.to_string().to_lowercase();
+            if n.contains("log") || n.contains("warn") || n.contains("report") {
+                self.found = true;
+            }
+            visit::visit_expr_method_call(self, c);
+        }
+    }
+    let mut v = V { found: false };
+    for a in &e.args {
+        v.visit_expr(a);
+    }
+    v.found
+}
+
 impl<'a> SwallowVisitor<'a> {
     fn enclosing(&self) -> String {
         self.scope.enclosing()
     }
 
     fn record(&mut self, kind: &'static str, line: usize) {
+        self.record_tagged(kind, line, None);
+    }
+
+    fn record_tagged(&mut self, kind: &'static str, line: usize, benign: Option<&'static str>) {
         let ctx = self.enclosing();
         self.hits.push(Hit {
             kind,
             file: self.file.to_string(),
             line,
             context: ctx,
+            benign,
         });
     }
 }
@@ -146,7 +219,12 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
             _ => None,
         };
         if let Some(k) = kind {
-            self.record(k, line_of(&e.method));
+            let benign = if k == ".unwrap_or_else" && fallback_is_logged(e) {
+                Some("logged-fallback")
+            } else {
+                None
+            };
+            self.record_tagged(k, line_of(&e.method), benign);
         }
         visit::visit_expr_method_call(self, e);
     }
@@ -198,14 +276,46 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
             syn::Pat::Type(pt) => matches!(*pt.pat, syn::Pat::Wild(_)),
             _ => false,
         };
-        if is_wild && l.init.is_some() {
-            self.record("let-_", line_of(&l.let_token));
+        if is_wild {
+            if let Some(init) = &l.init {
+                let benign = if is_infallible_write(&init.expr) {
+                    Some("infallible-write")
+                } else {
+                    None
+                };
+                self.record_tagged("let-_", line_of(&l.let_token), benign);
+            }
         }
         visit::visit_local(self, l);
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<usize> {
+/// Which families of swallow site to report.
+#[derive(Clone, Copy)]
+pub struct SwallowOpts {
+    /// `.unwrap_or(…)` with any argument. Noisy; off by default.
+    pub include_unwrap_or: bool,
+    /// `let _ = write!(buf, …)` into an in-memory buffer.
+    pub include_infallible: bool,
+    /// `.unwrap_or_else(|| { log!(…); default })` — failure already observable.
+    pub include_logged: bool,
+}
+
+impl Default for SwallowOpts {
+    /// The bare `error-swallows` command keeps every family: the dedicated
+    /// command is where someone goes to see everything. `audit` opts out of
+    /// the benign families, since it is read for defects.
+    fn default() -> Self {
+        SwallowOpts {
+            include_unwrap_or: false,
+            include_infallible: true,
+            include_logged: true,
+        }
+    }
+}
+
+pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
+    let include_unwrap_or = opts.include_unwrap_or;
     let files = ctx.files;
     let summary = ctx.summary;
     let mut all: Vec<Hit> = Vec::new();
@@ -220,6 +330,14 @@ pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<usize> 
         all.extend(v.hits);
     }
     ctx.retain_changed(&mut all, |h| &h.file);
+    ctx.retain_unsuppressed(&mut all, |h| (h.file.as_str(), h.line));
+    let before = all.len();
+    all.retain(|h| match h.benign {
+        Some("infallible-write") => opts.include_infallible,
+        Some("logged-fallback") => opts.include_logged,
+        _ => true,
+    });
+    let benign_hidden = before - all.len();
     all.sort_by(|a, b| {
         a.kind
             .cmp(b.kind)
@@ -228,8 +346,12 @@ pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<usize> 
     });
     if !summary {
         for h in &all {
-            println!("{}\t{}\t{}:{}", h.kind, h.context, h.file, h.line);
-            ctx.print_context(&h.file, h.line);
+            row!(
+                ctx.out,
+                "kind" => h.kind,
+                "context" => h.context.clone(),
+                "at" => site(&h.file, h.line),
+            );
         }
     }
     use std::collections::BTreeMap;
@@ -241,11 +363,20 @@ pub fn run(ctx: &AnalysisCtx, include_unwrap_or: bool) -> anyhow::Result<usize> 
         .iter()
         .map(|(k, n)| format!("{}={}", k, n))
         .collect();
-    eprintln!(
-        "({} swallow site(s); {}; include_unwrap_or={}; explain: silent-fallbacks)",
+    ctx.out.summary(&format!(
+        "({} swallow site(s); {}; include_unwrap_or={}{}; explain: silent-fallbacks)",
         all.len(),
         breakdown.join(", "),
-        include_unwrap_or
-    );
+        include_unwrap_or,
+        if benign_hidden > 0 {
+            format!(
+                "; {} benign site(s) hidden (infallible writes / logged fallbacks — \
+                 `--include-infallible` / `--include-logged` to restore)",
+                benign_hidden
+            )
+        } else {
+            String::new()
+        }
+    ));
     Ok(all.len())
 }

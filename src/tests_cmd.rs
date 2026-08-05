@@ -13,6 +13,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{line_of, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::{display_path, ParsedFile};
+use crate::emit::row;
 
 #[derive(Debug)]
 struct TestInfo {
@@ -306,13 +307,17 @@ pub fn run(
         rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         if !summary {
             for (sub, n) in &rows {
-                println!("{}\t{}", n, sub);
+                row!(ctx.out, "count" => *n, "subcommand" => sub.clone());
             }
             if none > 0 {
-                println!("{}\t<no detectable subcommand>", none);
+                row!(
+                    ctx.out,
+                    "count" => none,
+                    "subcommand" => "<no detectable subcommand>",
+                );
             }
         }
-        eprintln!(
+        ctx.out.summary(&format!(
             "({} test fn(s) across {} distinct subcommand(s){})",
             all.len(),
             rows.len(),
@@ -321,7 +326,7 @@ pub fn run(
             } else {
                 String::new()
             }
-        );
+        ));
         return Ok(all.len());
     }
 
@@ -332,9 +337,20 @@ pub fn run(
             let range = format!("{}:{}-{}", t.file, t.line_start, t.line_end);
             if with_hint {
                 let h = t.hint.as_deref().unwrap_or("");
-                println!("{}\t{}\t{}\t{}", t.attr, range, t.qpath, h);
+                row!(
+                    ctx.out,
+                    "attr" => t.attr,
+                    "range" => range,
+                    "qpath" => t.qpath.clone(),
+                    "hint" => h,
+                );
             } else {
-                println!("{}\t{}\t{}", t.attr, range, t.qpath);
+                row!(
+                    ctx.out,
+                    "attr" => t.attr,
+                    "range" => range,
+                    "qpath" => t.qpath.clone(),
+                );
             }
         }
     }
@@ -345,6 +361,7 @@ pub fn run(
         *by_attr.entry(t.attr).or_insert(0) += 1;
     }
     let parts: Vec<String> = by_attr.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
-    eprintln!("({} test fn(s); {})", all.len(), parts.join(", "));
+    ctx.out
+        .summary(&format!("({} test fn(s); {})", all.len(), parts.join(", ")));
     Ok(all.len())
 }

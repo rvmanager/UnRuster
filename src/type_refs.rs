@@ -3,6 +3,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{fn_span, trait_fn_span, line_of, path_to_string_with_args, type_short, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct Ref {
@@ -165,7 +166,7 @@ pub fn run(
 
     let targets = aliases.synonyms(ty);
     if targets.len() > 1 {
-        eprintln!(
+        ctx.out.note(&format!(
             "note: also matching alias-equivalent names: {}",
             targets
                 .iter()
@@ -173,7 +174,7 @@ pub fn run(
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        ));
     }
 
     // A name with exactly one definition in the tree can't be confused with
@@ -223,17 +224,15 @@ pub fn run(
             if r.matched_via == "alias" {
                 alias_hits += 1;
             }
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}:{}",
-                r.role,
-                r.matched_via,
-                conf_of(r.matched_via).as_str(),
-                r.written,
-                r.context,
-                r.file,
-                r.line
+            row!(
+                ctx.out,
+                "role" => r.role,
+                "via" => r.matched_via,
+                "confidence" => conf_of(r.matched_via).as_str(),
+                "written" => r.written.clone(),
+                "context" => r.context.clone(),
+                "at" => site(&r.file, r.line),
             );
-            ctx.print_context(&r.file, r.line);
         }
     } else {
         alias_hits = all.iter().filter(|r| r.matched_via == "alias").count();
@@ -249,12 +248,12 @@ pub fn run(
             .join("::");
         *by_module.entry(module_of).or_default() += 1;
     }
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} reference(s) across {} module(s); {} via alias)",
         all.len(),
         by_module.len(),
         alias_hits
-    );
+    ));
     if !known && all.is_empty() {
         return Err(TargetNotFound::err("type", ty));
     }

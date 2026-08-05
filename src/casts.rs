@@ -4,6 +4,7 @@ use crate::ast::{fn_span, print_grouped_counts, top_module_of, type_short, type_
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 use crate::semantic::{FnSigIndex, FnTypes};
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct Hit {
@@ -41,6 +42,7 @@ pub enum CastClass {
     WidenFloat,
     Ptr,
     UsizeCross,
+    UsizeWiden,
     Unknown,
     Other,
 }
@@ -57,6 +59,7 @@ impl CastClass {
             CastClass::WidenFloat => "widen-float",
             CastClass::Ptr => "ptr",
             CastClass::UsizeCross => "usize-cross",
+            CastClass::UsizeWiden => "usize-widen",
             CastClass::Unknown => "unknown",
             CastClass::Other => "other",
         }
@@ -117,17 +120,68 @@ fn classify_float_mix(s: &str, dst: &str) -> Option<&'static str> {
     None
 }
 
+/// Width of `usize`/`isize` on the targets this tool is used to audit. Every
+/// mainstream Rust target in practice is 64-bit; a 16- or 32-bit embedded
+/// target would make some `usize-widen` rows narrowing, which is why the class
+/// name says *widen* rather than *safe* and the summary line names the
+/// assumption.
+const USIZE_WIDTH: u16 = 64;
+
+/// `u32 as usize` on a 64-bit target loses nothing, and neither does
+/// `usize as u64`. Bundling those with genuinely lossy `f64 as usize` made
+/// this check ~83% noise on a real codebase — 29 of 35 rows were lossless
+/// widening that no reader ever acted on.
+fn usize_cross_is_lossless(src: &str, dst: &str) -> bool {
+    let width_of = |t: &str| -> Option<u16> {
+        if is_usize_family(t) {
+            Some(USIZE_WIDTH)
+        } else {
+            int_width_signed(t).map(|(w, _)| w)
+        }
+    };
+    let signed_of = |t: &str| -> Option<bool> {
+        if t == "usize" {
+            Some(false)
+        } else if t == "isize" {
+            Some(true)
+        } else {
+            int_width_signed(t).map(|(_, s)| s)
+        }
+    };
+    let (Some(sw), Some(dw)) = (width_of(src), width_of(dst)) else {
+        return false;
+    };
+    let (Some(ss), Some(ds)) = (signed_of(src), signed_of(dst)) else {
+        return false;
+    };
+    match (ss, ds) {
+        // Signed → signed: lossless when the destination is at least as wide.
+        (true, true) => dw >= sw,
+        // Signed → unsigned: a negative value wraps. Never lossless.
+        (true, false) => false,
+        // Unsigned → signed: needs a strictly wider destination, since the
+        // sign bit costs one bit of range.
+        (false, true) => dw > sw,
+        // Unsigned → unsigned: lossless when at least as wide.
+        (false, false) => dw >= sw,
+    }
+}
+
 fn classify(src: Option<&str>, dst: &str) -> &'static str {
     if dst.starts_with("*const") || dst.starts_with("*mut") {
         return "ptr";
     }
     let src_is_usize = src.map(is_usize_family).unwrap_or(false);
     let dst_is_usize = is_usize_family(dst);
-    if src_is_usize && !dst_is_usize && int_width_signed(dst).is_some() {
-        return "usize-cross";
-    }
-    if dst_is_usize && src.is_some() && !src_is_usize {
-        return "usize-cross";
+    let usize_involved = (src_is_usize && !dst_is_usize && int_width_signed(dst).is_some())
+        || (dst_is_usize && src.is_some() && !src_is_usize);
+    if usize_involved {
+        let s = src.expect("usize_involved implies a known source type");
+        return if usize_cross_is_lossless(s, dst) {
+            "usize-widen"
+        } else {
+            "usize-cross"
+        };
     }
     let dst_int = int_width_signed(dst);
     let src_int = src.and_then(int_width_signed);
@@ -201,10 +255,14 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
 
     fn visit_expr_cast(&mut self, e: &'ast syn::ExprCast) {
         let dst = type_to_string(&e.ty);
+        // Grounded inference only: a cast row *states* the source type, and a
+        // wrong statement costs more than a missing one. A reader who sees
+        // `f64 → usize` on code that is actually `u32 → usize` stops trusting
+        // the whole check; `_ → usize` just prompts a look.
         let src = self
             .fn_types_stack
             .last()
-            .and_then(|ft| ft.type_of(&e.expr, self.fn_sigs));
+            .and_then(|ft| ft.type_of_grounded(&e.expr, self.fn_sigs));
         let class = classify(src.as_deref(), &dst);
         self.hits.push(Hit {
             class,
@@ -248,12 +306,22 @@ pub fn run(
     }
 
     ctx.retain_changed(&mut all, |h| &h.file);
+    ctx.retain_unsuppressed(&mut all, |h| (h.file.as_str(), h.line));
     if !class_filter.is_empty() {
         let wanted: Vec<&str> = class_filter.iter().map(|c| c.as_str()).collect();
         all.retain(|h| wanted.contains(&h.class));
     }
     if hide_widen {
-        all.retain(|h| !matches!(h.class, "widen-int" | "widen-float"));
+        all.retain(|h| !matches!(h.class, "widen-int" | "widen-float" | "usize-widen"));
+    }
+    // `usize-widen` is lossless by construction, so it is off unless asked for
+    // by name. Without an explicit --class the default view is defect classes.
+    let asked_for_widen = class_filter.contains(&CastClass::UsizeWiden);
+    let mut widen_hidden = 0usize;
+    if !asked_for_widen {
+        let before = all.len();
+        all.retain(|h| h.class != "usize-widen");
+        widen_hidden = before - all.len();
     }
 
     all.sort_by(|a, b| {
@@ -276,12 +344,25 @@ pub fn run(
                 } else {
                     &all
                 };
+                let shown = rows.len();
+                if shown < all.len() {
+                    // Never truncate silently: a capped list reads as the whole
+                    // result set, and "20 rows" then gets treated as "20 hits".
+                    ctx.out.note(&format!(
+                        "(note: showing {} of {} row(s) — raise or drop --top for the rest)",
+                        shown,
+                        all.len()
+                    ));
+                }
                 for h in rows {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}:{}",
-                        h.class, h.src, h.dst, h.context, h.file, h.line
+                    row!(
+                        ctx.out,
+                        "class" => h.class,
+                        "src" => h.src.clone(),
+                        "dst" => h.dst.clone(),
+                        "context" => h.context.clone(),
+                        "at" => site(&h.file, h.line),
                     );
-                    ctx.print_context(&h.file, h.line);
                 }
             }
         }
@@ -293,11 +374,20 @@ pub fn run(
         *by_class.entry(h.class).or_insert(0) += 1;
     }
     let break_str: Vec<String> = by_class.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
-    eprintln!(
-        "({} cast(s); {}; hide_widen={}; explain: casts)",
+    ctx.out.summary(&format!(
+        "({} cast(s); {}; hide_widen={}{}; explain: casts)",
         all.len(),
         break_str.join(", "),
-        hide_widen
-    );
+        hide_widen,
+        if widen_hidden > 0 {
+            format!(
+                "; {} lossless usize-widen row(s) hidden (assumes {}-bit usize; \
+                 `--class usize-widen` to see them)",
+                widen_hidden, USIZE_WIDTH
+            )
+        } else {
+            String::new()
+        }
+    ));
     Ok(all.len())
 }

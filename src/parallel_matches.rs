@@ -4,6 +4,7 @@ use syn::visit::{self, Visit};
 
 use crate::ast::{doc_text, enum_variant_of_path, fn_span, line_of, trait_fn_span, type_short, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::emit::{row, site as site_cell};
 use crate::macro_scan::{macro_body, Body};
 use crate::parse::{display_path, ParsedFile};
 
@@ -489,26 +490,26 @@ pub fn run(
             let variant_names = variant_names_of(ctx.files, enum_name);
             if variant_names.is_empty() {
                 if ctx.idx.knows_name(enum_name) {
-                    eprintln!(
+                    ctx.out.note(&format!(
                         "note: `{}` is named in the tree but no enum definition with variants \
                          was found under --scope; nothing to scan",
                         enum_name
-                    );
-                    eprintln!(
+                    ));
+                    ctx.out.summary(&format!(
                         "(0 match site(s) across 0 variant-set group(s) on `{}`)",
                         enum_name
-                    );
+                    ));
                     return Ok(0);
                 }
                 warn_unknown_target("enum", enum_name);
-                eprintln!(
+                ctx.out.summary(&format!(
                     "(0 match site(s) across 0 variant-set group(s) on `{}`)",
                     enum_name
-                );
+                ));
                 return Err(TargetNotFound::err("enum", enum_name));
             }
             let (sites, groups) = scan_groups(ctx, enum_name, &variant_names, opts, false);
-            eprintln!(
+            ctx.out.summary(&format!(
                 "({} match site(s) across {} variant-set group(s) on `{}`{})",
                 sites,
                 groups,
@@ -518,7 +519,7 @@ pub fn run(
                 } else {
                     ""
                 }
-            );
+            ));
             Ok(groups)
         }
         // `--all`: every enum in the index; group rows gain a leading enum column.
@@ -536,7 +537,7 @@ pub fn run(
                 total_sites += sites;
                 total_groups += groups;
             }
-            eprintln!(
+            ctx.out.summary(&format!(
                 "({} match site(s) across {} group(s) on {} enum(s); --all{})",
                 total_sites,
                 total_groups,
@@ -546,7 +547,7 @@ pub fn run(
                 } else {
                     ""
                 }
-            );
+            ));
             Ok(total_groups)
         }
     }
@@ -612,9 +613,20 @@ fn scan_groups(
         for ((variants, wildcard), sites) in &rows {
             let key = group_label(variants, *wildcard, opts, total, variant_names);
             if prefixed {
-                println!("group\t{}\t{}\t{} site(s)", enum_name, key, sites.len());
+                row!(
+                    ctx.out,
+                    "kind" => "group",
+                    "enum" => enum_name,
+                    "variants" => key,
+                    "sites" => format!("{} site(s)", sites.len()),
+                );
             } else {
-                println!("group\t{}\t{} site(s)", key, sites.len());
+                row!(
+                    ctx.out,
+                    "kind" => "group",
+                    "variants" => key,
+                    "sites" => format!("{} site(s)", sites.len()),
+                );
             }
             print_group_sites(ctx, sites);
         }
@@ -632,6 +644,11 @@ struct Row<'s> {
 
 /// Print one `enum-coverage` row (with kind/SEALED tags, optional enum-name
 /// prefix in --all mode, and the optional --context snippet).
+///
+/// `compact` drops the covered/missing variant lists from the row. On a wide
+/// enum those two columns repeat nearly the whole variant set on every site —
+/// a 19-variant enum with 37 sites spent thousands of tokens restating what a
+/// single per-enum header line says once.
 fn print_coverage_row(
     ctx: &AnalysisCtx,
     r: &Row,
@@ -639,6 +656,7 @@ fn print_coverage_row(
     sealed: bool,
     prefixed: bool,
     enum_name: &str,
+    compact: bool,
 ) {
     let mut tag = if r.site.trait_routed {
         " (catchall→method; likely false positive)".to_string()
@@ -652,24 +670,45 @@ fn print_coverage_row(
     if sealed {
         tag.push_str(" SEALED");
     }
-    let body = format!(
-        "{:.2}\t{}/{}\t{}\t{}\t{}:{}\t{}{}",
-        r.gap,
-        r.site.variants.len(),
-        total,
-        r.site.variants.join(","),
-        r.missing.join(","),
-        r.site.file,
-        r.site.line,
-        r.site.context,
-        tag
-    );
-    if prefixed {
-        println!("{}\t{}", enum_name, body);
-    } else {
-        println!("{}", body);
+    let context = format!("{}{}", r.site.context, tag);
+    let covered = format!("{}/{}", r.site.variants.len(), total);
+    let at = site_cell(&r.site.file, r.site.line);
+    match (prefixed, compact) {
+        (true, true) => row!(
+            ctx.out,
+            "enum" => enum_name,
+            "gap" => r.gap,
+            "covered" => covered,
+            "at" => at,
+            "context" => context,
+        ),
+        (true, false) => row!(
+            ctx.out,
+            "enum" => enum_name,
+            "gap" => r.gap,
+            "covered" => covered,
+            "variants" => r.site.variants.clone(),
+            "missing" => r.missing.clone(),
+            "at" => at,
+            "context" => context,
+        ),
+        (false, true) => row!(
+            ctx.out,
+            "gap" => r.gap,
+            "covered" => covered,
+            "at" => at,
+            "context" => context,
+        ),
+        (false, false) => row!(
+            ctx.out,
+            "gap" => r.gap,
+            "covered" => covered,
+            "variants" => r.site.variants.clone(),
+            "missing" => r.missing.clone(),
+            "at" => at,
+            "context" => context,
+        ),
     }
-    ctx.print_context(&r.site.file, r.site.line);
 }
 
 /// Print one group's indented site lines (with kind tag and optional
@@ -683,8 +722,11 @@ fn print_group_sites(ctx: &AnalysisCtx, sites: &[&Site]) {
         } else {
             ""
         };
-        println!("  {}{}\t{}:{}", s.context, tag, s.file, s.line);
-        ctx.print_context(&s.file, s.line);
+        row!(
+            ctx.out,
+            "context" => format!("  {}{}", s.context, tag),
+            "at" => site_cell(&s.file, s.line),
+        );
     }
 }
 
@@ -745,6 +787,24 @@ pub(crate) fn enum_sealed(files: &[ParsedFile], enum_name: &str) -> bool {
     v.sealed
 }
 
+/// Knobs for an `enum-coverage` scan.
+#[derive(Default, Clone, Copy)]
+pub struct CoverageOpts {
+    /// Drop rows whose `_` arm calls a method on the scrutinee.
+    pub hide_trait_routed: bool,
+    /// Keep only sites missing at most N variants. `Some(1)` isolates the
+    /// "forgot exactly one" shape — the highest-yield subset, and previously
+    /// only reachable by piping the rows through `awk -F'\t' '{split($5,a,",")…}'`.
+    pub max_missing: Option<usize>,
+    /// Drop the covered/missing variant columns and print one header line per
+    /// enum instead.
+    pub compact: bool,
+    /// Instead of per-site rows, print one row per enum: how many partial sites
+    /// it has and its worst gap. Replaces the `awk | sort | uniq -c | sort -rn`
+    /// pipeline for "which enum should I look at first".
+    pub rank_enums: bool,
+}
+
 /// `enum-coverage <Enum>` — synthesis of the partial-enumeration defect class.
 /// One row per *partial* match / `matches!` site (exhaustive sites are
 /// compiler-protected and hidden), sorted by gap_score = covered/total
@@ -753,24 +813,24 @@ pub(crate) fn enum_sealed(files: &[ParsedFile], enum_name: &str) -> bool {
 pub fn run_enum_coverage(
     ctx: &AnalysisCtx,
     target: Option<&str>,
-    hide_trait_routed: bool,
+    opts: CoverageOpts,
 ) -> anyhow::Result<usize> {
     match target {
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);
             if variant_names.is_empty() {
                 let summary_line = || {
-                    eprintln!(
+                    ctx.out.summary(&format!(
                         "(0 partial site(s) on `{}`; 0 total variant(s); exhaustive sites hidden)",
                         enum_name
-                    );
+                    ));
                 };
                 if ctx.idx.knows_name(enum_name) {
-                    eprintln!(
+                    ctx.out.note(&format!(
                         "note: `{}` is named in the tree but no enum definition with variants \
                          was found under --scope; nothing to score",
                         enum_name
-                    );
+                    ));
                     summary_line();
                     return Ok(0);
                 }
@@ -778,73 +838,126 @@ pub fn run_enum_coverage(
                 summary_line();
                 return Err(TargetNotFound::err("enum", enum_name));
             }
-            let (shown, hidden, sealed_rows) =
-                coverage_one(ctx, enum_name, &variant_names, hide_trait_routed, false);
-            eprintln!(
-                "({} partial site(s) on `{}`; {} total variant(s); exhaustive sites hidden{}{}; explain: partial-enumeration)",
-                shown,
+            let scan = coverage_one(ctx, enum_name, &variant_names, opts, false);
+            ctx.out.summary(&format!(
+                "({} partial site(s) on `{}`; {} total variant(s); exhaustive sites hidden{}{}{}; explain: partial-enumeration)",
+                scan.shown,
                 enum_name,
                 variant_names.len(),
-                if hide_trait_routed {
-                    format!("; {} trait-routed catch-all(s) hidden", hidden)
+                if opts.hide_trait_routed {
+                    format!("; {} trait-routed catch-all(s) hidden", scan.hidden)
                 } else {
                     String::new()
                 },
-                if sealed_rows > 0 {
-                    format!("; {} on a SEALED enum", sealed_rows)
+                gap_filter_note(opts, scan.filtered_by_gap),
+                if scan.sealed_rows > 0 {
+                    format!("; {} on a SEALED enum", scan.sealed_rows)
                 } else {
                     String::new()
                 }
-            );
-            Ok(shown)
+            ));
+            Ok(scan.shown)
         }
         // `--all`: every enum in the index; rows gain a leading enum column.
         None => {
             let mut shown = 0usize;
             let mut hidden = 0usize;
+            let mut filtered = 0usize;
             let mut sealed_rows = 0usize;
             let mut scanned = 0usize;
+            // `--rank-enums` needs every enum's totals before it can order
+            // them, so it collects instead of streaming.
+            let mut ranked: Vec<(String, usize, f64, bool)> = Vec::new();
             for name in ctx.idx.enum_names() {
                 let variant_names = variant_names_of(ctx.files, &name);
                 if variant_names.is_empty() {
                     continue;
                 }
                 scanned += 1;
-                let (s, h, sl) = coverage_one(ctx, &name, &variant_names, hide_trait_routed, true);
-                shown += s;
-                hidden += h;
-                sealed_rows += sl;
+                let scan = coverage_one(ctx, &name, &variant_names, opts, true);
+                shown += scan.shown;
+                hidden += scan.hidden;
+                filtered += scan.filtered_by_gap;
+                sealed_rows += scan.sealed_rows;
+                if opts.rank_enums && scan.shown > 0 {
+                    ranked.push((name, scan.shown, scan.worst_gap, scan.sealed_rows > 0));
+                }
             }
-            eprintln!(
-                "({} partial site(s) across {} enum(s); --all; exhaustive sites hidden{}{}; explain: partial-enumeration)",
+            if opts.rank_enums {
+                // Most partial sites first: the enum with the widest spread of
+                // disagreeing dispatch sites is where a new variant does the
+                // most damage.
+                ranked.sort_by(|a, b| {
+                    b.1.cmp(&a.1)
+                        .then_with(|| b.2.total_cmp(&a.2))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                for (name, sites, worst, sealed) in &ranked {
+                    row!(
+                        ctx.out,
+                        "enum" => name.clone(),
+                        "partial_sites" => *sites,
+                        "worst_gap" => *worst,
+                        "sealed" => *sealed,
+                    );
+                }
+            }
+            ctx.out.summary(&format!(
+                "({} partial site(s) across {} enum(s); --all; exhaustive sites hidden{}{}{}; explain: partial-enumeration)",
                 shown,
                 scanned,
-                if hide_trait_routed {
+                if opts.hide_trait_routed {
                     format!("; {} trait-routed catch-all(s) hidden", hidden)
                 } else {
                     String::new()
                 },
+                gap_filter_note(opts, filtered),
                 if sealed_rows > 0 {
                     format!("; {} on SEALED enums", sealed_rows)
                 } else {
                     String::new()
                 }
-            );
+            ));
             Ok(shown)
         }
     }
 }
 
+/// Say what `--max-missing` removed. A filter that silently shrinks the result
+/// set reads as a clean codebase.
+fn gap_filter_note(opts: CoverageOpts, filtered: usize) -> String {
+    match opts.max_missing {
+        Some(n) if filtered > 0 => format!(
+            "; {} site(s) hidden by --max-missing {} (drop the flag to see them)",
+            filtered, n
+        ),
+        Some(n) => format!("; --max-missing {}", n),
+        None => String::new(),
+    }
+}
+
+/// Outcome of scoring one enum.
+struct CoverageScan {
+    shown: usize,
+    /// Rows dropped as trait-routed catch-alls.
+    hidden: usize,
+    /// Rows dropped by `--max-missing`.
+    filtered_by_gap: usize,
+    sealed_rows: usize,
+    /// Highest coverage ratio among shown rows — the closest-to-exhaustive
+    /// site, which is the one a new variant most likely mis-binds.
+    worst_gap: f64,
+}
+
 /// Score one enum's partial sites and print its rows. With `prefixed`
-/// (--all mode) each row carries a leading enum-name column. Returns
-/// (rows shown, trait-routed rows hidden, rows on a sealed enum).
+/// (--all mode) each row carries a leading enum-name column.
 fn coverage_one(
     ctx: &AnalysisCtx,
     enum_name: &str,
     variant_names: &[String],
-    hide_trait_routed: bool,
+    opts: CoverageOpts,
     prefixed: bool,
-) -> (usize, usize, usize) {
+) -> CoverageScan {
     let summary = ctx.summary;
     let total = variant_names.len();
     let sealed = enum_sealed(ctx.files, enum_name);
@@ -853,9 +966,11 @@ fn coverage_one(
     // primary vectors for this defect, so enum-coverage always includes them.
     let mut all_sites = collect_sites(ctx.files, enum_name, variant_names, true, true, ctx.spans);
     ctx.retain_changed(&mut all_sites, |s| &s.file);
+    ctx.retain_unsuppressed(&mut all_sites, |s| (s.file.as_str(), s.line));
 
     // One row per site; keep only partials (covered < total).
     let mut hidden_trait_routed = 0usize;
+    let mut filtered_by_gap = 0usize;
     let mut rows: Vec<Row> = all_sites
         .iter()
         .filter(|s| s.variants.len() < total)
@@ -863,12 +978,19 @@ fn coverage_one(
             // A catch-all that routes through a method call on the scrutinee is
             // structurally safe (a new variant must implement the trait method).
             // With the flag set, drop those rows; count them for the summary.
-            if hide_trait_routed && s.trait_routed {
+            if opts.hide_trait_routed && s.trait_routed {
                 hidden_trait_routed += 1;
                 false
             } else {
                 true
             }
+        })
+        .filter(|s| match opts.max_missing {
+            Some(n) if total - s.variants.len() > n => {
+                filtered_by_gap += 1;
+                false
+            }
+            _ => true,
         })
         .map(|s| Row {
             gap: s.variants.len() as f64 / total as f64,
@@ -888,11 +1010,26 @@ fn coverage_one(
             .then_with(|| a.site.line.cmp(&b.site.line))
     });
 
-    if !summary {
+    // `--compact` drops the per-row variant lists, so the variant set has to be
+    // stated once somewhere or the rows become unreadable.
+    if !summary && opts.compact && !opts.rank_enums && !rows.is_empty() {
+        ctx.out.line(&format!(
+            "# {} [{} variants: {}]",
+            enum_name,
+            total,
+            variant_names.join(",")
+        ));
+    }
+    if !summary && !opts.rank_enums {
         for r in &rows {
-            print_coverage_row(ctx, r, total, sealed, prefixed, enum_name);
+            print_coverage_row(ctx, r, total, sealed, prefixed, enum_name, opts.compact);
         }
     }
-    let sealed_rows = if sealed { rows.len() } else { 0 };
-    (rows.len(), hidden_trait_routed, sealed_rows)
+    CoverageScan {
+        shown: rows.len(),
+        hidden: hidden_trait_routed,
+        filtered_by_gap,
+        sealed_rows: if sealed { rows.len() } else { 0 },
+        worst_gap: rows.first().map(|r| r.gap).unwrap_or(0.0),
+    }
 }

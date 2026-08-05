@@ -15,6 +15,7 @@ pub enum CallersBy {
 use crate::index::NameIndex;
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{Semantic, UseMap};
+use crate::emit::{row, site};
 
 #[derive(Debug, Clone)]
 struct CallSite {
@@ -289,11 +290,11 @@ pub fn run_callers(
             .iter()
             .map(|s| s.caller.as_str())
             .collect::<BTreeSet<_>>();
-        eprintln!(
+        ctx.out.summary(&format!(
             "({} call site(s) across {} caller(s))",
             direct.len(),
             unique.len()
-        );
+        ));
         if !known && direct.is_empty() {
             return Err(TargetNotFound::err("fn, method, or macro matching", query));
         }
@@ -305,17 +306,17 @@ pub fn run_callers(
     rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     if !summary {
         for (caller, d) in &rows {
-            println!("d{}\t{}", d, caller);
+            row!(ctx.out, "depth" => format!("d{}", d), "caller" => caller.clone());
         }
     }
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} direct, {} transitive caller(s); max_depth={})",
         direct.len(),
         rows.len(),
         depth
             .map(|d| d.to_string())
             .unwrap_or_else(|| "∞".to_string())
-    );
+    ));
     if !known && direct.is_empty() && rows.is_empty() {
         return Err(TargetNotFound::err("fn, method, or macro matching", query));
     }
@@ -402,15 +403,13 @@ fn emit_caller_rows(
                     .then_with(|| a.line.cmp(&b.line))
             });
             for s in sorted {
-                println!(
-                    "{}\t{}\t{}\t{}:{}",
-                    s.caller,
-                    s.target,
-                    site_confidence(s, query, unique_name).as_str(),
-                    s.file,
-                    s.line
+                row!(
+                    ctx.out,
+                    "caller" => s.caller.clone(),
+                    "target" => s.target.clone(),
+                    "confidence" => site_confidence(s, query, unique_name).as_str(),
+                    "at" => site(&s.file, s.line),
                 );
-                ctx.print_context(&s.file, s.line);
             }
         }
     }
@@ -508,7 +507,10 @@ pub fn run_callers_among(
     let members = cohort_members(index, pattern);
     if members.is_empty() {
         warn_unknown_target("fn or method matching cohort pattern", pattern);
-        eprintln!("(0/0 cohort member(s) call `{}`; 0 do not)", query);
+        ctx.out.summary(&format!(
+            "(0/0 cohort member(s) call `{}`; 0 do not)",
+            query
+        ));
         return Err(TargetNotFound::err(
             "fn or method matching cohort pattern",
             pattern,
@@ -537,9 +539,19 @@ pub fn run_callers_among(
             match call_in.get(qpath.as_str()) {
                 Some(site) => {
                     calls += 1;
-                    println!("✓\t{}\t{}:{}", label, site.file, site.line);
+                    row!(
+                        ctx.out,
+                        "calls" => "✓",
+                        "member" => label.clone(),
+                        "at" => crate::emit::site(&site.file, site.line),
+                    );
                 }
-                None => println!("✗\t{}\t(no call site)", label),
+                None => row!(
+                    ctx.out,
+                    "calls" => "✗",
+                    "member" => label.clone(),
+                    "at" => "(no call site)",
+                ),
             }
         }
     } else {
@@ -548,13 +560,13 @@ pub fn run_callers_among(
             .filter(|(_, q, _, _)| call_in.contains_key(q.as_str()))
             .count();
     }
-    eprintln!(
+    ctx.out.summary(&format!(
         "({}/{} cohort member(s) call `{}`; {} do not)",
         calls,
         members.len(),
         query,
         members.len() - calls
-    );
+    ));
     Ok(members.len() - calls)
 }
 
@@ -569,7 +581,8 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<us
     let members = cohort_members(index, pattern);
     if members.is_empty() {
         warn_unknown_target("fn or method matching cohort pattern", pattern);
-        eprintln!("(0 cohort member(s), 0 distinct callee(s), 0 divergence candidate(s))");
+        ctx.out
+            .summary("(0 cohort member(s), 0 distinct callee(s), 0 divergence candidate(s))");
         return Err(TargetNotFound::err(
             "fn or method matching cohort pattern",
             pattern,
@@ -608,7 +621,7 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<us
             header.push('\t');
             header.push_str(label);
         }
-        println!("{}", header);
+        ctx.out.line(&header);
     }
     for callee in &all_callees {
         let present = presence_row(callee, &cols, &by_member);
@@ -622,18 +635,18 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<us
             if diverges {
                 row.push_str("\t<- divergence");
             }
-            println!("{}", row);
+            ctx.out.line(&row);
         }
         if diverges {
             divergences.push(callee.clone());
         }
     }
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} cohort member(s), {} distinct callee(s), {} divergence candidate(s); explain: sibling)",
         n,
         all_callees.len(),
         divergences.len()
-    );
+    ));
     Ok(divergences.len())
 }
 
@@ -750,20 +763,32 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<usize>
 
     if !summary {
         for (caller, n, (file, line)) in &a_only {
-            println!("A-only\t{}\t{}\tvia {}:{}", n, caller, file, line);
+            row!(
+                ctx.out,
+                "side" => "A-only",
+                "count" => *n,
+                "caller" => caller.to_string(),
+                "via" => format!("via {}:{}", file, line),
+            );
         }
         for (caller, n, (file, line)) in &b_only {
-            println!("B-only\t{}\t{}\tvia {}:{}", n, caller, file, line);
+            row!(
+                ctx.out,
+                "side" => "B-only",
+                "count" => *n,
+                "caller" => caller.to_string(),
+                "via" => format!("via {}:{}", file, line),
+            );
         }
     }
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} call both `{}`+`{}`; {} call A-not-B; {} call B-not-A; explain: co-call)",
         both,
         a,
         b,
         a_only.len(),
         b_only.len()
-    );
+    ));
     let a_hit = by_caller.values().any(|c| c.calls_a > 0);
     let b_hit = by_caller.values().any(|c| c.calls_b > 0);
     if !known_a && !a_hit {
@@ -797,9 +822,9 @@ pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<usize> {
         if !known {
             warn_unknown_target("fn or method matching", query);
         } else {
-            eprintln!("note: `{}` makes no calls", query);
+            ctx.out.note(&format!("note: `{}` makes no calls", query));
         }
-        eprintln!("(0 distinct callees)");
+        ctx.out.summary("(0 distinct callees)");
         if !known {
             return Err(TargetNotFound::err("fn or method matching", query));
         }
@@ -817,9 +842,15 @@ pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<usize> {
     rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
     if !summary {
         for (target, (n, file, line)) in &rows {
-            println!("{}\t{}\t{}:{}", n, target, file, line);
+            row!(
+                ctx.out,
+                "count" => *n,
+                "target" => target.clone(),
+                "at" => site(file, *line),
+            );
         }
     }
-    eprintln!("({} distinct callees)", rows.len());
+    ctx.out
+        .summary(&format!("({} distinct callees)", rows.len()));
     Ok(rows.len())
 }

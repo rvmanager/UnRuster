@@ -42,15 +42,15 @@ fn heading_matches(heading: &str, query: &str) -> bool {
         .all(|w| h.contains(w))
 }
 
-pub fn run(topic: Option<&str>) -> anyhow::Result<usize> {
+pub fn run(out: &crate::emit::Out, topic: Option<&str>) -> anyhow::Result<usize> {
     let secs = sections();
     match topic {
         None => {
-            println!("playbook topics (unruster explain <topic>):");
+            out.line("playbook topics (unruster explain <topic>):");
             for (h, _) in &secs {
-                println!("  {}", h);
+                out.line(&format!("  {}", h));
             }
-            eprintln!("({} topic(s))", secs.len());
+            out.summary(&format!("({} topic(s))", secs.len()));
             Ok(0)
         }
         Some(q) => {
@@ -59,20 +59,29 @@ pub fn run(topic: Option<&str>) -> anyhow::Result<usize> {
                 .filter(|(h, _)| heading_matches(h, q))
                 .collect();
             if hits.is_empty() {
-                eprintln!("no playbook topic matching `{}`; topics are:", q);
+                out.note(&format!("no playbook topic matching `{}`; topics are:", q));
                 for (h, _) in &secs {
-                    eprintln!("  {}", h);
+                    out.note(&format!("  {}", h));
                 }
                 return Err(crate::context::TargetNotFound::err("playbook topic", q));
             }
             for (i, (_, body)) in hits.iter().enumerate() {
                 if i > 0 {
-                    println!();
+                    out.line("");
                 }
-                println!("{}", body.trim_end());
+                out.line(body.trim_end());
             }
-            eprintln!("({} matching topic(s))", hits.len());
+            out.summary(&format!("({} matching topic(s))", hits.len()));
             Ok(0)
         }
+    }
+}
+
+/// `playbook` — the whole design-audit text, which used to be printed by
+/// `--help` ahead of the command list. Moving it behind its own subcommand is
+/// what let `Commands:` move to the top of the help output.
+pub fn run_playbook(out: &crate::emit::Out) {
+    for line in PLAYBOOK.lines() {
+        out.line(line);
     }
 }

@@ -13,6 +13,8 @@ mod context;
 mod conversion_pairs;
 mod conversions;
 mod dead_code;
+mod divergence;
+mod emit;
 mod error_swallows;
 mod explain;
 mod field_uses;
@@ -27,19 +29,26 @@ mod parse;
 mod pass_through;
 mod semantic;
 mod stringly;
+mod suppress;
 mod takes_mut;
 mod tests_cmd;
 mod type_refs;
 mod variants;
 
 use context::AnalysisCtx;
+use emit::Format;
 use parse::Scope;
 
 #[derive(Parser)]
 #[command(
     name = "unruster",
     about = "Query a Rust codebase: inventory, callers/callees, field uses, variants, impls, metrics, dead-code.",
-    long_about = include_str!("playbook.txt"),
+    // The 294-line design playbook used to live here. clap prints long_about
+    // *before* the command list, which pushed `Commands:` to line 297 of a
+    // 364-line help — past where any reader (or agent running `help | head`)
+    // ever looked, so half the tool was undiscoverable. The playbook now has
+    // its own subcommand; this is a ~40-line orientation instead.
+    long_about = include_str!("quickstart.txt"),
     version
 )]
 struct Cli {
@@ -82,6 +91,25 @@ struct Cli {
     /// so small findings need no follow-up file reads.
     #[arg(long, global = true, value_name = "N")]
     context: Option<usize>,
+
+    /// Output shape. `tsv` (default) streams tab-separated rows; `json` emits
+    /// one document with `file`/`line` and numeric columns as real fields, so
+    /// cross-row filtering and ranking need no `awk`.
+    #[arg(long, global = true, value_enum, default_value = "tsv")]
+    format: Format,
+
+    /// Shorthand for `--format json`.
+    #[arg(long, global = true, conflicts_with = "format")]
+    json: bool,
+
+    /// Send summary and note lines to stdout instead of stderr, so one
+    /// redirect captures the whole run.
+    #[arg(long, global = true)]
+    all_stdout: bool,
+
+    /// Ignore `// unruster: ok` waiver comments and report every site.
+    #[arg(long, global = true)]
+    no_suppress: bool,
 
     /// Exit 1 when the command reports one or more findings (0 = clean,
     /// 2 = error/unknown target). For scripted/agent loops:
@@ -148,6 +176,17 @@ enum Cmd {
     /// `--hide-trait-routed-catchalls` drops rows whose `_` arm calls a method
     /// on the scrutinee (structurally-safe false positives).
     EnumCoverage(EnumCoverageArgs),
+    /// Sibling paths that disagree. Pairs up dispatch sites on one enum whose
+    /// enclosing fns look like siblings (same scope and/or a shared name word)
+    /// but cover different variant sets, and ranks them by how deliberate the
+    /// omission looks — a one-variant gap between twins outranks a wide gap.
+    /// `--handling` switches to the error-handling axis: one callee treated
+    /// with different care (`.expect` vs `.ok()`) by sibling fns.
+    /// Highest-yield check in the tool; start here.
+    Divergence(DivergenceArgs),
+    /// Print the full design-audit playbook (themes, signals, repair recipes).
+    /// `explain <topic>` prints one section instead.
+    Playbook,
     /// Cohort divergence matrix: for a name-pattern cohort of fns (e.g.
     /// `wrap_in_*`), show a (callee × function) grid. A callee called by most
     /// of the cohort but missing from one column is a divergence candidate —
@@ -195,6 +234,41 @@ enum Cmd {
     Tests(TestsArgs),
 }
 
+/// The subcommand's CLI name, for the `command` field of `--json` output.
+/// Exhaustive (no `_`) for the same reason as `implies_fail_on_findings`: a new
+/// command must state its own name rather than inherit a wrong one.
+fn cmd_name(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::Audit(_) => "audit",
+        Cmd::Inventory(_) => "inventory",
+        Cmd::Callers(_) => "callers",
+        Cmd::Callees(_) => "callees",
+        Cmd::CoCall(_) => "co-call",
+        Cmd::FieldUses(_) => "field-uses",
+        Cmd::Fields(_) => "fields",
+        Cmd::Variants(_) => "variants",
+        Cmd::Impls(_) => "impls",
+        Cmd::TypeRefs(_) => "type-refs",
+        Cmd::TakesMut(_) => "takes-mut",
+        Cmd::Metrics(_) => "metrics",
+        Cmd::DeadCode(_) => "dead-code",
+        Cmd::CatchAllArms(_) => "catch-all-arms",
+        Cmd::ParallelMatches(_) => "parallel-matches",
+        Cmd::EnumCoverage(_) => "enum-coverage",
+        Cmd::Divergence(_) => "divergence",
+        Cmd::Playbook => "playbook",
+        Cmd::CohortCallees(_) => "cohort-callees",
+        Cmd::ErrorSwallows(_) => "error-swallows",
+        Cmd::PassThrough(_) => "pass-through",
+        Cmd::Explain(_) => "explain",
+        Cmd::Casts(_) => "casts",
+        Cmd::Conversions(_) => "conversions",
+        Cmd::ConversionPairs => "conversion-pairs",
+        Cmd::Stringly(_) => "stringly",
+        Cmd::Tests(_) => "tests",
+    }
+}
+
 impl Cmd {
     /// Commands that imply `--fail-on-findings`. Exhaustive (no `_`) so a new
     /// command must declare its agent-loop semantics — `unruster enum-coverage
@@ -218,6 +292,8 @@ impl Cmd {
             | Cmd::ParallelMatches(_)
             | Cmd::EnumCoverage(_)
             | Cmd::CohortCallees(_)
+            | Cmd::Divergence(_)
+            | Cmd::Playbook
             | Cmd::ErrorSwallows(_)
             | Cmd::PassThrough(_)
             | Cmd::Explain(_)
@@ -363,8 +439,10 @@ struct TypeRefsArgs {
 
 #[derive(Args)]
 struct TakesMutArgs {
-    /// Type name (last segment).
-    ty: String,
+    /// Type name (last segment). Omit to list the types with the largest
+    /// `&mut` surface instead of erroring — the answer to "which type should I
+    /// pass here?" is usually the point of running this bare.
+    ty: Option<String>,
 }
 
 #[derive(Args)]
@@ -396,8 +474,11 @@ struct DeadCodeArgs {
 
 #[derive(Args)]
 struct CatchAllArgs {
-    /// Enum name (last segment). Omit with --all.
-    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    /// Enum name (last segment). Omit to scan every enum (rows gain a leading
+    /// enum column) — the same as `--all`, which is kept as an explicit
+    /// spelling. Erroring on a bare invocation just cost a round-trip; naming
+    /// an enum *and* passing `--all` is still a contradiction, so it errors.
+    #[arg(conflicts_with = "all")]
     name: Option<String>,
     /// Scan every enum defined in the tree; rows gain a leading enum column.
     #[arg(long)]
@@ -442,12 +523,28 @@ struct ParallelMatchesArgs {
 
 #[derive(Args)]
 struct EnumCoverageArgs {
-    /// Enum name (last segment). Omit with --all.
-    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    /// Enum name (last segment). Omit to scan every enum — bare invocation is
+    /// the same as `--all`. Naming an enum *and* passing `--all` contradicts
+    /// itself and errors.
+    #[arg(conflicts_with = "all")]
     name: Option<String>,
     /// Scan every enum defined in the tree; rows gain a leading enum column.
     #[arg(long)]
     all: bool,
+    /// Keep only sites missing at most N variants. `--max-missing 1` isolates
+    /// the "forgot exactly one" shape, which is where this check's real
+    /// defects live.
+    #[arg(long, value_name = "N")]
+    max_missing: Option<usize>,
+    /// Drop the covered/missing variant columns; print one header line per
+    /// enum instead. On a wide enum the two columns restate the variant set on
+    /// every row.
+    #[arg(long)]
+    compact: bool,
+    /// One row per enum (partial-site count + worst gap) instead of one per
+    /// site — "which enum should I look at first".
+    #[arg(long)]
+    rank_enums: bool,
     /// Hide rows whose catch-all / `_` arm routes through a method call on the
     /// matched scrutinee (e.g. `_ => node.paint_slots()`). Those sites are
     /// structurally safe — a newly-added variant must implement the trait
@@ -456,6 +553,28 @@ struct EnumCoverageArgs {
     /// noise; read the remaining rows' `_` arms to confirm.
     #[arg(long)]
     hide_trait_routed_catchalls: bool,
+}
+
+#[derive(Args)]
+struct DivergenceArgs {
+    /// Enum name (last segment). Omit to scan every enum.
+    name: Option<String>,
+    /// Compare error-handling care instead of enum coverage: one callee that
+    /// sibling fns treat differently (`.expect` in one, `.ok()` in another).
+    /// Ignores the enum argument.
+    #[arg(long)]
+    handling: bool,
+    /// Drop pairs scoring below this. Raise to see only the loudest.
+    #[arg(long, default_value_t = 0.25)]
+    min_score: f64,
+    /// With `--handling`: minimum care distance between the two sides
+    /// (0 = dropped, 1 = unwrap, 2 = default, 3 = fallback, 4 = expect).
+    #[arg(long, default_value_t = 2)]
+    min_care_gap: u8,
+    /// Stop after roughly N rows when scanning every enum. The cap is
+    /// announced in the output — a silent truncation reads as "that's all".
+    #[arg(long)]
+    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -470,6 +589,15 @@ struct ErrorSwallowsArgs {
     /// Include `.unwrap_or(...)` (any arg). Noisy; off by default.
     #[arg(long)]
     include_unwrap_or: bool,
+    /// Hide `let _ = write!(buf, …)` into an in-memory buffer — infallible, so
+    /// the discard is idiomatic rather than a swallowed error. On by default
+    /// here; `audit` hides them.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    include_infallible: bool,
+    /// Hide `.unwrap_or_else(|| { log!(…); … })` — the failure is already
+    /// observable, so the fallback is a policy, not a silent drop.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    include_logged: bool,
 }
 
 #[derive(Args)]
@@ -605,15 +733,17 @@ fn full_tree_if_needed(
     }
 }
 
-/// Print the macro blind-spot count, if any, on stderr.
-fn report_blind_spots() {
+/// Report the macro blind-spot count, if any. Emitted on every path including
+/// error exits: a reader must know what was *not* analyzed regardless of how
+/// the run ended.
+fn report_blind_spots(out: &emit::Out) {
     let blind = macro_scan::blind_spots();
     if blind > 0 {
-        eprintln!(
+        out.note(&format!(
             "(blind spots: {} macro body(ies) could not be parsed as expressions — \
              code inside them was not analyzed)",
             blind
-        );
+        ));
     }
 }
 
@@ -662,7 +792,10 @@ fn dispatch(
         Cmd::Variants(a) => variants::run(ctx, &a.name, a.bare),
         Cmd::Impls(a) => impls::run(ctx, a.of.as_deref(), a.trait_.as_deref()),
         Cmd::TypeRefs(a) => type_refs::run(ctx, &a.ty, a.min_confidence),
-        Cmd::TakesMut(a) => takes_mut::run(ctx, &a.ty),
+        Cmd::TakesMut(a) => match a.ty.as_deref() {
+            Some(ty) => takes_mut::run(ctx, ty),
+            None => takes_mut::run_candidates(ctx),
+        },
         Cmd::Metrics(a) => metrics::run(ctx, a.sort, a.top, a.threshold, false),
         Cmd::DeadCode(a) => {
             // Build the call-set from the FULL tree so production items called
@@ -683,11 +816,34 @@ fn dispatch(
                 include_if_chains: a.include_if_chains,
             },
         ),
-        Cmd::EnumCoverage(a) => {
-            parallel_matches::run_enum_coverage(ctx, a.name.as_deref(), a.hide_trait_routed_catchalls)
+        Cmd::EnumCoverage(a) => parallel_matches::run_enum_coverage(
+            ctx,
+            a.name.as_deref(),
+            parallel_matches::CoverageOpts {
+                hide_trait_routed: a.hide_trait_routed_catchalls,
+                max_missing: a.max_missing,
+                // Ranking enums implies the per-site variant lists are noise.
+                compact: a.compact || a.rank_enums,
+                rank_enums: a.rank_enums,
+            },
+        ),
+        Cmd::Divergence(a) => {
+            if a.handling {
+                divergence::run_handling(ctx, a.min_care_gap)
+            } else {
+                divergence::run(ctx, a.name.as_deref(), a.min_score, a.top)
+            }
         }
+        Cmd::Playbook => unreachable!("handled before the tree scan"),
         Cmd::CohortCallees(a) => callers::run_cohort_callees(ctx, &a.pattern),
-        Cmd::ErrorSwallows(a) => error_swallows::run(ctx, a.include_unwrap_or),
+        Cmd::ErrorSwallows(a) => error_swallows::run(
+            ctx,
+            error_swallows::SwallowOpts {
+                include_unwrap_or: a.include_unwrap_or,
+                include_infallible: a.include_infallible,
+                include_logged: a.include_logged,
+            },
+        ),
         Cmd::PassThrough(a) => pass_through::run(ctx, a.max_loc),
         Cmd::Explain(_) => unreachable!("handled before the tree scan"),
         Cmd::Casts(a) => casts::run(ctx, &a.class, a.by, a.hide_widen, a.top),
@@ -714,15 +870,23 @@ fn dispatch(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // `explain` reads only the embedded playbook — skip the tree scan.
+    let format = if cli.json { Format::Json } else { cli.format };
+    let out = emit::Out::new(format, cli.summary, cli.all_stdout, cli.context);
+    // `explain` and `playbook` read only the embedded text — skip the tree scan.
     if let Cmd::Explain(a) = &cli.cmd {
-        let result = explain::run(a.topic.as_deref());
+        let result = explain::run(&out, a.topic.as_deref());
+        out.finish("explain");
         if let Err(e) = &result {
             if e.downcast_ref::<context::TargetNotFound>().is_some() {
                 std::process::exit(2);
             }
         }
         result?;
+        return Ok(());
+    }
+    if matches!(cli.cmd, Cmd::Playbook) {
+        explain::run_playbook(&out);
+        out.finish("playbook");
         return Ok(());
     }
     let Cli {
@@ -733,9 +897,10 @@ fn main() -> Result<()> {
         summary,
         spans,
         changed_since,
-        context: context_lines,
         fail_on_findings,
+        no_suppress,
         cmd,
+        ..
     } = cli;
     // Exit-code contract: any setup error (bad glob, bad git ref, IO) is 2.
     let files = match parse::parse_dir(&root, scope, &cfg, &exclude) {
@@ -754,6 +919,24 @@ fn main() -> Result<()> {
     }
     let idx = index::NameIndex::build(&files);
     let sem = semantic::Semantic::build(&files);
+    // Waivers are read from the same files that were scanned, so a `//
+    // unruster: ok` in an excluded or out-of-scope file has no effect.
+    let suppressions = if no_suppress {
+        suppress::Suppressions::default()
+    } else {
+        let paths: Vec<(String, &std::path::Path)> = files
+            .iter()
+            .map(|f| (parse::display_path(&f.path), f.path.as_path()))
+            .collect();
+        suppress::scan(&paths)
+    };
+    if suppressions.unexplained > 0 {
+        out.note(&format!(
+            "note: {} `// unruster: ok` waiver(s) carry no reason — a waiver \
+             nobody can evaluate is worse than the finding it hides",
+            suppressions.unexplained
+        ));
+    }
     let changed = match changed_since.as_deref() {
         Some(r) => match context::changed_set(r) {
             Ok(set) => Some(set),
@@ -771,13 +954,14 @@ fn main() -> Result<()> {
         summary,
         spans,
         changed,
-        context_lines,
+        out: &out,
+        suppressions,
     };
     let fail_on_findings = fail_on_findings || cmd.implies_fail_on_findings();
+    let command_name = cmd_name(&cmd);
     let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude);
-    // Report blind spots on every path — including error exits: an agent must
-    // know what was not analyzed regardless of how the run ended.
-    report_blind_spots();
+    report_blind_spots(&out);
+    out.finish(command_name);
     let findings = match result {
         Ok(n) => n,
         // Exit-code contract: 0 = clean, 1 = findings (with --fail-on-findings

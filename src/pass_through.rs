@@ -4,6 +4,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{line_of, path_to_string, type_short, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct Hit {
@@ -132,13 +133,20 @@ pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<usize> {
     all.sort_by(|a, b| a.qpath.cmp(&b.qpath));
     if !summary {
         for h in &all {
-            println!(
-                "{}\t->\t{}\tloc:{}\t{}:{}",
-                h.qpath, h.forwarded_to, h.loc, h.file, h.line
+            row!(
+                ctx.out,
+                "qpath" => h.qpath.clone(),
+                "arrow" => "->",
+                "forwards_to" => h.forwarded_to.clone(),
+                "loc" => format!("loc:{}", h.loc),
+                "at" => site(&h.file, h.line),
             );
-            ctx.print_context(&h.file, h.line);
         }
     }
-    eprintln!("({} pass-through fn(s); max_loc={})", all.len(), max_loc);
+    ctx.out.summary(&format!(
+        "({} pass-through fn(s); max_loc={})",
+        all.len(),
+        max_loc
+    ));
     Ok(all.len())
 }

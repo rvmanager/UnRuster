@@ -1,3 +1,4 @@
+use crate::emit::Out;
 use crate::index::NameIndex;
 use crate::parse::ParsedFile;
 use crate::semantic::Semantic;
@@ -21,27 +22,39 @@ pub struct AnalysisCtx<'a> {
     /// git ref. Site-listing commands drop rows outside this set, so an agent
     /// can verify exactly its own edit. `None` = no filter.
     pub changed: Option<std::collections::HashSet<std::path::PathBuf>>,
-    /// With `--context N`: print ±N source lines under each finding row so
-    /// small findings need zero follow-up reads. `None` = off.
-    pub context_lines: Option<usize>,
+    /// Where rows, section headers, and summary lines go. Every command emits
+    /// through this so `--json` needs no per-command support.
+    pub out: &'a Out,
+    /// Sites suppressed by an in-source `// unruster: ok` comment, keyed by
+    /// `(canonical file, line)`. Checked by [`AnalysisCtx::suppressed`].
+    pub suppressions: crate::suppress::Suppressions,
 }
 
 impl AnalysisCtx<'_> {
     /// With `--context N`, print the ±N source lines around `line` beneath a
-    /// finding row (`>` marks the site line). No-op otherwise.
+    /// finding row (`>` marks the site line). No-op otherwise. Rows emitted
+    /// through `out.row(…)` already carry their own context — this is only for
+    /// grouped listings that render their site lines by hand.
     pub fn print_context(&self, file: &str, line: usize) {
-        let Some(n) = self.context_lines else { return };
-        let Ok(src) = std::fs::read_to_string(file) else {
-            return;
-        };
-        let lines: Vec<&str> = src.lines().collect();
-        let start = line.saturating_sub(n + 1);
-        let end = (line + n).min(lines.len());
-        for (i, l) in lines[start..end].iter().enumerate() {
-            let ln = start + i + 1;
-            let marker = if ln == line { '>' } else { ' ' };
-            println!("  {}{:>4}| {}", marker, ln, l);
+        self.out.context_at(file, line);
+    }
+
+    /// Drop waived sites from `items`, returning how many were dropped so the
+    /// summary line can say so — a silent drop would read as "clean".
+    pub fn retain_unsuppressed<T>(
+        &self,
+        items: &mut Vec<T>,
+        site_of: impl Fn(&T) -> (&str, usize),
+    ) -> usize {
+        if self.suppressions.is_empty() {
+            return 0;
         }
+        let before = items.len();
+        items.retain(|it| {
+            let (f, l) = site_of(it);
+            !self.suppressions.contains(f, l)
+        });
+        before - items.len()
     }
 
     /// With `--changed-since`, keep only hits whose file is in the changed

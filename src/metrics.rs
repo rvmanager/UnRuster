@@ -4,6 +4,7 @@ use syn::visit::{self, Visit};
 use crate::ast::{line_of, type_short, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct FnMetric {
@@ -342,27 +343,38 @@ pub fn run(
 
     if !summary {
         for m in fns.iter().take(top) {
-            println!(
-                "fn\tloc:{}\tparams:{}\tcyclo:{}\tnesting:{}\t{}\t{}:{}",
-                m.loc, m.params, m.cyclo, m.nesting, m.qpath, m.file, m.line
+            row!(
+                ctx.out,
+                "kind" => "fn",
+                "loc" => format!("loc:{}", m.loc),
+                "params" => format!("params:{}", m.params),
+                "cyclo" => format!("cyclo:{}", m.cyclo),
+                "nesting" => format!("nesting:{}", m.nesting),
+                "qpath" => m.qpath.clone(),
+                "at" => site(&m.file, m.line),
             );
-            ctx.print_context(&m.file, m.line);
         }
         for m in structs.iter().take(if fns_only { 0 } else { top }) {
-            println!(
-                "struct\tfields:{}\t{}\t{}:{}",
-                m.fields, m.qpath, m.file, m.line
+            row!(
+                ctx.out,
+                "kind" => "struct",
+                "fields" => format!("fields:{}", m.fields),
+                "qpath" => m.qpath.clone(),
+                "at" => site(&m.file, m.line),
             );
         }
         for m in enums.iter().take(if fns_only { 0 } else { top }) {
-            println!(
-                "enum\tvariants:{}\t{}\t{}:{}",
-                m.variants, m.qpath, m.file, m.line
+            row!(
+                ctx.out,
+                "kind" => "enum",
+                "variants" => format!("variants:{}", m.variants),
+                "qpath" => m.qpath.clone(),
+                "at" => site(&m.file, m.line),
             );
         }
     }
 
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} fns, {} structs, {} enums; showing top {} each; sort={}{})",
         fns.len(),
         structs.len(),
@@ -372,7 +384,7 @@ pub fn run(
         threshold
             .map(|t| format!("; threshold={}", t))
             .unwrap_or_default()
-    );
+    ));
     // With --threshold the fn table is the findings set; otherwise everything shown counts.
     Ok(if threshold.is_some() || fns_only {
         fns.len()

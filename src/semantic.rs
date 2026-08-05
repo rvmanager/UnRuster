@@ -268,6 +268,18 @@ impl<'ast, 'a> Visit<'ast> for SigVisitor<'a> {
 pub struct FnTypes {
     /// binding-name → type last-name
     pub bindings: BTreeMap<String, String>,
+    /// Bindings whose type came from the *name-only* method-return fallback:
+    /// `let w = pixmap.width();` resolves `width` through a tree-wide map of
+    /// fn name → return type, with no check that the receiver is the type that
+    /// defines it. When the receiver is external (`tiny_skia::Pixmap`) and some
+    /// unrelated local type happens to define a same-named method, the answer
+    /// is confidently wrong.
+    ///
+    /// Callers that would *report* the type to a reader (cast classification)
+    /// must use [`FnTypes::type_of_grounded`], which refuses to guess. Callers
+    /// that only use it to narrow a search (`field-uses via=ti`, already
+    /// labelled APPROXIMATE) keep the looser [`FnTypes::type_of`].
+    pub guessed: std::collections::BTreeSet<String>,
 }
 
 impl FnTypes {
@@ -311,6 +323,17 @@ impl FnTypes {
     pub fn type_of(&self, expr: &syn::Expr, sigs: &FnSigIndex) -> Option<String> {
         infer_expr_type(expr, sigs, &self.bindings)
     }
+
+    /// Like [`FnTypes::type_of`], but `None` unless the answer is *grounded* —
+    /// traceable to a type annotation, a parameter, a struct literal, an
+    /// explicit cast, or arithmetic over those. Never guesses a method's return
+    /// type from its bare name. Use this wherever the type appears in output.
+    pub fn type_of_grounded(&self, expr: &syn::Expr, sigs: &FnSigIndex) -> Option<String> {
+        if !is_grounded(expr, &self.guessed) {
+            return None;
+        }
+        infer_expr_type(expr, sigs, &self.bindings)
+    }
 }
 
 struct TypeInferVisitor<'a> {
@@ -332,6 +355,9 @@ impl<'ast, 'a> Visit<'ast> for TypeInferVisitor<'a> {
         } else if let Some(name) = name_opt {
             if let Some(init) = &l.init {
                 if let Some(ty) = infer_expr_type(&init.expr, self.sigs, &self.ft.bindings) {
+                    if !is_grounded(&init.expr, &self.ft.guessed) {
+                        self.ft.guessed.insert(name.clone());
+                    }
                     self.ft.bindings.insert(name, ty);
                 }
             }
@@ -391,7 +417,83 @@ fn infer_expr_type(
         syn::Expr::Paren(p) => infer_expr_type(&p.expr, sigs, bindings),
         syn::Expr::Group(g) => infer_expr_type(&g.expr, sigs, bindings),
         syn::Expr::Try(t) => infer_expr_type(&t.expr, sigs, bindings),
+        // Arithmetic preserves the operand type in Rust — `a * b` is only
+        // well-typed when both sides agree. Without this arm every computed
+        // width/stride was type-unknown, so its later cast was reported with a
+        // `_` source (or, worse, inherited a guessed type from a sibling let).
+        syn::Expr::Binary(b) if is_arith(&b.op) => {
+            let l = infer_expr_type(&b.left, sigs, bindings);
+            let r = infer_expr_type(&b.right, sigs, bindings);
+            match (l, r) {
+                (Some(a), Some(c)) if a == c => Some(a),
+                // One side unknown (often a `const`): the known side still
+                // types the expression, since the other must match it.
+                (Some(a), None) => Some(a),
+                (None, Some(c)) => Some(c),
+                _ => None,
+            }
+        }
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => {
+            infer_expr_type(&u.expr, sigs, bindings)
+        }
+        syn::Expr::Lit(l) => numeric_lit_type(l),
         _ => None,
+    }
+}
+
+/// Arithmetic operators, whose operands and result share one type. Comparison
+/// and logical operators yield `bool` and are deliberately not handled here —
+/// they are not what a cast site reads from.
+fn is_arith(op: &syn::BinOp) -> bool {
+    use syn::BinOp::*;
+    matches!(
+        op,
+        Add(_) | Sub(_) | Mul(_) | Div(_) | Rem(_) | BitAnd(_) | BitOr(_) | BitXor(_) | Shl(_)
+            | Shr(_)
+    )
+}
+
+/// The type of a *suffixed* numeric literal (`4u32`, `1.5f32`). Unsuffixed
+/// literals are deliberately unknown: `4` is whatever context demands, and
+/// claiming `i32` would misclassify casts in `u64` arithmetic.
+fn numeric_lit_type(l: &syn::ExprLit) -> Option<String> {
+    match &l.lit {
+        syn::Lit::Int(i) if !i.suffix().is_empty() => Some(i.suffix().to_string()),
+        syn::Lit::Float(f) if !f.suffix().is_empty() => Some(f.suffix().to_string()),
+        _ => None,
+    }
+}
+
+/// Is `e`'s inferred type traceable to something declared, rather than guessed
+/// from a bare method name? See [`FnTypes::guessed`].
+fn is_grounded(e: &syn::Expr, guessed: &std::collections::BTreeSet<String>) -> bool {
+    match e {
+        syn::Expr::Path(p) => p
+            .path
+            .segments
+            .first()
+            .map(|s| !guessed.contains(&s.ident.to_string()))
+            .unwrap_or(true),
+        // The one unsound arm: a method's return type looked up by name alone.
+        syn::Expr::MethodCall(_) => false,
+        syn::Expr::Cast(_) | syn::Expr::Struct(_) | syn::Expr::Lit(_) => true,
+        syn::Expr::Reference(r) => is_grounded(&r.expr, guessed),
+        syn::Expr::Paren(p) => is_grounded(&p.expr, guessed),
+        syn::Expr::Group(g) => is_grounded(&g.expr, guessed),
+        syn::Expr::Try(t) => is_grounded(&t.expr, guessed),
+        syn::Expr::Unary(u) => is_grounded(&u.expr, guessed),
+        syn::Expr::Binary(b) => {
+            is_grounded(&b.left, guessed)
+                && is_grounded(&b.right, guessed)
+        }
+        // A field access is grounded when its base is: field types come from
+        // the struct definition, not from a name guess.
+        syn::Expr::Field(f) => is_grounded(&f.base, guessed),
+        // Free-fn / constructor calls resolve through the same name map as
+        // methods, but a path call carries its own module qualification, so a
+        // collision is far less likely. Treat as grounded.
+        syn::Expr::Call(_) => true,
+        _ => true,
     }
 }
 

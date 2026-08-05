@@ -5,6 +5,7 @@ use crate::ast::{
 };
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 pub struct Item {
@@ -205,14 +206,17 @@ pub fn run(
         });
         if !summary {
             for it in &all {
-                println!(
-                    "{}\t{}\t{}\t{}:{}",
-                    it.kind, it.vis, it.name, it.file, it.line
+                row!(
+                    ctx.out,
+                    "kind" => it.kind,
+                    "vis" => it.vis,
+                    "name" => it.name.clone(),
+                    "at" => site(&it.file, it.line),
                 );
             }
         }
     }
-    eprintln!("({} items)", all.len());
+    ctx.out.summary(&format!("({} items)", all.len()));
     Ok(all.len())
 }
 

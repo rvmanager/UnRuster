@@ -4,6 +4,7 @@ use crate::ast::{fn_span, line_of, path_last, path_to_string, type_short, ScopeT
 use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{FnSigIndex, FnTypes};
+use crate::emit::{row, site};
 
 #[derive(Debug)]
 struct FieldHit {
@@ -365,16 +366,14 @@ fn tally_and_print(ctx: &AnalysisCtx, all: &[FieldHit]) -> (usize, usize, usize,
             _ => {}
         }
         if !ctx.summary {
-            println!(
-                "{}\t{}\t{}\t{}\t{}:{}",
-                h.kind.as_str(),
-                h.via,
-                h.receiver,
-                h.context,
-                h.file,
-                h.line
+            row!(
+                ctx.out,
+                "kind" => h.kind.as_str(),
+                "via" => h.via,
+                "receiver" => h.receiver.clone(),
+                "context" => h.context.clone(),
+                "at" => site(&h.file, h.line),
             );
-            ctx.print_context(&h.file, h.line);
         }
     }
     (reads, writes, inits, ti_count, q_count)
@@ -415,19 +414,19 @@ pub fn run(
     });
 
     let (reads, writes, inits, ti_count, q_count) = tally_and_print(ctx, &all);
-    eprintln!(
+    ctx.out.summary(&format!(
         "({} reads, {} writes, {} inits; via: {} type-inferred, {} unknown receiver; strict={})",
         reads, writes, inits, ti_count, q_count, opts.strict
-    );
+    ));
 
     if opts.strict && all.is_empty() && opts.via_receiver.is_none() && opts.kinds.is_empty() {
         let cand = collect(files, ty, field, false, fn_sigs, false);
         if !cand.is_empty() {
-            eprintln!(
+            ctx.out.note(&format!(
                 "hint: strict matched 0; --candidates would report {} hit(s) (mostly unknown receivers). \
                  Try `--candidates` or `--candidates --via-receiver <substring>`.",
                 cand.len()
-            );
+            ));
         }
     }
     if !known && all.is_empty() {

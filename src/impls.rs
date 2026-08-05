@@ -1,4 +1,5 @@
 use crate::context::AnalysisCtx;
+use crate::emit::{row, site};
 
 pub fn run(
     ctx: &AnalysisCtx,
@@ -39,9 +40,15 @@ pub fn run(
     if !summary {
         for d in &hits {
             let trait_disp = d.trait_name.as_deref().unwrap_or("—");
-            println!("{}\t{}\t{}\t{}:{}", trait_disp, d.name, d.qpath, d.file, d.line);
+            row!(
+                ctx.out,
+                "trait" => trait_disp,
+                "name" => d.name.clone(),
+                "qpath" => d.qpath.clone(),
+                "at" => site(&d.file, d.line),
+            );
         }
     }
-    eprintln!("({} impl block(s))", hits.len());
+    ctx.out.summary(&format!("({} impl block(s))", hits.len()));
     Ok(hits.len())
 }

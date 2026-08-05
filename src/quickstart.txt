@@ -1,0 +1,41 @@
+Query a Rust codebase via syntactic (syn) analysis. Finds candidates; you judge them.
+
+AGENT QUICKSTART
+  unruster audit                     ranked battery, exit 1 while gating findings remain
+  unruster audit --changed-since HEAD~1    same, scoped to your last commit — highest yield
+  unruster divergence --all          sibling paths that treat the same thing differently
+  unruster explain <topic>           one repair recipe (cheap; skip this help)
+  unruster playbook                  the full design-audit playbook
+  --json                             every command; keeps file/line as real fields
+
+HIGHEST-SIGNAL FIRST
+  Divergence beats volume. A check that returns 400 rows returns ~1% real defects;
+  two sibling functions handling the same enum, Result, or index differently is a
+  defect far more often than not. Start with `divergence`, then `audit`.
+  Fresh code beats old code: `--changed-since` before anything else.
+
+PRECISION TIERS (the `via` column on a row says which fired)
+  PRECISE      inventory, impls, fields, variants, match/pattern shapes,
+               self.field inside `impl Type`, call sites by last-segment name.
+  APPROXIMATE  field-uses via=ti (inferred receiver), type-refs via=alias,
+               callers Type::method, dead-code (pub items may have outside callers).
+  BEST-EFFORT  field-uses via=? , macro bodies parsed speculatively as expressions.
+  Rows tagged APPROXIMATE/BEST-EFFORT are leads to verify, not facts. Every run
+  reports unparseable macro bodies as blind spots — code in them was NOT analyzed.
+
+GLOBAL FLAGS
+  -r/--root <path>       scan root (default `.`); respects .gitignore
+  --scope prod|tests|all test-code inclusion (default production)
+  --changed-since <ref>  keep only rows in files changed vs a git ref
+  --format tsv|json      output shape; --json is an alias for --format json
+  --context N            print ±N source lines under each row
+  --spans                fn labels become `name@start-end`
+  --summary              drop rows, keep the summary line
+  --all-stdout           summaries/notes to stdout instead of stderr
+  --exclude GLOB         drop matching files (repeatable)
+  --cfg KEY[=VALUE]      strip items whose cfg is definitively false
+  --fail-on-findings     exit 1 on any finding (0 = clean, 2 = error)
+
+IN-SOURCE MARKERS
+  /// unruster: sealed        on an enum: partial dispatch on it is tagged SEALED
+  // unruster: ok — <reason>  waive one finding (own line, or the line below)
