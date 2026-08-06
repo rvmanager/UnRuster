@@ -232,14 +232,29 @@ pub struct Waiver {
     pub reason_col: usize,
     /// Findings this waiver suppressed during the run.
     hits: Cell<usize>,
+    /// Findings this waiver hides that the audit battery would *not* have
+    /// reported anyway — rows below `--max-missing`, under the variant floor,
+    /// trait-routed catch-alls, sub-threshold divergence pairs. Counted
+    /// separately because a waiver whose whole contribution lands here is dead
+    /// weight in the only loop that gates, while still being harmless enough
+    /// that calling it a lie would overstate the case.
+    below_audit: Cell<usize>,
     /// Which checks those hits came from — the evidence `--upgrade` uses to
     /// qualify a legacy waiver.
     hit_checks: RefCell<BTreeSet<String>>,
 }
 
 impl Waiver {
+    /// Findings suppressed that the audit battery would have gated on. This is
+    /// the number that decides whether a waiver is earning its place.
     pub fn hits(&self) -> usize {
         self.hits.get()
+    }
+
+    /// Findings suppressed that only a permissive, non-gating configuration
+    /// surfaces. See [`Waiver::below_audit`].
+    pub fn below_audit(&self) -> usize {
+        self.below_audit.get()
     }
 
     pub fn hit_checks(&self) -> Vec<String> {
@@ -284,6 +299,21 @@ impl<'a> Site<'a> {
     }
 }
 
+/// Which counter [`Suppressions::matches`] increments.
+///
+/// `waivers` runs the battery twice — once configured exactly as `audit` runs
+/// it, once wide open — so it can tell "this waiver is load-bearing" from "this
+/// waiver only hides rows the audit already filters out". Without the split,
+/// orphan detection answered a question nobody asks: *does this suppress
+/// anything under maximally permissive settings?*
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HitMode {
+    /// Hits count toward [`Waiver::hits`] — the gating number.
+    Gating,
+    /// Hits count toward [`Waiver::below_audit`].
+    BelowAudit,
+}
+
 /// Every waiver in the scanned tree, indexed by file.
 #[derive(Debug, Default)]
 pub struct Suppressions {
@@ -291,7 +321,15 @@ pub struct Suppressions {
     by_file: HashMap<String, Vec<usize>>,
     /// Waivers with no reason text after the head.
     pub unexplained: usize,
+    /// Which counter `matches` bumps. Defaults to `Gating`, so an ordinary
+    /// command run attributes its hits to the number that matters.
+    mode: Cell<HitModeRepr>,
 }
+
+/// `Cell` needs `Copy + Default`; `HitMode` has no sensible `Default`.
+type HitModeRepr = bool;
+const MODE_GATING: HitModeRepr = false;
+const MODE_BELOW: HitModeRepr = true;
 
 impl Suppressions {
     pub fn is_empty(&self) -> bool {
@@ -318,6 +356,20 @@ impl Suppressions {
         self.waivers.iter().map(Waiver::hits).sum()
     }
 
+    /// Route subsequent `matches` hits to the given counter; returns the
+    /// previous mode so a caller can restore it.
+    pub fn set_hit_mode(&self, m: HitMode) -> HitMode {
+        let prev = self.mode.replace(match m {
+            HitMode::Gating => MODE_GATING,
+            HitMode::BelowAudit => MODE_BELOW,
+        });
+        if prev == MODE_GATING {
+            HitMode::Gating
+        } else {
+            HitMode::BelowAudit
+        }
+    }
+
     /// Does a waiver cover this finding? Records the hit, so
     /// `unruster waivers` can report what each waiver is actually buying and
     /// flag the ones that no longer suppress anything.
@@ -337,7 +389,11 @@ impl Suppressions {
             if !key_matches(w.key.as_deref(), site.key) {
                 continue;
             }
-            w.hits.set(w.hits.get() + 1);
+            if self.mode.get() == MODE_GATING {
+                w.hits.set(w.hits.get() + 1);
+            } else {
+                w.below_audit.set(w.below_audit.get() + 1);
+            }
             w.hit_checks.borrow_mut().insert(check.to_string());
             hit = true;
         }
@@ -353,10 +409,54 @@ impl Suppressions {
     }
 }
 
+/// Checks that ask the same question of the same site, and the name they are
+/// already grouped under in the audit output (`explain: partial-enumeration`).
+///
+/// `divergence` and `enum-coverage` both answer "does this dispatch site
+/// deliberately omit variant X?". Without a group, verifying that once cost two
+/// waivers — and on a real codebase six of thirty-three had the reason `same.`,
+/// written only because the check name differed. The group name is not invented
+/// here: both checks already print it as their `explain:` topic.
+const CHECK_GROUPS: &[(&str, &[&str])] = &[
+    ("partial-enumeration", &["divergence", "enum-coverage"]),
+    (
+        "silent-fallbacks",
+        &["error-swallows", "divergence-handling"],
+    ),
+    ("replication", &["conversion-pairs", "pass-through"]),
+];
+
+/// The group a check belongs to, if any. Lets `waivers` spot two waivers that
+/// differ only by check name and suggest the one-comment spelling.
+pub fn group_of(check: &str) -> Option<&'static str> {
+    CHECK_GROUPS
+        .iter()
+        .find(|(_, members)| members.contains(&check))
+        .map(|(g, _)| *g)
+}
+
+/// Every check a waiver key may name, group aliases included — used to warn
+/// about a misspelled check rather than silently waiving nothing.
+pub fn known_check_names() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = CHECK_GROUPS.iter().map(|(g, _)| *g).collect();
+    v.extend(CHECK_GROUPS.iter().flat_map(|(_, m)| m.iter().copied()));
+    v.extend(["dead-code", "casts", "stringly"]);
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 /// An unqualified waiver matches every check — that is the legacy contract and
-/// breaking it would silently un-waive judgments already recorded.
+/// breaking it would silently un-waive judgments already recorded. A waiver
+/// naming a group matches every check in it.
 fn check_matches(waiver: Option<&str>, check: &str) -> bool {
-    waiver.is_none_or(|w| w == check)
+    let Some(w) = waiver else { return true };
+    if w == check {
+        return true;
+    }
+    CHECK_GROUPS
+        .iter()
+        .any(|(g, members)| *g == w && members.contains(&check))
 }
 
 /// An unkeyed waiver matches any key. A keyed waiver requires a keyed finding
@@ -845,6 +945,7 @@ fn scan_source(out: &mut Suppressions, display: &str, src: &str, spans: &FileSpa
             comment_col: head.comment_col,
             reason_col: head.reason_col,
             hits: Cell::new(0),
+            below_audit: Cell::new(0),
             hit_checks: RefCell::new(BTreeSet::new()),
         });
         i = end + 1;

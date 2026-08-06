@@ -120,3 +120,20 @@ pub mod ffi {
     pub unsafe fn unsafe_fn(p: *const ()) -> *const u8 { p as *const u8 }
     pub fn unsafe_block(p: *const ()) -> *const u8 { unsafe { p as *const u8 } }
 }
+
+/// `divergence` and `enum-coverage` ask the same question here. One group key
+/// answers both; before it, this needed two comments and the second one's
+/// reason was invariably the word "same".
+pub mod group_key {
+    pub enum G { Alpha, Beta, Gamma, Delta }
+
+    pub fn wide(g: &G) -> u8 {
+        match g { G::Alpha => 1, G::Beta => 2, G::Gamma => 3, _ => 0 }
+    }
+
+    // unruster: ok(partial-enumeration/G::Alpha) 2026-04-01 — Alpha is handled by
+    // the caller before dispatch ever reaches here.
+    pub fn narrow(g: &G) -> u8 {
+        match g { G::Beta => 2, G::Gamma => 3, G::Delta => 4, _ => 0 }
+    }
+}

@@ -2586,6 +2586,7 @@ fn waiver_comment_suppresses_exactly_its_own_site() {
 const WV: &str = "fixtures/waivers/src";
 const SCOPE_FIXTURE: &str = "fixtures/scope/src";
 const DIVGROUP: &str = "fixtures/divgroup/src";
+const TYPO_FIXTURE: &str = "fixtures/typo/src";
 /// Pinned "today" — the system clock is the only non-deterministic input in
 /// the tool, and an unpinned age would make these assertions rot.
 const TODAY: &str = "2026-08-06";
@@ -2663,15 +2664,74 @@ fn one_enum_named_waiver_covers_every_missing_variant() {
     let with = ur_stdout(&["--root", WV, "enum-coverage", "Modal"]);
     assert_eq!(rows_of(&without).len(), 1);
     assert!(rows_of(&with).is_empty(), "one waiver should clear the row");
+
+    // …and the count lands in `below_audit`, not `suppresses`: this row misses
+    // four of five variants, so `audit`'s `--max-missing 1` filters it out and
+    // the waiver earns nothing there. That distinction is the whole point of
+    // the two columns — a real ledger was a third full of waivers like this
+    // while reporting "0 orphaned".
     let waivers = ur_stdout(&["--root", WV, "waivers", "--check", "enum-coverage", "--today", TODAY]);
     let s = String::from_utf8_lossy(&waivers);
-    let suppresses: usize = s
+    let row = s.lines().find(|l| l.contains("Modal")).expect("Modal row");
+    let cols: Vec<&str> = row.split('\t').collect();
+    assert_eq!(cols[5], "0", "earns nothing in audit: {row}");
+    assert_eq!(cols[6], "4", "one comment, four variants: {row}");
+}
+
+#[test]
+fn orphan_detection_agrees_with_the_audit_line() {
+    // These two used to contradict each other in the same run: `audit` counted
+    // hits under its own (strict) config while `waivers` counted them wide
+    // open, so a ledger could report "0 orphaned" next to an audit line saying
+    // several suppressed nothing.
+    // `--all-stdout`: the audit summary rides stderr by default.
+    let audit = ur_stdout_allow_findings(&["--root", WV, "--all-stdout", "audit"]);
+    let a = String::from_utf8_lossy(&audit);
+    let audit_dead: usize = a
         .lines()
-        .find(|l| l.contains("Modal"))
-        .and_then(|l| l.split('\t').nth(5))
-        .and_then(|c| c.parse().ok())
+        .find(|l| l.contains("suppressing nothing"))
+        .and_then(|l| l.split(", ").find_map(|p| p.trim().split(' ').next()?.parse().ok()))
         .unwrap_or(0);
-    assert_eq!(suppresses, 4, "one comment, four variants:\n{}", s);
+    let orphaned = rows_of(&ur_stdout(&["--root", WV, "waivers", "--orphaned", "--today", TODAY]));
+    assert_eq!(
+        audit_dead,
+        orphaned.len(),
+        "audit and `waivers --orphaned` must count the same set:\naudit said {audit_dead}, \
+         waivers listed {}",
+        orphaned.len()
+    );
+}
+
+#[test]
+fn a_group_key_waives_every_check_in_the_group() {
+    // `divergence` and `enum-coverage` ask the same question of the same site.
+    // Six of thirty-three waivers on a real ledger had the reason `same.`,
+    // written only because the check name differed.
+    let div_off = ur_stdout(&["--root", WV, "--no-suppress", "divergence", "G"]);
+    let cov_off = ur_stdout(&["--root", WV, "--no-suppress", "enum-coverage", "G"]);
+    assert!(!rows_of(&div_off).is_empty(), "fixture needs a divergence pair");
+    assert!(
+        String::from_utf8_lossy(&cov_off).contains("narrow"),
+        "fixture needs an enum-coverage row on the same fn"
+    );
+    // One comment, both checks.
+    let div_on = String::from_utf8_lossy(&ur_stdout(&["--root", WV, "divergence", "G"])).into_owned();
+    let cov_on = String::from_utf8_lossy(&ur_stdout(&["--root", WV, "enum-coverage", "G"])).into_owned();
+    assert!(!div_on.contains("narrow"), "group key must cover divergence:\n{div_on}");
+    assert!(!cov_on.contains("narrow"), "…and enum-coverage:\n{cov_on}");
+}
+
+#[test]
+fn a_waiver_naming_an_unknown_check_is_reported() {
+    // A typo'd check name waives nothing, silently — the same dead weight as an
+    // orphan, but catchable the moment the comment is read.
+    let out = ur().args(["--root", TYPO_FIXTURE, "casts", "--summary"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("does not have") && err.contains("divergance"),
+        "expected an unknown-check note, got:\n{}",
+        err
+    );
 }
 
 #[test]
@@ -2745,8 +2805,9 @@ fn divergence_collapses_one_decision_into_one_row() {
 fn item_scoped_variant_keyed_waiver_retires_a_divergence_pair() {
     // The arena `NodeContent::Group` shape: one comment on the lean side,
     // scoped to the whole fn, keyed to the one variant it means.
-    let without = ur_stdout(&["--root", WV, "--no-suppress", "divergence"]);
-    let with = ur_stdout(&["--root", WV, "divergence"]);
+    // Scoped to `Node`: the fixture carries other enums for other cases.
+    let without = ur_stdout(&["--root", WV, "--no-suppress", "divergence", "Node"]);
+    let with = ur_stdout(&["--root", WV, "divergence", "Node"]);
     assert_eq!(rows_of(&without).len(), 1, "fixture should have one pair");
     assert!(
         rows_of(&with).is_empty(),
@@ -2754,7 +2815,7 @@ fn item_scoped_variant_keyed_waiver_retires_a_divergence_pair() {
         String::from_utf8_lossy(&with)
     );
     assert!(
-        ur_stderr(&["--root", WV, "divergence"]).contains("1 waived"),
+        ur_stderr(&["--root", WV, "divergence", "Node"]).contains("1 waived"),
         "the summary must report what it hid — a silent drop reads as clean"
     );
 }
@@ -2803,7 +2864,7 @@ fn a_reason_wrapped_across_lines_is_rejoined() {
 #[test]
 fn waivers_listing_reports_scope_key_and_suppression_count() {
     let out = ur_stdout(&["--root", WV, "waivers", "--today", TODAY]);
-    assert_tsv_cols(&out, 8);
+    assert_tsv_cols(&out, 9);
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("\titem\t"), "item scope must be visible:\n{}", s);
     assert!(s.contains("\tsite\t"), "site scope must be visible:\n{}", s);
@@ -2822,11 +2883,15 @@ fn waivers_listing_reports_scope_key_and_suppression_count() {
 fn orphaned_finds_waivers_that_suppress_nothing() {
     let out = ur_stdout(&["--root", WV, "waivers", "--orphaned", "--today", TODAY]);
     let rows = rows_of(&out);
-    assert_eq!(rows.len(), 2, "the dead one and the wrong-keyed one:\n{:?}", rows);
+    assert_eq!(rows.len(), 3, "two dead + one below-audit:\n{:?}", rows);
     for r in &rows {
         let cols: Vec<&str> = r.split('\t').collect();
-        assert_eq!(cols[5], "0", "orphaned rows suppress nothing: {}", r);
+        assert_eq!(cols[5], "0", "orphaned rows earn nothing in audit: {}", r);
     }
+    // The two sub-cases must be distinguishable, or "delete it" and "it is
+    // below your thresholds" collapse into one unactionable bucket.
+    let below: Vec<&String> = rows.iter().filter(|r| r.split('\t').nth(6) != Some("0")).collect();
+    assert_eq!(below.len(), 1, "exactly one is below-audit rather than dead:\n{:?}", rows);
 }
 
 #[test]

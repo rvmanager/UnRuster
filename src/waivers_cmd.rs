@@ -7,17 +7,23 @@
 //!
 //! Two decay signals, deliberately kept apart:
 //!
-//! * **orphaned** — the waiver suppressed nothing this run. Mechanical and
-//!   objective: the finding it was written for is gone, so the comment is
-//!   lying. Safe to strip in bulk.
+//! * **orphaned** — the waiver suppresses nothing the *audit battery* would
+//!   have reported. Mechanical and objective. Two sub-cases, distinguished by
+//!   the `below_audit` column: the finding is gone entirely (the comment now
+//!   lies), or it only exists below audit's thresholds (harmless, but dead
+//!   weight in the only loop that gates).
 //! * **stale** — older than `--stale N` days. A proxy, not proof; it asks a
 //!   human to re-read, and that is all it can do.
 //!
-//! Hit counts come from re-running the check battery against the same
-//! [`Suppressions`] the listing is about, with output silenced. That is also
-//! what makes the `suppresses` column honest — an item-scoped waiver quietly
-//! covering two hundred findings shows up as a 200, which is the guardrail on
-//! item scope being as broad as it is.
+//! Hit counts come from re-running the battery twice against the same
+//! [`Suppressions`] the listing is about, output silenced: once configured
+//! exactly as `audit` runs it, once wide open. Only the first decides whether a
+//! waiver is earning its place. Counting a single permissive pass is what let a
+//! real codebase report "0 orphaned" while a third of its ledger had stopped
+//! mattering — the tool disagreed with its own audit line in the same run.
+//!
+//! The `suppresses` column is also the guardrail on item scope: a waiver
+//! quietly covering two hundred findings shows up as a 200.
 
 use std::collections::BTreeMap;
 
@@ -26,7 +32,7 @@ use anyhow::Result;
 use crate::context::AnalysisCtx;
 use crate::emit::{row, site};
 use crate::parse::ParsedFile;
-use crate::suppress::{Date, Scope, Waiver};
+use crate::suppress::{Date, HitMode, Scope, Waiver};
 
 /// What `waivers` should do. Listing filters compose; the two mutating actions
 /// are mutually exclusive at the CLI boundary.
@@ -74,8 +80,22 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
         suppressions: ctx.suppressions,
         suggest_waivers: false,
     };
+
+    // Pass 1 — exactly how `audit` runs the battery. These hits are the number
+    // that decides whether a waiver is earning its place, because `audit` is
+    // the loop waivers exist to unblock.
+    ctx.suppressions.set_hit_mode(HitMode::Gating);
+    crate::audit::run_silent_battery(&probe, call_source);
+
+    // Pass 2 — wide open. The *difference* between the two is the interesting
+    // quantity: a waiver that only scores here is hiding rows the audit filters
+    // out anyway, which is dead weight in the gating loop without being an
+    // outright lie. Running only this pass is what made `--orphaned` report a
+    // clean ledger on a codebase where a third of the waivers had stopped
+    // mattering.
+    ctx.suppressions.set_hit_mode(HitMode::BelowAudit);
     // Errors here are not the user's problem: a check that fails to run just
-    // contributes no hits, and the listing says `?` rather than claiming 0.
+    // contributes no hits.
     let _ = crate::divergence::run(&probe, None, 0.0, None);
     let _ = crate::divergence::run_handling(&probe, 1);
     let _ = crate::parallel_matches::run_enum_coverage(
@@ -86,8 +106,6 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
             max_missing: None,
             compact: true,
             rank_enums: false,
-            // No floor: this pass exists to exercise every waiver, including
-            // ones written against a two-variant enum.
             min_variants: 0,
         },
     );
@@ -102,6 +120,7 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
     let _ = crate::casts::run(&probe, &[], None, false, true, None);
     let _ = crate::dead_code::run(&probe, call_source, false, false);
     let _ = crate::conversion_pairs::run(&probe);
+    ctx.suppressions.set_hit_mode(HitMode::Gating);
 }
 
 /// Does this waiver pass the listing filters?
@@ -207,6 +226,75 @@ pub fn run(ctx: &AnalysisCtx, call_source: &[ParsedFile], opts: WaiverOpts) -> R
     Ok(0)
 }
 
+/// Point out waivers that differ only by check name and could be one comment.
+///
+/// `divergence` and `enum-coverage` ask the same question of the same site, so
+/// verifying it once used to cost two waivers — on a real ledger six of
+/// thirty-three carried the reason `same.`, written purely to satisfy the other
+/// check. The group key retires both; this is how anyone finds out.
+fn note_groupable(ctx: &AnalysisCtx, all: &[Waiver]) {
+    let mut seen: BTreeMap<(&str, String, Option<String>), Vec<&str>> = BTreeMap::new();
+    for w in all {
+        let (Some(check), Some(key)) = (w.check.as_deref(), w.key.clone()) else {
+            continue;
+        };
+        let Some(group) = crate::suppress::group_of(check) else {
+            continue;
+        };
+        seen.entry((group, key, Some(w.file.clone())))
+            .or_default()
+            .push(check);
+    }
+    let mut pairs: Vec<String> = seen
+        .into_iter()
+        .filter(|(_, checks)| {
+            let mut c = checks.clone();
+            c.sort_unstable();
+            c.dedup();
+            c.len() > 1
+        })
+        .map(|((group, key, _), _)| format!("ok({}/{})", group, key))
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    if pairs.is_empty() {
+        return;
+    }
+    ctx.out.note(&format!(
+        "(note: {} site(s) carry one waiver per check where a single group key would do — \
+         {}{})",
+        pairs.len(),
+        pairs
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "),
+        if pairs.len() > 3 { ", …" } else { "" }
+    ));
+}
+
+/// Every waiver sharing one date is normal — `--suggest-waivers` stamps today,
+/// so a session's worth lands together — but it reads as a bug (a real reader's
+/// first thought was "date parsing issue"), and it means `--stale` will one day
+/// fire on the whole ledger at once rather than a few at a time.
+fn note_date_herd(ctx: &AnalysisCtx, all: &[Waiver]) {
+    let dates: Vec<Date> = all.iter().filter_map(|w| w.date).collect();
+    if dates.len() < 5 {
+        return;
+    }
+    let first = dates[0];
+    if dates.iter().all(|d| *d == first) {
+        ctx.out.note(&format!(
+            "(note: all {} dated waiver(s) carry {} — `--suggest-waivers` stamps today, so a \
+             batch written in one session ages together and `--stale` will surface the whole \
+             ledger at once)",
+            dates.len(),
+            first
+        ));
+    }
+}
+
 fn list(ctx: &AnalysisCtx, chosen: &[&Waiver], opts: &WaiverOpts) {
     let all = ctx.suppressions.all();
     for w in chosen {
@@ -218,6 +306,7 @@ fn list(ctx: &AnalysisCtx, chosen: &[&Waiver], opts: &WaiverOpts) {
             "scope" => w.scope.as_str(),
             "covers" => format!("{}-{}", w.covers.0, w.covers.1),
             "suppresses" => w.hits(),
+            "below_audit" => w.below_audit(),
             "at" => site(&w.file, w.comment_line),
             "reason" => if w.reason.is_empty() {
                 "(none)".to_string()
@@ -228,6 +317,11 @@ fn list(ctx: &AnalysisCtx, chosen: &[&Waiver], opts: &WaiverOpts) {
     }
 
     let orphaned = all.iter().filter(|w| w.hits() == 0).count();
+    let dead = all
+        .iter()
+        .filter(|w| w.hits() == 0 && w.below_audit() == 0)
+        .count();
+    let sub_threshold = orphaned - dead;
     let legacy = ctx.suppressions.legacy_count();
     let undated = all.iter().filter(|w| w.date.is_none()).count();
     let item_scoped = all.iter().filter(|w| w.scope == Scope::Item).count();
@@ -238,24 +332,30 @@ fn list(ctx: &AnalysisCtx, chosen: &[&Waiver], opts: &WaiverOpts) {
     }
     let breakdown: Vec<String> = by_check.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     ctx.out.summary(&format!(
-        "({} of {} waiver(s) shown; {}; {} item-scoped; {} orphaned (suppress nothing); \
-         {} legacy; {} undated; widest suppresses {} finding(s))",
+        "({} of {} waiver(s) shown; {}; {} item-scoped; {} earning nothing in `audit` \
+         ({} suppress nothing at all, {} only below audit thresholds); {} legacy; \
+         {} undated; widest suppresses {} finding(s))",
         chosen.len(),
         all.len(),
         breakdown.join(", "),
         item_scoped,
         orphaned,
+        dead,
+        sub_threshold,
         legacy,
         undated,
         widest,
     ));
     if orphaned > 0 {
         ctx.out.note(
-            "(note: an orphaned waiver no longer suppresses anything — the code moved on and \
-             the comment now misdescribes it. `waivers --orphaned --remove` previews the \
-             cleanup; add --write to apply)",
+            "(note: a waiver earning nothing in `audit` is either describing a finding that \
+             is gone (the comment now lies) or one the audit filters out anyway. Either way \
+             it is not holding the gating loop open. `waivers --orphaned --remove` previews \
+             the cleanup; add --write to apply)",
         );
     }
+    note_groupable(ctx, all);
+    note_date_herd(ctx, all);
     if legacy > 0 {
         ctx.out.note(
             "(note: a legacy waiver carries no check name, so it waives every check on its \

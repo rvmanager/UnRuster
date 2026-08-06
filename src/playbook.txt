@@ -443,9 +443,22 @@ today's date already filled in.
   rather than matching the row whole, so two waivers can jointly clear
   a site whose delta spans two variants.
 
+  GROUP KEYS. Some checks ask the same question of the same site, and
+  a group name waives all of them at once:
+    partial-enumeration  divergence + enum-coverage
+    silent-fallbacks     error-swallows + divergence-handling
+    replication          conversion-pairs + pass-through
+  These are the `explain:` topics already printed on each check's audit
+  header. Without them, verifying "this fn deliberately omits Group"
+  cost two comments — and on a real ledger six of thirty-three had the
+  reason "same.", written only to satisfy the other check name.
+  `unruster waivers` points out sites where a group key would collapse
+  two comments into one.
+
   Checks WITHOUT waiver support: stringly, metrics, pass-through,
   cohort-callees, co-call, and every query command. `--suggest-waivers`
-  says so rather than printing nothing.
+  says so rather than printing nothing. A waiver naming a check that
+  does not exist waives nothing; every run reports those by name.
 
   REASONS may wrap onto following comment lines: a waiver a human or
   rustfmt broke across lines parses the same as a one-liner. Absorption
@@ -460,9 +473,16 @@ today's date already filled in.
   go to be forgotten, and the output then reads as clean.
     unruster waivers              age, scope, and how many findings each
                                   one actually suppresses
-    unruster waivers --orphaned   suppresses nothing — the finding is
-                                  gone and the comment now lies. This is
-                                  mechanical, unlike age
+    unruster waivers --orphaned   earns nothing in `audit`. Two columns
+                                  tell the sub-cases apart: `suppresses`
+                                  counts findings the gating battery
+                                  would have reported, `below_audit`
+                                  counts ones only a permissive config
+                                  surfaces. 0/0 means the comment lies;
+                                  0/N means it is hiding rows the audit
+                                  filters out anyway. Both are dead
+                                  weight in the loop that gates.
+                                  Mechanical, unlike age
     unruster waivers --stale 365  older than N days; a proxy that asks a
                                   human to re-read, nothing more
     unruster waivers --remove     strip them (dry-run without --write)

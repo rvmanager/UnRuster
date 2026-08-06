@@ -63,6 +63,69 @@ enum Gate {
     Advisory,
 }
 
+/// The battery's per-check configuration, defined once.
+///
+/// `waivers` must run the identical set to count waiver hits — if the two drift,
+/// orphan detection starts answering a different question than the gating loop
+/// asks, which is exactly the defect these helpers exist to prevent.
+pub fn coverage_opts() -> parallel_matches::CoverageOpts {
+    parallel_matches::CoverageOpts {
+        // A row the check itself labels "likely false positive" must not gate
+        // the agent loop. `_ => scrutinee.method()` is structurally safe: a new
+        // variant has to implement the method. The dedicated command still
+        // shows them.
+        hide_trait_routed: true,
+        // A 1-of-2 `matches!` is an if/else, not partial dispatch.
+        min_variants: 3,
+        // Sites one variant short of exhaustive are the "forgot one" shape;
+        // wider gaps are usually two different jobs. The full list stays
+        // available from the dedicated command.
+        max_missing: Some(1),
+        ..Default::default()
+    }
+}
+
+pub fn swallow_opts() -> error_swallows::SwallowOpts {
+    error_swallows::SwallowOpts {
+        include_unwrap_or: false,
+        // Infallible `write!` into a String and fallbacks that already log are
+        // the two families that dominated this check's output while producing
+        // no defects.
+        include_infallible: false,
+        include_logged: false,
+    }
+}
+
+pub fn cast_classes() -> [CastClass; 5] {
+    [
+        CastClass::NarrowInt,
+        CastClass::SignedFlip,
+        CastClass::FloatInt,
+        CastClass::NarrowFloat,
+        CastClass::Ptr,
+        // `usize-cross` deliberately absent: on a 64-bit target it is dominated
+        // by lossless `u32 as usize` widening, now classified as `usize-widen`
+        // and reachable on demand.
+    ]
+}
+
+/// Run the gating battery with every row suppressed, purely for its effect on
+/// waiver hit counts. `ctx.out` must already be a silent sink.
+pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile]) {
+    // `--top` is a display cap applied after waiver matching, so omitting it
+    // here changes no hit count.
+    let _ = divergence::run(ctx, None, DIVERGENCE_MIN_SCORE, None);
+    let _ = divergence::run_handling(ctx, HANDLING_MIN_CARE_GAP);
+    let _ = parallel_matches::run_enum_coverage(ctx, None, coverage_opts());
+    let _ = dead_code::run(ctx, dead_call_source, false, false);
+    let _ = conversion_pairs::run(ctx);
+    let _ = error_swallows::run(ctx, swallow_opts());
+    let _ = casts::run(ctx, &cast_classes(), None, false, false, None);
+}
+
+/// Minimum care distance for the `--handling` axis.
+const HANDLING_MIN_CARE_GAP: u8 = 2;
+
 pub fn run(
     ctx: &AnalysisCtx,
     dead_call_source: &[ParsedFile],
@@ -106,30 +169,13 @@ pub fn run(
     section(
         "[high] divergence --handling — one callee, different care (explain: silent-fallbacks)",
         Gate::Gating,
-        &mut || divergence::run_handling(ctx, 2),
+        &mut || divergence::run_handling(ctx, HANDLING_MIN_CARE_GAP),
     )?;
     section(
         "[high] enum-coverage --all — partial enum dispatch (explain: partial-enumeration)",
         Gate::Gating,
         &mut || {
-            parallel_matches::run_enum_coverage(
-                ctx,
-                None,
-                parallel_matches::CoverageOpts {
-                    // A row the check itself labels "likely false positive" must
-                    // not gate the agent loop. `_ => scrutinee.method()` is
-                    // structurally safe: a new variant has to implement the
-                    // method. The dedicated command still shows them.
-                    hide_trait_routed: true,
-                    // A 1-of-2 `matches!` is an if/else, not partial dispatch.
-                    min_variants: 3,
-                    // Sites one variant short of exhaustive are the "forgot
-                    // one" shape; wider gaps are usually two different jobs.
-                    // The full list stays available from the dedicated command.
-                    max_missing: Some(1),
-                    ..Default::default()
-                },
-            )
+            parallel_matches::run_enum_coverage(ctx, None, coverage_opts())
         },
     )?;
     section(
@@ -155,41 +201,14 @@ pub fn run(
         "[medium] error-swallows — silently dropped Results (explain: silent-fallbacks)",
         Gate::Advisory,
         &mut || {
-            error_swallows::run(
-                ctx,
-                error_swallows::SwallowOpts {
-                    include_unwrap_or: false,
-                    // Infallible `write!` into a String and fallbacks that
-                    // already log are the two families that dominated this
-                    // check's output while producing no defects.
-                    include_infallible: false,
-                    include_logged: false,
-                },
-            )
+            error_swallows::run(ctx, swallow_opts())
         },
     )?;
     section(
         "[medium] casts — data-loss classes only (explain: casts)",
         Gate::Advisory,
         &mut || {
-            casts::run(
-                ctx,
-                &[
-                    CastClass::NarrowInt,
-                    CastClass::SignedFlip,
-                    CastClass::FloatInt,
-                    CastClass::NarrowFloat,
-                    CastClass::Ptr,
-                    // `usize-cross` deliberately absent: on a 64-bit target it
-                    // is dominated by lossless `u32 as usize` widening, now
-                    // classified as `usize-widen` and reachable on demand.
-                ],
-                None,
-                false,
-                // FFI pointer casts are not a data-loss defect class.
-                false,
-                top,
-            )
+            casts::run(ctx, &cast_classes(), None, false, false, top)
         },
     )?;
     // Low-volume checks: show the offending line inline. Skipped when the
@@ -232,11 +251,17 @@ pub fn run(
     let waivers = ctx.suppressions.len();
     let hidden = ctx.suppressions.total_hits();
     ctx.out.summary(&format!(
-        "(audit: {} gating + {} advisory finding(s) across {} check(s); \
-         exit 1 while gating findings remain{}{})",
+        "(audit: {} gating + {} advisory finding(s) across {} check(s); {}{}{})",
         gating,
         advisory,
         checks,
+        // Printing "exit 1 while gating findings remain" next to "0 gating" read
+        // as a contradiction on the one line that is supposed to say you are done.
+        if gating > 0 {
+            "exit 1 while gating findings remain"
+        } else {
+            "clean: no gating findings, exit 0"
+        },
         if strict { "; --strict: all gate" } else { "" },
         if waivers > 0 {
             // Every check that honours waivers has now run, so a waiver with

@@ -1074,6 +1074,27 @@ fn main() -> Result<()> {
     // A legacy waiver has no check name, so it silences every check on its
     // line. Say so once per run rather than per finding: the fix is one
     // `waivers --upgrade`, not a decision at each site.
+    // A waiver naming a check that does not exist waives nothing, silently.
+    // That is the same dead-weight class `--orphaned` reports, but it is a
+    // typo rather than drift and can be caught the moment the comment is read.
+    let known = suppress::known_check_names();
+    let mut unknown: Vec<String> = suppressions
+        .all()
+        .iter()
+        .filter_map(|w| w.check.clone())
+        .filter(|c| !known.contains(&c.as_str()))
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    if !unknown.is_empty() {
+        out.note(&format!(
+            "note: {} waiver(s) name a check this tool does not have ({}) and so waive \
+             nothing — known checks and groups: {}",
+            unknown.len(),
+            unknown.join(", "),
+            known.join(", ")
+        ));
+    }
     let legacy = suppressions.legacy_count();
     if legacy > 0 && !matches!(cmd, Cmd::Waivers(_)) {
         out.note(&format!(
