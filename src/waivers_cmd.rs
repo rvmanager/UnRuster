@@ -86,6 +86,9 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
             max_missing: None,
             compact: true,
             rank_enums: false,
+            // No floor: this pass exists to exercise every waiver, including
+            // ones written against a two-variant enum.
+            min_variants: 0,
         },
     );
     let _ = crate::error_swallows::run(
@@ -96,8 +99,9 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
             include_logged: true,
         },
     );
-    let _ = crate::casts::run(&probe, &[], None, false, None);
-    let _ = call_source; // dead-code does not consult waivers yet
+    let _ = crate::casts::run(&probe, &[], None, false, true, None);
+    let _ = crate::dead_code::run(&probe, call_source, false, false);
+    let _ = crate::conversion_pairs::run(&probe);
 }
 
 /// Does this waiver pass the listing filters?

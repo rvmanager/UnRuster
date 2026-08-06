@@ -9,6 +9,11 @@ use crate::emit::{row, site};
 #[derive(Debug)]
 struct Hit {
     class: &'static str,
+    /// Inside an `unsafe` block or an `unsafe fn`. A pointer cast there is the
+    /// FFI boundary doing its job, not a data-loss defect: `p as *const Method`
+    /// in an objc shim has no safer spelling. Tracked rather than dropped so
+    /// `--include-unsafe-ptr` can restore the rows.
+    in_unsafe: bool,
     src: String, // "_" if unknown
     dst: String,
     context: String,
@@ -19,6 +24,8 @@ struct Hit {
 struct CastVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
+    /// Nesting depth of `unsafe` blocks / fns currently open.
+    unsafe_depth: usize,
     fn_types_stack: Vec<FnTypes>,
     fn_sigs: &'a FnSigIndex,
     hits: Vec<Hit>,
@@ -211,6 +218,8 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         self.scope.leave_mod();
     }
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+        let unsafe_fn = i.sig.unsafety.is_some();
+        self.unsafe_depth += usize::from(unsafe_fn);
         self.scope
             .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         self.fn_types_stack
@@ -223,6 +232,7 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         visit::visit_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
+        self.unsafe_depth -= usize::from(unsafe_fn);
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
         self.scope.enter_impl(type_short(&i.self_ty));
@@ -235,6 +245,8 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         self.scope.leave_trait();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+        let unsafe_fn = i.sig.unsafety.is_some();
+        self.unsafe_depth += usize::from(unsafe_fn);
         self.scope
             .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
         self.fn_types_stack
@@ -247,6 +259,7 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         visit::visit_impl_item_fn(self, i);
         self.fn_types_stack.pop();
         self.scope.leave_fn();
+        self.unsafe_depth -= usize::from(unsafe_fn);
     }
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
         // Trait default-method bodies count like any other fn body.
@@ -273,6 +286,7 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         let class = classify(src.as_deref(), &dst);
         self.hits.push(Hit {
             class,
+            in_unsafe: self.unsafe_depth > 0,
             src: src.unwrap_or_else(|| "_".into()),
             dst,
             context: self.enclosing(),
@@ -280,6 +294,12 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
             line: e.as_token.span.start().line,
         });
         visit::visit_expr_cast(self, e);
+    }
+
+    fn visit_expr_unsafe(&mut self, e: &'ast syn::ExprUnsafe) {
+        self.unsafe_depth += 1;
+        visit::visit_expr_unsafe(self, e);
+        self.unsafe_depth -= 1;
     }
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
@@ -294,6 +314,7 @@ pub fn run(
     class_filter: &[CastClass],
     by: Option<GroupBy>,
     hide_widen: bool,
+    include_unsafe_ptr: bool,
     top: Option<usize>,
 ) -> anyhow::Result<usize> {
     let files = ctx.files;
@@ -304,6 +325,7 @@ pub fn run(
         let mut v = CastVisitor {
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
+            unsafe_depth: 0,
             fn_types_stack: Vec::new(),
             fn_sigs,
             hits: Vec::new(),
@@ -327,6 +349,15 @@ pub fn run(
     }
     // `usize-widen` is lossless by construction, so it is off unless asked for
     // by name. Without an explicit --class the default view is defect classes.
+    // A `ptr` cast inside `unsafe` is the FFI boundary, not a data-loss defect.
+    // Five of five on a real audit were objc / UTI shims, reported every run and
+    // acted on never.
+    let mut unsafe_ptr_hidden = 0usize;
+    if !include_unsafe_ptr {
+        let before = all.len();
+        all.retain(|h| !(h.class == "ptr" && h.in_unsafe));
+        unsafe_ptr_hidden = before - all.len();
+    }
     let asked_for_widen = class_filter.contains(&CastClass::UsizeWiden);
     let mut widen_hidden = 0usize;
     if !asked_for_widen {
@@ -388,11 +419,20 @@ pub fn run(
     }
     let break_str: Vec<String> = by_class.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     ctx.out.summary(&format!(
-        "({} cast(s); {}; hide_widen={}{}{}; explain: casts)",
+        "({} cast(s); {}; hide_widen={}{}{}{}; explain: casts)",
         all.len(),
         break_str.join(", "),
         hide_widen,
         ctx.waived_note(waived),
+        if unsafe_ptr_hidden > 0 {
+            format!(
+                "; {} ptr cast(s) inside `unsafe` hidden (FFI boundary — \
+                 `--include-unsafe-ptr` to restore)",
+                unsafe_ptr_hidden
+            )
+        } else {
+            String::new()
+        },
         if widen_hidden > 0 {
             format!(
                 "; {} lossless usize-widen row(s) hidden (assumes {}-bit usize; \

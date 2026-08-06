@@ -302,6 +302,20 @@ struct WaiversArgs {
 /// The subcommand's CLI name, for the `command` field of `--json` output.
 /// Exhaustive (no `_`) for the same reason as `implies_fail_on_findings`: a new
 /// command must state its own name rather than inherit a wrong one.
+/// Checks that consult `// unruster: ok(…)` waivers. Kept next to `cmd_name`
+/// because the strings must match its output exactly — `--suggest-waivers`
+/// warns when it is invoked on anything not in this list, and `audit` gates on
+/// four of these five.
+const WAIVER_AWARE_CHECKS: &[&str] = &[
+    "audit",
+    "divergence",
+    "enum-coverage",
+    "dead-code",
+    "conversion-pairs",
+    "error-swallows",
+    "casts",
+];
+
 fn cmd_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::Audit(_) => "audit",
@@ -592,6 +606,12 @@ struct ParallelMatchesArgs {
 
 #[derive(Args)]
 struct EnumCoverageArgs {
+    /// Skip enums with fewer than N variants. Defaults to 3 when sweeping
+    /// (a 1-of-2 `matches!` is an if/else, not partial dispatch) and 0 when
+    /// an enum is named, since naming one means "tell me about this one".
+    #[arg(long, value_name = "N")]
+    min_variants: Option<usize>,
+
     /// Enum name (last segment). Omit to scan every enum — bare invocation is
     /// the same as `--all`. Naming an enum *and* passing `--all` contradicts
     /// itself and errors.
@@ -690,6 +710,12 @@ struct PassThroughArgs {
 
 #[derive(Args)]
 struct CastsArgs {
+    /// Include `ptr` casts inside `unsafe` blocks / fns. Hidden by default:
+    /// an FFI shim's `p as *const Method` has no safer spelling, so the rows
+    /// are noise on every run.
+    #[arg(long)]
+    include_unsafe_ptr: bool,
+
     /// Filter to one or more comma-separated classes.
     #[arg(long, value_enum, value_delimiter = ',')]
     class: Vec<casts::CastClass>,
@@ -899,6 +925,12 @@ fn dispatch(
                 // Ranking enums implies the per-site variant lists are noise.
                 compact: a.compact || a.rank_enums,
                 rank_enums: a.rank_enums,
+                // Naming an enum means "tell me about this one" — no floor.
+                // Sweeping means "rank by signal", where 1-of-2 predicates are
+                // noise. `--min-variants` overrides either way.
+                min_variants: a
+                    .min_variants
+                    .unwrap_or(if a.name.is_some() { 0 } else { 3 }),
             },
         ),
         Cmd::Divergence(a) => {
@@ -920,7 +952,7 @@ fn dispatch(
         ),
         Cmd::PassThrough(a) => pass_through::run(ctx, a.max_loc),
         Cmd::Explain(_) => unreachable!("handled before the tree scan"),
-        Cmd::Casts(a) => casts::run(ctx, &a.class, a.by, a.hide_widen, a.top),
+        Cmd::Casts(a) => casts::run(ctx, &a.class, a.by, a.hide_widen, a.include_unsafe_ptr, a.top),
         Cmd::Conversions(a) => conversions::run(ctx, &a.kind, a.by, a.top),
         Cmd::ConversionPairs => conversion_pairs::run(ctx),
         Cmd::Stringly(a) => {
@@ -1071,6 +1103,19 @@ fn main() -> Result<()> {
         suppressions: &suppressions,
         suggest_waivers,
     };
+    // Silence here is worse than absence: an agent that runs
+    // `--suggest-waivers` on an unsupported check gets no line, no error, and
+    // no way to tell whether the check has no findings or no waiver support.
+    // On a real codebase that dead end sent someone off to invent a parallel
+    // `// NOTE (unruster … false positive)` convention this tool cannot read.
+    if suggest_waivers && !WAIVER_AWARE_CHECKS.contains(&cmd_name(&cmd)) {
+        out.note(&format!(
+            "note: `{}` does not support waivers, so --suggest-waivers has nothing to \
+             offer here. Checks that do: {}",
+            cmd_name(&cmd),
+            WAIVER_AWARE_CHECKS.join(", ")
+        ));
+    }
     let fail_on_findings = fail_on_findings || cmd.implies_fail_on_findings();
     let command_name = cmd_name(&cmd);
     let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude);

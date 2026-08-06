@@ -39,10 +39,10 @@ fn build_walker(root: &Path, excludes: &[String]) -> anyhow::Result<ignore::Walk
 /// Should `path` be skipped entirely under this scope? Exhaustive (no `_`)
 /// so a new Scope variant forces a decision here.
 fn out_of_scope(path: &Path, scope: Scope) -> bool {
-    let is_test_file = is_under_test_dir(path);
+    let is_test_file = is_under_test_dir(path) || looks_like_test_named(path);
     match scope {
         Scope::Production => is_test_file,
-        Scope::Tests => !is_test_file && !looks_like_test_named(path),
+        Scope::Tests => !is_test_file,
         Scope::All => false,
     }
 }
@@ -168,10 +168,19 @@ fn is_under_test_dir(p: &Path) -> bool {
     })
 }
 
+/// `foo_tests.rs` / `foo_test.rs` / `tests.rs` — a whole file of test code that
+/// happens to live outside a `tests/` directory.
+///
+/// This narrows `Production`, not just `Tests`. Previously it only widened
+/// `Tests`, so `--scope production` reported swallows in
+/// `model/animation/tests.rs` as production defects. Per-file cfg stripping
+/// cannot catch these: a parent's `#[cfg(test)] mod foo_tests;` is stripped
+/// from the parent's AST, but `parse_dir` still walks `foo_tests.rs` as its own
+/// file and never sees the gate.
 fn looks_like_test_named(p: &Path) -> bool {
     p.file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| s.ends_with("_test") || s.ends_with("_tests"))
+        .map(|s| s == "tests" || s.ends_with("_test") || s.ends_with("_tests"))
         .unwrap_or(false)
 }
 

@@ -16,6 +16,18 @@ struct FromImpl {
     line: usize,
 }
 
+/// `A<->B`, order-independent, for the waiver key. Uses `<->` rather than the
+/// display `↔` so the key is typeable without a character picker — a waiver you
+/// cannot type by hand is one nobody will correct by hand.
+fn pair_key(f: &FromImpl) -> String {
+    let (a, b) = if f.src < f.dst {
+        (&f.src, &f.dst)
+    } else {
+        (&f.dst, &f.src)
+    };
+    format!("{}<->{}", a, b)
+}
+
 struct FromVisitor<'a> {
     file: &'a str,
     out: Vec<FromImpl>,
@@ -80,7 +92,10 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
     // we don't double-emit `A↔B` and `B↔A`.
     let mut emitted: std::collections::BTreeSet<(String, String, String)> =
         std::collections::BTreeSet::new();
-    let mut pairs: Vec<(FromImpl, FromImpl)> = Vec::new();
+    // The waiver key is carried alongside so `retain_unsuppressed` can borrow
+    // it — a `Site` holds `&str`, so a key built inside the closure would not
+    // outlive the call.
+    let mut pairs: Vec<(FromImpl, FromImpl, String)> = Vec::new();
     for fi in &impls {
         let key_reverse = (
             fi.trait_name.clone(),
@@ -99,7 +114,8 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
             };
             let canon_key = (fi.trait_name.clone(), a.src.clone(), a.dst.clone());
             if emitted.insert(canon_key) {
-                pairs.push((a, b));
+                let key = pair_key(&a);
+                pairs.push((a, b, key));
             }
         }
     }
@@ -111,8 +127,17 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
             .then_with(|| x.0.dst.cmp(&y.0.dst))
     });
 
+    // Keyed by the type pair, and matched against the *forward* impl's site so
+    // one waiver above `impl From<A> for B` retires the pair. A gating check
+    // whose commonest true verdict is "one of these types is foreign, so they
+    // cannot be merged" needs a way to record that verdict.
+    let waived = ctx.retain_unsuppressed("conversion-pairs", &mut pairs, |p| {
+        crate::suppress::Site::keyed(p.0.file.as_str(), p.0.line, p.2.as_str())
+    });
+
     if !summary {
-        for (forward, reverse) in &pairs {
+        let today = crate::suppress::Date::today();
+        for (forward, reverse, key) in &pairs {
             row!(
                 ctx.out,
                 "trait" => forward.trait_name.clone(),
@@ -120,11 +145,13 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
                 "at" => site(&forward.file, forward.line),
                 "reverse_at" => site(&reverse.file, reverse.line),
             );
+            ctx.suggest("conversion-pairs", Some(key), today);
         }
     }
     ctx.out.summary(&format!(
-        "({} bidirectional pair(s); explain: replication)",
-        pairs.len()
+        "({} bidirectional pair(s){}; explain: replication)",
+        pairs.len(),
+        ctx.waived_note(waived)
     ));
     Ok(pairs.len())
 }

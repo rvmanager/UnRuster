@@ -2584,6 +2584,8 @@ fn waiver_comment_suppresses_exactly_its_own_site() {
 // can't shift the row counts asserted above.
 
 const WV: &str = "fixtures/waivers/src";
+const SCOPE_FIXTURE: &str = "fixtures/scope/src";
+const DIVGROUP: &str = "fixtures/divgroup/src";
 /// Pinned "today" — the system clock is the only non-deterministic input in
 /// the tool, and an unpinned age would make these assertions rot.
 const TODAY: &str = "2026-08-06";
@@ -2606,6 +2608,137 @@ fn scratch_fixture(name: &str) -> std::path::PathBuf {
     )
     .unwrap();
     dir.join("src")
+}
+
+#[test]
+fn the_two_gating_checks_that_had_no_waiver_support_now_have_it() {
+    // `dead-code` and `conversion-pairs` gate the audit loop but ignored
+    // waivers entirely, so a verified false positive in either could never be
+    // retired and `audit` could never exit 0. On a real codebase that dead end
+    // pushed someone into maintaining a parallel `// NOTE (unruster …)`
+    // convention this tool cannot read.
+    for (check, marker) in [
+        ("dead-code", "named_by_attribute"),
+        ("conversion-pairs", "Foreign"),
+    ] {
+        let without = ur_stdout(&["--root", WV, "--no-suppress", check]);
+        let with = ur_stdout(&["--root", WV, check]);
+        let s_without = String::from_utf8_lossy(&without);
+        let s_with = String::from_utf8_lossy(&with);
+        assert!(
+            s_without.contains(marker),
+            "{check} should flag {marker} unwaived:\n{s_without}"
+        );
+        assert!(
+            !s_with.contains(marker),
+            "{check} waiver should retire it:\n{s_with}"
+        );
+    }
+}
+
+#[test]
+fn suggest_waivers_says_so_when_a_check_cannot_use_them() {
+    // Silence here is what sent a real agent off to invent its own format.
+    let out = ur().args(["--root", WV, "--suggest-waivers", "stringly"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("does not support waivers"),
+        "expected a note, got:\n{}",
+        err
+    );
+    // And it must not cry wolf on a check that does support them.
+    let ok = ur().args(["--root", WV, "--suggest-waivers", "dead-code"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&ok.stderr).contains("does not support waivers"),
+        "dead-code supports waivers now"
+    );
+}
+
+#[test]
+fn one_enum_named_waiver_covers_every_missing_variant() {
+    // `ok(enum-coverage/Modal)` against findings keyed `Modal::None`,
+    // `Modal::NewDoc`, … Before the prefix match this needed one comment per
+    // missing variant — four, on a real row.
+    let without = ur_stdout(&["--root", WV, "--no-suppress", "enum-coverage", "Modal"]);
+    let with = ur_stdout(&["--root", WV, "enum-coverage", "Modal"]);
+    assert_eq!(rows_of(&without).len(), 1);
+    assert!(rows_of(&with).is_empty(), "one waiver should clear the row");
+    let waivers = ur_stdout(&["--root", WV, "waivers", "--check", "enum-coverage", "--today", TODAY]);
+    let s = String::from_utf8_lossy(&waivers);
+    let suppresses: usize = s
+        .lines()
+        .find(|l| l.contains("Modal"))
+        .and_then(|l| l.split('\t').nth(5))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(suppresses, 4, "one comment, four variants:\n{}", s);
+}
+
+#[test]
+fn a_fn_named_only_by_an_attribute_string_is_not_dead() {
+    // `#[serde(default = "default_true")]` is a real call the derive expands,
+    // but the name lives in a string literal.
+    let out = ur_stdout(&["--root", WV, "--no-suppress", "dead-code"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        !s.contains("default_true"),
+        "attribute-named fn must not read as dead:\n{}",
+        s
+    );
+}
+
+#[test]
+fn pointer_casts_inside_unsafe_are_the_ffi_boundary_not_a_defect() {
+    let hidden = ur_stdout(&["--root", WV, "casts", "--class", "ptr"]);
+    let shown = ur_stdout(&["--root", WV, "casts", "--class", "ptr", "--include-unsafe-ptr"]);
+    assert_eq!(rows_of(&hidden).len(), 1, "only the safe cast");
+    assert_eq!(rows_of(&shown).len(), 3, "--include-unsafe-ptr restores them");
+}
+
+#[test]
+fn test_named_files_are_not_production_code() {
+    // `looks_like_test_named` only ever widened `--scope tests`; under
+    // `production` a `foo_tests.rs` was analysed as production, so swallows in
+    // test helpers were reported as defects. Per-file cfg stripping cannot
+    // catch it — the `#[cfg(test)] mod` gate lives in the *parent* file.
+    let prod = ur_stdout(&["--root", SCOPE_FIXTURE, "error-swallows"]);
+    let all = ur_stdout(&["--root", SCOPE_FIXTURE, "--scope", "all", "error-swallows"]);
+    let tests = ur_stdout(&["--root", SCOPE_FIXTURE, "--scope", "tests", "error-swallows"]);
+    assert_eq!(rows_of(&prod).len(), 1, "only lib.rs is production");
+    assert_eq!(rows_of(&all).len(), 3);
+    assert_eq!(rows_of(&tests).len(), 2, "tests.rs + foo_tests.rs");
+}
+
+#[test]
+fn divergence_collapses_one_decision_into_one_row() {
+    // The scan is an N×M cross-product by construction, but "this fn omits
+    // Group" is one decision no matter how many siblings handle Group. On a
+    // real tree three such decisions filled seventeen rows.
+    let out = ur_stdout(&["--root", DIVGROUP, "divergence"]);
+    let rows = rows_of(&out);
+    let collapsed: usize = rows
+        .iter()
+        .filter_map(|r| r.split("(+").nth(1))
+        .filter_map(|r| r.split(' ').next())
+        .filter_map(|n| n.parse::<usize>().ok())
+        .sum();
+    assert!(collapsed > 0, "expected some rows to absorb siblings:\n{:?}", rows);
+    assert!(
+        rows.len() < rows.len() + collapsed,
+        "grouping must reduce the row count"
+    );
+    // Every lean site appears at most once per (enum, delta).
+    let mut keys: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let c: Vec<&str> = r.split('\t').collect();
+            format!("{}|{}|{}", c[0], c[3], c[5])
+        })
+        .collect();
+    let before = keys.len();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(before, keys.len(), "duplicate (enum, delta, lean) rows remain");
 }
 
 #[test]

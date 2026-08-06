@@ -43,7 +43,8 @@ WAIVERS — record a verified false positive (`unruster explain waivers`)
   // unruster: ok(<check>[/<key>]) <YYYY-MM-DD> — <reason>
   Don't write it by hand: `--suggest-waivers` prints the exact line to paste.
   Above an item it waives that whole item (the `#[allow]` model), so one
-  comment retires an omission across every method in an impl.
+  comment retires an omission across every method in an impl. A bare enum
+  name as the key covers all of that enum's variants at once.
   unruster waivers [--orphaned]  list them / find the ones now suppressing nothing
 
 IN-SOURCE MARKERS

@@ -360,12 +360,22 @@ fn check_matches(waiver: Option<&str>, check: &str) -> bool {
 }
 
 /// An unkeyed waiver matches any key. A keyed waiver requires a keyed finding
-/// and matches either the full key or its last `::` segment, so
-/// `ok(divergence/Group)` and `ok(divergence/NodeContent::Group)` both work.
+/// and matches three ways, narrowest spelling first:
+///
+/// * exact — `ok(divergence/NodeContent::Group)`
+/// * bare variant — `ok(divergence/Group)`, so the enum path is optional
+/// * whole enum — `ok(enum-coverage/ActiveModal)` covers `ActiveModal::None`,
+///   `ActiveModal::TextEntry`, … in one comment.
+///
+/// The last form is why this isn't just equality: an enum-coverage row lists
+/// every uncovered variant, and without a prefix match retiring one row meant
+/// pasting one comment per missing variant — four, on a real codebase.
 fn key_matches(waiver: Option<&str>, finding: Option<&str>) -> bool {
     let Some(w) = waiver else { return true };
     let Some(f) = finding else { return false };
-    f == w || f.rsplit("::").next() == Some(w)
+    f == w
+        || f.rsplit("::").next() == Some(w)
+        || f.strip_prefix(w).is_some_and(|r| r.starts_with("::"))
 }
 
 // ---------------------------------------------------------------------------

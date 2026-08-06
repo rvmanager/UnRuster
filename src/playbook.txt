@@ -431,13 +431,21 @@ today's date already filled in.
   waives every cast there; `ok(casts/ptr)` leaves narrowing casts
   flagged. A keyed waiver never matches an unkeyed finding, so it
   cannot over-suppress.
-    divergence, enum-coverage  <Enum>::<Variant> (bare <Variant> too)
+    divergence, enum-coverage  <Enum>::<Variant>; bare <Variant> works, and
+                               bare <Enum> covers every variant of that enum
+                               in one comment
     casts                      cast class (ptr, narrow, …)
     error-swallows             swallow kind (let-_, .ok, …)
     divergence-handling        the callee being handled
+    dead-code                  the item's own name
+    conversion-pairs           the type pair, `A<->B` (alphabetical)
   For divergence and enum-coverage the key is subtracted from the gap
   rather than matching the row whole, so two waivers can jointly clear
   a site whose delta spans two variants.
+
+  Checks WITHOUT waiver support: stringly, metrics, pass-through,
+  cohort-callees, co-call, and every query command. `--suggest-waivers`
+  says so rather than printing nothing.
 
   REASONS may wrap onto following comment lines: a waiver a human or
   rustfmt broke across lines parses the same as a one-liner. Absorption

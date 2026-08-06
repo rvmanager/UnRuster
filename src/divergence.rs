@@ -248,14 +248,53 @@ fn sort_pairs(pairs: &mut [Pair]) {
     });
 }
 
-fn print_pair(ctx: &AnalysisCtx, p: &Pair, prefixed: bool) {
+/// Collapse pairs that differ only in which richer sibling they were compared
+/// against.
+///
+/// The scan is an N×M cross-product by construction: every partial site is
+/// paired with every richer partial sibling. But "`insert` omits `Group`" is
+/// **one** decision regardless of how many siblings happen to handle `Group` —
+/// and on a real 170-enum tree that one decision printed six identical-verdict
+/// rows, with three such decisions filling seventeen of the section's rows.
+/// Reading effort scaled with the sibling count instead of the decision count.
+///
+/// The exemplar kept is the highest-scoring pair in the group (input must be
+/// sorted), which is also the sibling most worth comparing against.
+fn group_by_lean(pairs: Vec<Pair<'_>>) -> Vec<(Pair<'_>, usize)> {
+    let mut out: Vec<(Pair, usize)> = Vec::new();
+    let mut seen: BTreeMap<(String, usize, String, String), usize> = BTreeMap::new();
+    for p in pairs {
+        let key = (
+            p.lean.file.clone(),
+            p.lean.line,
+            p.enum_name.clone(),
+            p.delta.join(","),
+        );
+        match seen.get(&key) {
+            Some(&i) => out[i].1 += 1,
+            None => {
+                seen.insert(key, out.len());
+                out.push((p, 0));
+            }
+        }
+    }
+    out
+}
+
+fn print_pair(ctx: &AnalysisCtx, p: &Pair, prefixed: bool, others: usize) {
     let tag = if p.sealed { " SEALED" } else { "" };
     let lean = format!("{}{}", p.lean.context, tag);
+    let more = if others > 0 {
+        format!(" (+{} more sibling(s))", others)
+    } else {
+        String::new()
+    };
     let vs = format!(
-        "{} [{}/{}]",
+        "{} [{}/{}]{}",
         p.rich.context,
         p.rich.variants.len(),
-        p.total
+        p.total,
+        more
     );
     if prefixed {
         row!(
@@ -358,11 +397,12 @@ pub fn run(
     let waived = waived_sites + waived_pairs;
     sort_pairs(&mut all);
 
-    let found = all.len();
+    let grouped = group_by_lean(all);
+    let found = grouped.len();
     let shown = top.map(|n| found.min(n)).unwrap_or(found);
     let today = crate::suppress::Date::today();
-    for p in all.iter().take(shown) {
-        print_pair(ctx, p, !single);
+    for (p, others) in grouped.iter().take(shown) {
+        print_pair(ctx, p, !single, *others);
         for v in &p.delta {
             ctx.suggest(
                 "divergence",
@@ -379,7 +419,7 @@ pub fn run(
         ));
     }
 
-    let sealed_rows = all.iter().take(shown).filter(|p| p.sealed).count();
+    let sealed_rows = grouped.iter().take(shown).filter(|(p, _)| p.sealed).count();
     let sealed_note = if sealed_rows > 0 {
         format!("; {} on SEALED enum(s)", sealed_rows)
     } else {

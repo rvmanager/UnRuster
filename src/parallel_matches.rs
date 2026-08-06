@@ -839,6 +839,13 @@ pub struct CoverageOpts {
     /// it has and its worst gap. Replaces the `awk | sort | uniq -c | sort -rn`
     /// pipeline for "which enum should I look at first".
     pub rank_enums: bool,
+    /// Skip enums with fewer than this many variants. On a two-variant enum,
+    /// "covers 1 of 2" is the definition of an if/else — `is_playing`,
+    /// `is_animating`, `is_cage_edit_for` are predicates, not partial dispatch.
+    /// Nine of fifteen rows on a real audit were this shape, and every one was
+    /// waived. Sweeps (`--all`) default to 3; naming an enum explicitly means
+    /// "tell me about *this* one", so that path keeps the floor at 0.
+    pub min_variants: usize,
 }
 
 /// `enum-coverage <Enum>` — synthesis of the partial-enumeration defect class.
@@ -901,6 +908,7 @@ pub fn run_enum_coverage(
             let mut hidden = 0usize;
             let mut filtered = 0usize;
             let mut waived = 0usize;
+            let mut small_enums = 0usize;
             let mut sealed_rows = 0usize;
             let mut scanned = 0usize;
             // `--rank-enums` needs every enum's totals before it can order
@@ -909,6 +917,10 @@ pub fn run_enum_coverage(
             for name in ctx.idx.enum_names() {
                 let variant_names = variant_names_of(ctx.files, &name);
                 if variant_names.is_empty() {
+                    continue;
+                }
+                if variant_names.len() < opts.min_variants {
+                    small_enums += 1;
                     continue;
                 }
                 scanned += 1;
@@ -942,7 +954,7 @@ pub fn run_enum_coverage(
                 }
             }
             ctx.out.summary(&format!(
-                "({} partial site(s) across {} enum(s); --all; exhaustive sites hidden{}{}{}{}; explain: partial-enumeration)",
+                "({} partial site(s) across {} enum(s); --all; exhaustive sites hidden{}{}{}{}{}; explain: partial-enumeration)",
                 shown,
                 scanned,
                 if opts.hide_trait_routed {
@@ -952,6 +964,15 @@ pub fn run_enum_coverage(
                 },
                 gap_filter_note(opts, filtered),
                 ctx.waived_note(waived),
+                if small_enums > 0 {
+                    format!(
+                        "; {} enum(s) with <{} variants skipped (a 1-of-2 `matches!` is \
+                         an if/else, not partial dispatch — `--min-variants 0` to include)",
+                        small_enums, opts.min_variants
+                    )
+                } else {
+                    String::new()
+                },
                 if sealed_rows > 0 {
                     format!("; {} on SEALED enums", sealed_rows)
                 } else {

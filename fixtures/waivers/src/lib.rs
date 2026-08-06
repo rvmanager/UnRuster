@@ -73,3 +73,50 @@ pub mod orphan {
         7
     }
 }
+
+/// Two checks that had no waiver support at all until they were wired in —
+/// both *gating*, so without this an audit loop could never reach zero.
+pub mod newly_waivable {
+    pub struct Local(pub f64);
+    pub struct Foreign(pub f64);
+
+    // unruster: ok(conversion-pairs/Foreign<->Local) 2026-04-01 — Foreign is a
+    // third-party type at the boundary; it cannot be merged or made a view.
+    impl From<Foreign> for Local {
+        fn from(f: Foreign) -> Self { Local(f.0) }
+    }
+    impl From<Local> for Foreign {
+        fn from(l: Local) -> Self { Foreign(l.0) }
+    }
+
+    // unruster: ok(dead-code/named_by_attribute) 2026-04-01 — reached only
+    // through a derive's attribute string.
+    fn named_by_attribute() -> bool { true }
+}
+
+/// One waiver, four missing variants. Before enum-name key matching this
+/// needed four separate comments.
+pub mod enum_level {
+    pub enum Modal { None, NewDoc, PendingAdd, TextEntry, Other }
+
+    // unruster: ok(enum-coverage/Modal) 2026-04-01 — this dialog reacts to Other only
+    pub fn dispatch(m: Modal) -> bool {
+        matches!(m, Modal::Other)
+    }
+}
+
+/// The serde shape: the fn is named by an attribute string, not a call.
+pub mod serde_named {
+    pub struct S {
+        #[serde(default = "default_true")]
+        pub b: bool,
+    }
+    pub fn default_true() -> bool { true }
+}
+
+/// FFI pointer casts: `unsafe` marks the boundary, not a data-loss defect.
+pub mod ffi {
+    pub fn safe_cast(p: *const ()) -> *const u8 { p as *const u8 }
+    pub unsafe fn unsafe_fn(p: *const ()) -> *const u8 { p as *const u8 }
+    pub fn unsafe_block(p: *const ()) -> *const u8 { unsafe { p as *const u8 } }
+}

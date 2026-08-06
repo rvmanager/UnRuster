@@ -116,7 +116,13 @@ pub fn run(
                 ctx,
                 None,
                 parallel_matches::CoverageOpts {
-                    hide_trait_routed: false,
+                    // A row the check itself labels "likely false positive" must
+                    // not gate the agent loop. `_ => scrutinee.method()` is
+                    // structurally safe: a new variant has to implement the
+                    // method. The dedicated command still shows them.
+                    hide_trait_routed: true,
+                    // A 1-of-2 `matches!` is an if/else, not partial dispatch.
+                    min_variants: 3,
                     // Sites one variant short of exhaustive are the "forgot
                     // one" shape; wider gaps are usually two different jobs.
                     // The full list stays available from the dedicated command.
@@ -180,6 +186,8 @@ pub fn run(
                 ],
                 None,
                 false,
+                // FFI pointer casts are not a data-loss defect class.
+                false,
                 top,
             )
         },
@@ -231,9 +239,26 @@ pub fn run(
         checks,
         if strict { "; --strict: all gate" } else { "" },
         if waivers > 0 {
+            // Every check that honours waivers has now run, so a waiver with
+            // zero hits is orphaned against all of them — a mistyped key or a
+            // scope that missed. Saying only "N waivers hiding M findings"
+            // left a real codebase with 33 waivers hiding 30 findings and
+            // nobody noticing that at least three of them did nothing.
+            let dead = ctx
+                .suppressions
+                .all()
+                .iter()
+                .filter(|w| w.hits() == 0)
+                .count();
             format!(
-                "; {} waiver(s) hiding {} finding(s) — `unruster waivers` to review",
-                waivers, hidden
+                "; {} waiver(s) hiding {} finding(s){} — `unruster waivers` to review",
+                waivers,
+                hidden,
+                if dead > 0 {
+                    format!(", {} of them suppressing nothing", dead)
+                } else {
+                    String::new()
+                }
             )
         } else {
             String::new()
