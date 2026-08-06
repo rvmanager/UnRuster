@@ -218,7 +218,11 @@ pub fn run(
     // The battery-wide line goes back to the normal stream: it is the one an
     // `until unruster audit` loop greps for, and callers already redirect for it.
     ctx.out.set_summary_inline(prev_inline);
-    let waived = ctx.suppressions.len();
+    // Both numbers, not just the waiver count: two item-scoped waivers hiding
+    // seven findings reported as "2 site(s) waived" understates the reach by
+    // 3.5x, which is the exact failure this line exists to prevent.
+    let waivers = ctx.suppressions.len();
+    let hidden = ctx.suppressions.total_hits();
     ctx.out.summary(&format!(
         "(audit: {} gating + {} advisory finding(s) across {} check(s); \
          exit 1 while gating findings remain{}{})",
@@ -226,8 +230,11 @@ pub fn run(
         advisory,
         checks,
         if strict { "; --strict: all gate" } else { "" },
-        if waived > 0 {
-            format!("; {} site(s) waived by `// unruster: ok`", waived)
+        if waivers > 0 {
+            format!(
+                "; {} waiver(s) hiding {} finding(s) — `unruster waivers` to review",
+                waivers, hidden
+            )
         } else {
             String::new()
         }

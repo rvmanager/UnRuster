@@ -311,6 +311,13 @@ impl Suppressions {
         self.waivers.iter().filter(|w| w.is_legacy()).count()
     }
 
+    /// Findings suppressed so far this run, across every waiver. Meaningful
+    /// only after the checks have run; `audit` reads it at the end so its
+    /// summary can state reach rather than just how many comments exist.
+    pub fn total_hits(&self) -> usize {
+        self.waivers.iter().map(Waiver::hits).sum()
+    }
+
     /// Does a waiver cover this finding? Records the hit, so
     /// `unruster waivers` can report what each waiver is actually buying and
     /// flag the ones that no longer suppress anything.
@@ -543,98 +550,188 @@ fn is_continuation(line: &str) -> bool {
 // Item spans
 // ---------------------------------------------------------------------------
 
-/// `(first_line, last_line)` of every item in a file, 1-indexed and inclusive.
-/// `first_line` accounts for attributes and doc comments, which precede the
-/// item keyword and are where a waiver above a documented fn would otherwise
-/// fall into the gap.
-struct ItemSpans {
-    spans: Vec<(usize, usize)>,
+/// Where one item lives, 1-indexed and inclusive.
+///
+/// Three lines rather than two, because a waiver can legitimately sit on
+/// either side of an item's documentation:
+///
+/// ```ignore
+/// // unruster: ok(…)   ← above the docs      → header_start
+/// /// Docs.
+/// #[inline]
+/// // unruster: ok(…)   ← below them          → keyword
+/// fn f() {}                                  → .. last
+/// ```
+///
+/// `syn` reports `item.span().start()` as the first *attribute* line (doc
+/// comments are attributes), so matching on that alone silently demotes the
+/// second placement to site scope — which is how six findings survived a
+/// waiver that claimed to cover them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ItemSpan {
+    /// First line of the item including its attributes and doc comments.
+    pub header_start: usize,
+    /// Line of the item's own keyword (`fn`, `impl`, `enum`, …).
+    pub keyword: usize,
+    /// Last line of the item.
+    pub last: usize,
 }
 
-impl ItemSpans {
-    fn collect(file: &syn::File) -> Vec<(usize, usize)> {
-        let mut v = ItemSpans { spans: Vec::new() };
-        v.visit_file(file);
-        v.spans.sort_unstable();
-        v.spans
+/// Item spans plus the line ranges of multi-line string literals.
+///
+/// [`find_line_comment`] tracks quotes within one line, which is enough for
+/// `println!("// unruster: ok")` but not for a literal that spans lines: its
+/// continuation lines carry no opening quote, so a `//` inside one reads as a
+/// real comment. That is precisely the "a codebase documenting this tool
+/// waives random lines of itself" failure the parser doc warns about, and
+/// unruster's own test fixtures tripped it. `syn` has already lexed these
+/// literals — raw strings and escapes included — so the spans are exact.
+struct SourceSpans {
+    spans: Vec<ItemSpan>,
+    /// Inclusive 1-indexed line ranges that lie *inside* a multi-line literal
+    /// (the opening line is excluded — its quote is visible to the scanner).
+    literal_lines: Vec<(usize, usize)>,
+}
+
+/// Everything a waiver scan needs to know about one parsed file.
+pub struct FileSpans {
+    items: Vec<ItemSpan>,
+    literal_lines: Vec<(usize, usize)>,
+}
+
+impl FileSpans {
+    /// Used when the file won't re-parse. Every waiver in it then falls back
+    /// to site scope and no line is masked — the same behaviour as before
+    /// spans existed, rather than a silent loss of waivers.
+    fn empty() -> Self {
+        FileSpans {
+            items: Vec::new(),
+            literal_lines: Vec::new(),
+        }
     }
 
-    fn push<T: Spanned>(&mut self, node: &T, attrs: &[syn::Attribute]) {
+    fn contains_literal(&self, line: usize) -> bool {
+        self.literal_lines
+            .iter()
+            .any(|&(a, b)| line >= a && line <= b)
+    }
+}
+
+impl SourceSpans {
+    fn collect(file: &syn::File) -> FileSpans {
+        let mut v = SourceSpans {
+            spans: Vec::new(),
+            literal_lines: Vec::new(),
+        };
+        v.visit_file(file);
+        v.spans
+            .sort_unstable_by_key(|s| (s.header_start, s.keyword, s.last));
+        FileSpans {
+            items: v.spans,
+            literal_lines: v.literal_lines,
+        }
+    }
+
+    /// `kw` must be the item's own keyword token, not the item node — the
+    /// node's span starts at its first attribute.
+    fn push<T: Spanned, K: Spanned>(&mut self, node: &T, kw: &K, attrs: &[syn::Attribute]) {
         let s = node.span();
-        let first = attrs
+        let keyword = kw.span().start().line;
+        let header_start = attrs
             .iter()
             .map(|a| a.span().start().line)
             .chain(std::iter::once(s.start().line))
             .min()
-            .unwrap_or_else(|| s.start().line);
-        let last = s.end().line.max(first);
-        self.spans.push((first, last));
+            .unwrap_or(keyword)
+            .min(keyword);
+        self.spans.push(ItemSpan {
+            header_start,
+            keyword,
+            last: s.end().line.max(keyword),
+        });
     }
 }
 
 /// Every item kind a waiver can sensibly scope to. Nested items are reached
 /// through the default walk, so a `fn` inside a `fn` body gets its own span.
-impl<'ast> Visit<'ast> for ItemSpans {
+impl<'ast> Visit<'ast> for SourceSpans {
+    /// Every literal, not just strings: byte strings and raw strings can span
+    /// lines too, and the cost of over-collecting is nil (a numeric literal is
+    /// always one line, so it never contributes a range).
+    fn visit_lit(&mut self, l: &'ast syn::Lit) {
+        let s = l.span();
+        let (start, end) = (s.start().line, s.end().line);
+        if end > start {
+            self.literal_lines.push((start + 1, end));
+        }
+        visit::visit_lit(self, l);
+    }
+
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.sig.fn_token, &i.attrs);
         visit::visit_item_fn(self, i);
     }
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.impl_token, &i.attrs);
         visit::visit_item_impl(self, i);
     }
     fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.mod_token, &i.attrs);
         visit::visit_item_mod(self, i);
     }
     fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.enum_token, &i.attrs);
         visit::visit_item_enum(self, i);
     }
     fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.struct_token, &i.attrs);
         visit::visit_item_struct(self, i);
     }
     fn visit_item_union(&mut self, i: &'ast syn::ItemUnion) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.union_token, &i.attrs);
         visit::visit_item_union(self, i);
     }
     fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.trait_token, &i.attrs);
         visit::visit_item_trait(self, i);
     }
     fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.const_token, &i.attrs);
         visit::visit_item_const(self, i);
     }
     fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.static_token, &i.attrs);
         visit::visit_item_static(self, i);
     }
     fn visit_item_type(&mut self, i: &'ast syn::ItemType) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.type_token, &i.attrs);
         visit::visit_item_type(self, i);
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.sig.fn_token, &i.attrs);
         visit::visit_impl_item_fn(self, i);
     }
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.push(i, &i.attrs);
+        self.push(i, &i.sig.fn_token, &i.attrs);
         visit::visit_trait_item_fn(self, i);
     }
 }
 
-/// The item a standalone waiver ending at `comment_end` attaches to: the
-/// widest one whose first line falls between the comment and the next line
-/// with code (inclusive), so doc comments and attributes in the gap don't
-/// break the association.
-fn item_at(spans: &[(usize, usize)], comment_end: usize, next_code: usize) -> Option<(usize, usize)> {
+/// The item a standalone waiver attaches to: one whose *header* — anywhere
+/// from its first attribute through its keyword — contains the next line with
+/// code. That range is what lets the waiver sit above the docs or below them
+/// and mean the same thing.
+///
+/// A waiver inside a body can't match: the enclosing item's keyword is above
+/// it, so `next_code <= keyword` fails and the caller falls back to site scope.
+/// Ties prefer the widest span, which is how a waiver above `impl Foo` takes
+/// the impl rather than its first method.
+fn item_at(spans: &[ItemSpan], next_code: usize) -> Option<ItemSpan> {
     spans
         .iter()
         .copied()
-        .filter(|&(first, _)| first > comment_end && first <= next_code)
-        .max_by_key(|&(first, last)| (last.saturating_sub(first), std::cmp::Reverse(first)))
+        .filter(|s| s.header_start <= next_code && next_code <= s.keyword)
+        .max_by_key(|s| (s.last.saturating_sub(s.keyword), std::cmp::Reverse(s.keyword)))
 }
 
 // ---------------------------------------------------------------------------
@@ -650,7 +747,15 @@ pub fn scan(files: &[ParsedFile]) -> Suppressions {
             continue;
         };
         let display = display_path(&f.path);
-        let spans = ItemSpans::collect(&f.ast);
+        // Re-parse the raw text rather than reusing `f.ast`: that one has had
+        // its cfg-false items stripped, so its spans have holes wherever, say,
+        // a `#[cfg(test)] mod tests` used to be — while the *text* this scan
+        // walks still has those lines. The mismatch let string literals inside
+        // stripped code register as waivers. A comment's meaning should not
+        // depend on which `--cfg` flags were passed, either.
+        let spans = syn::parse_file(&src)
+            .map(|ast| SourceSpans::collect(&ast))
+            .unwrap_or_else(|_| FileSpans::empty());
         scan_source(&mut out, &display, &src, &spans);
     }
     out
@@ -658,10 +763,16 @@ pub fn scan(files: &[ParsedFile]) -> Suppressions {
 
 /// The textual half of [`scan`], split out so tests can drive it without
 /// touching the filesystem.
-fn scan_source(out: &mut Suppressions, display: &str, src: &str, spans: &[(usize, usize)]) {
+fn scan_source(out: &mut Suppressions, display: &str, src: &str, spans: &FileSpans) {
     let lines: Vec<&str> = src.lines().collect();
     let mut i = 0;
     while i < lines.len() {
+        // Inside a multi-line literal there is no comment, only text that
+        // looks like one.
+        if spans.contains_literal(i + 1) {
+            i += 1;
+            continue;
+        }
         let Some(head) = parse_head(lines[i]) else {
             i += 1;
             continue;
@@ -693,14 +804,19 @@ fn scan_source(out: &mut Suppressions, display: &str, src: &str, spans: &[(usize
             match lines[end + 1..].iter().position(|l| !is_codeless(l)) {
                 Some(off) => {
                     let next_code = end + 1 + off + 1; // 1-indexed
-                    match item_at(spans, end + 1, next_code) {
-                        Some((first, last)) => (Scope::Item, (first, last)),
+                    match item_at(&spans.items, next_code) {
+                        // Cover from the keyword, not the header: the doc
+                        // comments above an item hold no findings, and
+                        // starting there would let one item's waiver reach
+                        // back over the line the previous item ends on.
+                        Some(s) => (Scope::Item, (s.keyword, s.last)),
                         None => (Scope::Site, (next_code, next_code)),
                     }
                 }
-                // A trailing waiver at end-of-file guards nothing; keep it
-                // listed (so `waivers` can report it as dead) but covering
-                // only its own line.
+                // No code after it at all — a standalone waiver dangling at
+                // end of file. It guards nothing, but stays listed so
+                // `waivers --orphaned` can report it as dead rather than
+                // dropping it silently.
                 None => (Scope::Site, (i + 1, i + 1)),
             }
         };
@@ -833,66 +949,158 @@ mod tests {
         assert!(!is_continuation("// unruster: ok — a second waiver"));
     }
 
-    fn scan_str(src: &str, spans: &[(usize, usize)]) -> Suppressions {
+    /// Parse `src` for real and scan it. Hand-supplied spans were how a
+    /// placement bug survived: the tests agreed with each other about where
+    /// items start, and both were wrong. Everything below goes through the
+    /// actual `syn` span collection.
+    fn scan_str(src: &str) -> Suppressions {
+        let file = syn::parse_file(src).expect("fixture must parse");
+        let spans = SourceSpans::collect(&file);
         let mut s = Suppressions::default();
-        scan_source(&mut s, "f.rs", src, spans);
+        scan_source(&mut s, "f.rs", src, &spans);
         s
     }
 
     #[test]
+    fn item_spans_separate_the_header_from_the_keyword() {
+        // `syn` reports an item's span as starting at its first attribute, and
+        // doc comments are attributes. Conflating that with the keyword line
+        // is what silently demoted item scope to site scope.
+        let src = "/// Docs.\n/// More docs.\n#[inline]\npub fn f() {\n    let x = 1;\n}\n";
+        let file = syn::parse_file(src).unwrap();
+        let spans = SourceSpans::collect(&file);
+        assert_eq!(
+            spans.items,
+            vec![ItemSpan {
+                header_start: 1,
+                keyword: 4,
+                last: 6
+            }]
+        );
+    }
+
+    #[test]
+    fn a_waiver_inside_a_multi_line_literal_is_text_not_a_waiver() {
+        // Found by running unruster on itself: this file's own test fixtures
+        // were being read as live waivers. Per-line quote tracking cannot see
+        // that a continuation line sits inside a string.
+        let src = "fn f() {\n    let doc = \"usage:\n\
+                   // unruster: ok(casts/ptr) 2026-08-06 — this is documentation\n\
+                   end\";\n    let _ = doc;\n}\n";
+        let s = scan_str(src);
+        assert!(
+            s.is_empty(),
+            "text inside a literal must not waive: {:?}",
+            s.all()
+        );
+    }
+
+    #[test]
+    fn a_raw_string_spanning_lines_is_also_inert() {
+        let src = "fn f() {\n    let d = r#\"\n// unruster: ok — nope\n\"#;\n    let _ = d;\n}\n";
+        assert!(scan_str(src).is_empty());
+    }
+
+    #[test]
+    fn a_real_waiver_after_a_multi_line_literal_still_registers() {
+        // The mask must not bleed past the literal's closing line.
+        let src = "fn f() {\n    let d = \"a\nb\";\n    let _ = d;\n\
+                       // unruster: ok(error-swallows) 2026-08-06 — real one\n\
+                   let _ = g();\n}\n";
+        let s = scan_str(src);
+        assert_eq!(s.len(), 1, "{:?}", s.all());
+        assert_eq!(s.all()[0].reason, "real one");
+    }
+
+    #[test]
     fn wrapped_reason_is_rejoined() {
-        let src = "// unruster: ok(casts/ptr) 2026-08-06 — objc runtime guarantees\n\
-                   // alignment for these selectors\nlet x = p as *const u8;\n";
-        let s = scan_str(src, &[]);
+        let src = "fn g() {\n\
+                   // unruster: ok(casts/ptr) 2026-08-06 — objc runtime guarantees\n\
+                   // alignment for these selectors\nlet x = 1;\n}\n";
+        let s = scan_str(src);
         assert_eq!(s.len(), 1);
         let w = &s.all()[0];
         assert_eq!(
             w.reason,
             "objc runtime guarantees alignment for these selectors"
         );
-        assert_eq!(w.comment_line, 1);
-        assert_eq!(w.comment_end, 2);
+        assert_eq!(w.comment_line, 2);
+        assert_eq!(w.comment_end, 3);
         // The waiver still lands on the code line, not on its own comment.
-        assert_eq!(w.covers, (3, 3));
+        assert_eq!(w.covers, (4, 4));
     }
 
     #[test]
     fn standalone_waiver_above_an_item_takes_item_scope() {
         let src = "// unruster: ok(dead-code) 2026-08-06 — called from a json! macro\n\
                    fn f() {\n    let _ = g();\n}\n";
-        let s = scan_str(src, &[(2, 4)]);
+        let s = scan_str(src);
         let w = &s.all()[0];
         assert_eq!(w.scope, Scope::Item);
         assert_eq!(w.covers, (2, 4));
     }
 
     #[test]
-    fn item_scope_survives_doc_comments_and_attributes_in_the_gap() {
-        let src = "// unruster: ok(dead-code) 2026-08-06 — serde attribute names it\n\
-                   /// Docs.\n#[inline]\nfn f() {}\n";
-        // syn reports the item span starting at the first attribute (line 2).
-        let s = scan_str(src, &[(2, 4)]);
+    fn item_scope_holds_above_the_docs_and_below_them() {
+        // Both placements are natural and must mean the same thing. The
+        // second one is the regression: `syn` puts the item's span start at
+        // the doc comment, so a naive match found no item after the waiver
+        // and silently fell back to site scope.
+        let above = "// unruster: ok(dead-code) 2026-08-06 — serde names it\n\
+                     /// Docs.\n#[inline]\nfn f() {\n    let _ = g();\n}\n";
+        let below = "/// Docs.\n#[inline]\n\
+                     // unruster: ok(dead-code) 2026-08-06 — serde names it\n\
+                     fn f() {\n    let _ = g();\n}\n";
+        let a = scan_str(above);
+        assert_eq!(a.all()[0].scope, Scope::Item);
+        assert_eq!(a.all()[0].covers, (4, 6));
+        let b = scan_str(below);
+        assert_eq!(b.all()[0].scope, Scope::Item, "waiver below the docs");
+        assert_eq!(b.all()[0].covers, (4, 6));
+    }
+
+    #[test]
+    fn item_scope_reaches_every_method_in_an_impl() {
+        // The claim the docs make, on real spans: one comment above `impl`
+        // covers all of its methods.
+        let src = "struct S;\n// unruster: ok(error-swallows) 2026-08-06 — all deliberate\n\
+                   impl S {\n    fn a(&self) { let _ = 1; }\n\
+                   \n    fn b(&self) { let _ = 2; }\n}\n";
+        let s = scan_str(src);
         let w = &s.all()[0];
         assert_eq!(w.scope, Scope::Item);
-        assert_eq!(w.covers, (2, 4));
+        assert_eq!(w.covers, (3, 7), "the whole impl, not just its first fn");
+        assert!(s.matches("error-swallows", Site::new("f.rs", 4)));
+        assert!(s.matches("error-swallows", Site::new("f.rs", 6)));
+    }
+
+    #[test]
+    fn a_waiver_above_a_method_takes_the_method_not_the_impl() {
+        let src = "struct S;\nimpl S {\n    fn a(&self) { let _ = 1; }\n\
+                   \n    // unruster: ok(error-swallows) 2026-08-06 — just this one\n\
+                   fn b(&self) { let _ = 2; }\n}\n";
+        let s = scan_str(src);
+        assert_eq!(s.all()[0].covers, (6, 6));
+        assert!(!s.matches("error-swallows", Site::new("f.rs", 3)));
+        assert!(s.matches("error-swallows", Site::new("f.rs", 6)));
     }
 
     #[test]
     fn standalone_waiver_above_a_statement_stays_site_scoped() {
         let src = "fn f() {\n    // unruster: ok(error-swallows) 2026-08-06 — guard\n\
-                       let _ = g();\n}\n";
-        let s = scan_str(src, &[(1, 4)]);
+                       let _ = g();\n    let _ = h();\n}\n";
+        let s = scan_str(src);
         let w = &s.all()[0];
         assert_eq!(w.scope, Scope::Site);
         assert_eq!(w.covers, (3, 3));
+        // Emphatically not the rest of the body.
+        assert!(!s.matches("error-swallows", Site::new("f.rs", 4)));
     }
 
     #[test]
     fn matching_respects_check_and_key() {
         let src = "// unruster: ok(divergence/NodeContent::Group) 2026-08-06 — structural\nfn f() {}\n";
-        let s = scan_str(src, &[(2, 2)]);
-        assert!(s.matches("divergence", Site::keyed("f.rs", 2, "NodeContent::Group")));
-        // Bare last segment also matches, so nobody has to remember the path.
+        let s = scan_str(src);
         assert!(s.matches("divergence", Site::keyed("f.rs", 2, "NodeContent::Group")));
         // Wrong variant, wrong check, and unkeyed findings must all survive.
         assert!(!s.matches("divergence", Site::keyed("f.rs", 2, "NodeContent::Image")));
@@ -903,23 +1111,23 @@ mod tests {
     #[test]
     fn bare_variant_key_matches_a_qualified_finding() {
         let src = "// unruster: ok(divergence/Group) 2026-08-06 — structural\nfn f() {}\n";
-        let s = scan_str(src, &[(2, 2)]);
+        let s = scan_str(src);
         assert!(s.matches("divergence", Site::keyed("f.rs", 2, "NodeContent::Group")));
     }
 
     #[test]
     fn legacy_waiver_matches_every_check() {
-        let src = "let _ = f(); // unruster: ok — legacy\n";
-        let s = scan_str(src, &[]);
-        assert!(s.matches("error-swallows", Site::keyed("f.rs", 1, "let-_")));
-        assert!(s.matches("casts", Site::new("f.rs", 1)));
+        let src = "fn f() {\n    let _ = g(); // unruster: ok — legacy\n}\n";
+        let s = scan_str(src);
+        assert!(s.matches("error-swallows", Site::keyed("f.rs", 2, "let-_")));
+        assert!(s.matches("casts", Site::new("f.rs", 2)));
         assert_eq!(s.legacy_count(), 1);
     }
 
     #[test]
     fn hits_are_counted_per_waiver() {
         let src = "// unruster: ok(error-swallows) 2026-08-06 — all of them\nfn f() {}\n";
-        let s = scan_str(src, &[(2, 2)]);
+        let s = scan_str(src);
         assert!(s.matches("error-swallows", Site::new("f.rs", 2)));
         assert!(s.matches("error-swallows", Site::new("f.rs", 2)));
         assert_eq!(s.all()[0].hits(), 2);

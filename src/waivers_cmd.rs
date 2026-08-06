@@ -58,6 +58,9 @@ pub struct WaiverOpts<'a> {
 /// with zero hits afterwards is orphaned with respect to everything that could
 /// possibly have honoured it — no separate "which checks exist" list to keep in
 /// sync.
+// unruster: ok(error-swallows/let-_) 2026-08-06 — each check is run purely for its
+// hit-counting side effect; a check that fails contributes no hits and the
+// listing says so.
 fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
     let quiet = crate::emit::Out::silent();
     let probe = AnalysisCtx {

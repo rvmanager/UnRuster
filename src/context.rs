@@ -133,6 +133,7 @@ pub fn changed_set(
             if line.is_empty() {
                 continue;
             }
+            // unruster: ok(error-swallows) 2026-08-06 — a path that won't canonicalize isn't in the repo
             if let Ok(p) = std::fs::canonicalize(top.join(line)) {
                 set.insert(p);
             }
