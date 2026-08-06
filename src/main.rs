@@ -147,17 +147,17 @@ enum Cmd {
     /// while any finding remains — the agent-loop entry point:
     /// `until unruster audit; do <fix>; done`.
     Audit(AuditArgs),
-    /// Same struct, built two ways. Groups every `Foo { … }` literal by type
-    /// and reports the fields whose constant values disagree across sites —
-    /// the `divergence` thesis applied to configuration rather than enum
-    /// dispatch. Ranks a one-field disagreement between two configurations
-    /// above a broad one, and demotes builders that vary on purpose.
     /// Sibling builder chains, one missing a step. `config-drift` for method
     /// chains: groups every `Type::ctor(args).a().b()` by constructor *and its
     /// constant arguments*, then reports the calls some chains make and others
     /// omit. Ranks a single missing call between two chains in one function
     /// above a broad difference across the tree.
     BuilderDrift(BuilderDriftArgs),
+    /// Same struct, built two ways. Groups every `Foo { … }` literal by type
+    /// and reports the fields whose constant values disagree across sites —
+    /// the `divergence` thesis applied to configuration rather than enum
+    /// dispatch. Ranks a one-field disagreement between two configurations
+    /// above a broad one, and demotes literals that vary on purpose.
     ConfigDrift(ConfigDriftArgs),
     /// List all top-level items (struct, enum, trait, fn, impl, ...).
     Inventory(InventoryArgs),
@@ -1214,11 +1214,22 @@ fn main() -> Result<()> {
         }
     };
     if files.is_empty() {
+        // Exit 2, not 0. A scan that saw nothing is a setup error — a typo'd
+        // `--root`, a wrong cwd, an over-broad `--exclude` — and reporting it
+        // as a clean run is the worst possible answer: `until unruster audit;
+        // do fix; done` terminates immediately and a CI gate passes
+        // vacuously. This actually happened: an agent ran
+        // `unruster -r vectorian/src audit` from the wrong directory and got
+        // "0 gating + 0 advisory across 12 checks; clean; exit 0" under a
+        // warning it had no reason to read.
         eprintln!(
-            "warning: no .rs files found under {} (scope={:?})",
+            "error: no .rs files found under {} (scope={:?}) — nothing was analysed, so \
+             this is a setup error rather than a clean result. Check --root, the working \
+             directory, --scope, and --exclude.",
             root.display(),
             scope
         );
+        std::process::exit(2);
     }
     let idx = index::NameIndex::build(&files);
     let sem = semantic::Semantic::build(&files);

@@ -47,6 +47,14 @@ use crate::parse::display_path;
 /// is a real difference and the easiest kind to miss by eye.
 const DEFAULTED: &str = "(default)";
 
+/// Fields whose whole purpose is to differ between instances. Five of the ten
+/// top rows on a real codebase were wgpu descriptors differing only in
+/// `label` — `Some("glass")` against `Some("glass-hl")` — which is two
+/// pipelines correctly naming themselves, not drift. Excluded from the
+/// comparison rather than merely down-weighted: a name that matched would be
+/// the surprising thing.
+const NAMING_FIELDS: &[&str] = &["label", "name", "id", "title", "debug_name", "tag", "key"];
+
 /// One `Foo { .. }` expression.
 #[derive(Debug)]
 struct Literal {
@@ -192,6 +200,15 @@ fn path_is_constish(s: &str) -> bool {
     s.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
+/// `crate::a::b::Enum::Variant` → `Enum::Variant`; `Some` → `Some`.
+fn last_two_segments(s: &str) -> String {
+    let segs: Vec<&str> = s.split("::").collect();
+    match segs.len() {
+        0 | 1 => s.to_string(),
+        n => segs[n - 2..].join("::"),
+    }
+}
+
 fn lit_str(l: &syn::Lit) -> String {
     match l {
         syn::Lit::Bool(b) => b.value.to_string(),
@@ -216,7 +233,13 @@ pub(crate) fn render_const(e: &syn::Expr) -> Option<String> {
             if !path_is_constish(&s) {
                 return None;
             }
-            s
+            // Compare the item, not how it was imported. On a real codebase
+            // `DxfMargin::Percent(0.0)` and
+            // `crate::app::app_state::DxfMargin::Percent(0.0)` were reported as
+            // a 0.56 drift: the *same value*, written two ways. Keeping the
+            // last two segments preserves `Enum::Variant` and `Type::CONST`
+            // while dropping the module path that says nothing about the value.
+            last_two_segments(&s)
         }
         syn::Expr::Unary(u) => {
             let op = match u.op {
@@ -322,6 +345,9 @@ pub fn run(
     }
 
     let mut drifts: Vec<Drift> = Vec::new();
+    // Types whose only disagreement was a name — reported as a count, never
+    // silently dropped.
+    let mut naming_only = 0usize;
     for (ty, lits) in &by_ty {
         if lits.len() < 2 {
             continue;
@@ -333,6 +359,7 @@ pub fn run(
 
         let mut differing: Vec<(usize, String)> = Vec::new();
         let mut agreed = 0usize;
+        let mut naming = 0usize;
         for name in &names {
             // Only sites that actually vote count; a field set from a local
             // abstains rather than blocking the comparison.
@@ -343,12 +370,15 @@ pub fn run(
             let distinct: BTreeSet<&str> = votes.iter().copied().collect();
             if distinct.len() == 1 {
                 agreed += 1;
+            } else if NAMING_FIELDS.contains(name) {
+                naming += 1;
             } else {
                 let joined = distinct.into_iter().collect::<Vec<_>>().join("|");
                 differing.push((votes.len(), format!("{}{{{}}}", name, joined)));
             }
         }
         if differing.is_empty() {
+            naming_only += usize::from(naming > 0);
             continue;
         }
         // Distinct configurations across the whole type: the builder test.
@@ -434,12 +464,21 @@ pub fn run(
         ));
     }
     ctx.out.summary(&format!(
-        "({} drifting type(s) across {} multi-site type(s); min_score={:.2}{}; \
+        "({} drifting type(s) across {} multi-site type(s); min_score={:.2}{}{}; \
          explain: config-drift)",
         shown,
         by_ty.values().filter(|v| v.len() >= 2).count(),
         min_score,
-        ctx.waived_note(waived)
+        ctx.waived_note(waived),
+        if naming_only > 0 {
+            format!(
+                "; {} type(s) differed only in a naming field (label/name/id/…), which is \
+                 what those fields are for",
+                naming_only
+            )
+        } else {
+            String::new()
+        }
     ));
     Ok(shown)
 }

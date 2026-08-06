@@ -2751,6 +2751,32 @@ fn fingerprints_are_emitted_in_json_and_behind_a_tsv_flag() {
 // ── config-drift ──────────────────────────────────────────────────────────
 
 #[test]
+fn config_drift_ignores_a_naming_field_and_an_import_spelling() {
+    // Seven of the nine false positives on a real codebase were these two
+    // shapes: descriptors differing only in `label`, and the same constant
+    // written `Margin::Percent(0)` at one site and
+    // `crate::…::Margin::Percent(0)` at another.
+    let out = ur_stdout(&["--root", DRIFT, "config-drift", "--min-score", "0.0"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("Desc\t"), "a label is meant to differ:\n{s}");
+    assert!(!s.contains("Pending\t"), "same value, two import spellings:\n{s}");
+    // …and the label-only case is counted, never silently dropped.
+    let err = ur_stderr(&["--root", DRIFT, "config-drift", "--min-score", "0.0"]);
+    assert!(err.contains("naming field"), "{err}");
+}
+
+#[test]
+fn an_empty_scan_is_an_error_not_a_clean_result() {
+    // A typo'd --root reported "0 gating + 0 advisory; clean; exit 0", so
+    // `until unruster audit; do fix; done` terminated immediately and a CI
+    // gate passed vacuously. Seen in the wild.
+    let out = ur().args(["--root", "no/such/dir", "audit"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "an empty scan must exit 2");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("nothing was analysed"), "{err}");
+}
+
+#[test]
 fn builder_drift_finds_the_chain_that_forgot_a_step() {
     // Two `git` chains alike but for one call — the shape that made
     // `--since` resolve the wrong repository. `co-call` could not see it:

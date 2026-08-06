@@ -99,3 +99,23 @@ pub mod chains {
         Cmd::new("tar").args(&["-x"]).dir(d).run()
     }
 }
+
+/// Precision cases measured on a real codebase, where seven of nine top rows
+/// were one of these two shapes.
+pub mod precision {
+    pub mod inner { #[derive(Clone, Copy)] pub enum Margin { Percent(u32) } }
+
+    /// wgpu-style descriptors differ in `label` by design — that is what the
+    /// field is for. Five of ten top rows on a real audit were exactly this.
+    pub struct Desc { pub label: Option<&'static str>, pub layers: u32 }
+    pub fn pipeline_a() -> Desc { Desc { label: Some("glass"), layers: 1 } }
+    pub fn pipeline_b() -> Desc { Desc { label: Some("glass-hl"), layers: 1 } }
+
+    /// The *same value*, written two ways. Reported as a 0.56 drift until
+    /// paths were compared by item rather than by import spelling.
+    pub struct Pending { pub margin: inner::Margin, pub scale: u32 }
+    pub fn near() -> Pending { Pending { margin: inner::Margin::Percent(0), scale: 1 } }
+    pub fn far() -> Pending {
+        Pending { margin: crate::precision::inner::Margin::Percent(0), scale: 1 }
+    }
+}
