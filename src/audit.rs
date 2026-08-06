@@ -45,7 +45,12 @@ const CONTEXT_LINES: usize = 2;
 /// Divergence score below which pairs are dropped from the audit section.
 /// Tuned so the section stays short enough to read in full — the point of
 /// putting it first is that its rows are worth reading in full.
-const DIVERGENCE_MIN_SCORE: f64 = 0.35;
+///
+/// Re-tuned after the overlap term was corrected to a real set intersection:
+/// on a 170-enum tree the distribution went 0.35 → 79 pairs, 0.40 → 41,
+/// 0.45 → 16. The knee is at 0.45, and the dedicated command (default 0.25)
+/// is where someone goes for the long tail.
+const DIVERGENCE_MIN_SCORE: f64 = 0.45;
 
 /// Whether a section's findings gate the exit code. Deterministic defect
 /// classes gate; candidate classes that need per-site judgment (stringly,

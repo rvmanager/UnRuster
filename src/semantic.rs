@@ -329,7 +329,7 @@ impl FnTypes {
     /// explicit cast, or arithmetic over those. Never guesses a method's return
     /// type from its bare name. Use this wherever the type appears in output.
     pub fn type_of_grounded(&self, expr: &syn::Expr, sigs: &FnSigIndex) -> Option<String> {
-        if !is_grounded(expr, &self.guessed) {
+        if !is_grounded(expr, sigs, &self.guessed) {
             return None;
         }
         infer_expr_type(expr, sigs, &self.bindings)
@@ -342,6 +342,38 @@ struct TypeInferVisitor<'a> {
 }
 
 impl<'ast, 'a> Visit<'ast> for TypeInferVisitor<'a> {
+    /// `for i in 0..n` types `i` as `n`'s type — usually `usize`, since the
+    /// bound is nearly always a `.len()`. Index arithmetic built from loop
+    /// variables is the single most common source of the casts this tool is
+    /// asked about, and without this arm every one of them was type-unknown.
+    fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+        // `for (i, x) in xs.iter().enumerate()` types `i` as `usize` — the
+        // index half of an enumerate tuple is `usize` by definition, and index
+        // arithmetic built on it is exactly what later gets cast.
+        if let (syn::Pat::Tuple(t), syn::Expr::MethodCall(mc)) = (&*f.pat, &*f.expr) {
+            if mc.method == "enumerate" {
+                if let Some(idx) = t.elems.first().and_then(pat_first_ident) {
+                    self.ft.bindings.insert(idx, "usize".to_string());
+                }
+            }
+        }
+        if let (Some(name), syn::Expr::Range(r)) = (pat_first_ident(&f.pat), &*f.expr) {
+            let bound = r
+                .start
+                .as_deref()
+                .and_then(|e| infer_expr_type(e, self.sigs, &self.ft.bindings))
+                .or_else(|| {
+                    r.end
+                        .as_deref()
+                        .and_then(|e| infer_expr_type(e, self.sigs, &self.ft.bindings))
+                });
+            if let Some(ty) = bound {
+                self.ft.bindings.insert(name, ty);
+            }
+        }
+        visit::visit_expr_for_loop(self, f);
+    }
+
     fn visit_local(&mut self, l: &'ast syn::Local) {
         let name_opt = pat_first_ident(&l.pat);
 
@@ -355,7 +387,7 @@ impl<'ast, 'a> Visit<'ast> for TypeInferVisitor<'a> {
         } else if let Some(name) = name_opt {
             if let Some(init) = &l.init {
                 if let Some(ty) = infer_expr_type(&init.expr, self.sigs, &self.ft.bindings) {
-                    if !is_grounded(&init.expr, &self.ft.guessed) {
+                    if !is_grounded(&init.expr, self.sigs, &self.ft.guessed) {
                         self.ft.guessed.insert(name.clone());
                     }
                     self.ft.bindings.insert(name, ty);
@@ -410,7 +442,16 @@ fn infer_expr_type(
         }
         // `expr.method()` — best-effort by unique method return type.
         syn::Expr::MethodCall(mc) => {
-            sigs.return_type(&mc.method.to_string()).map(str::to_string)
+            let name = mc.method.to_string();
+            // `.len()` / `.count()` are `usize` on every std collection, and on
+            // essentially every hand-rolled one. Without this, `buf.len() as
+            // u32` reported a `_` source and landed in the `unknown` class,
+            // which no check reports — the honest-but-useless outcome of
+            // refusing to guess at all.
+            if is_std_usize_method(&name, sigs) {
+                return Some("usize".to_string());
+            }
+            sigs.return_type(&name).map(str::to_string)
         }
         syn::Expr::Cast(c) => type_last_segment(&c.ty),
         syn::Expr::Reference(r) => infer_expr_type(&r.expr, sigs, bindings),
@@ -441,6 +482,21 @@ fn infer_expr_type(
     }
 }
 
+/// Method names that yield `usize` by universal convention. Returns false when
+/// the scanned tree defines the same name with a different return type, so a
+/// project with its own `fn len(&self) -> f64` is not mis-typed.
+fn is_std_usize_method(name: &str, sigs: &FnSigIndex) -> bool {
+    if !matches!(name, "len" | "count") {
+        return false;
+    }
+    match sigs.return_type(name) {
+        // Tree defines it and agrees, or defines it ambiguously (entry
+        // dropped) — the convention holds either way.
+        Some(t) => t == "usize",
+        None => true,
+    }
+}
+
 /// Arithmetic operators, whose operands and result share one type. Comparison
 /// and logical operators yield `bool` and are deliberately not handled here —
 /// they are not what a cast site reads from.
@@ -466,7 +522,11 @@ fn numeric_lit_type(l: &syn::ExprLit) -> Option<String> {
 
 /// Is `e`'s inferred type traceable to something declared, rather than guessed
 /// from a bare method name? See [`FnTypes::guessed`].
-fn is_grounded(e: &syn::Expr, guessed: &std::collections::BTreeSet<String>) -> bool {
+fn is_grounded(
+    e: &syn::Expr,
+    sigs: &FnSigIndex,
+    guessed: &std::collections::BTreeSet<String>,
+) -> bool {
     match e {
         syn::Expr::Path(p) => p
             .path
@@ -475,20 +535,22 @@ fn is_grounded(e: &syn::Expr, guessed: &std::collections::BTreeSet<String>) -> b
             .map(|s| !guessed.contains(&s.ident.to_string()))
             .unwrap_or(true),
         // The one unsound arm: a method's return type looked up by name alone.
-        syn::Expr::MethodCall(_) => false,
+        // `.len()` / `.count()` are grounded by convention (see
+        // `is_std_usize_method`); any other method return is a name guess.
+        syn::Expr::MethodCall(mc) => is_std_usize_method(&mc.method.to_string(), sigs),
         syn::Expr::Cast(_) | syn::Expr::Struct(_) | syn::Expr::Lit(_) => true,
-        syn::Expr::Reference(r) => is_grounded(&r.expr, guessed),
-        syn::Expr::Paren(p) => is_grounded(&p.expr, guessed),
-        syn::Expr::Group(g) => is_grounded(&g.expr, guessed),
-        syn::Expr::Try(t) => is_grounded(&t.expr, guessed),
-        syn::Expr::Unary(u) => is_grounded(&u.expr, guessed),
+        syn::Expr::Reference(r) => is_grounded(&r.expr, sigs, guessed),
+        syn::Expr::Paren(p) => is_grounded(&p.expr, sigs, guessed),
+        syn::Expr::Group(g) => is_grounded(&g.expr, sigs, guessed),
+        syn::Expr::Try(t) => is_grounded(&t.expr, sigs, guessed),
+        syn::Expr::Unary(u) => is_grounded(&u.expr, sigs, guessed),
         syn::Expr::Binary(b) => {
-            is_grounded(&b.left, guessed)
-                && is_grounded(&b.right, guessed)
+            is_grounded(&b.left, sigs, guessed)
+                && is_grounded(&b.right, sigs, guessed)
         }
         // A field access is grounded when its base is: field types come from
         // the struct definition, not from a name guess.
-        syn::Expr::Field(f) => is_grounded(&f.base, guessed),
+        syn::Expr::Field(f) => is_grounded(&f.base, sigs, guessed),
         // Free-fn / constructor calls resolve through the same name map as
         // methods, but a path call carries its own module qualification, so a
         // collision is far less likely. Treat as grounded.

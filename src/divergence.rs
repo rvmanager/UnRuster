@@ -130,16 +130,35 @@ struct Pair<'s> {
     lean: &'s Site,
     /// What `rich` covers that `lean` does not.
     delta: Vec<String>,
+    /// Which enum this pair is about (`--all` mode prints it as a column).
+    enum_name: String,
+    /// Variant count of the enum, for the `[n/total]` annotation.
+    total: usize,
+    sealed: bool,
 }
 
-/// Rank a divergence. The dominant term is the *delta size relative to what
-/// both sides already share*: two paths covering 5 and 4 of 6 variants differ
+/// How many variants both sides name. This is the whole basis of the check:
+/// two sites are *disagreeing about a shared job* only if they overlap. Two
+/// sites with nothing in common are doing different jobs.
+fn intersection(a: &[String], b: &[String]) -> usize {
+    a.iter().filter(|v| b.contains(v)).count()
+}
+
+/// Rank a divergence. The dominant term is how much of the richer site's job
+/// the leaner one already does: two paths covering 5 and 4 of 6 variants differ
 /// by one deliberate-looking omission, which is a far louder signal than 5-vs-1
 /// (two paths doing genuinely different jobs).
+///
+/// The first version of this used `|lean| / |rich|` for that term, which is not
+/// an overlap at all — it made two *disjoint* single-variant sites score 1.00,
+/// the maximum. A codebase's families of single-purpose functions
+/// (`paint_cage_corners` / `paint_cage_knots` / `paint_cage_midpoints`, or
+/// `as_base_shape` / `as_composite_shape`) then filled the top of the ranking:
+/// 70 rows scored >= 0.9 on one real tree, and none of them was a defect.
+/// Overlap is now a real set intersection, and a pair with none is not a pair.
 fn score(rich: &Site, lean: &Site, delta: usize, kinship: Kinship, sealed: bool) -> f64 {
-    let shared = lean.variants.len() as f64;
+    let shared = intersection(&lean.variants, &rich.variants) as f64;
     let rich_n = rich.variants.len() as f64;
-    // Overlap ratio: 1.0 when lean is a strict prefix of rich's coverage.
     let overlap = if rich_n > 0.0 { shared / rich_n } else { 0.0 };
     // A single missing variant is the classic "forgot one" bug; the signal
     // decays as the gap widens into "these are different jobs".
@@ -148,20 +167,22 @@ fn score(rich: &Site, lean: &Site, delta: usize, kinship: Kinship, sealed: bool)
     overlap * gap_penalty * kinship.weight() * sealed_boost
 }
 
-/// Pair up an enum's dispatch sites and report the asymmetric ones.
-/// Returns (rows shown, rows on a sealed enum).
-fn diverge_one(
+/// Pair up one enum's dispatch sites and return the asymmetric ones.
+///
+/// Collecting rather than printing is what lets `--all` rank across every enum
+/// before applying `--top`. Printing here meant the cap stopped the *scan*, so
+/// `audit --top 40` only ever reached the first six enums in alphabetical
+/// order — every pair in the remaining 164 was unreachable no matter how high
+/// it scored.
+fn diverge_one<'s>(
     ctx: &AnalysisCtx,
     enum_name: &str,
     variant_names: &[String],
     min_score: f64,
-    prefixed: bool,
-) -> (usize, usize) {
+    sites: &'s [Site],
+) -> Vec<Pair<'s>> {
     let sealed = enum_sealed(ctx.files, enum_name);
     let total = variant_names.len();
-    let mut sites = collect_sites(ctx.files, enum_name, variant_names, true, true, ctx.spans);
-    ctx.retain_changed(&mut sites, |s| &s.file);
-    ctx.retain_unsuppressed(&mut sites, |s| (s.file.as_str(), s.line));
     // Only partial sites can diverge: an exhaustive match covers everything by
     // construction, so it can't be the lean side, and as the rich side it says
     // nothing the compiler isn't already enforcing.
@@ -189,6 +210,13 @@ fn diverge_one(
             if delta.is_empty() {
                 continue;
             }
+            // No shared variant = not a disagreement. `show_new_doc_dialog`
+            // checks `ActiveModal::NewDocument`; `show_file_add_dialog` checks
+            // `PendingFileAdd`. Neither forgot anything — each dialog asks
+            // about itself.
+            if intersection(&lean.variants, &rich.variants) == 0 {
+                continue;
+            }
             let s = score(rich, lean, delta.len(), k, sealed);
             if s < min_score {
                 continue;
@@ -199,120 +227,146 @@ fn diverge_one(
                 rich,
                 lean,
                 delta,
+                enum_name: enum_name.to_string(),
+                total,
+                sealed,
             });
         }
     }
+    pairs
+}
 
+/// Order pairs loudest-first, with a stable tiebreak so two runs agree.
+fn sort_pairs(pairs: &mut [Pair]) {
     pairs.sort_by(|x, y| {
         y.score
             .partial_cmp(&x.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| x.lean.file.cmp(&y.lean.file))
             .then_with(|| x.lean.line.cmp(&y.lean.line))
+            .then_with(|| x.enum_name.cmp(&y.enum_name))
     });
-
-    for p in &pairs {
-        let tag = if sealed { " SEALED" } else { "" };
-        if prefixed {
-            row!(
-                ctx.out,
-                "enum" => enum_name,
-                "score" => p.score,
-                "kin" => p.kinship.as_str(),
-                "missing_here" => p.delta.clone(),
-                "lean" => format!("{}{}", p.lean.context, tag),
-                "at" => site(&p.lean.file, p.lean.line),
-                "vs" => format!("{} [{}/{}]", p.rich.context, p.rich.variants.len(), total),
-                "vs_at" => site(&p.rich.file, p.rich.line),
-            );
-        } else {
-            row!(
-                ctx.out,
-                "score" => p.score,
-                "kin" => p.kinship.as_str(),
-                "missing_here" => p.delta.clone(),
-                "lean" => format!("{}{}", p.lean.context, tag),
-                "at" => site(&p.lean.file, p.lean.line),
-                "vs" => format!("{} [{}/{}]", p.rich.context, p.rich.variants.len(), total),
-                "vs_at" => site(&p.rich.file, p.rich.line),
-            );
-        }
-    }
-    let sealed_rows = if sealed { pairs.len() } else { 0 };
-    (pairs.len(), sealed_rows)
 }
 
-/// `divergence <Enum>` / `divergence --all`.
+fn print_pair(ctx: &AnalysisCtx, p: &Pair, prefixed: bool) {
+    let tag = if p.sealed { " SEALED" } else { "" };
+    let lean = format!("{}{}", p.lean.context, tag);
+    let vs = format!(
+        "{} [{}/{}]",
+        p.rich.context,
+        p.rich.variants.len(),
+        p.total
+    );
+    if prefixed {
+        row!(
+            ctx.out,
+            "enum" => p.enum_name.clone(),
+            "score" => p.score,
+            "kin" => p.kinship.as_str(),
+            "missing_here" => p.delta.clone(),
+            "lean" => lean,
+            "at" => site(&p.lean.file, p.lean.line),
+            "vs" => vs,
+            "vs_at" => site(&p.rich.file, p.rich.line),
+        );
+    } else {
+        row!(
+            ctx.out,
+            "score" => p.score,
+            "kin" => p.kinship.as_str(),
+            "missing_here" => p.delta.clone(),
+            "lean" => lean,
+            "at" => site(&p.lean.file, p.lean.line),
+            "vs" => vs,
+            "vs_at" => site(&p.rich.file, p.rich.line),
+        );
+    }
+}
+
+/// `divergence <Enum>` — or, with no enum named, every enum in the tree ranked
+/// together.
+///
+/// The whole tree is scanned before anything is printed. `--top` then cuts the
+/// *ranking*, not the scan: capping mid-scan meant the sections a reader
+/// actually looks at contained whichever enums sorted first alphabetically.
 pub fn run(
     ctx: &AnalysisCtx,
     target: Option<&str>,
     min_score: f64,
     top: Option<usize>,
 ) -> anyhow::Result<usize> {
-    match target {
-        Some(enum_name) => {
-            let variant_names = variant_names_of(ctx.files, enum_name);
-            if variant_names.is_empty() {
-                warn_unknown_target("enum", enum_name);
-                ctx.out
-                    .summary(&format!("(0 divergent pair(s) on `{}`)", enum_name));
-                return Err(TargetNotFound::err("enum", enum_name));
-            }
-            let (n, sealed) = diverge_one(ctx, enum_name, &variant_names, min_score, false);
-            ctx.out.summary(&format!(
-                "({} divergent pair(s) on `{}`; {} variant(s); min_score={:.2}{}; explain: partial-enumeration)",
-                n,
-                enum_name,
-                variant_names.len(),
-                min_score,
-                if sealed > 0 {
-                    format!("; {} on a SEALED enum", sealed)
-                } else {
-                    String::new()
-                }
-            ));
-            Ok(n)
+    // Sites are collected up front and held for the whole run so pairs can
+    // borrow them across enums.
+    let names: Vec<String> = match target {
+        Some(n) => vec![n.to_string()],
+        None => ctx.idx.enum_names(),
+    };
+    let single = target.is_some();
+
+    let mut per_enum: Vec<(String, Vec<String>, Vec<Site>)> = Vec::new();
+    for name in &names {
+        let variant_names = variant_names_of(ctx.files, name);
+        if variant_names.is_empty() {
+            continue;
         }
-        None => {
-            let mut total = 0usize;
-            let mut sealed_rows = 0usize;
-            let mut scanned = 0usize;
-            for name in ctx.idx.enum_names() {
-                let variant_names = variant_names_of(ctx.files, &name);
-                if variant_names.is_empty() {
-                    continue;
-                }
-                scanned += 1;
-                let (n, s) = diverge_one(ctx, &name, &variant_names, min_score, true);
-                total += n;
-                sealed_rows += s;
-                if let Some(cap) = top {
-                    if total >= cap {
-                        // Truncation must be announced: a silently capped list
-                        // reads as "that's everything".
-                        ctx.out.note(&format!(
-                            "(note: stopped after {} row(s) at --top {}; {} of {} enum(s) scanned — \
-                             raise --top or lower --min-score for the rest)",
-                            total, cap, scanned, ctx.idx.enum_names().len()
-                        ));
-                        break;
-                    }
-                }
-            }
-            ctx.out.summary(&format!(
-                "({} divergent pair(s) across {} enum(s); --all; min_score={:.2}{}; explain: partial-enumeration)",
-                total,
-                scanned,
-                min_score,
-                if sealed_rows > 0 {
-                    format!("; {} on SEALED enums", sealed_rows)
-                } else {
-                    String::new()
-                }
-            ));
-            Ok(total)
-        }
+        let mut sites = collect_sites(ctx.files, name, &variant_names, true, true, ctx.spans);
+        ctx.retain_changed(&mut sites, |s| &s.file);
+        ctx.retain_unsuppressed(&mut sites, |s| (s.file.as_str(), s.line));
+        per_enum.push((name.clone(), variant_names, sites));
     }
+
+    if single && per_enum.is_empty() {
+        let enum_name = &names[0];
+        warn_unknown_target("enum", enum_name);
+        ctx.out
+            .summary(&format!("(0 divergent pair(s) on `{}`)", enum_name));
+        return Err(TargetNotFound::err("enum", enum_name));
+    }
+
+    let mut all: Vec<Pair> = Vec::new();
+    for (name, variant_names, sites) in &per_enum {
+        all.extend(diverge_one(ctx, name, variant_names, min_score, sites));
+    }
+    sort_pairs(&mut all);
+
+    let found = all.len();
+    let shown = top.map(|n| found.min(n)).unwrap_or(found);
+    for p in all.iter().take(shown) {
+        print_pair(ctx, p, !single);
+    }
+    if shown < found {
+        ctx.out.note(&format!(
+            "(note: showing the {} highest-scoring of {} pair(s) — raise --top for the rest; \
+             the ranking covers every enum, so these are the loudest in the tree)",
+            shown, found
+        ));
+    }
+
+    let sealed_rows = all.iter().take(shown).filter(|p| p.sealed).count();
+    let sealed_note = if sealed_rows > 0 {
+        format!("; {} on SEALED enum(s)", sealed_rows)
+    } else {
+        String::new()
+    };
+    if single {
+        ctx.out.summary(&format!(
+            "({} divergent pair(s) on `{}`; {} variant(s); min_score={:.2}{}; explain: partial-enumeration)",
+            shown,
+            per_enum[0].0,
+            per_enum[0].1.len(),
+            min_score,
+            sealed_note
+        ));
+    } else {
+        ctx.out.summary(&format!(
+            "({} divergent pair(s) across {} enum(s); min_score={:.2}{}; explain: partial-enumeration)",
+            shown,
+            per_enum.len(),
+            min_score,
+            sealed_note
+        ));
+    }
+    Ok(shown)
 }
 
 // ─── sibling-handling divergence ────────────────────────────────────────────
@@ -489,6 +543,19 @@ fn treatment_of(method: &str, inspects: bool) -> Option<(&'static str, u8)> {
     })
 }
 
+/// Receiver methods that produce an `Option` by *design*, not by failing.
+/// `x.map(f).unwrap_or(d)` and `v.first().unwrap_or(&d)` are the ordinary way
+/// to spell "use a default"; there is no error, so there is nothing to have
+/// handled differently. Left in, `map` was the single loudest remaining row on
+/// a real tree — pairing a gradient-drag default against an unrelated
+/// `.expect` three modules away.
+const NON_FALLIBLE: &[&str] = &[
+    "map", "and_then", "filter", "first", "last", "get", "get_mut", "next", "pop", "front",
+    "back", "peek", "iter", "into_iter", "checked_add", "checked_sub", "checked_mul", "as_ref",
+    "as_mut", "as_deref", "cloned", "copied", "take", "or", "or_else", "find", "position", "min",
+    "max", "chars", "bytes", "keys", "values",
+];
+
 /// Is this expression the tail of a closure — i.e. its value is being returned
 /// into a combinator? `filter_map(|t| t.parse().ok())` converts a Result into
 /// an Option *to filter on it*; the error is not dropped, it is the predicate.
@@ -550,14 +617,11 @@ impl<'ast> Visit<'ast> for HandlingVisitor<'_> {
                 // root `m` scopes the comparison to that one subject.
                 match &*e.receiver {
                     syn::Expr::MethodCall(inner) => {
-                        let subject = receiver_root(&inner.receiver);
-                        self.push(
-                            inner.method.to_string(),
-                            subject,
-                            treatment,
-                            care,
-                            line_of(&e.method),
-                        );
+                        let callee = inner.method.to_string();
+                        if !NON_FALLIBLE.contains(&callee.as_str()) {
+                            let subject = receiver_root(&inner.receiver);
+                            self.push(callee, subject, treatment, care, line_of(&e.method));
+                        }
                     }
                     syn::Expr::Call(inner) => {
                         if let syn::Expr::Path(p) = &*inner.func {
@@ -570,7 +634,16 @@ impl<'ast> Visit<'ast> for HandlingVisitor<'_> {
                                 .map(|s| s.ident.to_string())
                                 .collect::<Vec<_>>()
                                 .join("::");
-                            self.push(full, String::new(), treatment, care, line_of(&e.method));
+                            // P1-3: a path call has no receiver, so the
+                            // *argument* is what is being converted. Without
+                            // it, every `u32::try_from` in the tree shares one
+                            // bucket and pairs across unrelated modules.
+                            let subject = inner
+                                .args
+                                .first()
+                                .map(receiver_root)
+                                .unwrap_or_default();
+                            self.push(full, subject, treatment, care, line_of(&e.method));
                         }
                     }
                     _ => {}
@@ -614,6 +687,14 @@ impl<'ast> Visit<'ast> for HandlingVisitor<'_> {
     }
 }
 
+/// Two sites handling the same callee with different care.
+struct HandlingPair<'h> {
+    gap: u8,
+    careful: &'h Handled,
+    careless: &'h Handled,
+    kinship: Kinship,
+}
+
 /// `divergence --handling` — one callee handled with different care by sibling
 /// functions. The row is written from the careless side, because that's the one
 /// a reader has to decide about.
@@ -640,12 +721,6 @@ pub fn run_handling(ctx: &AnalysisCtx, min_care_gap: u8) -> anyhow::Result<usize
         by_callee.entry(h.callee.as_str()).or_default().push(h);
     }
 
-    struct HandlingPair<'h> {
-        gap: u8,
-        careful: &'h Handled,
-        careless: &'h Handled,
-        kinship: Kinship,
-    }
     let mut pairs: Vec<HandlingPair> = Vec::new();
     for hits in by_callee.values() {
         for (i, a) in hits.iter().enumerate() {
@@ -686,7 +761,38 @@ pub fn run_handling(ctx: &AnalysisCtx, min_care_gap: u8) -> anyhow::Result<usize
             .then_with(|| x.careless.line.cmp(&y.careless.line))
     });
 
+    // One row per careless site, not per (careless, careful) combination. A
+    // site whose four sibling `.expect`s all disagree with it is one decision
+    // to make, and printing it four times buried the other decisions: 23 rows
+    // on a real tree collapsed to 6 once this was applied. The best-ranked
+    // exemplar is kept as the model, with a count of the rest.
+    let mut seen: BTreeMap<(&str, usize), usize> = BTreeMap::new();
+    let mut unique: Vec<&HandlingPair> = Vec::new();
     for p in &pairs {
+        let key = (p.careless.file.as_str(), p.careless.line);
+        match seen.get_mut(&key) {
+            Some(n) => *n += 1,
+            None => {
+                seen.insert(key, 1);
+                unique.push(p);
+            }
+        }
+    }
+
+    for p in &unique {
+        let others = seen
+            .get(&(p.careless.file.as_str(), p.careless.line))
+            .copied()
+            .unwrap_or(1)
+            - 1;
+        let vs = if others > 0 {
+            format!(
+                "{} [{}] (+{} more sibling(s))",
+                p.careful.context, p.careful.treatment, others
+            )
+        } else {
+            format!("{} [{}]", p.careful.context, p.careful.treatment)
+        };
         row!(
             ctx.out,
             "gap" => p.gap as usize,
@@ -694,17 +800,19 @@ pub fn run_handling(ctx: &AnalysisCtx, min_care_gap: u8) -> anyhow::Result<usize
             "callee" => p.careless.callee.clone(),
             "here" => format!("{} [{}]", p.careless.context, p.careless.treatment),
             "at" => site(&p.careless.file, p.careless.line),
-            "vs" => format!("{} [{}]", p.careful.context, p.careful.treatment),
+            "vs" => vs,
             "vs_at" => site(&p.careful.file, p.careful.line),
         );
     }
     ctx.out.summary(&format!(
-        "({} handling divergence(s) across {} callee(s); min_care_gap={}; explain: silent-fallbacks)",
-        pairs.len(),
+        "({} careless site(s) across {} callee(s); {} sibling comparison(s); \
+         min_care_gap={}; explain: silent-fallbacks)",
+        unique.len(),
         by_callee.len(),
+        pairs.len(),
         min_care_gap
     ));
-    Ok(pairs.len())
+    Ok(unique.len())
 }
 
 #[cfg(test)]

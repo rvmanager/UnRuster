@@ -104,13 +104,30 @@ levels, and all three have produced confirmed defects:
   `--min-score` raises the bar; the `kin` column says how the pairing was
   made (name+scope > scope > name) so a weak pairing can be discounted
   without opening either file.
-  With `--handling`, rows compare how carefully one callee is treated:
-  `.expect` (4) > `.unwrap_or_else` (3) > `.unwrap_or_default` (2) >
-  `.unwrap` (1) > `.ok()` / `if let Ok(..)` with no else (0). The row is
-  written from the careless side, since that's the one to decide about.
+  Pairs must OVERLAP. Two sites that name no variant in common are not
+  disagreeing — each dialog checking its own `ActiveModal` variant, or
+  each painter painting its own cage element, is a family of
+  single-purpose fns, not a defect. Those are dropped, not ranked.
+  With `--handling`, rows compare how much attention a failure got:
+    3  aborts        `.expect` / `.unwrap`
+    2  inspects      `.unwrap_or_else(|e| …e…)`, or a fallback that logs
+    1  substitutes   `.unwrap_or`, `.unwrap_or_default`, `|_| CONST`
+    0  discards      `.ok()`, `if let Ok(..)` with no else
+  Tiers 0 and 1 are both silent, so the gap that counts is silence versus
+  attention (`--min-care-gap`, default 2). Rows are written from the
+  careless side, one per site — a site whose four siblings all disagree
+  is one decision, annotated `(+N more sibling(s))`, not four rows.
   Each row is a CANDIDATE. Divergence is often correct — a read path and
   a write path legitimately handle different variant sets. What the tool
   does is put the two sides on one line so the comparison is one read.
+
+  ROUTINE (what a session looks like)
+    1. unruster divergence --changed-since HEAD~1     # your own last commit
+    2. unruster divergence --handling                 # then the whole tree
+    3. fix one; re-run — a fix re-ranks the sibling it was compared
+       against, which routinely surfaces the same bug next door
+    4. `// unruster: ok — <reason>` on anything judged intentional, so the
+       next run doesn't re-litigate it
 
 ──── 1. TYPE & DATA DESIGN ──────────────────────────────────────────
 When concrete types should become traits, primitives become newtypes,

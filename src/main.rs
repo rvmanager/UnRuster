@@ -559,6 +559,11 @@ struct EnumCoverageArgs {
 struct DivergenceArgs {
     /// Enum name (last segment). Omit to scan every enum.
     name: Option<String>,
+    /// Scan every enum — the default when no name is given. Accepted for
+    /// symmetry with `enum-coverage --all` / `catch-all-arms --all`, which is
+    /// what a reader coming from those commands will type.
+    #[arg(long)]
+    all: bool,
     /// Compare error-handling care instead of enum coverage: one callee that
     /// sibling fns treat differently (`.expect` in one, `.ok()` in another).
     /// Ignores the enum argument.

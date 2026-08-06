@@ -2630,3 +2630,67 @@ fn row_capped_checks_announce_what_they_dropped() {
         .success()
         .stderr(contains("note: showing 1 of"));
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Divergence — regressions from the 0.1.30 field run (see impl_logs/).
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn divergence_accepts_the_all_flag_documented_in_the_quickstart() {
+    // The quickstart advertised `divergence --all`; the command rejected it,
+    // so the first thing an agent typed after reading help was an error.
+    ur().args(["--root", FIXTURE, "divergence", "--all"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn divergence_drops_pairs_with_no_shared_variant() {
+    // Two sites naming disjoint variants are a family of single-purpose fns,
+    // not a disagreement. Scoring them by |lean|/|rich| gave every such pair
+    // 1.00 — the top of the ranking — so the loudest rows were all noise.
+    let out = ur_stdout(&["--root", FIXTURE, "divergence", "--min-score", "0.0"]);
+    for line in rows_of(&out) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        let score: f64 = cols[1].parse().unwrap_or(0.0);
+        assert!(
+            score < 1.0,
+            "a 1.00 score means |lean|/|rich|, not a real intersection: {:?}",
+            line
+        );
+    }
+}
+
+#[test]
+fn divergence_top_caps_the_ranking_not_the_scan() {
+    // Capping mid-scan made `--top` a prefix by enum name: on a 170-enum tree
+    // only the first six enums alphabetically were ever reachable.
+    let capped = ur_stdout(&["--root", FIXTURE, "divergence", "--min-score", "0.0", "--top", "1"]);
+    let full = ur_stdout(&["--root", FIXTURE, "divergence", "--min-score", "0.0"]);
+    let capped_rows = rows_of(&capped);
+    let full_rows = rows_of(&full);
+    if !full_rows.is_empty() {
+        assert_eq!(capped_rows.len(), 1, "--top 1 must yield exactly one row");
+        assert_eq!(
+            capped_rows[0], full_rows[0],
+            "the capped row must be the globally highest-scoring one"
+        );
+    }
+}
+
+#[test]
+fn handling_divergence_reports_one_row_per_careless_site() {
+    // One careless site with N careful siblings is one decision, not N rows.
+    let out = ur_stdout(&["--root", FIXTURE, "divergence", "--handling"]);
+    let mut sites: Vec<String> = rows_of(&out)
+        .iter()
+        .filter_map(|l| l.split('\t').nth(4).map(str::to_string))
+        .collect();
+    let before = sites.len();
+    sites.sort();
+    sites.dedup();
+    assert_eq!(before, sites.len(), "duplicate careless sites in output");
+}
