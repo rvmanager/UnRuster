@@ -19,6 +19,7 @@
 //! output by line number to tell the sections apart.
 
 use crate::casts::CastClass;
+use crate::emit::{row, site};
 use crate::context::AnalysisCtx;
 use crate::config_drift;
 use crate::divergence;
@@ -36,6 +37,9 @@ const CYCLO_THRESHOLD: usize = 15;
 /// Row cap for the two checks that get inline source context. Bounds the
 /// output: at most this many rows × (2·[`CONTEXT_LINES`] + 1) snippet lines.
 const CONTEXTED_TOP: usize = 20;
+
+/// Rows of the metrics ranking shown when `--top` is not given.
+const DEFAULT_METRICS_TOP: usize = 20;
 
 /// Source lines shown around each row of the low-volume checks. On the runs
 /// this battery was tuned against, `stringly` returned 4 rows and
@@ -171,18 +175,45 @@ impl BatteryConfig {
 pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cfg: BatteryConfig) {
     // `--top` is a display cap applied after waiver matching, so omitting it
     // changes no hit count.
-    let checks: [&dyn Fn() -> anyhow::Result<usize>; 8] = [
-        &|| divergence::run(ctx, None, cfg.divergence_min_score, None),
-        &|| divergence::run_handling(ctx, cfg.handling_min_care_gap),
-        &|| parallel_matches::run_enum_coverage(ctx, None, cfg.coverage),
-        &|| dead_code::run(ctx, dead_call_source, false, false),
-        &|| conversion_pairs::run(ctx),
-        &|| error_swallows::run(ctx, cfg.swallows),
-        &|| casts::run(ctx, cfg.cast_classes, None, false, cfg.include_unsafe_ptr, None),
-        &|| config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, None),
+    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 11] = [
+        ("divergence", &|| {
+            divergence::run(ctx, None, cfg.divergence_min_score, None)
+        }),
+        ("divergence-handling", &|| {
+            divergence::run_handling(ctx, cfg.handling_min_care_gap)
+        }),
+        ("enum-coverage", &|| {
+            parallel_matches::run_enum_coverage(ctx, None, cfg.coverage)
+        }),
+        ("dead-code", &|| {
+            dead_code::run(ctx, dead_call_source, false, false)
+        }),
+        ("conversion-pairs", &|| conversion_pairs::run(ctx)),
+        ("error-swallows", &|| error_swallows::run(ctx, cfg.swallows)),
+        ("casts", &|| {
+            casts::run(ctx, cfg.cast_classes, None, false, cfg.include_unsafe_ptr, None)
+        }),
+        ("config-drift", &|| {
+            config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, None)
+        }),
+        // The advisory three too. They consult no waivers, so they add nothing
+        // to hit counting — but a *baseline* comparison that omitted them would
+        // report every stringly and metrics row as new on the first run.
+        // Same caps as the printed run. A cap means "we did not look past
+        // here"; comparing a capped run against an uncapped one would report
+        // the tail as `gone` the moment anything shifted into view.
+        ("stringly", &|| {
+            stringly::run(ctx, false, false, None, Some(CONTEXTED_TOP))
+        }),
+        ("metrics", &|| {
+            metrics::run(ctx, SortKey::Cyclo, DEFAULT_METRICS_TOP, Some(CYCLO_THRESHOLD), true)
+        }),
+        ("pass-through", &|| pass_through::run(ctx, 1)),
     ];
-    for check in checks {
+    for (name, check) in checks {
+        let prev = ctx.out.set_check(name);
         let _ = check();
+        ctx.out.set_check(&prev);
     }
 }
 
@@ -200,7 +231,7 @@ pub fn run(
     top: Option<usize>,
     strict: bool,
 ) -> anyhow::Result<usize> {
-    let metrics_top = top.unwrap_or(20);
+    let metrics_top = top.unwrap_or(DEFAULT_METRICS_TOP);
     let mut gating = 0usize;
     let mut advisory = 0usize;
     let mut checks = 0usize;
@@ -211,11 +242,16 @@ pub fn run(
 
     // `count` is a closure so the header prints first. See the module note.
     let mut section = |title: &str,
+                       check: &str,
                        gate: Gate,
                        count: &mut dyn FnMut() -> anyhow::Result<usize>|
      -> anyhow::Result<()> {
         ctx.out.section(title);
+        // The check name is part of every fingerprint: two checks reporting the
+        // same line must not collapse into one identity.
+        let prev = ctx.out.set_check(check);
         let n = count()?;
+        ctx.out.set_check(&prev);
         if gate == Gate::Gating || strict {
             gating += n;
         } else {
@@ -231,16 +267,19 @@ pub fn run(
     // far higher rate than any volume check below.
     section(
         "[high] divergence — sibling paths that disagree (explain: partial-enumeration)",
+        "divergence",
         Gate::Gating,
         &mut || divergence::run(ctx, None, DIVERGENCE_MIN_SCORE, top.or(Some(40))),
     )?;
     section(
         "[high] divergence --handling — one callee, different care (explain: silent-fallbacks)",
+        "divergence-handling",
         Gate::Gating,
         &mut || divergence::run_handling(ctx, HANDLING_MIN_CARE_GAP),
     )?;
     section(
         "[high] enum-coverage --all — partial enum dispatch (explain: partial-enumeration)",
+        "enum-coverage",
         Gate::Gating,
         &mut || {
             parallel_matches::run_enum_coverage(ctx, None, coverage_opts())
@@ -248,11 +287,13 @@ pub fn run(
     )?;
     section(
         "[high] dead-code — fns with no observed caller",
+        "dead-code",
         Gate::Gating,
         &mut || dead_code::run(ctx, dead_call_source, false, false),
     )?;
     section(
         "[high] conversion-pairs — one concept in two shapes (explain: replication)",
+        "conversion-pairs",
         Gate::Gating,
         &mut || {
             let prev = if ctx.out.context_lines().is_none() {
@@ -267,6 +308,7 @@ pub fn run(
     )?;
     section(
         "[medium] error-swallows — silently dropped Results (explain: silent-fallbacks)",
+        "error-swallows",
         Gate::Advisory,
         &mut || {
             error_swallows::run(ctx, swallow_opts())
@@ -274,6 +316,7 @@ pub fn run(
     )?;
     section(
         "[medium] config-drift — same struct, two configurations (explain: config-drift)",
+        "config-drift",
         // Advisory, not gating: a struct built two ways is often deliberate (two
         // presets, a builder). The rows are worth reading — this check exists
         // because a drifted `CoverageOpts` made orphan detection contradict the
@@ -284,6 +327,7 @@ pub fn run(
     )?;
     section(
         "[medium] casts — data-loss classes only (explain: casts)",
+        "casts",
         Gate::Advisory,
         &mut || {
             casts::run(ctx, CAST_CLASSES, None, false, false, top)
@@ -294,6 +338,7 @@ pub fn run(
     let auto_context = ctx.out.context_lines().is_none();
     section(
         "[medium] stringly — logic branching on string literals (explain: stringly)",
+        "stringly",
         Gate::Advisory,
         &mut || {
             let prev = if auto_context {
@@ -311,11 +356,13 @@ pub fn run(
             "[medium] metrics — fns with cyclo >= {} (explain: god-function)",
             CYCLO_THRESHOLD
         ),
+        "metrics",
         Gate::Advisory,
         &mut || metrics::run(ctx, SortKey::Cyclo, metrics_top, Some(CYCLO_THRESHOLD), true),
     )?;
     section(
         "[low] pass-through — single-call wrapper fns (explain: replication)",
+        "pass-through",
         Gate::Advisory,
         &mut || pass_through::run(ctx, 1),
     )?;
@@ -368,4 +415,47 @@ pub fn run(
         }
     ));
     Ok(gating)
+}
+
+/// Render a cross-run comparison as its own section.
+///
+/// Kept out of the row stream: existing rows keep their column shape, and a
+/// reader (or an `awk` pipeline) that does not care about the baseline sees
+/// exactly what it saw before.
+pub fn print_diff(ctx: &AnalysisCtx, against: &str, d: &crate::baseline::Diff) {
+    ctx.out.section(&format!(
+        "[baseline] vs {} — {}",
+        against,
+        d.summary()
+    ));
+    for f in &d.gone {
+        row!(
+            ctx.out,
+            "status" => "gone",
+            "check" => f.check.clone(),
+            "was" => site(&f.file, f.line),
+            "what" => f.label.clone(),
+        );
+    }
+    for (was, now) in &d.moved {
+        row!(
+            ctx.out,
+            "status" => "moved",
+            "check" => now.check.clone(),
+            "was" => site(&was.file, was.line),
+            "what" => now.label.clone(),
+            "now" => site(&now.file, now.line),
+        );
+    }
+    for f in &d.new {
+        row!(
+            ctx.out,
+            "status" => "new",
+            "check" => f.check.clone(),
+            "was" => site(&f.file, f.line),
+            "what" => f.label.clone(),
+        );
+    }
+    ctx.out.summary(&format!("(baseline: {} vs {})", d.summary(), against));
+    ctx.out.section_end();
 }

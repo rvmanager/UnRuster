@@ -16,12 +16,7 @@ HIGHEST-SIGNAL FIRST
   defect far more often than not. Start with `divergence`, then `audit`.
   Fresh code beats old code: `--changed-since` before anything else.
 
-PRECISION TIERS (the `via` column on a row says which fired)
-  PRECISE      inventory, impls, fields, variants, match/pattern shapes,
-               self.field inside `impl Type`, call sites by last-segment name.
-  APPROXIMATE  field-uses via=ti (inferred receiver), type-refs via=alias,
-               callers Type::method, dead-code (pub items may have outside callers).
-  BEST-EFFORT  field-uses via=? , macro bodies parsed speculatively as expressions.
+PRECISION (the `via` column says which tier fired; `explain precision` for the table)
   Rows tagged APPROXIMATE/BEST-EFFORT are leads to verify, not facts. Every run
   reports unparseable macro bodies as blind spots — code in them was NOT analyzed.
 
@@ -39,15 +34,20 @@ GLOBAL FLAGS
   --fail-on-findings     exit 1 on any finding (0 = clean, 2 = error)
   --no-suppress          ignore waiver comments, report every site
   --suggest-waivers      print the exact waiver comment under each row
+  --fingerprints         add the stable `fp` column to TSV (--json always has it)
+
+COMPARING RUNS (`unruster explain baseline`)
+  Findings key on a line-number-free fingerprint, so an edit above one doesn't
+  make it look new. `audit --since HEAD~1` reports gone/new/moved against a git
+  ref (nothing stored — git is the baseline); `--write-baseline`/`--baseline`
+  pin a CI snapshot, and `--fail-on-new` gates on regressions only.
 
 WAIVERS — record a verified false positive (`unruster explain waivers`)
   // unruster: ok(<check>[/<key>]) <YYYY-MM-DD> — <reason>
-  Don't write it by hand: `--suggest-waivers` prints the exact line to paste.
-  Above an item it waives that whole item (the `#[allow]` model), so one
-  comment retires an omission across every method in an impl. A bare enum
-  name as the key covers all of that enum's variants; a group name
-  (`partial-enumeration`) covers every check that asks the same question.
-  unruster waivers [--orphaned]  list them / find the ones now suppressing nothing
+  Never hand-written: `--suggest-waivers` prints the exact line. Above an item
+  it waives that whole item (the `#[allow]` model). A bare enum name as the key
+  covers all its variants; a group name (`partial-enumeration`) covers every
+  check asking the same question. `unruster waivers [--orphaned]` audits them.
 
 IN-SOURCE MARKERS
   /// unruster: sealed        on an enum: partial dispatch is tagged SEALED

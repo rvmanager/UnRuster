@@ -2612,6 +2612,142 @@ fn scratch_fixture(name: &str) -> std::path::PathBuf {
     dir.join("src")
 }
 
+// ── stable finding identity ───────────────────────────────────────────────
+
+/// A throwaway git repo with `src/lib.rs` containing `body`, committed.
+fn git_fixture(name: &str, body: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), body).unwrap();
+    for args in [
+        vec!["init", "-q", "."],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "base"],
+    ] {
+        let ok = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+    dir
+}
+
+fn baseline_line(out: &[u8]) -> String {
+    String::from_utf8_lossy(out)
+        .lines()
+        .find(|l| l.starts_with("(baseline:"))
+        .unwrap_or("<no baseline line>")
+        .to_string()
+}
+
+const BODY: &str = "\
+pub fn a(p: &std::path::Path) { let _ = std::fs::remove_file(p); }
+pub fn b(n: u64) -> u32 { n as u32 }
+";
+
+#[test]
+fn inserting_lines_does_not_manufacture_findings() {
+    // The whole reason fingerprints exist. Before them, a diff of two runs
+    // across a five-line insertion reported every finding below it as one
+    // deletion plus one addition; five of six apparent regressions in a real
+    // session were this and nothing else.
+    let dir = git_fixture("fp-shift", BODY);
+    let src = dir.join("src");
+    std::fs::write(
+        src.join("lib.rs"),
+        format!("//! 1\n//! 2\n//! 3\n//! 4\n//! 5\n{BODY}"),
+    )
+    .unwrap();
+    let out = ur_stdout_allow_findings(&[
+        "--root", src.to_str().unwrap(), "--all-stdout", "audit", "--since", "HEAD",
+    ]);
+    let line = baseline_line(&out);
+    assert!(
+        line.contains("0 gone, 0 new, 0 moved"),
+        "a pure line shift must be invisible: {line}"
+    );
+}
+
+#[test]
+fn fixed_new_and_moved_land_in_the_right_buckets() {
+    let dir = git_fixture("fp-buckets", BODY);
+    let src = dir.join("src");
+    // Waive one, add one, relocate one into a submodule.
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod moved;\n\
+         // unruster: ok(error-swallows/let-_) 2026-08-06 — absence is fine\n\
+         pub fn a(p: &std::path::Path) { let _ = std::fs::remove_file(p); }\n\
+         pub fn d(x: u64) -> u32 { x as u32 }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(src.join("moved")).unwrap();
+    std::fs::write(
+        src.join("moved/mod.rs"),
+        "pub fn b(n: u64) -> u32 { n as u32 }\n",
+    )
+    .unwrap();
+
+    let out = ur_stdout_allow_findings(&[
+        "--root", src.to_str().unwrap(), "--all-stdout", "audit", "--since", "HEAD",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    // The waived swallow is gone; `b` relocated, so it must read as moved
+    // rather than as a fix plus a regression; `d` is genuinely new.
+    assert!(s.contains("gone\terror-swallows"), "expected the waiver to retire one:\n{s}");
+    assert!(s.contains("moved\t"), "a relocation is not a fix + a regression:\n{s}");
+    assert!(s.contains("new\t"), "a genuinely new finding must show:\n{s}");
+}
+
+#[test]
+fn a_baseline_file_round_trips_and_gates_on_regressions() {
+    let dir = git_fixture("fp-baseline", BODY);
+    let src = dir.join("src");
+    let bl = dir.join("bl.tsv");
+    let (s, b) = (src.to_str().unwrap(), bl.to_str().unwrap());
+
+    ur_stdout_allow_findings(&["--root", s, "audit", "--write-baseline", b]);
+    let same = ur_stdout_allow_findings(&["--root", s, "--all-stdout", "audit", "--baseline", b]);
+    assert!(
+        baseline_line(&same).contains("0 gone, 0 new, 0 moved"),
+        "an unchanged tree must diff clean: {}",
+        baseline_line(&same)
+    );
+    // The gate an agent wants: "did I make it worse", not "is it perfect".
+    ur().args(["--root", s, "audit", "--baseline", b, "--fail-on-new"])
+        .assert()
+        .success();
+    std::fs::write(
+        src.join("lib.rs"),
+        format!("{BODY}pub fn e(v: u64) -> u32 {{ v as u32 }}\n"),
+    )
+    .unwrap();
+    ur().args(["--root", s, "audit", "--baseline", b, "--fail-on-new"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn fingerprints_are_emitted_in_json_and_behind_a_tsv_flag() {
+    let json = ur_stdout(&["--root", WV, "--json", "casts"]);
+    assert!(
+        String::from_utf8_lossy(&json).contains("\"fp\""),
+        "JSON always carries the fingerprint"
+    );
+    // TSV stays byte-compatible unless asked: a new column breaks callers.
+    let plain = ur_stdout(&["--root", WV, "casts"]);
+    let flagged = ur_stdout(&["--root", WV, "--fingerprints", "casts"]);
+    let cols = |o: &[u8]| rows_of(o).first().map(|r| r.split('\t').count()).unwrap_or(0);
+    assert_eq!(cols(&flagged), cols(&plain) + 1, "--fingerprints adds exactly one column");
+}
+
 // ── config-drift ──────────────────────────────────────────────────────────
 
 #[test]

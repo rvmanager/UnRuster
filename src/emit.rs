@@ -171,7 +171,31 @@ pub struct Out {
     /// to populate per-waiver hit counts; the battery's own rows would drown
     /// the listing it is gathering data for.
     silent: bool,
+    /// `--fingerprints`: add the `fp` column to TSV. Off by default because
+    /// adding a column unconditionally breaks every caller's `awk` and every
+    /// column-count assertion. JSON always carries it.
+    pub show_fingerprints: bool,
+    /// Which check is producing rows right now. `audit` sets it per section; a
+    /// single-command run sets it once. Part of every fingerprint, so two
+    /// checks reporting the same line stay distinguishable.
+    current_check: RefCell<String>,
+    /// Every row emitted this run, for `--since` / `--baseline` comparison.
+    /// `None` unless someone asked.
+    recorded: RefCell<Option<Vec<Finding>>>,
+    /// `file -> lines`, so fingerprinting N rows in a file reads it once.
+    line_cache: RefCell<std::collections::HashMap<String, Vec<String>>>,
     state: RefCell<State>,
+}
+
+/// One emitted finding, reduced to what a cross-run comparison needs.
+#[derive(Clone, Debug)]
+pub struct Finding {
+    pub check: String,
+    pub fp: String,
+    pub file: String,
+    pub line: usize,
+    /// Human-readable identity, for the diff listing.
+    pub label: String,
 }
 
 impl Out {
@@ -183,6 +207,10 @@ impl Out {
             context_lines: std::cell::Cell::new(context_lines),
             summary_inline: std::cell::Cell::new(false),
             silent: false,
+            show_fingerprints: false,
+            current_check: RefCell::new(String::new()),
+            recorded: RefCell::new(None),
+            line_cache: RefCell::new(std::collections::HashMap::new()),
             state: RefCell::new(State::default()),
         }
     }
@@ -196,7 +224,69 @@ impl Out {
             context_lines: std::cell::Cell::new(None),
             summary_inline: std::cell::Cell::new(false),
             silent: true,
+            show_fingerprints: false,
+            current_check: RefCell::new(String::new()),
+            recorded: RefCell::new(None),
+            line_cache: RefCell::new(std::collections::HashMap::new()),
             state: RefCell::new(State::default()),
+        }
+    }
+
+    /// Name the check producing subsequent rows. Returns the previous name.
+    pub fn set_check(&self, name: &str) -> String {
+        self.current_check.replace(name.to_string())
+    }
+
+    /// Start recording every row's fingerprint for a cross-run comparison.
+    pub fn start_recording(&self) {
+        *self.recorded.borrow_mut() = Some(Vec::new());
+    }
+
+    /// Take what was recorded, leaving recording off.
+    pub fn take_recording(&self) -> Vec<Finding> {
+        self.recorded.borrow_mut().take().unwrap_or_default()
+    }
+
+    /// One source line, cached per file. Fingerprinting touches every row, and
+    /// re-reading a 2000-line file per row would dominate the run.
+    fn source_line(&self, file: &str, line: usize) -> Option<String> {
+        let mut cache = self.line_cache.borrow_mut();
+        let lines = cache.entry(file.to_string()).or_insert_with(|| {
+            std::fs::read_to_string(file)
+                .map(|s| s.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        });
+        lines.get(line.checked_sub(1)?).cloned()
+    }
+
+    /// Fingerprint plus the bits a diff listing needs.
+    fn finding_of(&self, cells: &[(&'static str, Val)]) -> Finding {
+        let check = self.current_check.borrow().clone();
+        let site = cells.iter().find_map(|(_, v)| match v {
+            Val::Site { file, line } => Some((file.clone(), *line)),
+            _ => None,
+        });
+        let text = site
+            .as_ref()
+            .and_then(|(f, l)| self.source_line(f, *l));
+        let fp = crate::fingerprint::of(&check, cells, text.as_deref());
+        let label = cells
+            .iter()
+            .filter_map(|(_, v)| match v {
+                Val::Str(s) => Some(crate::fingerprint::normalize(s)),
+                Val::List(i) => Some(i.join(",")),
+                _ => None,
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let (file, line) = site.unwrap_or_default();
+        Finding {
+            check,
+            fp,
+            file,
+            line,
+            label,
         }
     }
 
@@ -253,11 +343,25 @@ impl Out {
     /// Emit one finding. In TSV the cells are tab-joined in order; in JSON they
     /// become an object (a `Site` cell expands to `file` + `line`).
     pub fn row(&self, cells: Vec<(&'static str, Val)>) {
-        if self.summary_only || self.silent {
+        // Recording happens before every suppression check, including `silent`.
+        // The baseline half of `--since` runs the battery through a silent sink
+        // *specifically* to collect fingerprints; bailing out first made it
+        // record nothing and report the entire codebase as new.
+        let recording = self.recorded.borrow().is_some();
+        let want_fp = recording || (!self.silent && (self.json() || self.show_fingerprints));
+        let finding = want_fp.then(|| self.finding_of(&cells));
+        if let (Some(f), Some(list)) = (&finding, self.recorded.borrow_mut().as_mut()) {
+            list.push(f.clone());
+        }
+        if self.silent || self.summary_only {
             return;
         }
         let context = self.context_for(&cells);
         if self.json() {
+            let mut cells = cells;
+            if let Some(f) = &finding {
+                cells.push(("fp", Val::Str(f.fp.clone())));
+            }
             self.state
                 .borrow_mut()
                 .current()
@@ -265,7 +369,12 @@ impl Out {
                 .push(Row { cells, context });
             return;
         }
-        let line: Vec<String> = cells.iter().map(|(_, v)| v.tsv()).collect();
+        let mut line: Vec<String> = cells.iter().map(|(_, v)| v.tsv()).collect();
+        if self.show_fingerprints {
+            if let Some(f) = &finding {
+                line.push(f.fp.clone());
+            }
+        }
         println!("{}", line.join("\t"));
         for l in context {
             println!("{}", l);

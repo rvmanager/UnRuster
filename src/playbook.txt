@@ -1,5 +1,6 @@
 Query a Rust codebase via syntactic (syn) analysis.
 
+◇ PRECISION (which tier a row's `via` column names)
 Precision tiers (look for the `via` column on results to see which fired):
 
 PRECISE (raw AST shape — trustworthy):
@@ -432,6 +433,30 @@ missing flag combos.
   Repair: give the configurations one source. A `Config::gating()` /
   `Config::permissive()` pair next to each other is diffable by eye; two
   hand-written literals in two modules are not.
+
+──── 8b. COMPARING RUNS ─────────────────────────────────────────────
+◇ BASELINE (did I fix it, or just move it?)
+  unruster audit --since HEAD~1              # vs a git ref
+  unruster audit --write-baseline b.tsv      # snapshot
+  unruster audit --baseline b.tsv --fail-on-new
+  Findings key on a fingerprint, not on `file:line`. Inserting three
+  lines at the top of a file used to "move" every finding below it, and
+  a diff of two runs reported each as a deletion plus an addition —
+  measured on this codebase, five of six apparent regressions after a
+  round of fixes were that and nothing else. The fingerprint hashes the
+  check, the identifying cells, and the flagged line's text; no line
+  number participates.
+  Four buckets: `gone` (fixed, waived, deleted), `new`, `moved` (same
+  finding, different item — a refactor, not a fix), `unchanged`.
+  No state is kept between runs. `--since` materializes the ref with
+  `git archive` into a temp dir, scans it, and deletes it; git already
+  holds every prior state. `--write-baseline` exists for CI, where you
+  want to pin against a release rather than a commit.
+  `--fail-on-new` is the gate an agent wants mid-change: "did I make it
+  worse", rather than "is the whole codebase clean".
+  Caveats: reformatting a file changes its lines and so its
+  fingerprints; `moved` is a heuristic (same check, same description) and
+  can pair two same-named items in different modules.
 
 ──── 9. WAIVERS ─────────────────────────────────────────────────────
 ◇ WAIVERS (retiring a verified false positive)

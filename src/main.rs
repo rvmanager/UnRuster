@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ast;
 mod audit;
+mod baseline;
 mod callers;
 mod casts;
 mod catch_all;
@@ -19,6 +20,7 @@ mod emit;
 mod error_swallows;
 mod explain;
 mod field_uses;
+mod fingerprint;
 mod fields;
 mod impls;
 mod index;
@@ -118,6 +120,13 @@ struct Cli {
     /// the item (item scope) or on the line (site scope).
     #[arg(long, global = true)]
     suggest_waivers: bool,
+
+    /// Add the stable `fp` column to TSV rows. A fingerprint identifies a
+    /// finding without its line number, so two runs can be compared across an
+    /// edit — `--json` always carries it. Off by default for TSV because a new
+    /// column breaks existing `awk`.
+    #[arg(long, global = true)]
+    fingerprints: bool,
 
     /// Exit 1 when the command reports one or more findings (0 = clean,
     /// 2 = error/unknown target). For scripted/agent loops:
@@ -401,6 +410,28 @@ impl Cmd {
 
 #[derive(Args)]
 struct AuditArgs {
+    /// Compare against the tree as it was at this git ref (`HEAD~1`, `main`),
+    /// reporting gone / new / moved. The ref is materialized with `git archive`
+    /// and scanned in a temp dir, so nothing is written and a dirty working
+    /// tree is fine. Git is the baseline — no state is kept between runs.
+    #[arg(long, value_name = "GIT_REF", conflicts_with = "baseline")]
+    since: Option<String>,
+
+    /// Compare against a snapshot written by `--write-baseline`. For pinning a
+    /// CI gate to a release rather than a commit.
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
+
+    /// Write this run's findings to FILE as a baseline and exit normally.
+    #[arg(long, value_name = "FILE")]
+    write_baseline: Option<PathBuf>,
+
+    /// With `--since` / `--baseline`: exit 1 only when findings appeared that
+    /// were not there before. The gate an agent actually wants — "did I make
+    /// it worse" rather than "is it perfect".
+    #[arg(long)]
+    fail_on_new: bool,
+
     /// Cap per-section rows where the underlying check supports it.
     #[arg(long)]
     top: Option<usize>,
@@ -889,7 +920,39 @@ fn dispatch(
             // Like dead-code, the call-set must come from the FULL tree.
             let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
             let call_source = all_files.as_deref().unwrap_or(files);
-            audit::run(ctx, call_source, a.top, a.strict)
+            let comparing = a.since.is_some() || a.baseline.is_some();
+            if comparing || a.write_baseline.is_some() {
+                ctx.out.start_recording();
+            }
+            let gating = audit::run(ctx, call_source, a.top, a.strict)?;
+            let current = ctx.out.take_recording();
+
+            if let Some(p) = a.write_baseline.as_deref() {
+                baseline::write(p, &current)?;
+                ctx.out.note(&format!(
+                    "note: wrote {} finding(s) to {} — compare a later run with \
+                     `audit --baseline {}`",
+                    current.len(),
+                    p.display(),
+                    p.display()
+                ));
+            }
+
+            let Some((label, base)) = (match (&a.since, &a.baseline) {
+                (Some(r), _) => Some((r.clone(), battery_at_ref(r, root, scope, cfg, exclude)?)),
+                (_, Some(p)) => Some((p.display().to_string(), baseline::read(p)?)),
+                _ => None,
+            }) else {
+                return Ok(gating);
+            };
+            let d = baseline::diff(&base, &current);
+            audit::print_diff(ctx, &label, &d);
+            // `--fail-on-new` asks "did I make it worse", which is the gate an
+            // agent wants mid-change; the default keeps asking "is it clean".
+            if a.fail_on_new {
+                return Ok(d.new.len());
+            }
+            Ok(gating)
         }
         Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score, a.top),
         Cmd::Inventory(a) => inventory::run(ctx, a.kind, a.vis, a.tree),
@@ -1030,10 +1093,62 @@ fn dispatch(
     }
 }
 
+/// Run the gating battery over `root` as it existed at `git_ref`, and return
+/// the findings it produced.
+///
+/// A full second scan of a materialized snapshot rather than anything
+/// persisted: git already holds every prior state of the tree, and the tool
+/// already depends on it. The snapshot is deleted when `snap` drops.
+fn battery_at_ref(
+    git_ref: &str,
+    root: &std::path::Path,
+    scope: Scope,
+    cfg: &[String],
+    exclude: &[String],
+) -> Result<Vec<emit::Finding>> {
+    let snap = baseline::snapshot(git_ref, root)?;
+    let files = parse::parse_dir(&snap.scan_root, scope, cfg, exclude)?;
+    let idx = index::NameIndex::build(&files);
+    let sem = semantic::Semantic::build(&files);
+    let sup = suppress::scan(&files);
+    let out = emit::Out::silent();
+    out.start_recording();
+    let sctx = AnalysisCtx {
+        files: &files,
+        idx: &idx,
+        sem: &sem,
+        // NOT `summary: true`: every check guards its row loop with
+        // `if !summary`, so setting it would skip the very rows this run exists
+        // to record. `Out::silent()` is what suppresses the printing.
+        summary: false,
+        spans: false,
+        changed: None,
+        out: &out,
+        suppressions: &sup,
+        suggest_waivers: false,
+    };
+    audit::run_silent_battery(&sctx, &files, audit::BatteryConfig::gating());
+    // Rewrite the temp-dir paths back to how the caller spells them, so a
+    // `gone` row names a file the reader can actually open.
+    let prefix = snap.scan_root.to_string_lossy().into_owned();
+    let want = parse::display_path(root);
+    Ok(out
+        .take_recording()
+        .into_iter()
+        .map(|mut f| {
+            if let Some(rest) = f.file.strip_prefix(&prefix) {
+                f.file = format!("{}{}", want, rest);
+            }
+            f
+        })
+        .collect())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = if cli.json { Format::Json } else { cli.format };
-    let out = emit::Out::new(format, cli.summary, cli.all_stdout, cli.context);
+    let mut out = emit::Out::new(format, cli.summary, cli.all_stdout, cli.context);
+    out.show_fingerprints = cli.fingerprints;
     // `explain` and `playbook` read only the embedded text — skip the tree scan.
     if let Cmd::Explain(a) = &cli.cmd {
         let result = explain::run(&out, a.topic.as_deref());
@@ -1164,6 +1279,7 @@ fn main() -> Result<()> {
     }
     let fail_on_findings = fail_on_findings || cmd.implies_fail_on_findings();
     let command_name = cmd_name(&cmd);
+    out.set_check(command_name);
     let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude);
     report_blind_spots(&out);
     out.finish(command_name);
