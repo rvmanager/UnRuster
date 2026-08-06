@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ast;
 mod audit;
+mod builder_drift;
 mod baseline;
 mod callers;
 mod casts;
@@ -151,6 +152,12 @@ enum Cmd {
     /// the `divergence` thesis applied to configuration rather than enum
     /// dispatch. Ranks a one-field disagreement between two configurations
     /// above a broad one, and demotes builders that vary on purpose.
+    /// Sibling builder chains, one missing a step. `config-drift` for method
+    /// chains: groups every `Type::ctor(args).a().b()` by constructor *and its
+    /// constant arguments*, then reports the calls some chains make and others
+    /// omit. Ranks a single missing call between two chains in one function
+    /// above a broad difference across the tree.
+    BuilderDrift(BuilderDriftArgs),
     ConfigDrift(ConfigDriftArgs),
     /// List all top-level items (struct, enum, trait, fn, impl, ...).
     Inventory(InventoryArgs),
@@ -329,6 +336,7 @@ const WAIVER_AWARE_CHECKS: &[&str] = &[
     "dead-code",
     "conversion-pairs",
     "config-drift",
+    "builder-drift",
     "error-swallows",
     "casts",
 ];
@@ -336,6 +344,7 @@ const WAIVER_AWARE_CHECKS: &[&str] = &[
 fn cmd_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::Audit(_) => "audit",
+        Cmd::BuilderDrift(_) => "builder-drift",
         Cmd::ConfigDrift(_) => "config-drift",
         Cmd::Inventory(_) => "inventory",
         Cmd::Callers(_) => "callers",
@@ -374,7 +383,8 @@ impl Cmd {
     fn implies_fail_on_findings(&self) -> bool {
         match self {
             Cmd::Audit(_) => true,
-            Cmd::ConfigDrift(_)
+            Cmd::BuilderDrift(_)
+            | Cmd::ConfigDrift(_)
             | Cmd::Inventory(_)
             | Cmd::Callers(_)
             | Cmd::Callees(_)
@@ -440,6 +450,20 @@ struct AuditArgs {
     /// loop converges on a healthy codebase.
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Args)]
+struct BuilderDriftArgs {
+    /// Only chains rooted at this constructor path (e.g. `Command::new`).
+    root: Option<String>,
+
+    /// Drop rows scoring below this.
+    #[arg(long, default_value_t = 0.05)]
+    min_score: f64,
+
+    /// Stop after N rows; the cap is announced.
+    #[arg(long)]
+    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -954,6 +978,7 @@ fn dispatch(
             }
             Ok(gating)
         }
+        Cmd::BuilderDrift(a) => builder_drift::run(ctx, a.root.as_deref(), a.min_score, a.top),
         Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score, a.top),
         Cmd::Inventory(a) => inventory::run(ctx, a.kind, a.vis, a.tree),
         Cmd::Callers(a) => {

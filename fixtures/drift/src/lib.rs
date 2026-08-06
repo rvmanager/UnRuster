@@ -72,3 +72,30 @@ impl Default for Sink {
         Self::new()
     }
 }
+
+/// Fixture for `builder-drift`: sibling chains on one constructor, one missing
+/// a step. Modelled on the real defect — two `git` invocations, one of which
+/// forgot to say which directory to run in.
+pub mod chains {
+    pub struct Cmd(pub String);
+    impl Cmd {
+        pub fn new(p: &str) -> Self { Cmd(p.into()) }
+        pub fn args(self, _a: &[&str]) -> Self { self }
+        pub fn dir(self, _d: &str) -> Self { self }
+        pub fn run(self) -> String { self.0 }
+    }
+
+    pub fn resolve() -> String {
+        // Forgot `.dir()`, so this runs wherever the caller happens to be.
+        Cmd::new("git").args(&["rev-parse"]).run()
+    }
+
+    pub fn archive(d: &str) -> String {
+        Cmd::new("git").args(&["archive"]).dir(d).run()
+    }
+
+    /// A different program entirely — must not be compared with the two above.
+    pub fn extract(d: &str) -> String {
+        Cmd::new("tar").args(&["-x"]).dir(d).run()
+    }
+}

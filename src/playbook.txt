@@ -458,6 +458,25 @@ missing flag combos.
   fingerprints; `moved` is a heuristic (same check, same description) and
   can pair two same-named items in different modules.
 
+◇ BUILDER-DRIFT (sibling chains, one missing a step)
+  unruster builder-drift                    # every multi-use constructor
+  unruster builder-drift Command::new       # one constructor
+  Signal: groups every `Type::ctor(args).a().b()` chain by constructor AND
+  its constant arguments, then reports the calls some chains make and
+  others omit. Written for a defect nothing else could see: three
+  `Command::new` chains in one fn, two setting `.current_dir()` and one —
+  the one resolving the repo root — not. `co-call` works at fn
+  granularity and saw both calls in that fn, so it said nothing.
+  Grouping on the constant args is what makes it work: `Command::new("git")`
+  and `Command::new("tar")` are different operations.
+  Unlike `cohort-callees`, ANY split is reportable, including at two
+  chains. A fn body is full of incidental `.count()`/`.filter()`; a
+  builder chain has no incidental links, so the majority rule is not
+  needed to keep the noise down.
+  Locality is inverted from `config-drift`: two chains in ONE function are
+  the loudest signal (written together, one missed), where two config
+  literals are loudest in DIFFERENT modules (nobody sees them together).
+
 ──── 9. WAIVERS ─────────────────────────────────────────────────────
 ◇ WAIVERS (retiring a verified false positive)
 A run over a mature codebase re-reports every site a human already

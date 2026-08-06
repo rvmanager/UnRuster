@@ -168,7 +168,7 @@ impl<'ast, 'a> Visit<'ast> for DriftVisitor<'a> {
 
 /// Everything before the last `::` of an enclosing-fn label — the module (and
 /// impl) the literal was written in.
-fn module_of(context: &str) -> &str {
+pub(crate) fn module_of(context: &str) -> &str {
     context.rsplit_once("::").map(|(m, _)| m).unwrap_or("")
 }
 
@@ -208,7 +208,7 @@ fn lit_str(l: &syn::Lit) -> String {
 /// Render `e` if — and only if — it is constant-shaped. Validation and
 /// rendering in one pass, so the two can never disagree about what is
 /// comparable.
-fn render_const(e: &syn::Expr) -> Option<String> {
+pub(crate) fn render_const(e: &syn::Expr) -> Option<String> {
     Some(match peel(e) {
         syn::Expr::Lit(l) => lit_str(&l.lit),
         syn::Expr::Path(p) => {

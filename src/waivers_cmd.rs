@@ -66,6 +66,12 @@ pub struct WaiverOpts<'a> {
 /// sync.
 fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
     let quiet = crate::emit::Out::silent();
+    // unruster: ok(config-drift/AnalysisCtx) 2026-08-06 — the two probe contexts
+    // must disagree about `summary`. Hit counting happens in
+    // `retain_unsuppressed`, which runs whether or not rows are printed, so this
+    // one can skip the row loops; baseline recording happens *in* those loops,
+    // so `battery_at_ref` cannot. Config-drift ranks this 0.85 because the two
+    // are otherwise identical — which is exactly why they sit one field apart.
     let probe = AnalysisCtx {
         files: ctx.files,
         idx: ctx.idx,

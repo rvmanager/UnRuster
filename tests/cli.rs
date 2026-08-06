@@ -2751,6 +2751,28 @@ fn fingerprints_are_emitted_in_json_and_behind_a_tsv_flag() {
 // ── config-drift ──────────────────────────────────────────────────────────
 
 #[test]
+fn builder_drift_finds_the_chain_that_forgot_a_step() {
+    // Two `git` chains alike but for one call — the shape that made
+    // `--since` resolve the wrong repository. `co-call` could not see it:
+    // the enclosing fn calls both the constructor and the missing method.
+    let out = ur_stdout(&["--root", DRIFT, "builder-drift"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("dir{1/2}"), "expected the missing call:\n{s}");
+    assert!(s.contains("chains::resolve"), "row must name the lean chain:\n{s}");
+}
+
+#[test]
+fn builder_drift_groups_by_the_constructors_constant_args() {
+    // `Cmd::new("tar")` configures a different program; comparing its chain
+    // with the `git` ones would be noise, and it is the only `tar` chain so it
+    // cannot drift against anything.
+    let out = ur_stdout(&["--root", DRIFT, "builder-drift", "--min-score", "0.0"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("Cmd::new(\"git\")"), "{s}");
+    assert!(!s.contains("Cmd::new(\"tar\")"), "a lone chain cannot drift:\n{s}");
+}
+
+#[test]
 fn config_drift_finds_two_presets_that_agree_on_nothing() {
     // The shape of the real defect: two modules building the same options
     // struct for the same operation, with every field diverged.

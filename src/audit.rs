@@ -21,6 +21,7 @@
 use crate::casts::CastClass;
 use crate::emit::{row, site};
 use crate::context::AnalysisCtx;
+use crate::builder_drift;
 use crate::config_drift;
 use crate::divergence;
 use crate::metrics::SortKey;
@@ -175,7 +176,7 @@ impl BatteryConfig {
 pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cfg: BatteryConfig) {
     // `--top` is a display cap applied after waiver matching, so omitting it
     // changes no hit count.
-    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 11] = [
+    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 12] = [
         ("divergence", &|| {
             divergence::run(ctx, None, cfg.divergence_min_score, None)
         }),
@@ -195,6 +196,9 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
         }),
         ("config-drift", &|| {
             config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, None)
+        }),
+        ("builder-drift", &|| {
+            builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE, None)
         }),
         // The advisory three too. They consult no waivers, so they add nothing
         // to hit counting — but a *baseline* comparison that omitted them would
@@ -221,6 +225,12 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
 /// genuine finds on this codebase scored 0.18 and 0.23; ordinary two-preset
 /// structs land under 0.10.
 const CONFIG_DRIFT_MIN_SCORE: f64 = 0.12;
+
+/// One missing call between two chains scores 0.85 in one function and 0.48
+/// across two — both worth reading. Two spellings of the same helper
+/// (`context` vs `with_context`) land near 0.28, which is the noise this cut
+/// is placed to exclude.
+const BUILDER_DRIFT_MIN_SCORE: f64 = 0.4;
 
 /// Minimum care distance for the `--handling` axis.
 const HANDLING_MIN_CARE_GAP: u8 = 2;
@@ -324,6 +334,16 @@ pub fn run(
         // gating check that can never reach zero is one nobody runs.
         Gate::Advisory,
         &mut || config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, top.or(Some(10))),
+    )?;
+    section(
+        "[medium] builder-drift — sibling chains, one missing a step (explain: builder-drift)",
+        "builder-drift",
+        // Advisory alongside its config-drift sibling: two chains on one
+        // builder often differ on purpose. The rows are worth reading — this
+        // check exists because a `Command::new("git")` chain that forgot
+        // `.current_dir()` resolved the wrong repository.
+        Gate::Advisory,
+        &mut || builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE, top.or(Some(10))),
     )?;
     section(
         "[medium] casts — data-loss classes only (explain: casts)",

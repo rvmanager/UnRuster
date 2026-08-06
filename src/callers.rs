@@ -641,6 +641,9 @@ pub fn run_cohort_callees(ctx: &AnalysisCtx, pattern: &str) -> anyhow::Result<us
             divergences.push(callee.clone());
         }
     }
+    if let Some(n) = no_majority_note(cols.len(), divergences.len()) {
+        ctx.out.note(&n);
+    }
     ctx.out.summary(&format!(
         "({} cohort member(s), {} distinct callee(s), {} divergence candidate(s); explain: sibling)",
         n,
@@ -700,10 +703,31 @@ fn presence_row(
 }
 
 /// Divergence: a minority dissents from a present majority.
+/// A callee most of the cohort calls and at least one does not.
+///
+/// "Most" is the whole inference: a helper 7 of 8 siblings call is a lead, a
+/// helper 1 of 2 calls is just a difference. Relaxing this to "any split" was
+/// tried and produced 24 candidates on a correct two-member cohort — `.count`,
+/// `.filter`, and every other incidental adapter one sibling happened to use.
+///
+/// At N=2 no majority exists, so nothing can qualify. That is a real blind
+/// spot, not a bug to paper over, and [`no_majority_note`] says so out loud
+/// rather than letting `0 divergence candidate(s)` read as "they agree".
 fn is_divergent(present: &[bool]) -> bool {
     let p = present.iter().filter(|&&x| x).count();
     let a = present.len() - p;
     p > a && a > 0
+}
+
+/// Warn when the cohort is too small for the majority rule to say anything.
+fn no_majority_note(members: usize, divergences: usize) -> Option<String> {
+    (members < 3 && divergences == 0).then(|| format!(
+        "(note: a {}-member cohort has no majority, so no callee can qualify as a \
+         divergence candidate — widen the pattern, or read the ✓/· matrix directly: \
+         a callee in one column and not the other is visible there even when the \
+         rule cannot rank it)",
+        members
+    ))
 }
 
 /// `co-call <A> <B>` — paired-action invariant check. A and B are a coupled
