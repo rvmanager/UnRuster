@@ -203,6 +203,25 @@ pub fn format_backtrace() -> String {
     String::from("trace-stub")
 }
 
+/// A `key => value` macro, the shape that defeats expression parsing: the arm
+/// `"age" => age_label()` is not an expression, so a chunk-by-chunk parse drops
+/// it and keeps only the parts that happen to parse.
+macro_rules! kv_row {
+    ($($k:literal => $v:expr),+ $(,)?) => {
+        vec![ $(format!("{}={}", $k, $v)),+ ]
+    };
+}
+
+/// Called only from inside a `kv_row!` arm. Reported as dead until the
+/// call-set started reading raw macro tokens.
+pub fn age_label() -> String {
+    String::from("age")
+}
+
+pub fn render_row() -> Vec<String> {
+    kv_row!("age" => age_label(), "n" => 1)
+}
+
 mod inner {
     pub use crate::Document as Renamed;
 }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use syn::visit::{self, Visit};
 
 use crate::ast::{fn_span, trait_fn_span, line_of, line_of_span, type_short, ScopeTracker};
@@ -32,6 +34,11 @@ struct SwallowVisitor<'a> {
     /// iterator can filter on it* — the error is the predicate, not something
     /// dropped. On one real codebase this idiom was most of the `.ok` bucket.
     closure_tail: Vec<bool>,
+    /// Spans of `.ok()` / `.err()` calls that sit directly under a `?`.
+    /// `parse().ok()?` discards the error *value* but propagates the failure —
+    /// control never continues past it, so nothing is silently swallowed. On
+    /// this codebase six of the seven `.ok` rows were this idiom.
+    propagated: HashSet<(usize, usize)>,
     hits: Vec<Hit>,
 }
 
@@ -100,6 +107,13 @@ fn fallback_is_logged(e: &syn::ExprMethodCall) -> bool {
 impl<'a> SwallowVisitor<'a> {
     fn enclosing(&self) -> String {
         self.scope.enclosing()
+    }
+
+    /// Is this `.ok()` / `.err()` the operand of a `?`, i.e. propagation
+    /// rather than a silent drop?
+    fn is_propagated(&self, method: &syn::Ident) -> bool {
+        let s = method.span().start();
+        self.propagated.contains(&(s.line, s.column))
     }
 
     fn record(&mut self, kind: &'static str, line: usize) {
@@ -212,6 +226,16 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         self.scope.leave_fn();
     }
 
+    fn visit_expr_try(&mut self, e: &'ast syn::ExprTry) {
+        // Runs before the child method call is visited, so the mark is in
+        // place by the time the `.ok` arm asks about it.
+        if let syn::Expr::MethodCall(mc) = &*e.expr {
+            let s = mc.method.span().start();
+            self.propagated.insert((s.line, s.column));
+        }
+        visit::visit_expr_try(self, e);
+    }
+
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         let m = e.method.to_string();
         let kind: Option<&'static str> = match m.as_str() {
@@ -226,6 +250,8 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         if let Some(k) = kind {
             let benign = if k == ".unwrap_or_else" && fallback_is_logged(e) {
                 Some("logged-fallback")
+            } else if matches!(k, ".ok" | ".err") && self.is_propagated(&e.method) {
+                Some("propagated")
             } else if k == ".ok" && self.closure_tail.last().copied().unwrap_or(false) {
                 Some("combinator-ok")
             } else {
@@ -341,6 +367,7 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
             closure_tail: Vec::new(),
+            propagated: HashSet::new(),
             hits: Vec::new(),
         };
         v.visit_file(&f.ast);
@@ -355,10 +382,13 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
     let before = all.len();
     all.retain(|h| match h.benign {
         Some("infallible-write") => opts.include_infallible,
-        Some("logged-fallback") | Some("combinator-ok") => opts.include_logged,
+        Some("logged-fallback") | Some("combinator-ok") | Some("propagated") => {
+            opts.include_logged
+        }
         _ => true,
     });
     let benign_hidden = before - all.len();
+    let benign_shown = all.iter().filter(|h| h.benign.is_some()).count();
     all.sort_by(|a, b| {
         a.kind
             .cmp(b.kind)
@@ -397,6 +427,16 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
                 "; {} benign site(s) hidden (infallible writes / logged fallbacks — \
                  `--include-infallible` / `--include-logged` to restore)",
                 benign_hidden
+            )
+        } else if benign_shown > 0 {
+            // The converse matters just as much. This command shows every
+            // family by default while `audit` drops the benign ones, so after
+            // fixing a site the count here does not move and the fix reads as
+            // ineffective. Say which rows are already accounted for.
+            format!(
+                "; {} of these are benign (propagated `?`, logged fallbacks, \
+                 infallible writes) and are hidden in `audit`",
+                benign_shown
             )
         } else {
             String::new()

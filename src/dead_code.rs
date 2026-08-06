@@ -43,6 +43,21 @@ impl<'ast> Visit<'ast> for CallSink {
         for expr in crate::macro_scan::macro_exprs(m) {
             self.visit_expr(&expr);
         }
+        // Then every identifier in the raw tokens, whether or not the body
+        // parsed as expressions.
+        //
+        // `macro_exprs` parses chunk-by-chunk and keeps what it can, so a body
+        // like `row!(out, "age" => age_str(w))` yields `out` and silently drops
+        // the arm containing the call — the fn then looks dead while being
+        // called on that very line. It is not even reported as a blind spot,
+        // because the parse partially succeeded.
+        //
+        // A call-set only needs "might this name be called", and the check
+        // already declares itself heuristic. Over-collecting costs a missed
+        // dead fn; under-collecting sends someone to delete live code. This is
+        // the same treatment `visit_item_macro` already gives `macro_rules!`
+        // bodies, for the same reason.
+        collect_idents(&m.tokens, &mut self.called);
     }
 
     fn visit_item_macro(&mut self, im: &'ast syn::ItemMacro) {

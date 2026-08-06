@@ -60,6 +60,15 @@ pub mod swallows {
         let _ = std::fs::remove_dir(p); // unruster: ok — best-effort, absence is fine
     }
 
+    /// `.ok()?` discards the error *value* but propagates the failure — the
+    /// caller never continues past it, so nothing is silently swallowed.
+    /// A bare `.ok()` on the next line is the real thing.
+    pub fn propagates(s: &str) -> Option<u32> {
+        let n: u32 = s.parse().ok()?;
+        let _ = "x".parse::<u32>().ok();
+        Some(n)
+    }
+
     /// A fallback that logs is a policy, not a silent drop.
     pub fn parse_or_warn(s: &str) -> u32 {
         s.parse().unwrap_or_else(|_| {

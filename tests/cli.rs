@@ -633,6 +633,22 @@ fn dead_code_skips_macro_rules_referenced() {
 }
 
 #[test]
+fn dead_code_sees_calls_inside_unparseable_macro_arms() {
+    // `kv_row!("age" => age_label())`: the `=>` arm is not an expression, so
+    // the chunk parse drops it while still succeeding on the other chunks —
+    // no blind spot is even recorded. The call-set therefore reads raw macro
+    // tokens too. Found by running unruster on itself, where `row!(…)` made
+    // a live `age_str` look dead.
+    let out = ur_stdout(&["--root", FIXTURE, "dead-code"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        !s.contains("age_label"),
+        "age_label is called inside a `=>` macro arm — not dead:\n{}",
+        s
+    );
+}
+
+#[test]
 fn dead_code_pub_only() {
     ur().args(["--root", FIXTURE, "dead-code", "--pub-only"])
         .assert()
@@ -2530,6 +2546,25 @@ fn error_swallows_keeps_benign_families_by_default_and_audit_drops_them() {
         "`let _ = write!(String, …)` is infallible and should be hidden:\n{}",
         s
     );
+}
+
+#[test]
+fn ok_under_a_question_mark_is_propagation_not_a_swallow() {
+    // `parse().ok()?` discards the error value but propagates the failure, so
+    // control never continues past it. Found by running unruster on itself,
+    // where six of seven `.ok` rows were this idiom. `audit` drops them; the
+    // bare command shows them but says how many are benign.
+    let audit = ur_stdout_allow_findings(&["--root", DIV, "--no-suppress", "audit"]);
+    let s = String::from_utf8_lossy(&audit);
+    assert!(
+        s.contains(".ok=1"),
+        "only the bare `.ok()` should reach audit, got:\n{}",
+        s.lines().find(|l| l.contains("swallow site")).unwrap_or("")
+    );
+    // …and the bare command must not read as "nothing changed".
+    let bare = ur().args(["--root", DIV, "--no-suppress", "error-swallows"]).output().unwrap();
+    let err = String::from_utf8_lossy(&bare.stderr);
+    assert!(err.contains("are benign"), "summary should own up:\n{}", err);
 }
 
 #[test]
