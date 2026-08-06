@@ -71,7 +71,11 @@ impl From<usize> for Val {
 }
 impl From<u64> for Val {
     fn from(n: u64) -> Self {
-        Val::Num(n as i64)
+        // Saturate rather than wrap. Every `u64` this tool emits is a count, so
+        // the branch is unreachable in practice — but `as` would turn an
+        // impossible count into a *negative* one, and a nonsense row that reads
+        // as plausible data is worse than one that reads as a clamp.
+        Val::Num(i64::try_from(n).unwrap_or(i64::MAX))
     }
 }
 impl From<f64> for Val {

@@ -156,6 +156,10 @@ impl Date {
     }
 
     /// Inverse of [`Self::to_days`] (`civil_from_days`).
+    // unruster: ok(casts/narrow-int) 2026-08-06 — the algorithm's outputs are
+    // bounded by construction: `m` is 1..=12 and `d` is 1..=31, and `y`
+    // overflows i32 only past year 2.1e9, which needs a day count no clock can
+    // produce (`today()` falls back to the epoch when the clock is unreadable).
     pub fn from_days(z: i64) -> Date {
         let z = z + 719_468;
         let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -698,6 +702,11 @@ pub struct ItemSpan {
 /// literals — raw strings and escapes included — so the spans are exact.
 struct SourceSpans {
     spans: Vec<ItemSpan>,
+    /// `(first_line, last_line)` of every statement. A method chain broken
+    /// across lines reports its finding at the offending method's line, not at
+    /// the `let`, so a waiver written above the statement has to cover the
+    /// whole statement or it silently misses by three lines.
+    stmt_spans: Vec<(usize, usize)>,
     /// Inclusive 1-indexed line ranges that lie *inside* a multi-line literal
     /// (the opening line is excluded — its quote is visible to the scanner).
     literal_lines: Vec<(usize, usize)>,
@@ -706,6 +715,7 @@ struct SourceSpans {
 /// Everything a waiver scan needs to know about one parsed file.
 pub struct FileSpans {
     items: Vec<ItemSpan>,
+    stmts: Vec<(usize, usize)>,
     literal_lines: Vec<(usize, usize)>,
 }
 
@@ -716,8 +726,19 @@ impl FileSpans {
     fn empty() -> Self {
         FileSpans {
             items: Vec::new(),
+            stmts: Vec::new(),
             literal_lines: Vec::new(),
         }
+    }
+
+    /// The statement starting at `line`, if any — widest wins, so a `let`
+    /// wrapping a block gets the block.
+    fn stmt_at(&self, line: usize) -> Option<(usize, usize)> {
+        self.stmts
+            .iter()
+            .copied()
+            .filter(|&(a, b)| a == line && b > a)
+            .max_by_key(|&(a, b)| b - a)
     }
 
     fn contains_literal(&self, line: usize) -> bool {
@@ -731,13 +752,16 @@ impl SourceSpans {
     fn collect(file: &syn::File) -> FileSpans {
         let mut v = SourceSpans {
             spans: Vec::new(),
+            stmt_spans: Vec::new(),
             literal_lines: Vec::new(),
         };
         v.visit_file(file);
         v.spans
             .sort_unstable_by_key(|s| (s.header_start, s.keyword, s.last));
+        v.stmt_spans.sort_unstable();
         FileSpans {
             items: v.spans,
+            stmts: v.stmt_spans,
             literal_lines: v.literal_lines,
         }
     }
@@ -768,6 +792,12 @@ impl<'ast> Visit<'ast> for SourceSpans {
     /// Every literal, not just strings: byte strings and raw strings can span
     /// lines too, and the cost of over-collecting is nil (a numeric literal is
     /// always one line, so it never contributes a range).
+    fn visit_stmt(&mut self, st: &'ast syn::Stmt) {
+        let sp = st.span();
+        self.stmt_spans.push((sp.start().line, sp.end().line));
+        visit::visit_stmt(self, st);
+    }
+
     fn visit_lit(&mut self, l: &'ast syn::Lit) {
         let s = l.span();
         let (start, end) = (s.start().line, s.end().line);
@@ -863,6 +893,9 @@ pub fn scan(files: &[ParsedFile]) -> Suppressions {
         // walks still has those lines. The mismatch let string literals inside
         // stripped code register as waivers. A comment's meaning should not
         // depend on which `--cfg` flags were passed, either.
+        // unruster: ok(error-swallows/.unwrap_or_else) 2026-08-06 — a file that
+        // `parse_dir` already parsed cannot fail here; the fallback exists so a
+        // race on disk degrades to site-scoped waivers rather than losing them.
         let spans = syn::parse_file(&src)
             .map(|ast| SourceSpans::collect(&ast))
             .unwrap_or_else(|_| FileSpans::empty());
@@ -920,7 +953,13 @@ fn scan_source(out: &mut Suppressions, display: &str, src: &str, spans: &FileSpa
                         // starting there would let one item's waiver reach
                         // back over the line the previous item ends on.
                         Some(s) => (Scope::Item, (s.keyword, s.last)),
-                        None => (Scope::Site, (next_code, next_code)),
+                        // Not an item: cover the whole statement when it spans
+                        // lines, so a waiver above a broken-up method chain
+                        // reaches the method that was actually flagged.
+                        None => match spans.stmt_at(next_code) {
+                            Some((a, b)) => (Scope::Site, (a, b)),
+                            None => (Scope::Site, (next_code, next_code)),
+                        },
                     }
                 }
                 // No code after it at all — a standalone waiver dangling at

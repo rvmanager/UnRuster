@@ -96,31 +96,92 @@ pub fn swallow_opts() -> error_swallows::SwallowOpts {
     }
 }
 
-pub fn cast_classes() -> [CastClass; 5] {
-    [
+pub const CAST_CLASSES: &[CastClass] = &[
         CastClass::NarrowInt,
         CastClass::SignedFlip,
         CastClass::FloatInt,
         CastClass::NarrowFloat,
         CastClass::Ptr,
-        // `usize-cross` deliberately absent: on a 64-bit target it is dominated
-        // by lossless `u32 as usize` widening, now classified as `usize-widen`
-        // and reachable on demand.
-    ]
+    // `usize-cross` deliberately absent: on a 64-bit target it is dominated by
+    // lossless `u32 as usize` widening, now classified as `usize-widen` and
+    // reachable on demand.
+];
+
+/// How the battery is configured for one pass.
+///
+/// Two passes exist — `audit`'s own, and the wide-open one `waivers` uses to
+/// tell "earns nothing here" from "earns nothing anywhere" — and last release
+/// they were two hand-written call sequences that silently drifted apart, which
+/// is how orphan detection ended up disagreeing with the audit line. Making the
+/// difference a *value* rather than duplicated code means the two configs sit
+/// side by side and can be diffed by eye.
+#[derive(Clone, Copy)]
+pub struct BatteryConfig {
+    pub divergence_min_score: f64,
+    pub handling_min_care_gap: u8,
+    pub coverage: parallel_matches::CoverageOpts,
+    pub swallows: error_swallows::SwallowOpts,
+    /// Empty = every class (the permissive pass).
+    pub cast_classes: &'static [CastClass],
+    pub include_unsafe_ptr: bool,
 }
 
-/// Run the gating battery with every row suppressed, purely for its effect on
+impl BatteryConfig {
+    /// Exactly what `audit` gates on.
+    pub fn gating() -> Self {
+        BatteryConfig {
+            divergence_min_score: DIVERGENCE_MIN_SCORE,
+            handling_min_care_gap: HANDLING_MIN_CARE_GAP,
+            coverage: coverage_opts(),
+            swallows: swallow_opts(),
+            cast_classes: CAST_CLASSES,
+            include_unsafe_ptr: false,
+        }
+    }
+
+    /// Every threshold opened up: reports rows `audit` deliberately filters.
+    pub fn permissive() -> Self {
+        BatteryConfig {
+            divergence_min_score: 0.0,
+            handling_min_care_gap: 1,
+            coverage: parallel_matches::CoverageOpts {
+                compact: true,
+                ..Default::default()
+            },
+            swallows: error_swallows::SwallowOpts {
+                include_unwrap_or: true,
+                include_infallible: true,
+                include_logged: true,
+            },
+            cast_classes: &[],
+            include_unsafe_ptr: true,
+        }
+    }
+}
+
+/// Run the whole battery discarding every result, for its side effect on
 /// waiver hit counts. `ctx.out` must already be a silent sink.
-pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile]) {
+///
+/// Results are dropped on purpose: a check that fails to run contributes no
+/// hits, which is the correct outcome, and there is no caller to report to.
+// unruster: ok(error-swallows/let-_) 2026-08-06 — the battery runs purely for
+// its effect on waiver hit counts; a check that fails contributes no hits,
+// which is the correct outcome, and there is no caller to report to.
+pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cfg: BatteryConfig) {
     // `--top` is a display cap applied after waiver matching, so omitting it
-    // here changes no hit count.
-    let _ = divergence::run(ctx, None, DIVERGENCE_MIN_SCORE, None);
-    let _ = divergence::run_handling(ctx, HANDLING_MIN_CARE_GAP);
-    let _ = parallel_matches::run_enum_coverage(ctx, None, coverage_opts());
-    let _ = dead_code::run(ctx, dead_call_source, false, false);
-    let _ = conversion_pairs::run(ctx);
-    let _ = error_swallows::run(ctx, swallow_opts());
-    let _ = casts::run(ctx, &cast_classes(), None, false, false, None);
+    // changes no hit count.
+    let checks: [&dyn Fn() -> anyhow::Result<usize>; 7] = [
+        &|| divergence::run(ctx, None, cfg.divergence_min_score, None),
+        &|| divergence::run_handling(ctx, cfg.handling_min_care_gap),
+        &|| parallel_matches::run_enum_coverage(ctx, None, cfg.coverage),
+        &|| dead_code::run(ctx, dead_call_source, false, false),
+        &|| conversion_pairs::run(ctx),
+        &|| error_swallows::run(ctx, cfg.swallows),
+        &|| casts::run(ctx, cfg.cast_classes, None, false, cfg.include_unsafe_ptr, None),
+    ];
+    for check in checks {
+        let _ = check();
+    }
 }
 
 /// Minimum care distance for the `--handling` axis.
@@ -208,7 +269,7 @@ pub fn run(
         "[medium] casts — data-loss classes only (explain: casts)",
         Gate::Advisory,
         &mut || {
-            casts::run(ctx, &cast_classes(), None, false, false, top)
+            casts::run(ctx, CAST_CLASSES, None, false, false, top)
         },
     )?;
     // Low-volume checks: show the offending line inline. Skipped when the

@@ -106,6 +106,9 @@ impl AnalysisCtx<'_> {
 /// <ref>` (tracked changes, staged or not) plus untracked files. Paths are
 /// resolved against the repo top-level, so this works from any CWD. Git is
 /// the only state consulted — there is no tracking file.
+// unruster: ok(error-swallows/if-let-ok) 2026-08-06 — a path that will not
+// canonicalize is not in the working tree, which is precisely the reason to
+// leave it out of the changed set.
 pub fn changed_set(
     git_ref: &str,
 ) -> anyhow::Result<std::collections::HashSet<std::path::PathBuf>> {
@@ -133,7 +136,6 @@ pub fn changed_set(
             if line.is_empty() {
                 continue;
             }
-            // unruster: ok(error-swallows) 2026-08-06 — a path that won't canonicalize isn't in the repo
             if let Ok(p) = std::fs::canonicalize(top.join(line)) {
                 set.insert(p);
             }

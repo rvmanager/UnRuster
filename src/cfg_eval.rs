@@ -176,6 +176,8 @@ fn meta_to_cfg(m: &syn::Meta) -> Option<Cfg> {
     }
 }
 
+// unruster: ok(error-swallows/.ok) 2026-08-06 — the fn returns Option; `.ok()`
+// IS its contract, converting "did not parse" into the None it promises.
 fn parse_meta_list(ts: &TokenStream) -> Option<Vec<syn::Meta>> {
     let parser = Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
     parser

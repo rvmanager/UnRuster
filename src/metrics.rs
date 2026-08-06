@@ -383,6 +383,8 @@ pub fn run(
         sort.as_str(),
         threshold
             .map(|t| format!("; threshold={}", t))
+            // unruster: ok(error-swallows/.unwrap_or_default) 2026-08-06 — `threshold` is an
+            // Option<usize> flag; an absent flag renders as the empty string by design.
             .unwrap_or_default()
     ));
     // With --threshold the fn table is the findings set; otherwise everything shown counts.

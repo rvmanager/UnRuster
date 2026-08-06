@@ -64,9 +64,6 @@ pub struct WaiverOpts<'a> {
 /// with zero hits afterwards is orphaned with respect to everything that could
 /// possibly have honoured it — no separate "which checks exist" list to keep in
 /// sync.
-// unruster: ok(error-swallows/let-_) 2026-08-06 — each check is run purely for its
-// hit-counting side effect; a check that fails contributes no hits and the
-// listing says so.
 fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
     let quiet = crate::emit::Out::silent();
     let probe = AnalysisCtx {
@@ -81,45 +78,20 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
         suggest_waivers: false,
     };
 
-    // Pass 1 — exactly how `audit` runs the battery. These hits are the number
-    // that decides whether a waiver is earning its place, because `audit` is
-    // the loop waivers exist to unblock.
-    ctx.suppressions.set_hit_mode(HitMode::Gating);
-    crate::audit::run_silent_battery(&probe, call_source);
-
-    // Pass 2 — wide open. The *difference* between the two is the interesting
-    // quantity: a waiver that only scores here is hiding rows the audit filters
-    // out anyway, which is dead weight in the gating loop without being an
-    // outright lie. Running only this pass is what made `--orphaned` report a
-    // clean ledger on a codebase where a third of the waivers had stopped
-    // mattering.
-    ctx.suppressions.set_hit_mode(HitMode::BelowAudit);
-    // Errors here are not the user's problem: a check that fails to run just
-    // contributes no hits.
-    let _ = crate::divergence::run(&probe, None, 0.0, None);
-    let _ = crate::divergence::run_handling(&probe, 1);
-    let _ = crate::parallel_matches::run_enum_coverage(
-        &probe,
-        None,
-        crate::parallel_matches::CoverageOpts {
-            hide_trait_routed: false,
-            max_missing: None,
-            compact: true,
-            rank_enums: false,
-            min_variants: 0,
-        },
-    );
-    let _ = crate::error_swallows::run(
-        &probe,
-        crate::error_swallows::SwallowOpts {
-            include_unwrap_or: true,
-            include_infallible: true,
-            include_logged: true,
-        },
-    );
-    let _ = crate::casts::run(&probe, &[], None, false, true, None);
-    let _ = crate::dead_code::run(&probe, call_source, false, false);
-    let _ = crate::conversion_pairs::run(&probe);
+    // Two passes over the same waivers. Pass 1 is configured exactly as
+    // `audit` runs the battery, because `audit` is the loop waivers exist to
+    // unblock — those hits decide whether a waiver earns its place. Pass 2 is
+    // wide open, and the *difference* is what distinguishes "this comment
+    // describes nothing" from "this comment describes a row your audit filters
+    // out anyway". Counting only pass 2 is what let a real ledger report
+    // "0 orphaned" while a third of it had stopped mattering.
+    for (mode, cfg) in [
+        (HitMode::Gating, crate::audit::BatteryConfig::gating()),
+        (HitMode::BelowAudit, crate::audit::BatteryConfig::permissive()),
+    ] {
+        ctx.suppressions.set_hit_mode(mode);
+        crate::audit::run_silent_battery(&probe, call_source, cfg);
+    }
     ctx.suppressions.set_hit_mode(HitMode::Gating);
 }
 

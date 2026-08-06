@@ -104,6 +104,84 @@ fn fallback_is_logged(e: &syn::ExprMethodCall) -> bool {
     v.found
 }
 
+
+/// Methods that yield `Option` and have no `Result` counterpart. Reaching one
+/// while walking back up a call chain proves the chain's value is an `Option`.
+const OPTION_SOURCES: &[&str] = &[
+    "last", "first", "get", "get_mut", "next", "next_back", "find", "find_map", "pop", "peek",
+    "position", "rposition", "strip_prefix", "strip_suffix", "file_name", "file_stem",
+    "extension", "parent", "to_str", "checked_add", "checked_sub", "checked_mul", "checked_div",
+    "chars_next", "front", "back", "iter_next",
+];
+
+/// Combinators that pass the Option/Result shape through unchanged, so the walk
+/// can look past them for the source.
+const SHAPE_PRESERVING: &[&str] = &[
+    "map", "filter", "cloned", "copied", "as_ref", "as_deref", "as_mut", "take", "or", "or_else",
+    "and_then", "flatten", "inspect",
+];
+
+/// Is this call chain's value definitively an `Option`?
+///
+/// `.unwrap_or_default()` on an `Option` is not error swallowing — there is no
+/// error. The check cannot infer types, but it does not need to: a chain that
+/// bottoms out in `.last()` / `.get()` / `.find()` has no `Result` anywhere in
+/// it. Nine of twenty-two rows on this codebase were
+/// `path.segments.last().map(…).unwrap_or_default()`.
+fn receiver_is_option(mut e: &syn::Expr) -> bool {
+    for _ in 0..8 {
+        let syn::Expr::MethodCall(mc) = peel(e) else {
+            return false;
+        };
+        let name = mc.method.to_string();
+        if OPTION_SOURCES.contains(&name.as_str()) {
+            return true;
+        }
+        if !SHAPE_PRESERVING.contains(&name.as_str()) {
+            return false;
+        }
+        e = &mc.receiver;
+    }
+    false
+}
+
+fn peel(e: &syn::Expr) -> &syn::Expr {
+    match e {
+        syn::Expr::Paren(p) => peel(&p.expr),
+        syn::Expr::Group(g) => peel(&g.expr),
+        other => other,
+    }
+}
+
+/// Does every path out of this block leave the enclosing function or loop?
+/// Only the last statement is inspected: an early `return` buried mid-block
+/// still leaves a joining tail, which is the case that genuinely drops the
+/// failure.
+fn block_diverges(b: &syn::Block) -> bool {
+    let Some(last) = b.stmts.last() else {
+        return false;
+    };
+    let e = match last {
+        syn::Stmt::Expr(e, _) => e,
+        _ => return false,
+    };
+    matches!(
+        peel(e),
+        syn::Expr::Return(_) | syn::Expr::Break(_) | syn::Expr::Continue(_)
+    ) || matches!(peel(e), syn::Expr::Macro(m)
+        if m.mac.path.segments.last().is_some_and(|s| {
+            let n = s.ident.to_string();
+            n == "panic" || n == "unreachable" || n == "todo"
+        }))
+}
+
+/// `Option::unwrap_or_else` takes `||`; `Result::unwrap_or_else` receives the
+/// error as `|e|`. The arity alone settles which one this is — the same free
+/// discriminator that distinguishes `.ok()?` from a bare `.ok()`.
+fn fallback_closure_is_nullary(e: &syn::ExprMethodCall) -> bool {
+    matches!(e.args.first(), Some(syn::Expr::Closure(c)) if c.inputs.is_empty())
+}
+
 impl<'a> SwallowVisitor<'a> {
     fn enclosing(&self) -> String {
         self.scope.enclosing()
@@ -248,7 +326,12 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
             _ => None,
         };
         if let Some(k) = kind {
-            let benign = if k == ".unwrap_or_else" && fallback_is_logged(e) {
+            let benign = if matches!(k, ".unwrap_or_else" | ".unwrap_or_default")
+                && (fallback_closure_is_nullary(e) || receiver_is_option(&e.receiver))
+            {
+                // An Option has no error to swallow.
+                Some("option-default")
+            } else if k == ".unwrap_or_else" && fallback_is_logged(e) {
                 Some("logged-fallback")
             } else if matches!(k, ".ok" | ".err") && self.is_propagated(&e.method) {
                 Some("propagated")
@@ -286,7 +369,18 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         if e.else_branch.is_none() {
             if let syn::Expr::Let(le) = &*e.cond {
                 if pat_is_ok(&le.pat) {
-                    self.record("if-let-ok", line_of(&e.if_token));
+                    // `if let Ok(v) = … { return v }` is a strategy in a
+                    // cascade: control diverges on success, so *falling
+                    // through is the error handler*, not a silent drop. Only a
+                    // body that runs on and joins the normal path discards the
+                    // failure. Four of eight surviving rows on this codebase
+                    // were the diverging shape, all in one parse-fallback chain.
+                    let benign = if block_diverges(&e.then_branch) {
+                        Some("fallthrough-is-handler")
+                    } else {
+                        None
+                    };
+                    self.record_tagged("if-let-ok", line_of(&e.if_token), benign);
                 }
             }
         }
@@ -382,9 +476,8 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
     let before = all.len();
     all.retain(|h| match h.benign {
         Some("infallible-write") => opts.include_infallible,
-        Some("logged-fallback") | Some("combinator-ok") | Some("propagated") => {
-            opts.include_logged
-        }
+        Some("logged-fallback") | Some("combinator-ok") | Some("propagated")
+        | Some("option-default") | Some("fallthrough-is-handler") => opts.include_logged,
         _ => true,
     });
     let benign_hidden = before - all.len();
@@ -434,8 +527,8 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
             // fixing a site the count here does not move and the fix reads as
             // ineffective. Say which rows are already accounted for.
             format!(
-                "; {} of these are benign (propagated `?`, logged fallbacks, \
-                 infallible writes) and are hidden in `audit`",
+                "; {} of these are benign (Option defaults, propagated `?`, logged \
+                 fallbacks, infallible writes) and are hidden in `audit`",
                 benign_shown
             )
         } else {

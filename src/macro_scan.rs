@@ -94,6 +94,9 @@ pub fn macro_exprs(m: &syn::Macro) -> Vec<syn::Expr> {
     }
 }
 
+// unruster: ok(error-swallows/if-let-ok) 2026-08-06 — a chunk that will not
+// parse as an expression is skipped on purpose; the caller gets the pieces
+// that did parse and every unparsed macro body is reported as a blind spot.
 fn parse_exprs(tokens: &TokenStream) -> Vec<syn::Expr> {
     if let Ok(list) =
         Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated.parse2(tokens.clone())
