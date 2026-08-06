@@ -406,15 +406,35 @@ impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
 /// Uses a visitor so enums declared inside nested inline modules are found
 /// too (a plain loop over `f.ast.items` would miss them).
 pub(crate) fn variant_names_of(files: &[ParsedFile], enum_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for set in variant_sets_of(files, enum_name) {
+        for v in set {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// One variant list per *definition* of `enum_name` in the tree.
+///
+/// Targets are matched by last segment, so two enums can share a name —
+/// `edit::Op` (26 variants) and `geom::boolean::Op` (4). Flattening both into
+/// one list made every exhaustive `match` on the small one look like 4/26
+/// coverage: six false-positive rows on one real codebase, and
+/// `enum-coverage Op` unable to answer for either enum. Keeping the sets apart
+/// lets each site be scored against the definition it actually dispatches on.
+pub(crate) fn variant_sets_of(files: &[ParsedFile], enum_name: &str) -> Vec<Vec<String>> {
     struct V<'a> {
         target: &'a str,
-        out: Vec<String>,
+        out: Vec<Vec<String>>,
     }
     impl<'ast, 'a> Visit<'ast> for V<'a> {
         fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
             if e.ident == self.target {
                 self.out
-                    .extend(e.variants.iter().map(|v| v.ident.to_string()));
+                    .push(e.variants.iter().map(|v| v.ident.to_string()).collect());
             }
         }
     }
@@ -426,6 +446,19 @@ pub(crate) fn variant_names_of(files: &[ParsedFile], enum_name: &str) -> Vec<Str
         v.visit_file(&f.ast);
     }
     v.out
+}
+
+/// The definition a site dispatches on: the smallest variant set that contains
+/// every variant the site named. A site can only be scored against an enum
+/// whose variants it stays inside, so this is exact whenever the covered set is
+/// non-empty and the definitions differ. Falls back to the union (index 0 of
+/// the caller's list) when nothing fits — a site mixing variants from two
+/// same-named enums is not valid Rust, so this only happens if the scan itself
+/// mis-attributed a path.
+pub(crate) fn definition_for<'a>(sets: &'a [Vec<String>], covered: &[String]) -> Option<&'a Vec<String>> {
+    sets.iter()
+        .filter(|set| covered.iter().all(|v| set.contains(v)))
+        .min_by_key(|set| set.len())
 }
 
 /// Walk every file and collect the match / `matches!` sites that mention the enum.
@@ -640,6 +673,9 @@ struct Row<'s> {
     gap: f64,
     site: &'s Site,
     missing: Vec<String>,
+    /// Variant count of the definition *this site* dispatches on, which is not
+    /// necessarily the union when two enums in the tree share a name.
+    total: usize,
 }
 
 /// Print one `enum-coverage` row (with kind/SEALED tags, optional enum-name
@@ -652,12 +688,12 @@ struct Row<'s> {
 fn print_coverage_row(
     ctx: &AnalysisCtx,
     r: &Row,
-    total: usize,
     sealed: bool,
     prefixed: bool,
     enum_name: &str,
     compact: bool,
 ) {
+    let total = r.total;
     let mut tag = if r.site.trait_routed {
         " (catchall→method; likely false positive)".to_string()
     } else if r.site.is_macro {
@@ -959,6 +995,9 @@ fn coverage_one(
     prefixed: bool,
 ) -> CoverageScan {
     let summary = ctx.summary;
+    // Per-definition variant sets: with two same-named enums in the tree, a
+    // site is scored against the one it actually dispatches on.
+    let sets = variant_sets_of(ctx.files, enum_name);
     let total = variant_names.len();
     let sealed = enum_sealed(ctx.files, enum_name);
 
@@ -968,12 +1007,22 @@ fn coverage_one(
     ctx.retain_changed(&mut all_sites, |s| &s.file);
     ctx.retain_unsuppressed(&mut all_sites, |s| (s.file.as_str(), s.line));
 
-    // One row per site; keep only partials (covered < total).
+    // The denominator is per-site: `total_for` resolves which same-named enum
+    // this site dispatches on. With one definition (the usual case) it is just
+    // that enum's variant count.
+    let owned_union = variant_names.to_vec();
+    let set_of = |s: &Site| -> Vec<String> {
+        definition_for(&sets, &s.variants)
+            .cloned()
+            .unwrap_or_else(|| owned_union.clone())
+    };
+
+    // One row per site; keep only partials (covered < its own enum's total).
     let mut hidden_trait_routed = 0usize;
     let mut filtered_by_gap = 0usize;
     let mut rows: Vec<Row> = all_sites
         .iter()
-        .filter(|s| s.variants.len() < total)
+        .filter(|s| s.variants.len() < set_of(s).len())
         .filter(|s| {
             // A catch-all that routes through a method call on the scrutinee is
             // structurally safe (a new variant must implement the trait method).
@@ -986,16 +1035,20 @@ fn coverage_one(
             }
         })
         .filter(|s| match opts.max_missing {
-            Some(n) if total - s.variants.len() > n => {
+            Some(n) if set_of(s).len() - s.variants.len() > n => {
                 filtered_by_gap += 1;
                 false
             }
             _ => true,
         })
-        .map(|s| Row {
-            gap: s.variants.len() as f64 / total as f64,
-            site: s,
-            missing: missing_variants(&s.variants, variant_names),
+        .map(|s| {
+            let set = set_of(s);
+            Row {
+                gap: s.variants.len() as f64 / set.len() as f64,
+                site: s,
+                missing: missing_variants(&s.variants, &set),
+                total: set.len(),
+            }
         })
         .collect();
     // Highest coverage ratio (smallest gap to full) first — loudest signal on
@@ -1020,9 +1073,23 @@ fn coverage_one(
             variant_names.join(",")
         ));
     }
+    // A name shared by two enums is worth saying out loud: it is the reason a
+    // reader might otherwise see an exhaustive match reported as partial.
+    if !summary && sets.len() > 1 && !rows.is_empty() {
+        ctx.out.note(&format!(
+            "(note: `{}` names {} distinct enums in this tree ({}); each site is \
+             scored against the definition it dispatches on)",
+            enum_name,
+            sets.len(),
+            sets.iter()
+                .map(|s| format!("{} variants", s.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if !summary && !opts.rank_enums {
         for r in &rows {
-            print_coverage_row(ctx, r, total, sealed, prefixed, enum_name, opts.compact);
+            print_coverage_row(ctx, r, sealed, prefixed, enum_name, opts.compact);
         }
     }
     CoverageScan {

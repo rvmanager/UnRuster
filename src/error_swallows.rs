@@ -27,6 +27,11 @@ struct SwallowVisitor<'a> {
     include_unwrap_or: bool,
     file: &'a str,
     scope: ScopeTracker,
+    /// Whether the expression being visited sits in a closure's tail position.
+    /// `filter_map(|t| t.parse().ok())` turns a Result into an Option *so the
+    /// iterator can filter on it* — the error is the predicate, not something
+    /// dropped. On one real codebase this idiom was most of the `.ok` bucket.
+    closure_tail: Vec<bool>,
     hits: Vec<Hit>,
 }
 
@@ -221,12 +226,23 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         if let Some(k) = kind {
             let benign = if k == ".unwrap_or_else" && fallback_is_logged(e) {
                 Some("logged-fallback")
+            } else if k == ".ok" && self.closure_tail.last().copied().unwrap_or(false) {
+                Some("combinator-ok")
             } else {
                 None
             };
             self.record_tagged(k, line_of(&e.method), benign);
         }
+        // A closure passed as an argument is not in *this* call's tail slot.
+        self.closure_tail.push(false);
         visit::visit_expr_method_call(self, e);
+        self.closure_tail.pop();
+    }
+
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        self.closure_tail.push(true);
+        visit::visit_expr_closure(self, c);
+        self.closure_tail.pop();
     }
 
     fn visit_expr_match(&mut self, e: &'ast syn::ExprMatch) {
@@ -324,6 +340,7 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
             include_unwrap_or,
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
+            closure_tail: Vec::new(),
             hits: Vec::new(),
         };
         v.visit_file(&f.ast);
@@ -334,7 +351,7 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
     let before = all.len();
     all.retain(|h| match h.benign {
         Some("infallible-write") => opts.include_infallible,
-        Some("logged-fallback") => opts.include_logged,
+        Some("logged-fallback") | Some("combinator-ok") => opts.include_logged,
         _ => true,
     });
     let benign_hidden = before - all.len();

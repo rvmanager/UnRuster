@@ -324,8 +324,19 @@ pub fn run(
 
 /// One call site, tagged with how its result was treated.
 struct Handled {
-    /// The called thing, by last segment (`lock`, `parent`, `pop_input_at`).
+    /// The called thing. For a path call this is the full path
+    /// (`Anchor::parse`); for a method call, the method name. A bare method
+    /// name is not enough on its own — see [`Handled::subject`].
     callee: String,
+    /// The root of the receiver expression (`OPEN_FILE` in `OPEN_FILE.lock()`,
+    /// `t` in `t.parse::<f64>()`), or empty for a path call.
+    ///
+    /// Pairing on the method name alone merged `str::parse` with
+    /// `Anchor::parse` and reported an iterator's `filter_map(|t|
+    /// t.parse().ok())` as the careless sibling of an `.expect()` three
+    /// hundred lines away. Two sites only get compared when they name the same
+    /// subject.
+    subject: String,
     /// How the result was handled — the axis siblings are compared on.
     treatment: &'static str,
     /// Weight of the treatment: higher = more careful. Divergence is reported
@@ -339,14 +350,25 @@ struct Handled {
 struct HandlingVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
+    /// Whether the expression currently being visited sits in a closure's tail
+    /// position. See [`in_combinator_position`].
+    closure_tail: Vec<bool>,
     hits: Vec<Handled>,
 }
 
 impl HandlingVisitor<'_> {
-    fn push(&mut self, callee: String, treatment: &'static str, care: u8, line: usize) {
+    fn push(
+        &mut self,
+        callee: String,
+        subject: String,
+        treatment: &'static str,
+        care: u8,
+        line: usize,
+    ) {
         let context = self.scope.enclosing();
         self.hits.push(Handled {
             callee,
+            subject,
             treatment,
             care,
             context,
@@ -354,6 +376,74 @@ impl HandlingVisitor<'_> {
             line,
         });
     }
+}
+
+/// Leftmost identifier of an expression — the "subject" a call is made on.
+/// `self.lists[l].closed` → `self`, `OPEN_FILE.lock()` → `OPEN_FILE`.
+fn receiver_root(e: &syn::Expr) -> String {
+    match e {
+        syn::Expr::Path(p) => p
+            .path
+            .segments
+            .first()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default(),
+        syn::Expr::MethodCall(m) => receiver_root(&m.receiver),
+        syn::Expr::Field(f) => receiver_root(&f.base),
+        syn::Expr::Index(i) => receiver_root(&i.expr),
+        syn::Expr::Call(c) => receiver_root(&c.func),
+        syn::Expr::Reference(r) => receiver_root(&r.expr),
+        syn::Expr::Paren(p) => receiver_root(&p.expr),
+        syn::Expr::Try(t) => receiver_root(&t.expr),
+        syn::Expr::Unary(u) => receiver_root(&u.expr),
+        _ => String::new(),
+    }
+}
+
+/// Does this closure body look at the error it was handed — bind and use the
+/// parameter, or log? That is the line between "recovered from the failure"
+/// and "substituted a constant without looking".
+fn closure_inspects_error(args: &[syn::Expr]) -> bool {
+    let Some(syn::Expr::Closure(c)) = args.first() else {
+        return false;
+    };
+    // `|_| …` / `|_e| …` discards the error by convention.
+    let binds = match c.inputs.first() {
+        Some(syn::Pat::Ident(i)) => !i.ident.to_string().starts_with('_'),
+        Some(syn::Pat::Wild(_)) | None => false,
+        Some(_) => true,
+    };
+    binds || body_logs(&c.body)
+}
+
+/// A log/warn/panic macro or method anywhere in the body makes the failure
+/// observable. Matched by name shape, not an allow-list: every project spells
+/// its logger differently.
+fn body_logs(body: &syn::Expr) -> bool {
+    struct V {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if let Some(seg) = m.path.segments.last() {
+                let n = seg.ident.to_string().to_lowercase();
+                if n.contains("log")
+                    || n.contains("warn")
+                    || n.contains("err")
+                    || n.contains("trace")
+                    || n.contains("debug")
+                    || n.contains("panic")
+                    || n.starts_with("eprint")
+                {
+                    self.found = true;
+                }
+            }
+            visit::visit_macro(self, m);
+        }
+    }
+    let mut v = V { found: false };
+    v.visit_expr(body);
+    v.found
 }
 
 /// `Ok(..)` head of an `if let` — the pattern that makes the binding an error
@@ -372,18 +462,39 @@ fn pat_is_ok(p: &syn::Pat) -> bool {
     }
 }
 
-/// Classify how a method call's result is treated. Ordered by care so two
-/// treatments of the same callee can be compared numerically.
-fn treatment_of(method: &str) -> Option<(&'static str, u8)> {
+/// How much attention the failure got, on one axis: *did this code notice?*
+///
+///   3  aborts — `.expect` / `.unwrap`: the failure stops the program.
+///   2  inspects — `.unwrap_or_else(|e| …e…)` or a fallback that logs: the
+///      error value was read, or the failure was made observable.
+///   1  substitutes blindly — `.unwrap_or`, `.unwrap_or_default`,
+///      `.unwrap_or_else(|_| CONST)`: a value appears, nobody looked.
+///   0  discards — `.ok()`, `if let Ok(..)` with no else.
+///
+/// The earlier ladder ranked `.unwrap_or_default` above `.ok()`, which made
+/// every `read_to_string(p).ok()` the "careless sibling" of every
+/// `read_to_string(p).unwrap_or_default()` — two spellings of the same
+/// policy, reported as a defect. Tiers 0 and 1 are both silent; the gap that
+/// matters is silence versus attention.
+fn treatment_of(method: &str, inspects: bool) -> Option<(&'static str, u8)> {
     Some(match method {
-        "expect" => ("expect", 4),
-        "unwrap_or_else" => ("unwrap_or_else", 3),
-        "unwrap_or_default" => ("unwrap_or_default", 2),
-        "unwrap_or" => ("unwrap_or", 2),
-        "unwrap" => ("unwrap", 1),
+        "expect" => ("expect", 3),
+        "unwrap" => ("unwrap", 3),
+        "unwrap_or_else" if inspects => ("unwrap_or_else(inspects)", 2),
+        "unwrap_or_else" => ("unwrap_or_else(const)", 1),
+        "unwrap_or_default" => ("unwrap_or_default", 1),
+        "unwrap_or" => ("unwrap_or", 1),
         "ok" => ("dropped(.ok)", 0),
         _ => return None,
     })
+}
+
+/// Is this expression the tail of a closure — i.e. its value is being returned
+/// into a combinator? `filter_map(|t| t.parse().ok())` converts a Result into
+/// an Option *to filter on it*; the error is not dropped, it is the predicate.
+/// Counting those made an iterator idiom the loudest finding in the check.
+fn in_combinator_position(stack: &[bool]) -> bool {
+    stack.last().copied().unwrap_or(false)
 }
 
 impl<'ast> Visit<'ast> for HandlingVisitor<'_> {
@@ -420,26 +531,56 @@ impl<'ast> Visit<'ast> for HandlingVisitor<'_> {
         self.scope.leave_fn();
     }
 
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        // Mark the closure's own tail position: a `.ok()` there is a
+        // Result→Option conversion feeding a combinator, not a dropped error.
+        self.closure_tail.push(true);
+        visit::visit_expr_closure(self, c);
+        self.closure_tail.pop();
+    }
+
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
-        if let Some((treatment, care)) = treatment_of(&e.method.to_string()) {
-            // The receiver's own trailing method name identifies *what* is
-            // being handled: in `m.lock().ok()` the subject is `lock`.
-            if let syn::Expr::MethodCall(inner) = &*e.receiver {
-                self.push(
-                    inner.method.to_string(),
-                    treatment,
-                    care,
-                    line_of(&e.method),
-                );
-            } else if let syn::Expr::Call(inner) = &*e.receiver {
-                if let syn::Expr::Path(p) = &*inner.func {
-                    if let Some(seg) = p.path.segments.last() {
-                        self.push(seg.ident.to_string(), treatment, care, line_of(&e.method));
+        let method = e.method.to_string();
+        let inspects = closure_inspects_error(&e.args.iter().cloned().collect::<Vec<_>>());
+        if let Some((treatment, care)) = treatment_of(&method, inspects) {
+            let combinator_ok = care == 0 && in_combinator_position(&self.closure_tail);
+            if !combinator_ok {
+                // The receiver's own trailing call names *what* is being
+                // handled: in `m.lock().ok()` the subject is `lock`, and the
+                // root `m` scopes the comparison to that one subject.
+                match &*e.receiver {
+                    syn::Expr::MethodCall(inner) => {
+                        let subject = receiver_root(&inner.receiver);
+                        self.push(
+                            inner.method.to_string(),
+                            subject,
+                            treatment,
+                            care,
+                            line_of(&e.method),
+                        );
                     }
+                    syn::Expr::Call(inner) => {
+                        if let syn::Expr::Path(p) = &*inner.func {
+                            // Full path, so `Anchor::parse` and `str::parse`
+                            // are never the same callee.
+                            let full = p
+                                .path
+                                .segments
+                                .iter()
+                                .map(|s| s.ident.to_string())
+                                .collect::<Vec<_>>()
+                                .join("::");
+                            self.push(full, String::new(), treatment, care, line_of(&e.method));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
+        // A closure argument's body is not in *this* call's tail position.
+        self.closure_tail.push(false);
         visit::visit_expr_method_call(self, e);
+        self.closure_tail.pop();
     }
 
     fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
@@ -451,8 +592,10 @@ impl<'ast> Visit<'ast> for HandlingVisitor<'_> {
             if let syn::Expr::Let(le) = &*e.cond {
                 if pat_is_ok(&le.pat) {
                     if let syn::Expr::MethodCall(inner) = &*le.expr {
+                        let subject = receiver_root(&inner.receiver);
                         self.push(
                             inner.method.to_string(),
+                            subject,
                             "dropped(if-let-ok)",
                             0,
                             line_of(&e.if_token),
@@ -480,6 +623,7 @@ pub fn run_handling(ctx: &AnalysisCtx, min_care_gap: u8) -> anyhow::Result<usize
         let mut v = HandlingVisitor {
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
+            closure_tail: Vec::new(),
             hits: Vec::new(),
         };
         v.visit_file(&f.ast);
@@ -506,6 +650,12 @@ pub fn run_handling(ctx: &AnalysisCtx, min_care_gap: u8) -> anyhow::Result<usize
     for hits in by_callee.values() {
         for (i, a) in hits.iter().enumerate() {
             for b in &hits[i + 1..] {
+                // Same callee name is not enough: the two sites must also
+                // name the same subject, or they are handling different things
+                // that happen to share a method name.
+                if a.subject != b.subject {
+                    continue;
+                }
                 let (careful, careless) = if a.care >= b.care { (*a, *b) } else { (*b, *a) };
                 let gap = careful.care - careless.care;
                 if gap < min_care_gap {

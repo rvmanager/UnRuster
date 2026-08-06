@@ -173,6 +173,13 @@ fn classify(src: Option<&str>, dst: &str) -> &'static str {
     }
     let src_is_usize = src.map(is_usize_family).unwrap_or(false);
     let dst_is_usize = is_usize_family(dst);
+    // `isize as usize` (and the reverse) used to fall past every arm and land
+    // in `other`, which no check reports. It is a sign flip on the type Rust
+    // indexes with: a negative `isize` becomes an enormous index, and the
+    // panic lands far from the cast. Classify it with the other sign flips.
+    if src_is_usize && dst_is_usize && src != Some(dst) {
+        return "signed-flip";
+    }
     let usize_involved = (src_is_usize && !dst_is_usize && int_width_signed(dst).is_some())
         || (dst_is_usize && src.is_some() && !src_is_usize);
     if usize_involved {
