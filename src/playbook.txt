@@ -406,6 +406,33 @@ missing flag combos.
   test in disguise); `file:start-end` lets an agent read just the
   relevant body via `sed -n start,endp file`.
 
+──── 0b. CONFIG DRIFT ───────────────────────────────────────────────
+◇ CONFIG-DRIFT (same struct, two configurations)
+  unruster config-drift                     # every multi-site struct, ranked
+  unruster config-drift <Type>              # one type
+  Signal: groups every `Foo { … }` literal by type and reports the fields
+  whose *constant* values disagree across sites. This is DIVERGENCE
+  applied to values instead of enum variants, and it exists because of a
+  measured miss: two functions built a `CoverageOpts` to configure the
+  same check battery, drifted to `min_variants: 3` against `0`, and made
+  orphan detection contradict the audit line on the same run. No other
+  check looked at struct literals.
+  A field set from a local abstains — that site is computing, not
+  configuring — but the field is still compared across the sites that do
+  spell out a constant. A field omitted behind `..Default::default()`
+  votes as `(default)`; "one side spelled it out, the other didn't" is
+  the difference readers skim past.
+  Ranking multiplies four terms: how much of the struct the sites agree
+  on (floored, because the motivating defect agreed on *nothing*), how
+  narrow the disagreement is, how few distinct configurations exist (two
+  is drift, twenty is a builder), and how far apart the sites are (two
+  literals in one module are a pair you see at once).
+  Literals inside `impl ThatType` are skipped: `Out::new` vs
+  `Out::silent` is the type's API, not drift.
+  Repair: give the configurations one source. A `Config::gating()` /
+  `Config::permissive()` pair next to each other is diffable by eye; two
+  hand-written literals in two modules are not.
+
 ──── 9. WAIVERS ─────────────────────────────────────────────────────
 ◇ WAIVERS (retiring a verified false positive)
 A run over a mature codebase re-reports every site a human already

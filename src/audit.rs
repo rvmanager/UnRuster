@@ -20,6 +20,7 @@
 
 use crate::casts::CastClass;
 use crate::context::AnalysisCtx;
+use crate::config_drift;
 use crate::divergence;
 use crate::metrics::SortKey;
 use crate::parse::ParsedFile;
@@ -170,7 +171,7 @@ impl BatteryConfig {
 pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cfg: BatteryConfig) {
     // `--top` is a display cap applied after waiver matching, so omitting it
     // changes no hit count.
-    let checks: [&dyn Fn() -> anyhow::Result<usize>; 7] = [
+    let checks: [&dyn Fn() -> anyhow::Result<usize>; 8] = [
         &|| divergence::run(ctx, None, cfg.divergence_min_score, None),
         &|| divergence::run_handling(ctx, cfg.handling_min_care_gap),
         &|| parallel_matches::run_enum_coverage(ctx, None, cfg.coverage),
@@ -178,11 +179,17 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
         &|| conversion_pairs::run(ctx),
         &|| error_swallows::run(ctx, cfg.swallows),
         &|| casts::run(ctx, cfg.cast_classes, None, false, cfg.include_unsafe_ptr, None),
+        &|| config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, None),
     ];
     for check in checks {
         let _ = check();
     }
 }
+
+/// Drift score below which rows are dropped from the audit section. The two
+/// genuine finds on this codebase scored 0.18 and 0.23; ordinary two-preset
+/// structs land under 0.10.
+const CONFIG_DRIFT_MIN_SCORE: f64 = 0.12;
 
 /// Minimum care distance for the `--handling` axis.
 const HANDLING_MIN_CARE_GAP: u8 = 2;
@@ -264,6 +271,16 @@ pub fn run(
         &mut || {
             error_swallows::run(ctx, swallow_opts())
         },
+    )?;
+    section(
+        "[medium] config-drift — same struct, two configurations (explain: config-drift)",
+        // Advisory, not gating: a struct built two ways is often deliberate (two
+        // presets, a builder). The rows are worth reading — this check exists
+        // because a drifted `CoverageOpts` made orphan detection contradict the
+        // audit line — but a codebase can hold correct ones indefinitely, and a
+        // gating check that can never reach zero is one nobody runs.
+        Gate::Advisory,
+        &mut || config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, top.or(Some(10))),
     )?;
     section(
         "[medium] casts — data-loss classes only (explain: casts)",

@@ -2587,6 +2587,7 @@ const WV: &str = "fixtures/waivers/src";
 const SCOPE_FIXTURE: &str = "fixtures/scope/src";
 const DIVGROUP: &str = "fixtures/divgroup/src";
 const TYPO_FIXTURE: &str = "fixtures/typo/src";
+const DRIFT: &str = "fixtures/drift/src";
 /// Pinned "today" — the system clock is the only non-deterministic input in
 /// the tool, and an unpinned age would make these assertions rot.
 const TODAY: &str = "2026-08-06";
@@ -2609,6 +2610,61 @@ fn scratch_fixture(name: &str) -> std::path::PathBuf {
     )
     .unwrap();
     dir.join("src")
+}
+
+// ── config-drift ──────────────────────────────────────────────────────────
+
+#[test]
+fn config_drift_finds_two_presets_that_agree_on_nothing() {
+    // The shape of the real defect: two modules building the same options
+    // struct for the same operation, with every field diverged.
+    let out = ur_stdout(&["--root", DRIFT, "config-drift"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("Opts"), "expected the drifted struct:\n{s}");
+    assert!(
+        s.contains("gating::build") && s.contains("probe::build"),
+        "row must name a concrete pair to diff:\n{s}"
+    );
+    // A field left to `..Default::default()` on one side and spelled out on
+    // the other is a difference, and the easiest kind to skim past.
+    assert!(s.contains("compact{(default)|true}"), "{s}");
+}
+
+#[test]
+fn config_drift_ignores_a_types_own_constructors() {
+    // `Sink::new` / `Sink::silent` differ on purpose — that is the type's API.
+    // Without this rule every two-constructor type tops the ranking forever.
+    let out = ur_stdout(&["--root", DRIFT, "config-drift"]);
+    assert!(
+        !String::from_utf8_lossy(&out).contains("Sink"),
+        "constructors are not drift:\n{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+#[test]
+fn config_drift_lets_a_computed_site_abstain() {
+    // `cli::build` sets every field from a parameter. It must not suppress the
+    // comparison between the two sites that do spell out constants.
+    let out = ur_stdout(&["--root", DRIFT, "config-drift"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("hide_routed{false|true}"),
+        "a computed third site must not erase the field:\n{s}"
+    );
+}
+
+#[test]
+fn config_drift_ranks_a_narrow_disagreement_above_a_broad_one() {
+    let out = ur_stdout(&["--root", DRIFT, "config-drift", "--min-score", "0.0"]);
+    let scores: Vec<f64> = rows_of(&out)
+        .iter()
+        .filter_map(|r| r.split('\t').nth(1)?.parse().ok())
+        .collect();
+    assert!(
+        scores.windows(2).all(|w| w[0] >= w[1]),
+        "rows must be ranked loudest-first: {scores:?}"
+    );
 }
 
 #[test]

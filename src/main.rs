@@ -10,6 +10,7 @@ mod casts;
 mod catch_all;
 mod cfg_eval;
 mod context;
+mod config_drift;
 mod conversion_pairs;
 mod conversions;
 mod dead_code;
@@ -136,6 +137,12 @@ enum Cmd {
     /// while any finding remains — the agent-loop entry point:
     /// `until unruster audit; do <fix>; done`.
     Audit(AuditArgs),
+    /// Same struct, built two ways. Groups every `Foo { … }` literal by type
+    /// and reports the fields whose constant values disagree across sites —
+    /// the `divergence` thesis applied to configuration rather than enum
+    /// dispatch. Ranks a one-field disagreement between two configurations
+    /// above a broad one, and demotes builders that vary on purpose.
+    ConfigDrift(ConfigDriftArgs),
     /// List all top-level items (struct, enum, trait, fn, impl, ...).
     Inventory(InventoryArgs),
     /// Find call sites of a function, method, or macro.
@@ -312,6 +319,7 @@ const WAIVER_AWARE_CHECKS: &[&str] = &[
     "enum-coverage",
     "dead-code",
     "conversion-pairs",
+    "config-drift",
     "error-swallows",
     "casts",
 ];
@@ -319,6 +327,7 @@ const WAIVER_AWARE_CHECKS: &[&str] = &[
 fn cmd_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::Audit(_) => "audit",
+        Cmd::ConfigDrift(_) => "config-drift",
         Cmd::Inventory(_) => "inventory",
         Cmd::Callers(_) => "callers",
         Cmd::Callees(_) => "callees",
@@ -356,7 +365,8 @@ impl Cmd {
     fn implies_fail_on_findings(&self) -> bool {
         match self {
             Cmd::Audit(_) => true,
-            Cmd::Inventory(_)
+            Cmd::ConfigDrift(_)
+            | Cmd::Inventory(_)
             | Cmd::Callers(_)
             | Cmd::Callees(_)
             | Cmd::CoCall(_)
@@ -399,6 +409,20 @@ struct AuditArgs {
     /// loop converges on a healthy codebase.
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Args)]
+struct ConfigDriftArgs {
+    /// Only this struct type (last segment).
+    ty: Option<String>,
+
+    /// Drop rows scoring below this. Raise to see only the loudest.
+    #[arg(long, default_value_t = 0.05)]
+    min_score: f64,
+
+    /// Stop after N rows; the cap is announced.
+    #[arg(long)]
+    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -867,6 +891,7 @@ fn dispatch(
             let call_source = all_files.as_deref().unwrap_or(files);
             audit::run(ctx, call_source, a.top, a.strict)
         }
+        Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score, a.top),
         Cmd::Inventory(a) => inventory::run(ctx, a.kind, a.vis, a.tree),
         Cmd::Callers(a) => {
             if let Some(pattern) = a.among.as_deref() {
