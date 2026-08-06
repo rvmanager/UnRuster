@@ -313,7 +313,11 @@ pub fn run(
     }
 
     ctx.retain_changed(&mut all, |h| &h.file);
-    ctx.retain_unsuppressed(&mut all, |h| (h.file.as_str(), h.line));
+    // Keyed by cast class, so `ok(casts/ptr)` on an FFI shim doesn't also
+    // waive a narrowing cast that lands inside the same span.
+    let waived = ctx.retain_unsuppressed("casts", &mut all, |h| {
+        crate::suppress::Site::keyed(h.file.as_str(), h.line, h.class)
+    });
     if !class_filter.is_empty() {
         let wanted: Vec<&str> = class_filter.iter().map(|c| c.as_str()).collect();
         all.retain(|h| wanted.contains(&h.class));
@@ -361,6 +365,7 @@ pub fn run(
                         all.len()
                     ));
                 }
+                let today = crate::suppress::Date::today();
                 for h in rows {
                     row!(
                         ctx.out,
@@ -370,6 +375,7 @@ pub fn run(
                         "context" => h.context.clone(),
                         "at" => site(&h.file, h.line),
                     );
+                    ctx.suggest("casts", Some(h.class), today);
                 }
             }
         }
@@ -382,10 +388,11 @@ pub fn run(
     }
     let break_str: Vec<String> = by_class.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     ctx.out.summary(&format!(
-        "({} cast(s); {}; hide_widen={}{}; explain: casts)",
+        "({} cast(s); {}; hide_widen={}{}{}; explain: casts)",
         all.len(),
         break_str.join(", "),
         hide_widen,
+        ctx.waived_note(waived),
         if widen_hidden > 0 {
             format!(
                 "; {} lossless usize-widen row(s) hidden (assumes {}-bit usize; \

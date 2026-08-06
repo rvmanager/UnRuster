@@ -36,7 +36,16 @@ GLOBAL FLAGS
   --exclude GLOB         drop matching files (repeatable)
   --cfg KEY[=VALUE]      strip items whose cfg is definitively false
   --fail-on-findings     exit 1 on any finding (0 = clean, 2 = error)
+  --no-suppress          ignore waiver comments, report every site
+  --suggest-waivers      print the exact waiver comment under each row
+
+WAIVERS — record a verified false positive (`unruster explain waivers`)
+  // unruster: ok(<check>[/<key>]) <YYYY-MM-DD> — <reason>
+  Don't write it by hand: `--suggest-waivers` prints the exact line to paste.
+  Above an item it waives that whole item (the `#[allow]` model), so one
+  comment retires an omission across every method in an impl.
+  unruster waivers [--orphaned]  list them / find the ones now suppressing nothing
 
 IN-SOURCE MARKERS
-  /// unruster: sealed        on an enum: partial dispatch on it is tagged SEALED
-  // unruster: ok — <reason>  waive one finding (own line, or the line below)
+  /// unruster: sealed        on an enum: partial dispatch is tagged SEALED
+  // unruster: ok(...) ...    waive a finding — see WAIVERS above

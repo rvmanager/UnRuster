@@ -2543,6 +2543,285 @@ fn waiver_comment_suppresses_exactly_its_own_site() {
     );
 }
 
+// ── waiver grammar: scope, keys, lifecycle ────────────────────────────────
+//
+// `fixtures/waivers` is separate from `fixtures/divergence` so these cases
+// can't shift the row counts asserted above.
+
+const WV: &str = "fixtures/waivers/src";
+/// Pinned "today" — the system clock is the only non-deterministic input in
+/// the tool, and an unpinned age would make these assertions rot.
+const TODAY: &str = "2026-08-06";
+
+/// stderr as a String, for summary-line assertions.
+fn ur_stderr(args: &[&str]) -> String {
+    let out = ur().args(args).output().unwrap();
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Copy the waiver fixture into a scratch dir so mutating tests can't touch
+/// the checked-in source. Returns the scratch root.
+fn scratch_fixture(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::copy(
+        "fixtures/waivers/src/lib.rs",
+        dir.join("src").join("lib.rs"),
+    )
+    .unwrap();
+    dir.join("src")
+}
+
+#[test]
+fn item_scoped_variant_keyed_waiver_retires_a_divergence_pair() {
+    // The arena `NodeContent::Group` shape: one comment on the lean side,
+    // scoped to the whole fn, keyed to the one variant it means.
+    let without = ur_stdout(&["--root", WV, "--no-suppress", "divergence"]);
+    let with = ur_stdout(&["--root", WV, "divergence"]);
+    assert_eq!(rows_of(&without).len(), 1, "fixture should have one pair");
+    assert!(
+        rows_of(&with).is_empty(),
+        "the variant-keyed waiver should retire it:\n{}",
+        String::from_utf8_lossy(&with)
+    );
+    assert!(
+        ur_stderr(&["--root", WV, "divergence"]).contains("1 waived"),
+        "the summary must report what it hid — a silent drop reads as clean"
+    );
+}
+
+#[test]
+fn a_keyed_waiver_naming_the_wrong_key_suppresses_nothing() {
+    // `ok(error-swallows/.ok)` sits on a `let _ =` line. Matching it would be
+    // the over-suppression the key exists to prevent.
+    let out = ur_stdout(&["--root", WV, "error-swallows"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("wrong_key"),
+        "the mismatched-key row must survive:\n{}",
+        s
+    );
+}
+
+#[test]
+fn a_waiver_for_one_check_does_not_silence_another_on_the_same_line() {
+    // Two checks, one line, one waiver: only the named check is waived.
+    let swallows = ur_stdout(&["--root", WV, "error-swallows"]);
+    assert_eq!(
+        rows_of(&swallows).len(),
+        1,
+        "two of three swallows are waived, the wrong-key one is not"
+    );
+    // The divergence waiver must not touch error-swallows, and vice versa.
+    let s = String::from_utf8_lossy(&swallows);
+    assert!(!s.contains("strip_incoming_refs"), "check leaked: {}", s);
+}
+
+#[test]
+fn a_reason_wrapped_across_lines_is_rejoined() {
+    // Reflow tolerance: a human (or rustfmt) breaking a long waiver must not
+    // truncate what the listing reports.
+    let out = ur_stdout(&["--root", WV, "waivers", "--today", TODAY]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("Group is a structural child edge, not a consumer reference; \
+                    every consumer walk in this impl excludes it deliberately."),
+        "three-line reason should come back as one string:\n{}",
+        s
+    );
+}
+
+#[test]
+fn waivers_listing_reports_scope_key_and_suppression_count() {
+    let out = ur_stdout(&["--root", WV, "waivers", "--today", TODAY]);
+    assert_tsv_cols(&out, 8);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\titem\t"), "item scope must be visible:\n{}", s);
+    assert!(s.contains("\tsite\t"), "site scope must be visible:\n{}", s);
+    assert!(
+        s.contains("Node::Group"),
+        "the key belongs in its own column:\n{}",
+        s
+    );
+    // The guardrail on item scope: a waiver that hides a lot must say so.
+    let summary = ur_stderr(&["--root", WV, "waivers", "--today", TODAY]);
+    assert!(summary.contains("item-scoped"), "{}", summary);
+    assert!(summary.contains("orphaned"), "{}", summary);
+}
+
+#[test]
+fn orphaned_finds_waivers_that_suppress_nothing() {
+    let out = ur_stdout(&["--root", WV, "waivers", "--orphaned", "--today", TODAY]);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 2, "the dead one and the wrong-keyed one:\n{:?}", rows);
+    for r in &rows {
+        let cols: Vec<&str> = r.split('\t').collect();
+        assert_eq!(cols[5], "0", "orphaned rows suppress nothing: {}", r);
+    }
+}
+
+#[test]
+fn stale_measures_against_the_pinned_date() {
+    // Fixture ages at TODAY: 2650d, 208d, 186d, 186d, and one undated.
+    let over_365 = rows_of(&ur_stdout(&[
+        "--root", WV, "waivers", "--stale", "365", "--today", TODAY,
+    ]));
+    assert_eq!(over_365.len(), 2, "2650d + the undated one: {:?}", over_365);
+    let over_200 = rows_of(&ur_stdout(&[
+        "--root", WV, "waivers", "--stale", "200", "--today", TODAY,
+    ]));
+    assert_eq!(over_200.len(), 3, "208d joins them: {:?}", over_200);
+}
+
+#[test]
+fn an_undated_waiver_counts_as_stale_at_every_threshold() {
+    // Deliberate: a waiver with no date cannot be shown to be fresh, so
+    // treating it as fresh would make dating optional in practice. `--stale`
+    // and `--fail-on-stale` agree on this.
+    let huge = rows_of(&ur_stdout(&[
+        "--root", WV, "waivers", "--stale", "99999", "--today", TODAY,
+    ]));
+    assert_eq!(huge.len(), 1, "only the undated one survives: {:?}", huge);
+    assert!(huge[0].starts_with("—\t"), "and it is the undated one: {:?}", huge);
+}
+
+#[test]
+fn fail_on_stale_gates_the_exit_code() {
+    ur().args(["--root", WV, "waivers", "--fail-on-stale", "365", "--today", TODAY])
+        .assert()
+        .failure();
+    // A tree whose waivers are all dated and fresh passes the gate. Upgrading
+    // stamps today's date on the legacy one; removing the 2019 orphan clears
+    // the rest.
+    let root = scratch_fixture("waivers-gate");
+    let r = root.to_str().unwrap();
+    ur_stdout(&["--root", r, "waivers", "--upgrade", "--write", "--today", TODAY]);
+    ur_stdout(&[
+        "--root", r, "waivers", "--stale", "365", "--remove", "--write", "--today", TODAY,
+    ]);
+    ur().args(["--root", r, "waivers", "--fail-on-stale", "365", "--today", TODAY])
+        .assert()
+        .success();
+}
+
+#[test]
+fn suggest_waivers_prints_a_line_that_actually_works() {
+    // The suggestion is the only place the grammar is spelled out at the point
+    // of use, so it has to be exactly right — key included.
+    let out = ur_stdout(&[
+        "--root", WV, "--no-suppress", "--suggest-waivers", "divergence",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("// unruster: ok(divergence/Node::Group)"),
+        "suggestion must carry the qualified key:\n{}",
+        s
+    );
+    // And it must be the same spelling the fixture already proves works.
+    let suggested = s
+        .lines()
+        .find(|l| l.contains("unruster: ok("))
+        .unwrap()
+        .trim();
+    assert!(suggested.contains(" — WHY?"), "{}", suggested);
+}
+
+#[test]
+fn mutating_actions_are_dry_runs_until_write_is_given() {
+    let root = scratch_fixture("waivers-dryrun");
+    let file = root.join("lib.rs");
+    let before = std::fs::read_to_string(&file).unwrap();
+    let r = root.to_str().unwrap();
+
+    let out = ur_stdout(&["--root", r, "waivers", "--upgrade", "--today", TODAY]);
+    assert!(
+        String::from_utf8_lossy(&out).contains("+"),
+        "a dry run should still show the diff"
+    );
+    ur_stdout(&["--root", r, "waivers", "--orphaned", "--remove", "--today", TODAY]);
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&file).unwrap(),
+        "neither action may touch the file without --write"
+    );
+}
+
+#[test]
+fn upgrade_qualifies_a_legacy_waiver_with_the_check_that_hit_it() {
+    let root = scratch_fixture("waivers-upgrade");
+    let file = root.join("lib.rs");
+    let r = root.to_str().unwrap();
+
+    ur_stdout(&["--root", r, "waivers", "--upgrade", "--write", "--today", TODAY]);
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        after.contains("// unruster: ok(error-swallows) 2026-08-06 — best effort"),
+        "check inferred, date stamped, reason preserved:\n{}",
+        after
+    );
+    // The upgraded waiver must still do its job, and no longer be legacy.
+    assert_eq!(rows_of(&ur_stdout(&["--root", r, "error-swallows"])).len(), 1);
+    assert!(!ur_stderr(&["--root", r, "error-swallows"]).contains("predate"));
+}
+
+#[test]
+fn remove_strips_a_multi_line_waiver_and_leaves_valid_source() {
+    let root = scratch_fixture("waivers-remove");
+    let file = root.join("lib.rs");
+    let r = root.to_str().unwrap();
+
+    ur_stdout(&[
+        "--root", r, "waivers", "--check", "divergence", "--remove", "--write", "--today", TODAY,
+    ]);
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        !after.contains("unruster: ok(divergence"),
+        "all three lines of the wrapped waiver should be gone:\n{}",
+        after
+    );
+    assert!(
+        !after.contains("child edge, not a consumer reference"),
+        "continuation lines must go too, not just the head:\n{}",
+        after
+    );
+    // Still parses, and the finding it was hiding comes back.
+    assert!(syn::parse_file(&after).is_ok(), "removal broke the source");
+    assert_eq!(rows_of(&ur_stdout(&["--root", r, "divergence"])).len(), 1);
+}
+
+#[test]
+fn removing_a_trailing_waiver_keeps_the_code_on_its_line() {
+    let root = scratch_fixture("waivers-trailing");
+    let file = root.join("lib.rs");
+    let r = root.to_str().unwrap();
+
+    ur_stdout(&[
+        "--root", r, "waivers", "--check", "error-swallows", "--remove", "--write", "--today",
+        TODAY,
+    ]);
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        after.contains("let _ = std::fs::remove_file(p);"),
+        "the statement must survive its comment:\n{}",
+        after
+    );
+    assert!(!after.contains("absence is fine"), "{}", after);
+    // A trailing waiver can carry continuation lines too; leaving them behind
+    // would strand prose that no longer refers to anything.
+    assert!(
+        !after.contains("directory already existing is the common case"),
+        "continuation of a trailing waiver must go with it:\n{}",
+        after
+    );
+    assert!(
+        after.contains("let _ = std::fs::create_dir(p);"),
+        "…but its statement stays:\n{}",
+        after
+    );
+    assert!(syn::parse_file(&after).is_ok(), "removal broke the source");
+}
+
 #[test]
 fn takes_mut_without_a_type_ranks_candidates_instead_of_erroring() {
     let out = ur_stdout(&["--root", FIXTURE, "takes-mut"]);

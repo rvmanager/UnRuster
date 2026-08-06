@@ -876,7 +876,7 @@ pub fn run_enum_coverage(
             }
             let scan = coverage_one(ctx, enum_name, &variant_names, opts, false);
             ctx.out.summary(&format!(
-                "({} partial site(s) on `{}`; {} total variant(s); exhaustive sites hidden{}{}{}; explain: partial-enumeration)",
+                "({} partial site(s) on `{}`; {} total variant(s); exhaustive sites hidden{}{}{}{}; explain: partial-enumeration)",
                 scan.shown,
                 enum_name,
                 variant_names.len(),
@@ -886,6 +886,7 @@ pub fn run_enum_coverage(
                     String::new()
                 },
                 gap_filter_note(opts, scan.filtered_by_gap),
+                ctx.waived_note(scan.waived),
                 if scan.sealed_rows > 0 {
                     format!("; {} on a SEALED enum", scan.sealed_rows)
                 } else {
@@ -899,6 +900,7 @@ pub fn run_enum_coverage(
             let mut shown = 0usize;
             let mut hidden = 0usize;
             let mut filtered = 0usize;
+            let mut waived = 0usize;
             let mut sealed_rows = 0usize;
             let mut scanned = 0usize;
             // `--rank-enums` needs every enum's totals before it can order
@@ -914,6 +916,7 @@ pub fn run_enum_coverage(
                 shown += scan.shown;
                 hidden += scan.hidden;
                 filtered += scan.filtered_by_gap;
+                waived += scan.waived;
                 sealed_rows += scan.sealed_rows;
                 if opts.rank_enums && scan.shown > 0 {
                     ranked.push((name, scan.shown, scan.worst_gap, scan.sealed_rows > 0));
@@ -939,7 +942,7 @@ pub fn run_enum_coverage(
                 }
             }
             ctx.out.summary(&format!(
-                "({} partial site(s) across {} enum(s); --all; exhaustive sites hidden{}{}{}; explain: partial-enumeration)",
+                "({} partial site(s) across {} enum(s); --all; exhaustive sites hidden{}{}{}{}; explain: partial-enumeration)",
                 shown,
                 scanned,
                 if opts.hide_trait_routed {
@@ -948,6 +951,7 @@ pub fn run_enum_coverage(
                     String::new()
                 },
                 gap_filter_note(opts, filtered),
+                ctx.waived_note(waived),
                 if sealed_rows > 0 {
                     format!("; {} on SEALED enums", sealed_rows)
                 } else {
@@ -979,6 +983,8 @@ struct CoverageScan {
     hidden: usize,
     /// Rows dropped by `--max-missing`.
     filtered_by_gap: usize,
+    /// Rows retired by an in-source waiver.
+    waived: usize,
     sealed_rows: usize,
     /// Highest coverage ratio among shown rows — the closest-to-exhaustive
     /// site, which is the one a new variant most likely mis-binds.
@@ -1005,7 +1011,11 @@ fn coverage_one(
     // primary vectors for this defect, so enum-coverage always includes them.
     let mut all_sites = collect_sites(ctx.files, enum_name, variant_names, true, true, ctx.spans);
     ctx.retain_changed(&mut all_sites, |s| &s.file);
-    ctx.retain_unsuppressed(&mut all_sites, |s| (s.file.as_str(), s.line));
+    // Unkeyed pass: `ok(enum-coverage)` retires the whole site. Waivers naming
+    // one variant are applied per-row below, once `missing` is known.
+    let mut waived = ctx.retain_unsuppressed("enum-coverage", &mut all_sites, |s| {
+        crate::suppress::Site::new(s.file.as_str(), s.line)
+    });
 
     // The denominator is per-site: `total_for` resolves which same-named enum
     // this site dispatches on. With one definition (the usual case) it is just
@@ -1051,6 +1061,25 @@ fn coverage_one(
             }
         })
         .collect();
+    // Variant-level waivers: `ok(enum-coverage/NodeContent::Group)` says this
+    // one omission is deliberate. Drop the waived variants from `missing`; a
+    // row whose every gap is accounted for is no longer a finding. Two waivers
+    // can therefore jointly clear a site, which one all-or-nothing match on the
+    // row could not express.
+    if !ctx.suppressions.is_empty() {
+        let before = rows.len();
+        rows.retain_mut(|r| {
+            r.missing.retain(|v| {
+                let qualified = format!("{}::{}", enum_name, v);
+                !ctx.suppressions.matches(
+                    "enum-coverage",
+                    crate::suppress::Site::keyed(r.site.file.as_str(), r.site.line, &qualified),
+                )
+            });
+            !r.missing.is_empty()
+        });
+        waived += before - rows.len();
+    }
     // Highest coverage ratio (smallest gap to full) first — loudest signal on
     // top. The denominator `total` is shared, so covered-count ordering is
     // exact; `gap` is computed only for display.
@@ -1088,14 +1117,26 @@ fn coverage_one(
         ));
     }
     if !summary && !opts.rank_enums {
+        let today = crate::suppress::Date::today();
         for r in &rows {
             print_coverage_row(ctx, r, sealed, prefixed, enum_name, opts.compact);
+            // Suggest the narrowest waiver that would retire the row: one per
+            // missing variant, so accepting all of them is the same as
+            // declaring the site's coverage intentional.
+            for v in &r.missing {
+                ctx.suggest(
+                    "enum-coverage",
+                    Some(&format!("{}::{}", enum_name, v)),
+                    today,
+                );
+            }
         }
     }
     CoverageScan {
         shown: rows.len(),
         hidden: hidden_trait_routed,
         filtered_by_gap,
+        waived,
         sealed_rows: if sealed { rows.len() } else { 0 },
         worst_gap: rows.first().map(|r| r.gap).unwrap_or(0.0),
     }

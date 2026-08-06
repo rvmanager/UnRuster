@@ -163,6 +163,10 @@ pub struct Out {
     /// check's `(N finding(s); …)` line sits with the rows it counts, rather
     /// than being separated onto another stream and re-associated by hand.
     summary_inline: std::cell::Cell<bool>,
+    /// Swallow every kind of output. `waivers` re-runs the check battery purely
+    /// to populate per-waiver hit counts; the battery's own rows would drown
+    /// the listing it is gathering data for.
+    silent: bool,
     state: RefCell<State>,
 }
 
@@ -174,6 +178,20 @@ impl Out {
             all_stdout,
             context_lines: std::cell::Cell::new(context_lines),
             summary_inline: std::cell::Cell::new(false),
+            silent: false,
+            state: RefCell::new(State::default()),
+        }
+    }
+
+    /// An `Out` that emits nothing at all — see [`Out::silent`].
+    pub fn silent() -> Self {
+        Out {
+            format: Format::Tsv,
+            summary_only: true,
+            all_stdout: false,
+            context_lines: std::cell::Cell::new(None),
+            summary_inline: std::cell::Cell::new(false),
+            silent: true,
             state: RefCell::new(State::default()),
         }
     }
@@ -202,6 +220,9 @@ impl Out {
     /// must be called *before* the section's rows, which is exactly the bug
     /// `audit` had when it passed an eagerly-evaluated count as an argument.
     pub fn section(&self, title: &str) {
+        if self.silent {
+            return;
+        }
         if self.json() {
             self.state.borrow_mut().sections.push(Section {
                 title: Some(title.to_string()),
@@ -217,6 +238,9 @@ impl Out {
 
     /// Blank separator between TSV sections (no-op in JSON).
     pub fn section_end(&self) {
+        if self.silent {
+            return;
+        }
         if !self.json() && !self.summary_only {
             println!();
         }
@@ -225,7 +249,7 @@ impl Out {
     /// Emit one finding. In TSV the cells are tab-joined in order; in JSON they
     /// become an object (a `Site` cell expands to `file` + `line`).
     pub fn row(&self, cells: Vec<(&'static str, Val)>) {
-        if self.summary_only {
+        if self.summary_only || self.silent {
             return;
         }
         let context = self.context_for(&cells);
@@ -247,7 +271,7 @@ impl Out {
     /// Emit a non-tabular line (tree renderings, cohort matrices, playbook
     /// text). JSON keeps it as a `{"text": …}` row so nothing is silently lost.
     pub fn line(&self, text: &str) {
-        if self.summary_only {
+        if self.summary_only || self.silent {
             return;
         }
         if self.json() {
@@ -260,10 +284,30 @@ impl Out {
         println!("{}", text);
     }
 
+    /// An advisory line attached to the row just emitted — currently the
+    /// `--suggest-waivers` comment. Rides the same channel as `--context`
+    /// snippets so JSON keeps it with its row instead of stranding it.
+    pub fn hint(&self, text: &str) {
+        if self.summary_only || self.silent {
+            return;
+        }
+        if self.json() {
+            let mut st = self.state.borrow_mut();
+            if let Some(r) = st.current().rows.last_mut() {
+                r.context.push(text.to_string());
+            }
+            return;
+        }
+        println!("{}", text);
+    }
+
     /// The trailing `(N finding(s); …)` line. Goes to stderr by default so
     /// stdout stays pipe-clean; `--all-stdout` moves it, and `audit` also
     /// echoes each section's line into the section body.
     pub fn summary(&self, text: &str) {
+        if self.silent {
+            return;
+        }
         if self.json() {
             let mut st = self.state.borrow_mut();
             st.current().summary = Some(text.to_string());
@@ -286,6 +330,9 @@ impl Out {
     /// "showing 20 of 87"). Follows `summary_inline`: inside an `audit`
     /// section a truncation note is only useful next to the rows it qualifies.
     pub fn note(&self, text: &str) {
+        if self.silent {
+            return;
+        }
         if self.json() {
             self.state.borrow_mut().notes.push(text.to_string());
             return;
@@ -324,7 +371,7 @@ impl Out {
         let Some(n) = self.context_lines.get() else {
             return;
         };
-        if self.summary_only {
+        if self.summary_only || self.silent {
             return;
         }
         let lines = snippet(file, line, n);
@@ -343,7 +390,7 @@ impl Out {
     /// In JSON mode, serialize everything buffered so far as one document.
     /// No-op for TSV, which has already streamed.
     pub fn finish(&self, command: &str) {
-        if !self.json() {
+        if !self.json() || self.silent {
             return;
         }
         let st = self.state.borrow();

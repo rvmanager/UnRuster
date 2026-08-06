@@ -56,12 +56,25 @@ In-source markers (no config file — the marker lives with the code):
   /// unruster: sealed        on an enum. Partial dispatch on it is tagged
                               SEALED by enum-coverage / catch-all-arms /
                               divergence, and ranked highest by audit.
-  // unruster: ok — <reason>  waive ONE finding. Placed at the end of the
-                              offending line, or on its own line directly
-                              above it. Always give the reason: it is what
-                              the next reader (or the next session) has to
-                              evaluate. `--no-suppress` ignores all waivers;
-                              every summary line reports how many were used.
+  // unruster: ok(<check>[/<key>]) <YYYY-MM-DD> — <reason>
+                              Waive a verified false positive. Run any check
+                              with `--suggest-waivers` to get the exact line
+                              to paste. Placed at the end of the offending
+                              line, or on its own line above it; above an
+                              *item* it waives that whole item, so one comment
+                              retires an omission across every method in an
+                              impl. The key narrows it to one finding on the
+                              line (`ok(casts/ptr)` leaves narrowing casts
+                              alone). Always give the reason: it is what the
+                              next reader has to evaluate. Reasons may wrap
+                              onto following comment lines.
+                              `--no-suppress` ignores all waivers; every
+                              summary reports how many were used, and
+                              `unruster waivers` lists them with their age and
+                              how many findings each actually suppresses.
+                              Bare `// unruster: ok — <reason>` still works
+                              (it waives every check on its line);
+                              `waivers --upgrade` qualifies it.
 
 Output for machines: `--json` on any command keeps `file`/`line` and the
 numeric columns as real fields, so ranking and filtering across rows need
@@ -126,8 +139,11 @@ levels, and all three have produced confirmed defects:
     2. unruster divergence --handling                 # then the whole tree
     3. fix one; re-run — a fix re-ranks the sibling it was compared
        against, which routinely surfaces the same bug next door
-    4. `// unruster: ok — <reason>` on anything judged intentional, so the
-       next run doesn't re-litigate it
+    4. `--suggest-waivers` on anything judged intentional, and paste the
+       line it prints, so the next run doesn't re-litigate it. Put it above
+       the enclosing impl when the whole sibling family shares one rationale
+    5. `unruster waivers --orphaned` periodically: a waiver that suppresses
+       nothing describes a finding that no longer exists
 
 ──── 1. TYPE & DATA DESIGN ──────────────────────────────────────────
 When concrete types should become traits, primitives become newtypes,
@@ -389,6 +405,68 @@ missing flag combos.
   `--with-hint` exposes near-duplicates (same args fingerprint = same
   test in disguise); `file:start-end` lets an agent read just the
   relevant body via `sed -n start,endp file`.
+
+──── 9. WAIVERS ─────────────────────────────────────────────────────
+◇ WAIVERS (retiring a verified false positive)
+A run over a mature codebase re-reports every site a human already
+judged intentional. Without a way to record that judgment, round two
+re-litigates round one — the most expensive failure mode there is when
+an agent works the audit loop across sessions.
+
+  // unruster: ok(<check>[/<key>]) <YYYY-MM-DD> — <reason>
+
+Never write it by hand. Run the check with `--suggest-waivers` and it
+prints the line to paste, with the right check name, the right key, and
+today's date already filled in.
+
+  SCOPE follows placement — the `#[allow(...)]` model:
+    trailing on a code line       waives that line
+    above an item (fn/impl/mod…)  waives the whole item, nested included
+    above a statement             waives the next line with code
+  Above `impl Foo` it therefore retires an omission across every method
+  in it. That is the point: sibling findings share one rationale, and
+  writing it once is what makes divergence output tractable.
+
+  KEYS narrow a waiver to one finding on the line. Unkeyed `ok(casts)`
+  waives every cast there; `ok(casts/ptr)` leaves narrowing casts
+  flagged. A keyed waiver never matches an unkeyed finding, so it
+  cannot over-suppress.
+    divergence, enum-coverage  <Enum>::<Variant> (bare <Variant> too)
+    casts                      cast class (ptr, narrow, …)
+    error-swallows             swallow kind (let-_, .ok, …)
+    divergence-handling        the callee being handled
+  For divergence and enum-coverage the key is subtracted from the gap
+  rather than matching the row whole, so two waivers can jointly clear
+  a site whose delta spans two variants.
+
+  REASONS may wrap onto following comment lines: a waiver a human or
+  rustfmt broke across lines parses the same as a one-liner. Absorption
+  stops at a blank line, code, a doc comment, or a TODO/SAFETY/NOTE
+  marker, so a neighbouring comment is never swallowed.
+
+  LEGACY `// unruster: ok — <reason>` still works and waives every
+  check on its line. `unruster waivers --upgrade` qualifies the ones
+  whose check is unambiguous, and leaves the rest alone.
+
+  DECAY. Judgments rot; a suppression nobody revisits is where findings
+  go to be forgotten, and the output then reads as clean.
+    unruster waivers              age, scope, and how many findings each
+                                  one actually suppresses
+    unruster waivers --orphaned   suppresses nothing — the finding is
+                                  gone and the comment now lies. This is
+                                  mechanical, unlike age
+    unruster waivers --stale 365  older than N days; a proxy that asks a
+                                  human to re-read, nothing more
+    unruster waivers --remove     strip them (dry-run without --write)
+    --fail-on-stale N             CI gate; undated waivers always count
+  The `suppresses` column is the guardrail on item scope: a waiver
+  quietly covering 200 findings shows up as a 200.
+
+  grep -rn "unruster: ok"             every waiver
+  grep -rn "unruster: ok(divergence"  one check
+
+A waiver is the escape hatch for a false positive, not a way to launder
+noise. If a check needs thirty of them, the check is what needs fixing.
 
 ─────────────────────────────────────────────────────────────────────
 Closing principle: the tool finds candidates. The decision "extract a

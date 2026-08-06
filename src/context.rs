@@ -25,9 +25,12 @@ pub struct AnalysisCtx<'a> {
     /// Where rows, section headers, and summary lines go. Every command emits
     /// through this so `--json` needs no per-command support.
     pub out: &'a Out,
-    /// Sites suppressed by an in-source `// unruster: ok` comment, keyed by
-    /// `(canonical file, line)`. Checked by [`AnalysisCtx::suppressed`].
-    pub suppressions: crate::suppress::Suppressions,
+    /// Sites waived by an in-source `// unruster: ok(…)` comment. Borrowed
+    /// rather than owned so `waivers` can re-run the check battery against the
+    /// same set and then read back each waiver's hit count.
+    pub suppressions: &'a crate::suppress::Suppressions,
+    /// With `--suggest-waivers`, print the exact waiver comment under each row.
+    pub suggest_waivers: bool,
 }
 
 impl AnalysisCtx<'_> {
@@ -41,20 +44,49 @@ impl AnalysisCtx<'_> {
 
     /// Drop waived sites from `items`, returning how many were dropped so the
     /// summary line can say so — a silent drop would read as "clean".
+    ///
+    /// `check` is the waiver check name (`"casts"`, `"divergence"`, …): an
+    /// `ok(casts)` waiver must not silence an error-swallow that happens to
+    /// share the line. `site_of` supplies the optional check-specific key.
     pub fn retain_unsuppressed<T>(
         &self,
+        check: &str,
         items: &mut Vec<T>,
-        site_of: impl Fn(&T) -> (&str, usize),
+        site_of: impl Fn(&T) -> crate::suppress::Site<'_>,
     ) -> usize {
         if self.suppressions.is_empty() {
             return 0;
         }
         let before = items.len();
-        items.retain(|it| {
-            let (f, l) = site_of(it);
-            !self.suppressions.contains(f, l)
-        });
+        items.retain(|it| !self.suppressions.matches(check, site_of(it)));
         before - items.len()
+    }
+
+    /// `; N waived` for a summary line, or empty when nothing was waived. Every
+    /// check that filters appends this — a suppression that hides its own
+    /// volume reads as a clean codebase.
+    pub fn waived_note(&self, n: usize) -> String {
+        if n == 0 {
+            String::new()
+        } else {
+            format!("; {} waived", n)
+        }
+    }
+
+    /// With `--suggest-waivers`, print the exact comment that would retire the
+    /// row just emitted — correct check, correct key, today's date filled in.
+    /// This is the only place the waiver grammar is spelled out at the point of
+    /// use, so nobody has to go find it in the help.
+    pub fn suggest(&self, check: &str, key: Option<&str>, today: crate::suppress::Date) {
+        if !self.suggest_waivers {
+            return;
+        }
+        let spec = match key {
+            Some(k) => format!("{}/{}", check, k),
+            None => check.to_string(),
+        };
+        self.out
+            .hint(&format!("  // unruster: ok({}) {} — WHY?", spec, today));
     }
 
     /// With `--changed-since`, keep only hits whose file is in the changed

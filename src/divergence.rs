@@ -304,6 +304,7 @@ pub fn run(
     let single = target.is_some();
 
     let mut per_enum: Vec<(String, Vec<String>, Vec<Site>)> = Vec::new();
+    let mut waived_sites = 0usize;
     for name in &names {
         let variant_names = variant_names_of(ctx.files, name);
         if variant_names.is_empty() {
@@ -311,7 +312,12 @@ pub fn run(
         }
         let mut sites = collect_sites(ctx.files, name, &variant_names, true, true, ctx.spans);
         ctx.retain_changed(&mut sites, |s| &s.file);
-        ctx.retain_unsuppressed(&mut sites, |s| (s.file.as_str(), s.line));
+        // Unkeyed pass: `ok(divergence)` retires a dispatch site outright, so
+        // it can neither lead nor trail a pair. Variant-keyed waivers are
+        // applied to the pair's delta below, where the omission is known.
+        waived_sites += ctx.retain_unsuppressed("divergence", &mut sites, |s| {
+            crate::suppress::Site::new(s.file.as_str(), s.line)
+        });
         per_enum.push((name.clone(), variant_names, sites));
     }
 
@@ -327,12 +333,43 @@ pub fn run(
     for (name, variant_names, sites) in &per_enum {
         all.extend(diverge_one(ctx, name, variant_names, min_score, sites));
     }
+    // Variant-keyed waivers attach to the *lean* side and read "this fn's
+    // omission of that variant is deliberate". Because the delta is filtered
+    // rather than the pair matched whole, one comment retires the omission
+    // against every sibling at once — the arena `NodeContent::Group` case that
+    // produced seventeen unwaivable rows — and two waivers can jointly clear a
+    // pair whose delta spans two variants.
+    let waived_pairs = if ctx.suppressions.is_empty() {
+        0
+    } else {
+        let before = all.len();
+        all.retain_mut(|p| {
+            p.delta.retain(|v| {
+                let qualified = format!("{}::{}", p.enum_name, v);
+                !ctx.suppressions.matches(
+                    "divergence",
+                    crate::suppress::Site::keyed(&p.lean.file, p.lean.line, &qualified),
+                )
+            });
+            !p.delta.is_empty()
+        });
+        before - all.len()
+    };
+    let waived = waived_sites + waived_pairs;
     sort_pairs(&mut all);
 
     let found = all.len();
     let shown = top.map(|n| found.min(n)).unwrap_or(found);
+    let today = crate::suppress::Date::today();
     for p in all.iter().take(shown) {
         print_pair(ctx, p, !single);
+        for v in &p.delta {
+            ctx.suggest(
+                "divergence",
+                Some(&format!("{}::{}", p.enum_name, v)),
+                today,
+            );
+        }
     }
     if shown < found {
         ctx.out.note(&format!(
@@ -350,19 +387,21 @@ pub fn run(
     };
     if single {
         ctx.out.summary(&format!(
-            "({} divergent pair(s) on `{}`; {} variant(s); min_score={:.2}{}; explain: partial-enumeration)",
+            "({} divergent pair(s) on `{}`; {} variant(s); min_score={:.2}{}{}; explain: partial-enumeration)",
             shown,
             per_enum[0].0,
             per_enum[0].1.len(),
             min_score,
+            ctx.waived_note(waived),
             sealed_note
         ));
     } else {
         ctx.out.summary(&format!(
-            "({} divergent pair(s) across {} enum(s); min_score={:.2}{}; explain: partial-enumeration)",
+            "({} divergent pair(s) across {} enum(s); min_score={:.2}{}{}; explain: partial-enumeration)",
             shown,
             per_enum.len(),
             min_score,
+            ctx.waived_note(waived),
             sealed_note
         ));
     }
@@ -711,7 +750,12 @@ pub fn run_handling(ctx: &AnalysisCtx, min_care_gap: u8) -> anyhow::Result<usize
         all.extend(v.hits);
     }
     ctx.retain_changed(&mut all, |h| &h.file);
-    ctx.retain_unsuppressed(&mut all, |h| (h.file.as_str(), h.line));
+    // A separate check name from `divergence`: this axis reports different
+    // rows with a different key (the callee being handled), so an
+    // `ok(divergence)` on a match site must not silence it.
+    let waived = ctx.retain_unsuppressed("divergence-handling", &mut all, |h| {
+        crate::suppress::Site::keyed(h.file.as_str(), h.line, h.callee.as_str())
+    });
 
     // Group by what is being handled; divergence is only meaningful within one
     // callee (comparing how `lock` is handled against how `parse` is handled
@@ -803,14 +847,20 @@ pub fn run_handling(ctx: &AnalysisCtx, min_care_gap: u8) -> anyhow::Result<usize
             "vs" => vs,
             "vs_at" => site(&p.careful.file, p.careful.line),
         );
+        ctx.suggest(
+            "divergence-handling",
+            Some(&p.careless.callee),
+            crate::suppress::Date::today(),
+        );
     }
     ctx.out.summary(&format!(
         "({} careless site(s) across {} callee(s); {} sibling comparison(s); \
-         min_care_gap={}; explain: silent-fallbacks)",
+         min_care_gap={}{}; explain: silent-fallbacks)",
         unique.len(),
         by_callee.len(),
         pairs.len(),
-        min_care_gap
+        min_care_gap,
+        ctx.waived_note(waived)
     ));
     Ok(unique.len())
 }

@@ -347,7 +347,11 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
         all.extend(v.hits);
     }
     ctx.retain_changed(&mut all, |h| &h.file);
-    ctx.retain_unsuppressed(&mut all, |h| (h.file.as_str(), h.line));
+    // Keyed by swallow kind (`let-_`, `.ok`, …) so a waiver written for the
+    // `let _ =` on a line doesn't also cover a `.unwrap_or_default()` on it.
+    let waived = ctx.retain_unsuppressed("error-swallows", &mut all, |h| {
+        crate::suppress::Site::keyed(h.file.as_str(), h.line, h.kind)
+    });
     let before = all.len();
     all.retain(|h| match h.benign {
         Some("infallible-write") => opts.include_infallible,
@@ -362,6 +366,7 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
             .then_with(|| a.line.cmp(&b.line))
     });
     if !summary {
+        let today = crate::suppress::Date::today();
         for h in &all {
             row!(
                 ctx.out,
@@ -369,6 +374,7 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
                 "context" => h.context.clone(),
                 "at" => site(&h.file, h.line),
             );
+            ctx.suggest("error-swallows", Some(h.kind), today);
         }
     }
     use std::collections::BTreeMap;
@@ -381,10 +387,11 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
         .map(|(k, n)| format!("{}={}", k, n))
         .collect();
     ctx.out.summary(&format!(
-        "({} swallow site(s); {}; include_unwrap_or={}{}; explain: silent-fallbacks)",
+        "({} swallow site(s); {}; include_unwrap_or={}{}{}; explain: silent-fallbacks)",
         all.len(),
         breakdown.join(", "),
         include_unwrap_or,
+        ctx.waived_note(waived),
         if benign_hidden > 0 {
             format!(
                 "; {} benign site(s) hidden (infallible writes / logged fallbacks — \

@@ -34,6 +34,7 @@ mod takes_mut;
 mod tests_cmd;
 mod type_refs;
 mod variants;
+mod waivers_cmd;
 
 use context::AnalysisCtx;
 use emit::Format;
@@ -110,6 +111,12 @@ struct Cli {
     /// Ignore `// unruster: ok` waiver comments and report every site.
     #[arg(long, global = true)]
     no_suppress: bool,
+
+    /// Print the exact `// unruster: ok(…)` comment that would retire each
+    /// row — right check, right key, today's date filled in. Paste it above
+    /// the item (item scope) or on the line (site scope).
+    #[arg(long, global = true)]
+    suggest_waivers: bool,
 
     /// Exit 1 when the command reports one or more findings (0 = clean,
     /// 2 = error/unknown target). For scripted/agent loops:
@@ -232,6 +239,64 @@ enum Cmd {
     /// which CLI subcommand they invoke (assert_cmd-style: looks at
     /// `.args([...])`).
     Tests(TestsArgs),
+    /// List, audit, and clean up in-source `// unruster: ok(…)` waivers.
+    /// Every row reports how many findings it actually suppresses, so a
+    /// broad item-scoped waiver can't hide its own reach. `--orphaned`
+    /// finds waivers that suppress nothing (the finding is gone; the comment
+    /// now lies), `--stale N` those older than N days, `--remove` strips them
+    /// (dry-run unless `--write`), `--upgrade` rewrites legacy waivers with
+    /// the check that actually hit them.
+    Waivers(WaiversArgs),
+}
+
+#[derive(Args)]
+struct WaiversArgs {
+    /// Only waivers for this check (`divergence`, `casts`, …). Legacy waivers
+    /// always match — they waive every check, which is the point of listing
+    /// them under one.
+    #[arg(long)]
+    check: Option<String>,
+
+    /// Only waivers at least N days old. Undated waivers always qualify:
+    /// they cannot be shown to be fresh.
+    #[arg(long, value_name = "DAYS")]
+    stale: Option<i64>,
+
+    /// Only waivers that suppressed nothing this run — the code moved on and
+    /// the comment no longer describes anything. Mechanical, unlike `--stale`.
+    #[arg(long)]
+    orphaned: bool,
+
+    /// Only waivers written in the pre-grammar spelling (no check name).
+    #[arg(long)]
+    legacy: bool,
+
+    /// Strip the matching waiver comments from source. Previews unless
+    /// `--write` is also given.
+    #[arg(long, conflicts_with = "upgrade")]
+    remove: bool,
+
+    /// Rewrite legacy waivers as `ok(<check>) <today>`, keeping the reason.
+    /// Only touches waivers hit by exactly one check — anything ambiguous is
+    /// reported and left alone. Previews unless `--write` is also given.
+    #[arg(long)]
+    upgrade: bool,
+
+    /// Actually modify files. Without it `--remove` / `--upgrade` print the
+    /// diff and change nothing.
+    #[arg(long)]
+    write: bool,
+
+    /// Exit 1 if any waiver is undated or at least N days old. For CI, in the
+    /// shape of `--fail-on-findings`.
+    #[arg(long, value_name = "DAYS")]
+    fail_on_stale: Option<i64>,
+
+    /// Treat this date as today (`YYYY-MM-DD`). The clock is the only
+    /// non-deterministic input in the tool; this pins it for tests and for
+    /// reproducible CI output.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    today: Option<String>,
 }
 
 /// The subcommand's CLI name, for the `command` field of `--json` output.
@@ -266,6 +331,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::ConversionPairs => "conversion-pairs",
         Cmd::Stringly(_) => "stringly",
         Cmd::Tests(_) => "tests",
+        Cmd::Waivers(_) => "waivers",
     }
 }
 
@@ -302,6 +368,9 @@ impl Cmd {
             | Cmd::ConversionPairs
             | Cmd::Stringly(_)
             | Cmd::Tests(_) => false,
+            // `waivers` returns a count only for `--fail-on-stale`, which is
+            // itself the opt-in; a plain listing must never fail a build.
+            Cmd::Waivers(a) => a.fail_on_stale.is_some(),
         }
     }
 }
@@ -870,6 +939,37 @@ fn dispatch(
                 &cli_grammar(),
             )
         }
+        Cmd::Waivers(a) => {
+            let today = match a.today.as_deref() {
+                Some(s) => suppress::Date::parse(s).ok_or_else(|| {
+                    anyhow::anyhow!("--today must be YYYY-MM-DD, got `{}`", s)
+                })?,
+                None => suppress::Date::today(),
+            };
+            let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
+            let call_source = all_files.as_deref().unwrap_or(files);
+            let action = if a.remove {
+                waivers_cmd::Action::Remove
+            } else if a.upgrade {
+                waivers_cmd::Action::Upgrade
+            } else {
+                waivers_cmd::Action::List
+            };
+            waivers_cmd::run(
+                ctx,
+                call_source,
+                waivers_cmd::WaiverOpts {
+                    action,
+                    check: a.check.as_deref(),
+                    stale: a.stale,
+                    orphaned: a.orphaned,
+                    legacy_only: a.legacy,
+                    write: a.write,
+                    fail_on_stale: a.fail_on_stale,
+                    today,
+                },
+            )
+        }
     }
 }
 
@@ -904,6 +1004,7 @@ fn main() -> Result<()> {
         changed_since,
         fail_on_findings,
         no_suppress,
+        suggest_waivers,
         cmd,
         ..
     } = cli;
@@ -929,17 +1030,24 @@ fn main() -> Result<()> {
     let suppressions = if no_suppress {
         suppress::Suppressions::default()
     } else {
-        let paths: Vec<(String, &std::path::Path)> = files
-            .iter()
-            .map(|f| (parse::display_path(&f.path), f.path.as_path()))
-            .collect();
-        suppress::scan(&paths)
+        suppress::scan(&files)
     };
     if suppressions.unexplained > 0 {
         out.note(&format!(
             "note: {} `// unruster: ok` waiver(s) carry no reason — a waiver \
              nobody can evaluate is worse than the finding it hides",
             suppressions.unexplained
+        ));
+    }
+    // A legacy waiver has no check name, so it silences every check on its
+    // line. Say so once per run rather than per finding: the fix is one
+    // `waivers --upgrade`, not a decision at each site.
+    let legacy = suppressions.legacy_count();
+    if legacy > 0 && !matches!(cmd, Cmd::Waivers(_)) {
+        out.note(&format!(
+            "note: {} waiver(s) predate the `ok(<check>)` grammar and waive every check \
+             on their line — `unruster waivers --upgrade` qualifies the unambiguous ones",
+            legacy
         ));
     }
     let changed = match changed_since.as_deref() {
@@ -960,7 +1068,8 @@ fn main() -> Result<()> {
         spans,
         changed,
         out: &out,
-        suppressions,
+        suppressions: &suppressions,
+        suggest_waivers,
     };
     let fail_on_findings = fail_on_findings || cmd.implies_fail_on_findings();
     let command_name = cmd_name(&cmd);
