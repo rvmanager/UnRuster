@@ -32,7 +32,9 @@ use syn::visit::{self, Visit};
 use crate::ast::{line_of, scope_visits, ScopeTracker, trait_fn_span};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::emit::{row, site};
-use crate::parallel_matches::{collect_sites, enum_sealed, variant_names_of, Site};
+use crate::parallel_matches::{
+    collect_sites, definition_for, enum_sealed, variant_names_of, variant_sets_of, Site,
+};
 use crate::parse::display_path;
 
 /// How the two sides of a pair were judged to be siblings — printed so a reader
@@ -182,11 +184,25 @@ fn diverge_one<'s>(
     sites: &'s [Site],
 ) -> Vec<Pair<'s>> {
     let sealed = enum_sealed(ctx.files, enum_name);
-    let total = variant_names.len();
+    // Per-definition sets, as in `scan_groups` and `coverage_one`: with two
+    // same-named enums in a workspace, measuring against the union makes a
+    // match that is exhaustive over its own type look partial — and a site the
+    // compiler already guarantees is then eligible to be somebody's "lean"
+    // side, which is a divergence pair that cannot be real.
+    let sets = variant_sets_of(ctx.files, enum_name);
+    let owned_union = variant_names.to_vec();
+    let total_for = |s: &Site| -> usize {
+        definition_for(&sets, &s.variants)
+            .unwrap_or(&owned_union)
+            .len()
+    };
     // Only partial sites can diverge: an exhaustive match covers everything by
     // construction, so it can't be the lean side, and as the rich side it says
     // nothing the compiler isn't already enforcing.
-    let partial: Vec<&Site> = sites.iter().filter(|s| s.variants.len() < total).collect();
+    let partial: Vec<&Site> = sites
+        .iter()
+        .filter(|s| s.variants.len() < total_for(s))
+        .collect();
 
     let mut pairs: Vec<Pair> = Vec::new();
     for (i, a) in partial.iter().enumerate() {
@@ -228,7 +244,10 @@ fn diverge_one<'s>(
                 lean,
                 delta,
                 enum_name: enum_name.to_string(),
-                total,
+                // The rich side's enum: it contains every variant the lean side
+                // named (the pair shares variants, and `delta` is rich-minus-
+                // lean), so it is the denominator both sides are measured on.
+                total: total_for(rich),
                 sealed,
             });
         }

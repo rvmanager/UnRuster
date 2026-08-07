@@ -2,8 +2,12 @@
 //! with file:start-end and a hint of what each test exercises.
 //!
 //! Designed to feed agentic workflows like "group these tests by what they
-//! cover, find inconsistencies" — the per-test line range lets a reader
-//! selectively read the body via `sed -n start,endp file`.
+//! cover, find inconsistencies". Three steps, each answering the question the
+//! previous one raises: `--by subcommand` says how many tests cover each,
+//! `--subcommand <name>` says which those are, and `--context N` prints their
+//! bodies. The range column is a real span cell, so the last step needs no
+//! second command — and the fingerprint no longer moves when a test shifts
+//! down the file.
 
 use std::collections::BTreeMap;
 
@@ -270,11 +274,31 @@ fn build_hint(lits: &[String]) -> Option<String> {
 /// `full_files` is the FULL tree (tests included) — under `--scope production`
 /// the tests this command enumerates would be stripped from `ctx.files`, so
 /// never read files from `ctx` here.
+/// The `--subcommand` value that selects the tests whose subcommand could not
+/// be detected — the bucket `--by subcommand` reports as
+/// `<no detectable subcommand>`, which is not a string anyone will type.
+/// Safe as a literal because `unruster` has no subcommand called `none`, and
+/// [`run`] asserts that rather than trusting it.
+pub const NO_SUBCOMMAND: &str = "none";
+
+/// What `tests` was asked for. A struct rather than four more positional
+/// arguments, matching `FieldUsesOpts` / `SwallowOpts` / `ScanOpts` — three
+/// adjacent `bool`s in a call are three chances to swap two of them, and
+/// nothing at the call site would say so.
+pub struct TestsOpts<'a> {
+    /// Append each test's `.args([...])` fingerprint.
+    pub with_hint: bool,
+    /// Print the per-subcommand histogram instead of the per-test listing.
+    pub by_subcommand: bool,
+    /// List only the tests invoking this subcommand ([`NO_SUBCOMMAND`] for the
+    /// ones whose subcommand could not be detected).
+    pub only: Option<&'a str>,
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
     full_files: &[ParsedFile],
-    with_hint: bool,
-    by_subcommand: bool,
+    opts: &TestsOpts,
     grammar: &CliGrammar,
 ) -> anyhow::Result<usize> {
     let summary = ctx.summary;
@@ -290,7 +314,15 @@ pub fn run(
         all.extend(v.out);
     }
 
-    if by_subcommand {
+    // The histogram says *how many* tests cover each subcommand; this says
+    // *which*. Without it the only way from `6  impls` to those six tests was
+    // to grep the test file for the subcommand string and read what came back
+    // — which is the same locate-by-guessing that `show` exists to end.
+    if let Some(want) = opts.only {
+        return listing(ctx, filter_to(ctx, all, want)?, opts.with_hint, Some(want));
+    }
+
+    if opts.by_subcommand {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut none = 0usize;
         for t in &all {
@@ -326,11 +358,78 @@ pub fn run(
         return Ok(all.len());
     }
 
+    listing(ctx, all, opts.with_hint, None)
+}
+
+/// Keep only the tests that exercise `want`, or fail with the alternatives.
+///
+/// An empty listing would be the wrong answer twice over: it cannot distinguish
+/// "no test covers this subcommand" (worth knowing, and actionable) from "you
+/// typed a subcommand that does not exist" (a typo), and it offers nothing
+/// either way.
+fn filter_to(
+    ctx: &AnalysisCtx,
+    all: Vec<TestInfo>,
+    want: &str,
+) -> anyhow::Result<Vec<TestInfo>> {
+    // Owned: the failure path needs this list after `all` has been consumed by
+    // the filter, and it is only built when the filter is in play.
+    let covered: Vec<String> = {
+        let mut v: Vec<String> = all
+            .iter()
+            .filter_map(|t| t.subcommand.clone())
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let hits: Vec<TestInfo> = all
+        .into_iter()
+        .filter(|t| match t.subcommand.as_deref() {
+            Some(s) => s == want,
+            None => want == NO_SUBCOMMAND,
+        })
+        .collect();
+    if !hits.is_empty() {
+        return Ok(hits);
+    }
+    // Nothing matched. Say which of the two reasons it was.
+    let near = crate::index::closest(want, covered.iter().map(String::as_str), 5);
+    if near.is_empty() {
+        ctx.out.note(&format!(
+            "note: no test invokes `{}`. Subcommands with tests: {} (or `--subcommand {}` \
+             for the tests whose subcommand could not be detected)",
+            want,
+            covered.join(", "),
+            NO_SUBCOMMAND
+        ));
+    } else {
+        ctx.out.note(&format!(
+            "note: no test invokes `{}`. Did you mean: {}",
+            want,
+            near.join(", ")
+        ));
+    }
+    Err(crate::context::TargetNotFound::err("tested subcommand", want))
+}
+
+/// One row per test: attr, `file:start-end`, qpath, and optionally the hint.
+fn listing(
+    ctx: &AnalysisCtx,
+    mut all: Vec<TestInfo>,
+    with_hint: bool,
+    only: Option<&str>,
+) -> anyhow::Result<usize> {
     all.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line_start.cmp(&b.line_start)));
 
-    if !summary {
+    if !ctx.summary {
         for t in &all {
-            let range = format!("{}:{}-{}", t.file, t.line_start, t.line_end);
+            // A typed span cell, not the `format!("{}:{}-{}")` string this
+            // built by hand. Same TSV text, but `--context N` can now find the
+            // site and print the body, and `--json` gets real
+            // `file`/`line`/`end_line` fields instead of one opaque string —
+            // which is the whole reason the column existed.
+            let range = crate::emit::span_site(&t.file, t.line_start, t.line_end);
             if with_hint {
                 let h = t.hint.as_deref().unwrap_or("");
                 row!(
@@ -357,7 +456,15 @@ pub fn run(
         *by_attr.entry(t.attr).or_insert(0) += 1;
     }
     let parts: Vec<String> = by_attr.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
-    ctx.out
-        .summary(&format!("({} test fn(s); {})", all.len(), parts.join(", ")));
+    let scope = match only {
+        Some(s) => format!(" invoking `{}`", s),
+        None => String::new(),
+    };
+    ctx.out.summary(&format!(
+        "({} test fn(s){}; {})",
+        all.len(),
+        scope,
+        parts.join(", ")
+    ));
     Ok(all.len())
 }

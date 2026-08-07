@@ -291,7 +291,8 @@ enum Cmd {
     /// since test code is the whole point. Use `--with-hint` to include the
     /// `args(...)` body fingerprint; use `--by subcommand` to group tests by
     /// which CLI subcommand they invoke (assert_cmd-style: looks at
-    /// `.args([...])`).
+    /// `.args([...])`), then `--subcommand <name>` to list the tests behind
+    /// one of those counts — with `--context N` to read their bodies.
     Tests(TestsArgs),
     /// List, audit, and clean up in-source `// unruster: ok(…)` waivers.
     /// Every row reports how many findings it actually suppresses, so a
@@ -548,11 +549,17 @@ struct InventoryArgs {
 
 #[derive(Args)]
 struct ShowArgs {
-    /// The item: a bare name (`draft_regions`), a `Type::method`
+    /// The item(s): a bare name (`draft_regions`), a `Type::method`
     /// (`Window::parse`), or any qualified suffix
     /// (`geom::window::Window::parse`). Matching is on whole `::` segments, so
     /// a suffix that isn't one won't silently resolve to something else.
-    name: String,
+    ///
+    /// Repeatable — `show a b c` resolves all three in one pass. The tree is
+    /// parsed once per invocation, so a batch is dramatically cheaper than the
+    /// same names one call at a time. A name that doesn't resolve is reported
+    /// and the rest still run.
+    #[arg(required = true, num_args = 1..)]
+    name: Vec<String>,
 
     /// How much of the item to print. `full` = docs + signature + body;
     /// `sig` = docs + signature (a fn's, through the return type); `doc` = the
@@ -935,6 +942,12 @@ struct TestsArgs {
     /// list, prints a histogram.
     #[arg(long, value_enum)]
     by: Option<TestsBy>,
+    /// List the tests that invoke this subcommand — the drill-in for a row of
+    /// `--by subcommand`, which counts them but cannot say which they are.
+    /// `--subcommand none` lists the tests whose subcommand went undetected.
+    /// Composes with `--with-hint` and with `--context N` to read the bodies.
+    #[arg(long, value_name = "NAME", conflicts_with = "by")]
+    subcommand: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1035,6 +1048,20 @@ fn full_tree_if_needed(
 /// scope. It used to accumulate as checks happened to reach macros, which made
 /// it a fact about the check battery wearing the phrasing of a fact about the
 /// code — one tree reported 21, 18 and 17 in the same session.
+/// Does this command draw a conclusion from the code, or only say where the
+/// code is?
+///
+/// Only the first kind can be wrong because a macro body was unreadable, and
+/// only the first kind should therefore carry the blind-spot note. `show` and
+/// `outline` report spans and print source: an unparseable `json!` changes
+/// neither where a fn starts nor where it ends, so the warning is not merely
+/// noise there — it answers a question the command never asked. Across one real
+/// session it printed 38 times, each an unwrapped three-line paragraph under a
+/// four-line function.
+fn analyses_code(command_name: &str) -> bool {
+    !matches!(command_name, "show" | "outline")
+}
+
 fn report_blind_spots(out: &emit::Out) {
     let blind = macro_scan::blind_spots();
     if blind > 0 {
@@ -1222,8 +1249,11 @@ fn dispatch(
             tests_cmd::run(
                 ctx,
                 source,
-                a.with_hint,
-                matches!(a.by, Some(TestsBy::Subcommand)),
+                &tests_cmd::TestsOpts {
+                    with_hint: a.with_hint,
+                    by_subcommand: matches!(a.by, Some(TestsBy::Subcommand)),
+                    only: a.subcommand.as_deref(),
+                },
                 &cli_grammar(),
             )
         }
@@ -1464,7 +1494,9 @@ fn main() -> Result<()> {
     let command_name = cmd_name(&cmd);
     out.set_check(command_name);
     let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude);
-    report_blind_spots(&out);
+    if analyses_code(command_name) {
+        report_blind_spots(&out);
+    }
     out.finish(command_name);
     let findings = match result {
         Ok(n) => n,

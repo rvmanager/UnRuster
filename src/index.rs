@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use syn::visit::{self, Visit};
 
 use crate::ast::{
-    doc_summary, extent_of, has_allow_dead_code, line_of, line_of_span, path_to_string, sig_end,
-    type_short, type_to_string, vis_str, Extent, ScopeTracker,
+    doc_summary, extent_of, has_allow_dead_code, line_of, line_of_span, path_to_string_with_args,
+    sig_end, type_short, type_to_string, vis_str, Extent, ScopeTracker,
 };
 use crate::parse::{display_path, ParsedFile};
 
@@ -199,6 +199,33 @@ impl Spot {
         self.allow_dead = on;
         self
     }
+}
+
+/// The entries of `candidates` closest to `query`, best-first.
+///
+/// The same ranking [`NameIndex::similar`] uses, over a caller-supplied list
+/// rather than the tree's definitions — for the targets that are not items at
+/// all, like a subcommand name in `tests --subcommand`. It lives here, beside
+/// [`similarity`], because two implementations of "did you mean" would drift
+/// and a reader would have no way to tell which one produced a given
+/// suggestion.
+pub fn closest<'a>(
+    query: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+    limit: usize,
+) -> Vec<&'a str> {
+    let want = query.to_lowercase();
+    if want.chars().count() < 3 {
+        return Vec::new();
+    }
+    let mut scored: Vec<(f64, &str)> = candidates
+        .into_iter()
+        .map(|c| (similarity(&c.to_lowercase(), &want), c))
+        .filter(|(s, _)| *s >= SIMILAR_ENOUGH)
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.truncate(limit);
+    scored.into_iter().map(|(_, c)| c).collect()
 }
 
 /// How close two names must be before one is offered as a correction. Tuned
@@ -413,13 +440,24 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
         let trait_name = i.trait_.as_ref().and_then(|(_, p, _)| {
             p.segments.last().map(|s| s.ident.to_string())
         });
+        // `_with_args`, not `path_to_string`: without the generic arguments a
+        // file with eight `impl From<T> for Val` blocks renders eight rows all
+        // reading `impl From for Val`, and the only thing telling them apart is
+        // the line number — which is precisely what a header exists to save the
+        // reader from having to go look up. The self-type has always rendered
+        // its arguments (`type_to_string` includes them); only the trait side
+        // was dropping them, so the two halves of one line disagreed.
+        //
+        // `name` and `trait_name` stay bare — `impls --of Val --trait From`
+        // filters on those, and a filter that demanded the arguments would make
+        // the common query unspellable.
         let header = match &i.trait_ {
             Some((bang, trait_path, _)) => {
                 let prefix = if bang.is_some() { "!" } else { "" };
                 format!(
                     "impl {}{} for {}",
                     prefix,
-                    path_to_string(trait_path),
+                    path_to_string_with_args(trait_path),
                     type_to_string(&i.self_ty)
                 )
             }

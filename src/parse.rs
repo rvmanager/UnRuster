@@ -142,8 +142,15 @@ fn module_path_for(root: &Path, file: &Path) -> String {
             _ => None,
         })
         .collect();
-    if parts.first().map(String::as_str) == Some("src") {
-        parts.remove(0);
+    // Drop the crate's `src/` marker wherever it sits, not only at the front.
+    // Scanning one crate gives `src/foo.rs` → `foo`; scanning a *workspace*
+    // gives `core/src/foo.rs`, and stripping only a leading `src` left every
+    // qualified path in the tree carrying a segment Rust does not have —
+    // `core::src::config::MirrorScope` for what the compiler calls
+    // `core::config::MirrorScope`. Only the first is removed: `src` nested
+    // below the crate root is a real module and its name is load-bearing.
+    if let Some(i) = parts.iter().position(|p| p == "src") {
+        parts.remove(i);
     }
     if let Some(last) = parts.last_mut() {
         if let Some(s) = last.strip_suffix(".rs") {

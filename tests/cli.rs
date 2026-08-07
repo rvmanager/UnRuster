@@ -335,6 +335,216 @@ fn show_json_carries_the_source_as_a_list_and_an_end_line() {
     assert!(s.contains("\"line\""), "{}", s);
 }
 
+/// A throwaway workspace: two crates, each defining an enum of the given name
+/// with different variants, each matched exhaustively over its own.
+fn collide_workspace(dir: &str, enum_name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(dir);
+    std::fs::remove_dir_all(&root).ok();
+    for (krate, variants) in [("core_c", vec!["Buy", "Sell"]), ("ex_c", vec!["Long", "Short", "Flat"])] {
+        let src = root.join(krate).join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let arms: String = variants
+            .iter()
+            .map(|v| format!("        {}::{} => \"{}\",\n", enum_name, v, v.to_lowercase()))
+            .collect();
+        std::fs::write(
+            src.join("lib.rs"),
+            format!(
+                "pub enum {e} {{ {vs} }}\n\npub fn label_{k}(s: &{e}) -> &'static str {{\n    match s {{\n{arms}    }}\n}}\n",
+                e = enum_name,
+                vs = variants.join(", "),
+                k = krate,
+                arms = arms
+            ),
+        )
+        .unwrap();
+    }
+    root
+}
+
+#[test]
+fn same_named_enums_in_two_crates_are_not_merged_into_one() {
+    // Two crates each define `enum Kindx`. Both matches are exhaustive over
+    // their own type — the compiler would reject them otherwise. Scoring
+    // against the *union* reported both as partial dispatch and listed the
+    // other enum's variants as "missing", in a gating check. On one real
+    // workspace this fired for seven enum names and the reader's only recourse
+    // was to write the seven names down somewhere.
+    let root = collide_workspace("unruster_collide_pm", "Kindx");
+    let out = ur_stdout(&[
+        "--root",
+        root.to_str().unwrap(),
+        "parallel-matches",
+        "Kindx",
+        "--show-missing",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("Buy,Sell"), "expected both groups:\n{}", s);
+    assert!(s.contains("Flat,Long,Short"), "expected both groups:\n{}", s);
+    for bogus in ["missing: Long", "missing: Buy", "missing: Flat", "missing: Sell"] {
+        assert!(!s.contains(bogus), "fabricated {:?} in:\n{}", bogus, s);
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn an_exhaustive_match_is_never_reported_as_partial_dispatch() {
+    // The gating shape: `--hide-exhaustive` is what `audit` runs, so a match
+    // the compiler already guarantees must produce no row at all.
+    let root = collide_workspace("unruster_collide_hide", "Kindy");
+    let out = ur_stdout(&[
+        "--root",
+        root.to_str().unwrap(),
+        "parallel-matches",
+        "Kindy",
+        "--hide-exhaustive",
+    ]);
+    assert!(
+        rows_of(&out).is_empty(),
+        "exhaustive matches reported as partial:\n{}",
+        String::from_utf8_lossy(&out)
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn same_named_enums_do_not_produce_divergence_pairs() {
+    // Two `Kind`s whose variant sets overlap but differ. Under the union both
+    // exhaustive matches look partial (2 of 3), they share `A` so they clear
+    // the "not a disagreement" guard, and they are same-named fns in one file
+    // so kinship fires — yielding a pair that accuses `beta::handle` of
+    // forgetting `B`, a variant `beta::Kind` does not have.
+    let root = std::env::temp_dir().join("unruster_collide_div");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+pub mod alpha {
+    pub enum Kind { A, B }
+    pub fn handle(k: &Kind) -> u8 {
+        match k { Kind::A => 1, Kind::B => 2 }
+    }
+}
+pub mod beta {
+    pub enum Kind { A, C }
+    pub fn handle(k: &Kind) -> u8 {
+        match k { Kind::A => 1, Kind::C => 3 }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let out = ur_stdout_allow_findings(&[
+        "--root",
+        root.to_str().unwrap(),
+        "divergence",
+        "Kind",
+        "--min-score",
+        "0",
+    ]);
+    assert!(
+        rows_of(&out).is_empty(),
+        "false divergence pair across two same-named enums:\n{}",
+        String::from_utf8_lossy(&out)
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_workspace_crates_module_path_has_no_src_segment() {
+    // `core/src/lib.rs` is `core::label`, not `core::src::label` — Rust has no
+    // such segment, and every qualified path in a workspace carried it.
+    let root = collide_workspace("unruster_srcseg", "Kindw");
+    let out = ur_stdout(&["--root", root.to_str().unwrap(), "inventory", "--kind", "fn"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("core_c::label_core_c"), "{}", s);
+    assert!(!s.contains("::src::"), "src segment still present:\n{}", s);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_single_crate_scan_still_drops_its_leading_src() {
+    let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "fn"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("::src::"), "{}", s);
+}
+
+#[test]
+fn show_of_a_qualified_name_says_how_many_siblings_it_passed_over() {
+    // `clones` reports a duplicated fn by its qualified path, so the obvious
+    // next command is `show <that path>` — which returns one copy and used to
+    // say nothing about the rest. That reads as a complete answer.
+    ur().args(["--root", FIXTURE, "show", "Document::render"])
+        .assert()
+        .success()
+        .stderr(contains("also named `render`"))
+        .stderr(contains("--all"));
+}
+
+#[test]
+fn show_of_a_bare_name_does_not_nag_about_siblings() {
+    // A bare-name query already listed them; repeating the count is noise.
+    let out = ur().args(["--root", FIXTURE, "show", "render"]).output().unwrap();
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(!e.contains("also named"), "{}", e);
+}
+
+#[test]
+fn navigation_commands_do_not_print_the_macro_blind_spot_note() {
+    // An unparseable `json!` changes neither where a fn starts nor where it
+    // ends, so the warning answers a question `show`/`outline` never asked.
+    for args in [
+        vec!["--root", FIXTURE, "show", "Document::new", "--part", "span"],
+        vec!["--root", FIXTURE, "outline", "src/main.rs"],
+    ] {
+        let out = ur().args(&args).output().unwrap();
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(!e.contains("blind spots"), "{:?} printed it:\n{}", args, e);
+    }
+}
+
+#[test]
+fn an_analysis_command_still_reports_blind_spots() {
+    let out = ur().args(["--root", FIXTURE, "inventory"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("blind spots"),
+        "the note must survive where it is load-bearing"
+    );
+}
+
+#[test]
+fn show_resolves_several_names_in_one_pass() {
+    let out = ur_stdout(&[
+        "--root", FIXTURE, "show", "--part", "span", "Document::new", "Document::touch", "render_row",
+    ]);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 3, "{:?}", rows);
+    assert_tsv_cols(&out, 4);
+}
+
+#[test]
+fn a_batch_survives_one_unresolvable_name() {
+    // One bad name must not cost the other 114 lookups the batch existed to
+    // save. Exit stays 0 because the run did answer.
+    let out = ur().args([
+        "--root", FIXTURE, "show", "--part", "span", "Document::new", "zzzznosuchname",
+    ])
+    .output()
+    .unwrap();
+    assert!(out.status.success());
+    assert_eq!(rows_of(&out.stdout).len(), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 unresolved"));
+}
+
+#[test]
+fn a_batch_where_nothing_resolves_is_still_exit_2() {
+    ur().args(["--root", FIXTURE, "show", "zzzznosuchname", "qqqnosuchname"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
 #[test]
 fn show_summary_mode() {
     assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "show", "Document::new"]);
@@ -761,6 +971,62 @@ fn impls_filter_by_self_type() {
     ur().args(["--root", FIXTURE, "impls", "--of", "Document"])
         .assert()
         .success();
+}
+
+#[test]
+fn impls_header_carries_the_traits_generic_arguments() {
+    // The header used to render the trait path without its arguments, so
+    // `impl Tag<u32> for Boxx` and `impl Tag<String> for Boxx` both came out as
+    // `impl Tag for Boxx` — two rows a reader could only tell apart by going and
+    // opening the file, which is the one thing a header exists to prevent.
+    let out = ur_stdout(&["--root", FIXTURE, "impls", "--of", "Boxx"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("impl Tag<u32> for Boxx"), "{}", s);
+    assert!(s.contains("impl Tag<String> for Boxx"), "{}", s);
+    assert!(
+        !s.contains("impl Tag for Boxx"),
+        "trait arguments dropped again:\n{}",
+        s
+    );
+}
+
+#[test]
+fn every_impl_header_in_the_fixture_is_distinct() {
+    // The property, rather than the two examples: no two impl blocks may render
+    // to the same string unless they really are two inherent blocks on one type
+    // (which the fixture has none of).
+    let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "impl"]);
+    let mut headers: Vec<String> = rows_of(&out)
+        .iter()
+        .map(|l| l.split('\t').nth(2).unwrap().to_string())
+        .collect();
+    assert!(!headers.is_empty(), "fixture should have impl blocks");
+    headers.sort();
+    let before = headers.len();
+    headers.dedup();
+    assert_eq!(before, headers.len(), "duplicate impl headers: {:?}", headers);
+}
+
+#[test]
+fn impls_filters_still_take_the_bare_trait_name() {
+    // The rendered header gained arguments; the filters did not. `--trait
+    // Tag<u32>` is not a thing anyone would type, and requiring it would make
+    // the common query unspellable.
+    let out = ur_stdout(&["--root", FIXTURE, "impls", "--trait", "Tag"]);
+    assert_eq!(rows_of(&out).len(), 2, "{}", String::from_utf8_lossy(&out));
+}
+
+#[test]
+fn nested_and_elided_generics_render_without_panicking() {
+    // `type_to_string` writes `_` for the shapes it does not spell out
+    // (`impl _`, `dyn _`, `fn(_)`, `[T; _]`). That is a deliberate elision and
+    // it must stay an elision — never a panic, and never silently empty.
+    let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "impl"]);
+    for line in rows_of(&out) {
+        let header = line.split('\t').nth(2).unwrap();
+        assert!(header.starts_with("impl "), "{}", header);
+        assert!(header.len() > "impl ".len(), "empty header: {:?}", header);
+    }
 }
 
 // ─── type-refs ─────────────────────────────────────────────────────────────
@@ -2582,6 +2848,128 @@ fn tests_by_subcommand_groups() {
 #[test]
 fn tests_summary_mode() {
     assert_summary_silent_stdout(&["--root", ".", "--summary", "tests"]);
+}
+
+#[test]
+fn tests_subcommand_names_the_tests_the_histogram_only_counted() {
+    // `--by subcommand` says `8  impls`; this says which eight. Without it the
+    // only route from the count to the tests was to grep the test file for the
+    // subcommand string — the locate-by-guessing this tool exists to end.
+    let out = ur_stdout(&["--root", ".", "tests", "--subcommand", "impls"]);
+    let rows = rows_of(&out);
+    assert!(!rows.is_empty(), "expected the impls tests");
+    for r in &rows {
+        assert!(r.contains("impls_"), "not an impls test: {}", r);
+    }
+    assert_tsv_cols(&out, 3);
+}
+
+#[test]
+fn tests_subcommand_count_agrees_with_the_histogram() {
+    // The drill-in and the overview must not be able to disagree — a listing
+    // that quietly dropped a row would be worse than no listing.
+    let hist = ur_stdout(&["--root", ".", "tests", "--by", "subcommand"]);
+    let counted: usize = rows_of(&hist)
+        .iter()
+        .find(|l| l.ends_with("\timpls"))
+        .and_then(|l| l.split('\t').next())
+        .and_then(|n| n.parse().ok())
+        .expect("expected an `impls` row in the histogram");
+    let listed = rows_of(&ur_stdout(&["--root", ".", "tests", "--subcommand", "impls"])).len();
+    assert_eq!(counted, listed);
+}
+
+#[test]
+fn tests_subcommand_none_lists_the_undetected_bucket() {
+    // The histogram reports these as `<no detectable subcommand>`, which is not
+    // a string anyone would type at a shell.
+    let out = ur_stdout(&["--root", FIXTURE, "tests", "--subcommand", "none"]);
+    assert!(!rows_of(&out).is_empty());
+}
+
+#[test]
+fn tests_subcommand_composes_with_with_hint() {
+    let out = ur_stdout(&["--root", ".", "tests", "--subcommand", "outline", "--with-hint"]);
+    assert!(!rows_of(&out).is_empty());
+    assert_tsv_cols(&out, 4);
+}
+
+#[test]
+fn tests_subcommand_typo_suggests_the_real_one() {
+    ur().args(["--root", ".", "tests", "--subcommand", "impl"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("Did you mean"))
+        .stderr(contains("impls"));
+}
+
+#[test]
+fn tests_subcommand_with_no_coverage_lists_what_is_covered() {
+    // Distinct from a typo: the name may be a real subcommand that simply has
+    // no test. An empty listing could not tell the two apart.
+    ur().args(["--root", ".", "tests", "--subcommand", "zzzznotasubcommand"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("Subcommands with tests:"));
+}
+
+#[test]
+fn tests_subcommand_conflicts_with_by() {
+    ur().args(["--root", ".", "tests", "--by", "subcommand", "--subcommand", "impls"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn tests_range_is_a_real_site_so_context_can_find_it() {
+    // The range column was a hand-built `format!("{}:{}-{}")` string, which
+    // meant `--context` could not locate the row and silently printed nothing.
+    ur().args(["--root", ".", "--context", "1", "tests", "--subcommand", "impls"])
+        .assert()
+        .success()
+        .stdout(contains(">"));
+}
+
+#[test]
+fn tests_json_carries_file_line_and_end_line_not_one_opaque_string() {
+    let out = ur_stdout(&["--root", FIXTURE, "--json", "tests"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\"end_line\""), "{}", s);
+    assert!(!s.contains("\"range\""), "range is still a string:\n{}", s);
+}
+
+#[test]
+fn a_tests_fingerprint_survives_an_edit_above_it() {
+    // The documented contract for every fingerprint: "findings key on a
+    // line-number-free fingerprint, so an edit above one doesn't make it look
+    // new". `tests` violated it — its range column was a `Val::Str`, so the
+    // line numbers went straight into the hash.
+    let tmp = std::env::temp_dir().join("unruster_tests_fp_stability");
+    let src = tmp.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let write = |body: &str| std::fs::write(src.join("lib.rs"), body).unwrap();
+    let fp = || -> String {
+        let out = ur_stdout(&[
+            "--root",
+            tmp.to_str().unwrap(),
+            "--scope",
+            "all",
+            "--fingerprints",
+            "tests",
+        ]);
+        rows_of(&out)
+            .first()
+            .and_then(|l| l.split('\t').next_back())
+            .expect("expected one test row")
+            .to_string()
+    };
+    write("#[test]\nfn t() { let _ = 1; }\n");
+    let before = fp();
+    write("\n\n\n#[test]\nfn t() { let _ = 1; }\n");
+    assert_eq!(before, fp(), "fingerprint moved with the line number");
+    std::fs::remove_dir_all(&tmp).ok();
 }
 
 #[test]

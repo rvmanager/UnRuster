@@ -565,7 +565,26 @@ fn scan_groups(
     prefixed: bool,
 ) -> (usize, usize) {
     let summary = ctx.summary;
-    let total = variant_names.len();
+    // Per-definition variant sets, for the same reason `coverage_one` keeps
+    // them: two crates in one workspace can both define `enum Side`, and
+    // scoring a site against the *union* reports a match the compiler accepts
+    // as exhaustive as a partial one — with the other enum's variants listed as
+    // "missing". That decision was made and documented on `variant_sets_of`,
+    // but only `enum-coverage` ever acted on it; this scan, `catch-all-arms`
+    // and `divergence` all kept taking the union. On one real workspace it
+    // produced false partial-dispatch rows for seven enum names in a *gating*
+    // check, and the reader's fix was to write down the seven names somewhere.
+    let sets = variant_sets_of(ctx.files, enum_name);
+    let owned_union = variant_names.to_vec();
+    // The set a group dispatches on: the smallest definition containing every
+    // variant it named. Falls back to the union when nothing fits, which for a
+    // real `match` means the scan mis-attributed a path rather than that the
+    // code is odd.
+    let set_for = |variants: &[String]| -> Vec<String> {
+        definition_for(&sets, variants)
+            .cloned()
+            .unwrap_or_else(|| owned_union.clone())
+    };
     let mut all_sites = collect_sites(
         ctx.files,
         enum_name,
@@ -586,9 +605,14 @@ fn scan_groups(
     }
     let mut rows: Vec<_> = groups.into_iter().collect();
 
-    // A group is "exhaustive" when it names every variant of the enum — those
-    // are compiler-protected, so `--hide-exhaustive` drops them.
-    let is_exhaustive = |variants: &[String]| total > 0 && variants.len() == total;
+    // A group is "exhaustive" when it names every variant of the enum it
+    // dispatches on — those are compiler-protected, so `--hide-exhaustive`
+    // drops them. Measured against that enum, not against the union: a match
+    // the compiler accepts must never be reported as partial.
+    let is_exhaustive = |variants: &[String]| {
+        let n = set_for(variants).len();
+        n > 0 && variants.len() == n
+    };
     if opts.partial_only {
         rows.retain(|((variants, _), _)| !is_exhaustive(variants));
     }
@@ -596,13 +620,17 @@ fn scan_groups(
     // Default ordering: by group size descending (parallel-shot first). With
     // --rank-by-gap, order by coverage ratio descending instead — a 7/8 group
     // (one new variant silently mis-binds) is a louder defect signal than a 1/8.
-    if opts.rank_by_gap && total > 0 {
-        // Every group shares the denominator `total`, so ordering by
-        // covered/total is exactly ordering by covered-count — no floats.
+    if opts.rank_by_gap {
+        // Groups no longer share a denominator — with two same-named enums,
+        // 2-of-2 and 2-of-9 both have a covered-count of 2 and are not remotely
+        // the same signal. Compare `covered/total` as a cross-multiplied
+        // integer ratio, which keeps the old ordering exactly when there is one
+        // definition (the usual case) and stays exact with no floats.
         rows.sort_by(|a, b| {
-            b.0 .0
-                .len()
-                .cmp(&a.0 .0.len())
+            let (ca, cb) = (a.0 .0.len(), b.0 .0.len());
+            let (ta, tb) = (set_for(&a.0 .0).len().max(1), set_for(&b.0 .0).len().max(1));
+            (cb * ta)
+                .cmp(&(ca * tb))
                 .then_with(|| b.1.len().cmp(&a.1.len()))
                 .then_with(|| a.0.cmp(&b.0))
         });
@@ -612,7 +640,10 @@ fn scan_groups(
 
     if !summary {
         for ((variants, wildcard), sites) in &rows {
-            let key = group_label(variants, *wildcard, opts, total, variant_names);
+            // The group's own enum, so `[covered/total]` and `missing:` name
+            // variants that exist on the type being matched.
+            let set = set_for(variants);
+            let key = group_label(variants, *wildcard, opts, set.len(), &set);
             if prefixed {
                 row!(
                     ctx.out,

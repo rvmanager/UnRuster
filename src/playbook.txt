@@ -1,5 +1,24 @@
 Query a Rust codebase via syntactic (syn) analysis.
 
+◇ SAME-NAMED TYPES (what the tool can and cannot tell apart)
+Targets resolve by last `::` segment, so `unruster enum-coverage Side` means
+"every enum named `Side`". In a workspace that is routinely more than one:
+`core::Side` (Buy/Sell) and an example's `Side` (Long/Short/Flat) are two
+types sharing a spelling.
+
+The enum checks score each match against the *definition it dispatches on* —
+the smallest same-named enum containing every variant the site named — so a
+match the compiler accepts as exhaustive is never reported as partial, and a
+`missing:` list only ever names variants the matched type actually has.
+
+What still merges: `catch-all-arms Side` reports wildcard arms on *both*
+enums under one name (it makes no claim about coverage, so nothing is
+fabricated — but the rows are two types' sites in one listing), and
+`callers`/`dead-code`/`type-refs` match by last segment throughout. When two
+types share a name and you need them apart, pass a qualified suffix
+(`config::Side`) or `--root` the single crate.
+
+────────────────────────────────────────────────────────────────────
 ◇ PRECISION (which tier a row's `via` column names)
 Precision tiers (look for the `via` column on results to see which fired):
 
@@ -131,6 +150,18 @@ WHAT TO RUN INSTEAD
                                 span` for just the `file:start-end` row when
                                 your own reader will do the seeking, `-n` to
                                 number the lines you are about to edit against.
+                                Takes several names at once — the tree is
+                                parsed once per invocation, so `show a b c` is
+                                far cheaper than three calls, and a name that
+                                does not resolve is reported without stopping
+                                the rest.
+
+  A NOTE ON DUPLICATED NAMES
+  `clones` reports a duplicated fn by its *qualified* path, so the obvious
+  next move is `show <that path>` — which prints one copy and, on its own,
+  would say nothing about the other seven. It now names the count and points
+  at `show <bare-name> --all`, which prints every copy for comparison. Reach
+  for the bare name whenever the question is "how do these differ".
 
   --spans                       on the commands that list *items* — inventory,
                                 dead-code, metrics, impls — upgrades the `at`
@@ -532,10 +563,23 @@ missing flag combos.
   unruster tests                                  # list #[test] fns + file:start-end
   unruster tests --with-hint                      # add args() fingerprint per test
   unruster tests --by subcommand                  # histogram by CLI subcommand
+  unruster tests --subcommand impls               # the tests behind one of those rows
+  unruster tests --subcommand impls --context 5   # ...and their bodies
+  unruster tests --subcommand none                # tests whose subcommand went undetected
   Signals: `--by subcommand` exposes coverage imbalance (5 tests vs 1);
   `--with-hint` exposes near-duplicates (same args fingerprint = same
-  test in disguise); `file:start-end` lets an agent read just the
-  relevant body via `sed -n start,endp file`.
+  test in disguise).
+
+  The three run in sequence, each answering what the previous one raises:
+  the histogram says a subcommand has 8 tests, `--subcommand` says which
+  8, `--context` prints them. A histogram row you cannot drill into sends
+  the reader back to grepping the test file for the subcommand string —
+  which is guessing at a location the tool already knows exactly.
+
+  A `--subcommand` that matches nothing distinguishes its two causes: a
+  typo answers with the near names, a real-but-untested subcommand
+  answers with the full list of what *is* covered. An empty listing would
+  be the same output for both.
 
 ──── 0b. CONFIG DRIFT ───────────────────────────────────────────────
 ◇ CONFIG-DRIFT (same struct, two configurations)

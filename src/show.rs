@@ -180,7 +180,32 @@ fn resolve<'a>(
     }
     hits.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
     hits.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.kind == b.kind);
+    note_siblings(ctx, query, &hits);
     Ok(hits)
+}
+
+/// Say when a qualified query resolved past same-named items elsewhere.
+///
+/// The trap this closes: `clones` reports a duplicated fn by its *qualified*
+/// path, so the obvious next command is `show <that path>` — which returns the
+/// one copy and says nothing about the other seven. That reads as a complete
+/// answer, and the way out was to abandon the tool and `grep -rn "fn name"`.
+/// One line naming the count turns the narrow answer into a signposted one.
+fn note_siblings(ctx: &AnalysisCtx, query: &str, hits: &[&Defn]) {
+    let bare = last_segment(query);
+    // Only for a query that narrowed: a bare-name query already listed them.
+    if query == bare {
+        return;
+    }
+    let others = ctx.idx.lookup(bare).len().saturating_sub(hits.len());
+    if others == 0 {
+        return;
+    }
+    ctx.out.note(&format!(
+        "note: {} other item(s) in the tree are also named `{}` — `show {} --all` prints \
+         every copy, `clones` compares them",
+        others, bare, bare
+    ));
 }
 
 /// Print one resolved item: its header row, then whatever `--part` asked for.
@@ -201,9 +226,8 @@ fn show_one(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ShowOpts) -> anyhow::Result<usize> {
-    let hits = resolve(ctx, query, opts)?;
-
+/// Render one query's resolved matches. Returns how many rows it emitted.
+fn emit_hits(ctx: &AnalysisCtx, query: &str, hits: &[&Defn], opts: &ShowOpts) -> usize {
     // More than one match and no `--all`: list them rather than print them.
     // Concatenating four function bodies under one header is the failure mode
     // this command was built to remove — the reader cannot tell where one ends.
@@ -215,14 +239,11 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ShowOpts) -> anyhow::Result<us
             query,
             hits.len()
         ));
-        for d in &hits {
+        for d in hits {
             header(ctx, d, range_of(d, opts));
         }
-        ctx.out
-            .summary(&format!("({} match(es); none printed)", hits.len()));
-        return Ok(hits.len());
+        return hits.len();
     }
-
     for (i, d) in hits.iter().enumerate() {
         // Blank line between concatenated items so `--all` output is readable.
         if i > 0 && ctx.out.format != Format::Json {
@@ -230,8 +251,55 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ShowOpts) -> anyhow::Result<us
         }
         show_one(ctx, d, opts);
     }
-    ctx.out.summary(&format!("({} item(s) shown)", hits.len()));
-    Ok(hits.len())
+    hits.len()
+}
+
+/// Resolve and print every `query`.
+///
+/// Taking more than one name is what makes this usable for the bulk case. An
+/// agent needing the start line of 115 named items sized the job as "115 calls,
+/// slow but manageable" and went looking for another way — each call re-walks
+/// and re-parses the whole tree, so the parse, not the lookup, is the cost.
+/// One invocation pays it once.
+pub fn run(ctx: &AnalysisCtx, queries: &[String], opts: &ShowOpts) -> anyhow::Result<usize> {
+    let single = queries.len() == 1;
+    let mut shown = 0usize;
+    let mut missed = 0usize;
+    let mut first = true;
+    for q in queries {
+        let hits = match resolve(ctx, q, opts) {
+            Ok(h) => h,
+            // A batch keeps going. One unknown name must not cost the other 114
+            // lookups the single call existed to save — `resolve` has already
+            // said what was wrong with this one.
+            Err(e) if single => return Err(e),
+            Err(_) => {
+                missed += 1;
+                continue;
+            }
+        };
+        if !first && ctx.out.format != Format::Json {
+            ctx.out.line("");
+        }
+        first = false;
+        shown += emit_hits(ctx, q, &hits, opts);
+    }
+    // Every name missed: the run answered nothing, which is the exit-2 case
+    // whether it was asked for one name or a hundred.
+    if missed == queries.len() {
+        return Err(TargetNotFound::err("item", &queries.join(", ")));
+    }
+    ctx.out.summary(&format!(
+        "({} item(s) from {} name(s){})",
+        shown,
+        queries.len(),
+        if missed > 0 {
+            format!("; {} unresolved", missed)
+        } else {
+            String::new()
+        }
+    ));
+    Ok(shown)
 }
 
 /// Nothing matched: say what is near before giving up. Exits 2 via

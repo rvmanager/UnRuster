@@ -74,6 +74,26 @@ impl Boxx {
     }
 }
 
+/// A generic trait implemented twice on one type. The two impl blocks below
+/// differ *only* in the trait's argument, so an impl header that drops generic
+/// arguments renders them as the same string — which is the regression
+/// `impls_header_carries_the_traits_generic_arguments` pins.
+pub trait Tag<T> {
+    fn tag(&self, t: T) -> String;
+}
+
+impl Tag<u32> for Boxx {
+    fn tag(&self, t: u32) -> String {
+        t.to_string()
+    }
+}
+
+impl Tag<String> for Boxx {
+    fn tag(&self, t: String) -> String {
+        t
+    }
+}
+
 pub fn build_doc() -> Document {
     Document::new("seed".into())
 }

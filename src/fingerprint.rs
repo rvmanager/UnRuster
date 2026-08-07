@@ -40,7 +40,13 @@ use crate::emit::Val;
 
 /// Bump when the hash input changes. Baselines record it; a mismatch is
 /// reported rather than silently producing a wall of false `new` rows.
-pub const SCHEME: u32 = 1;
+///
+/// v2: qualified paths in a workspace lost their bogus `src` segment
+/// (`mycrate::src::f` → `mycrate::f`), and qpaths are identity cells, so every
+/// workspace fingerprint moved. Single-crate baselines are unaffected in
+/// content and are still invalidated by this bump — one `--write-baseline` is
+/// a far cheaper mistake than a workspace being told its whole codebase is new.
+pub const SCHEME: u32 = 2;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
