@@ -3,7 +3,7 @@
 //! sites only, `match` exprs only), so the pattern semantics of the two
 //! commands can't drift apart.
 
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::context::AnalysisCtx;
 use crate::parallel_matches::{collect_sites, enum_sealed, variant_names_of};
 use crate::emit::row;
 
@@ -12,24 +12,11 @@ pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);
             if variant_names.is_empty() {
-                if ctx.idx.knows_name(enum_name) {
-                    ctx.out.note(&format!(
-                        "note: `{}` is named in the tree but no enum definition with variants \
-                         was found under --scope; nothing to scan",
-                        enum_name
-                    ));
-                    ctx.out.summary(&format!(
+                ctx.out.summary(&format!(
                         "(0 match site(s) on `{}` with a wildcard arm)",
                         enum_name
                     ));
-                    return Ok(0);
-                }
-                warn_unknown_target("enum", enum_name);
-                ctx.out.summary(&format!(
-                    "(0 match site(s) on `{}` with a wildcard arm)",
-                    enum_name
-                ));
-                return Err(TargetNotFound::err("enum", enum_name));
+                    return Err(ctx.unknown_target("enum", enum_name));
             }
             let (count, sealed_rows) = scan_one(ctx, enum_name, &variant_names, false);
             ctx.out.summary(&format!(

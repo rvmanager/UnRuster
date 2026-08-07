@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use syn::visit::{self, Visit};
 
 use crate::ast::{doc_text, enum_variant_of_path, line_of, scope_visits, ScopeTracker};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::context::AnalysisCtx;
 use crate::emit::{row, site as site_cell};
 use crate::macro_scan::{macro_body, Body};
 use crate::parse::{display_path, ParsedFile};
@@ -490,24 +490,11 @@ pub fn run(
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);
             if variant_names.is_empty() {
-                if ctx.idx.knows_name(enum_name) {
-                    ctx.out.note(&format!(
-                        "note: `{}` is named in the tree but no enum definition with variants \
-                         was found under --scope; nothing to scan",
-                        enum_name
-                    ));
-                    ctx.out.summary(&format!(
+                ctx.out.summary(&format!(
                         "(0 match site(s) across 0 variant-set group(s) on `{}`)",
                         enum_name
                     ));
-                    return Ok(0);
-                }
-                warn_unknown_target("enum", enum_name);
-                ctx.out.summary(&format!(
-                    "(0 match site(s) across 0 variant-set group(s) on `{}`)",
-                    enum_name
-                ));
-                return Err(TargetNotFound::err("enum", enum_name));
+                    return Err(ctx.unknown_target("enum", enum_name));
             }
             let (sites, groups) = scan_groups(ctx, enum_name, &variant_names, opts, false);
             ctx.out.summary(&format!(
@@ -867,18 +854,8 @@ pub fn run_enum_coverage(
                         enum_name
                     ));
                 };
-                if ctx.idx.knows_name(enum_name) {
-                    ctx.out.note(&format!(
-                        "note: `{}` is named in the tree but no enum definition with variants \
-                         was found under --scope; nothing to score",
-                        enum_name
-                    ));
-                    summary_line();
-                    return Ok(0);
-                }
-                warn_unknown_target("enum", enum_name);
                 summary_line();
-                return Err(TargetNotFound::err("enum", enum_name));
+                return Err(ctx.unknown_target("enum", enum_name));
             }
             let scan = coverage_one(ctx, enum_name, &variant_names, opts, false);
             ctx.out.summary(&format!(

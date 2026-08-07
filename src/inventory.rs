@@ -55,7 +55,7 @@ pub enum VisFilter {
 }
 
 impl VisFilter {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             VisFilter::Pub => "pub",
             VisFilter::Crate => "pub(crate)",

@@ -200,6 +200,183 @@ fn context_still_fires_when_the_at_cell_carries_a_span() {
     .stdout(contains(">"));
 }
 
+// ─── CLI consistency ───────────────────────────────────────────────────────
+
+#[test]
+fn waiver_hygiene_notes_stay_off_commands_waivers_cannot_affect() {
+    // These printed on every invocation of everything. On a `show` whose answer
+    // is 49 bytes the preamble was 558 — eleven times the output, about a
+    // subsystem the command does not consult.
+    for args in [
+        vec!["--root", WV, "show", "Arena", "--part", "span"],
+        vec!["--root", WV, "outline", "lib.rs"],
+        vec!["--root", WV, "inventory"],
+    ] {
+        let e = String::from_utf8_lossy(&ur().args(&args).output().unwrap().stderr).to_string();
+        assert!(!e.contains("waiver(s)"), "{:?} printed waiver advice:\n{}", args, e);
+    }
+}
+
+#[test]
+fn waiver_hygiene_notes_survive_where_a_waiver_changes_the_answer() {
+    let e = String::from_utf8_lossy(
+        &ur().args(["--root", WV, "dead-code"]).output().unwrap().stderr,
+    )
+    .to_string();
+    assert!(e.contains("waiver(s)"), "expected waiver advice on a waiver-aware check:\n{}", e);
+}
+
+#[test]
+fn builder_drifts_positional_is_not_called_root() {
+    // It is a constructor path. Displaying it as ROOT put it one line above
+    // `-r, --root <ROOT>  Root directory to scan`, so the usage line read as
+    // though the positional were a directory.
+    let h = String::from_utf8_lossy(&ur_stdout(&["builder-drift", "--help"])).to_string();
+    assert!(h.contains("builder-drift [OPTIONS] [CTOR]"), "{}", h);
+}
+
+#[test]
+fn enum_taking_commands_say_enum_in_their_usage_line() {
+    // `<NAME>` meant "enum" in five commands and "fn or item" in three, so the
+    // usage line alone could not tell you which.
+    for c in ["variants", "catch-all-arms", "parallel-matches", "enum-coverage", "divergence"] {
+        let h = String::from_utf8_lossy(&ur_stdout(&[c, "--help"])).to_string();
+        let usage = h.lines().find(|l| l.starts_with("Usage:")).unwrap();
+        assert!(usage.contains("ENUM"), "{} usage says {:?}", c, usage);
+    }
+    // …and the item-taking ones still say NAME.
+    for c in ["callers", "callees", "show"] {
+        let h = String::from_utf8_lossy(&ur_stdout(&[c, "--help"])).to_string();
+        let usage = h.lines().find(|l| l.starts_with("Usage:")).unwrap();
+        assert!(usage.contains("NAME"), "{} usage says {:?}", c, usage);
+    }
+}
+
+#[test]
+fn a_right_name_of_the_wrong_kind_gets_one_answer_everywhere() {
+    // `Document` is a struct. Handed to an enum-only command it used to produce
+    // three different messages and two different exit codes across five
+    // commands — and `variants` said "not found in the scanned tree", which is
+    // false: it is right there, as a struct.
+    for c in ["variants", "catch-all-arms", "parallel-matches", "enum-coverage", "divergence"] {
+        let out = ur().args(["--root", FIXTURE, c, "Document"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{} exit", c);
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            e.contains("is in the scanned tree but not as an enum") && e.contains("struct"),
+            "{} said:\n{}",
+            c,
+            e
+        );
+    }
+}
+
+#[test]
+fn a_zero_result_that_is_a_real_answer_stays_exit_0() {
+    // The counterpart: for commands where any name could plausibly match, zero
+    // hits is a finding, not a query error. Tightening these to 2 would be wrong.
+    for c in ["callers", "callees", "type-refs", "takes-mut"] {
+        let code = ur()
+            .args(["--root", FIXTURE, c, "Document"])
+            .output()
+            .unwrap()
+            .status
+            .code();
+        assert_eq!(code, Some(0), "{} should treat zero hits as an answer", c);
+    }
+}
+
+#[test]
+fn an_unknown_target_suggests_near_names_on_every_kind_requiring_command() {
+    ur().args(["--root", FIXTURE, "variants", "Tokne"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("Did you mean"))
+        .stderr(contains("Token"));
+}
+
+#[test]
+fn the_unknown_target_note_survives_json() {
+    // It went out through `eprintln!`, so `--json` consumers never saw it.
+    // Exit is 2 (unknown target), so this reads stdout directly.
+    let out = ur()
+        .args(["--root", FIXTURE, "--json", "variants", "Tokne"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("Did you mean"), "note missing from the JSON document:\n{}", s);
+}
+
+#[test]
+fn public_only_is_spelled_the_same_way_everywhere() {
+    // `inventory --vis pub` vs `dead-code --pub-only` vs `outline --pub-only`:
+    // one filter, two words. `--vis` now works on all three.
+    for args in [
+        vec!["--root", FIXTURE, "inventory", "--vis", "pub"],
+        vec!["--root", FIXTURE, "outline", "src/main.rs", "--vis", "pub"],
+        vec!["--root", FIXTURE, "dead-code", "--vis", "pub"],
+    ] {
+        let out = ur_stdout_allow_findings(&args);
+        for line in rows_of(&out) {
+            assert_eq!(line.split('\t').nth(1), Some("pub"), "{:?}: {}", args, line);
+        }
+    }
+}
+
+#[test]
+fn pub_only_still_works_as_the_shorthand() {
+    let long = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--vis", "pub"]);
+    let short = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--pub-only"]);
+    assert_eq!(long, short);
+}
+
+#[test]
+fn vis_and_pub_only_together_are_rejected_rather_than_silently_ranked() {
+    ur().args(["--root", FIXTURE, "outline", "src/main.rs", "--vis", "priv", "--pub-only"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn explain_resolves_a_command_name_not_just_a_defect_heading() {
+    // Topics are titled by defect (`COPY-PASTED FUNCTIONS`); a reader arrives
+    // holding the command they just ran. `explain clones` used to match nothing.
+    for c in ["clones", "stringly", "tests", "waivers", "divergence"] {
+        ur().args(["explain", c])
+            .assert()
+            .success()
+            .stdout(contains("◇"));
+    }
+}
+
+#[test]
+fn explain_lists_rather_than_dumping_when_a_command_spans_many_recipes() {
+    // `callers` appears in seven; 4 KB of prose is the opposite of what
+    // `explain` is for.
+    let out = ur_stdout(&["explain", "callers"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("◇"), "expected a heading list, got bodies:\n{}", s);
+    assert!(s.lines().count() > 2, "{}", s);
+}
+
+#[test]
+fn explain_does_not_confuse_a_command_with_its_longer_namesake() {
+    // `unruster conversions` must not answer for `conversion-pairs`.
+    let a = ur_stdout(&["explain", "conversion-pairs"]);
+    let b = ur_stdout(&["explain", "conversions"]);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn explain_still_fails_loudly_on_a_topic_that_does_not_exist() {
+    ur().args(["explain", "zzznosuchtopic"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
 // ─── show ──────────────────────────────────────────────────────────────────
 
 #[test]
@@ -1347,7 +1524,7 @@ fn enum_coverage_unknown_enum_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no enum `NotAnEnum` found"));
+        .stderr(predicates::str::contains("no enum `NotAnEnum`"));
 }
 
 #[test]
@@ -2014,7 +2191,7 @@ fn variants_unknown_enum_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no enum `NotAnEnum` found"));
+        .stderr(predicates::str::contains("no enum `NotAnEnum`"));
 }
 
 #[test]
@@ -2023,7 +2200,7 @@ fn catch_all_unknown_enum_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no enum `NotAnEnum` found"));
+        .stderr(predicates::str::contains("no enum `NotAnEnum`"));
 }
 
 #[test]
@@ -2032,7 +2209,7 @@ fn parallel_matches_unknown_enum_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no enum `NotAnEnum` found"));
+        .stderr(predicates::str::contains("no enum `NotAnEnum`"));
 }
 
 #[test]
@@ -2671,7 +2848,7 @@ fn fields_unknown_type_warns_and_exits_2() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no struct with named fields `NoSuchStruct` found"),
+        stderr.contains("no struct with named fields `NoSuchStruct`"),
         "expected unknown-struct warning, got:\n{}",
         stderr
     );

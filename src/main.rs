@@ -505,10 +505,14 @@ struct ClonesArgs {
 #[derive(Args)]
 struct BuilderDriftArgs {
     /// Only chains rooted at this constructor path (e.g. `Command::new`).
-    // Named `ctor`, shown as `ROOT`: the arg id has to differ from the global
-    // `--root`, and clap panics at access time rather than at definition time
-    // when two args share an id with different types.
-    #[arg(value_name = "ROOT")]
+    // The field is `ctor` because the arg id must differ from the global
+    // `--root` (clap panics at access time, not definition time, when two args
+    // share an id with different types). The *display* name was `ROOT` for the
+    // same reason, which put `builder-drift [OPTIONS] [ROOT]` one line above
+    // `-r, --root <ROOT>  Root directory to scan` — two unrelated things
+    // spelled identically in one help screen, and the usage line reads as
+    // though the positional is a directory.
+    #[arg(value_name = "CTOR")]
     ctor: Option<String>,
 
     /// Drop rows scoring below this.
@@ -600,8 +604,13 @@ struct OutlineArgs {
     #[arg(long, short = 'k', value_enum)]
     kind: Option<inventory::ItemKind>,
 
-    /// Only `pub` items — the file's external surface.
-    #[arg(long)]
+    /// Keep only items of this visibility — the same filter and the same
+    /// spelling as `inventory --vis`.
+    #[arg(long, value_enum)]
+    vis: Option<inventory::VisFilter>,
+
+    /// Shorthand for `--vis pub`: the file's external surface.
+    #[arg(long, conflicts_with = "vis")]
     pub_only: bool,
 
     /// Append each item's doc-comment first line as a final column.
@@ -692,6 +701,7 @@ struct FieldsArgs {
 #[derive(Args)]
 struct VariantsArgs {
     /// Enum name (last segment, e.g. `Token`).
+    #[arg(value_name = "ENUM")]
     name: String,
     /// Match bare variant names too (e.g. `V1` in addition to `Enum::V1`).
     /// Useful when callers `use Enum::*;` — noisier.
@@ -745,8 +755,12 @@ struct MetricsArgs {
 
 #[derive(Args)]
 struct DeadCodeArgs {
-    /// Only list pub items.
-    #[arg(long)]
+    /// Keep only items of this visibility — the same filter and the same
+    /// spelling as `inventory --vis`.
+    #[arg(long, value_enum)]
+    vis: Option<inventory::VisFilter>,
+    /// Shorthand for `--vis pub`.
+    #[arg(long, conflicts_with = "vis")]
     pub_only: bool,
     /// Also report trait-impl methods whose name is never called anywhere.
     /// Off by default: dyn-dispatch and generic calls are invisible to a
@@ -761,7 +775,7 @@ struct CatchAllArgs {
     /// enum column) — the same as `--all`, which is kept as an explicit
     /// spelling. Erroring on a bare invocation just cost a round-trip; naming
     /// an enum *and* passing `--all` is still a contradiction, so it errors.
-    #[arg(conflicts_with = "all")]
+    #[arg(value_name = "ENUM", conflicts_with = "all")]
     name: Option<String>,
     /// Scan every enum defined in the tree; rows gain a leading enum column.
     #[arg(long)]
@@ -771,7 +785,7 @@ struct CatchAllArgs {
 #[derive(Args)]
 struct ParallelMatchesArgs {
     /// Enum name (last segment). Omit with --all.
-    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    #[arg(value_name = "ENUM", required_unless_present = "all", conflicts_with = "all")]
     name: Option<String>,
     /// Scan every enum defined in the tree; group rows gain a leading enum column.
     #[arg(long)]
@@ -815,7 +829,7 @@ struct EnumCoverageArgs {
     /// Enum name (last segment). Omit to scan every enum — bare invocation is
     /// the same as `--all`. Naming an enum *and* passing `--all` contradicts
     /// itself and errors.
-    #[arg(conflicts_with = "all")]
+    #[arg(value_name = "ENUM", conflicts_with = "all")]
     name: Option<String>,
     /// Scan every enum defined in the tree; rows gain a leading enum column.
     #[arg(long)]
@@ -847,6 +861,7 @@ struct EnumCoverageArgs {
 #[derive(Args)]
 struct DivergenceArgs {
     /// Enum name (last segment). Omit to scan every enum.
+    #[arg(value_name = "ENUM")]
     name: Option<String>,
     /// Scan every enum — the default when no name is given. Accepted for
     /// symmetry with `enum-coverage --all` / `catch-all-arms --all`, which is
@@ -1062,6 +1077,67 @@ fn analyses_code(command_name: &str) -> bool {
     !matches!(command_name, "show" | "outline")
 }
 
+/// Would a waiver change what this command prints?
+///
+/// True for the checks that consult `// unruster: ok(…)` — plus `waivers`
+/// itself, which exists to audit them. Everything else (navigation, listings,
+/// `explain`) is unaffected by a waiver, so telling it about a malformed one is
+/// advice it cannot act on and did not ask for.
+fn waiver_relevant(command_name: &str) -> bool {
+    command_name == "waivers" || WAIVER_AWARE_CHECKS.contains(&command_name)
+}
+
+/// Report waivers that cannot do what they look like they do: ones with no
+/// reason, ones naming a check that does not exist, and ones predating the
+/// `ok(<check>)` grammar. Each is a comment that lies about the codebase, so
+/// each is worth one line — to a reader who is running a check it could affect.
+fn report_waiver_hygiene(
+    out: &emit::Out,
+    suppressions: &suppress::Suppressions,
+    is_waivers_cmd: bool,
+) {
+    if suppressions.unexplained > 0 {
+        out.note(&format!(
+            "note: {} `// unruster: ok` waiver(s) carry no reason — a waiver \
+             nobody can evaluate is worse than the finding it hides",
+            suppressions.unexplained
+        ));
+    }
+    // A waiver naming a check that does not exist waives nothing, silently.
+    // That is the same dead-weight class `--orphaned` reports, but it is a
+    // typo rather than drift and can be caught the moment the comment is read.
+    let known = suppress::known_check_names();
+    let mut unknown: Vec<String> = suppressions
+        .all()
+        .iter()
+        .filter_map(|w| w.check.clone())
+        .filter(|c| !known.contains(&c.as_str()))
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    if !unknown.is_empty() {
+        out.note(&format!(
+            "note: {} waiver(s) name a check this tool does not have ({}) and so waive \
+             nothing — known checks and groups: {}",
+            unknown.len(),
+            unknown.join(", "),
+            known.join(", ")
+        ));
+    }
+    // A legacy waiver has no check name, so it silences every check on its
+    // line. Say so once per run rather than per finding: the fix is one
+    // `waivers --upgrade`, not a decision at each site. `waivers` itself lists
+    // them in its own output, so it does not need the summary too.
+    let legacy = suppressions.legacy_count();
+    if legacy > 0 && !is_waivers_cmd {
+        out.note(&format!(
+            "note: {} waiver(s) predate the `ok(<check>)` grammar and waive every check \
+             on their line — `unruster waivers --upgrade` qualifies the unambiguous ones",
+            legacy
+        ));
+    }
+}
+
 fn report_blind_spots(out: &emit::Out) {
     let blind = macro_scan::blind_spots();
     if blind > 0 {
@@ -1146,7 +1222,8 @@ fn dispatch(
             &outline::OutlineOpts {
                 root,
                 kind: a.kind.map(inventory::ItemKind::as_str),
-                pub_only: a.pub_only,
+                // `--pub-only` is `--vis pub`; clap has already rejected both.
+                vis: a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
                 docs: a.docs,
                 flat: a.flat,
             },
@@ -1185,7 +1262,8 @@ fn dispatch(
             // only from tests aren't false-flagged as dead.
             let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
             let call_source = all_files.as_deref().unwrap_or(files);
-            dead_code::run(ctx, call_source, a.pub_only, a.include_trait_impls)
+            let vis = a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub));
+            dead_code::run(ctx, call_source, vis, a.include_trait_impls)
         }
         Cmd::CatchAllArms(a) => catch_all::run(ctx, a.name.as_deref()),
         Cmd::ParallelMatches(a) => parallel_matches::run(
@@ -1417,44 +1495,13 @@ fn main() -> Result<()> {
     } else {
         suppress::scan(&files)
     };
-    if suppressions.unexplained > 0 {
-        out.note(&format!(
-            "note: {} `// unruster: ok` waiver(s) carry no reason — a waiver \
-             nobody can evaluate is worse than the finding it hides",
-            suppressions.unexplained
-        ));
-    }
-    // A legacy waiver has no check name, so it silences every check on its
-    // line. Say so once per run rather than per finding: the fix is one
-    // `waivers --upgrade`, not a decision at each site.
-    // A waiver naming a check that does not exist waives nothing, silently.
-    // That is the same dead-weight class `--orphaned` reports, but it is a
-    // typo rather than drift and can be caught the moment the comment is read.
-    let known = suppress::known_check_names();
-    let mut unknown: Vec<String> = suppressions
-        .all()
-        .iter()
-        .filter_map(|w| w.check.clone())
-        .filter(|c| !known.contains(&c.as_str()))
-        .collect();
-    unknown.sort();
-    unknown.dedup();
-    if !unknown.is_empty() {
-        out.note(&format!(
-            "note: {} waiver(s) name a check this tool does not have ({}) and so waive \
-             nothing — known checks and groups: {}",
-            unknown.len(),
-            unknown.join(", "),
-            known.join(", ")
-        ));
-    }
-    let legacy = suppressions.legacy_count();
-    if legacy > 0 && !matches!(cmd, Cmd::Waivers(_)) {
-        out.note(&format!(
-            "note: {} waiver(s) predate the `ok(<check>)` grammar and waive every check \
-             on their line — `unruster waivers --upgrade` qualifies the unambiguous ones",
-            legacy
-        ));
+    // Waiver hygiene is advice about waivers, so it goes to the commands that
+    // read waivers. It used to print on every invocation of everything: on a
+    // `show` whose answer is 49 bytes the preamble was 558 — eleven times the
+    // output, on every call, about a subsystem the command does not touch. An
+    // agent making fifteen navigation calls paid for it fifteen times.
+    if waiver_relevant(cmd_name(&cmd)) {
+        report_waiver_hygiene(&out, &suppressions, matches!(cmd, Cmd::Waivers(_)));
     }
     let changed = match changed_since.as_deref() {
         Some(r) => match context::changed_set(r) {

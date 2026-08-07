@@ -163,7 +163,7 @@ fn collect_idents(ts: &TokenStream, out: &mut BTreeSet<String>) {
 pub fn run(
     ctx: &AnalysisCtx,
     call_source: &[ParsedFile],
-    pub_only: bool,
+    vis: Option<crate::inventory::VisFilter>,
     include_trait_impls: bool,
 ) -> anyhow::Result<usize> {
     let index = ctx.idx;
@@ -181,8 +181,10 @@ pub fn run(
             "fn" | "impl-fn" | "trait-fn" => {}
             _ => continue,
         }
-        if pub_only && d.vis != "pub" {
-            continue;
+        if let Some(v) = vis {
+            if d.vis != v.as_str() {
+                continue;
+            }
         }
         if matches!(d.name.as_str(), "main" | "start") {
             continue;
@@ -228,11 +230,11 @@ pub fn run(
         }
     }
     ctx.out.summary(&format!(
-        "({} candidate dead fn(s); pub_only={}; include_trait_impls={}{}; heuristic — call-set \
+        "({} candidate dead fn(s); vis={}; include_trait_impls={}{}; heuristic — call-set \
          built from full tree incl. tests; `#[allow(dead_code)]` skipped; pub items may still \
          have external callers we can't see.)",
         hits.len(),
-        pub_only,
+        vis.map_or("any", crate::inventory::VisFilter::as_str),
         include_trait_impls,
         ctx.waived_note(waived)
     ));

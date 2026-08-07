@@ -205,7 +205,7 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
             parallel_matches::run_enum_coverage(ctx, None, cfg.coverage)
         }),
         ("dead-code", &|| {
-            dead_code::run(ctx, dead_call_source, false, false)
+            dead_code::run(ctx, dead_call_source, None, false)
         }),
         ("conversion-pairs", &|| conversion_pairs::run(ctx)),
         ("clones", &|| {
@@ -337,7 +337,7 @@ pub fn run(
         "[high] dead-code — fns with no observed caller",
         "dead-code",
         Gate::Gating,
-        &mut || Ok(Counts::flat(dead_code::run(ctx, dead_call_source, false, false)?)),
+        &mut || Ok(Counts::flat(dead_code::run(ctx, dead_call_source, None, false)?)),
     )?;
     section(
         "[high] conversion-pairs — one concept in two shapes (explain: replication)",

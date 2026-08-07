@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, scope_visits, ScopeTracker, trait_fn_span};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::context::AnalysisCtx;
 use crate::emit::{row, site};
 use crate::parallel_matches::{
     collect_sites, definition_for, enum_sealed, variant_names_of, variant_sets_of, Site,
@@ -381,10 +381,9 @@ pub fn run(
 
     if single && per_enum.is_empty() {
         let enum_name = &names[0];
-        warn_unknown_target("enum", enum_name);
         ctx.out
             .summary(&format!("(0 divergent pair(s) on `{}`)", enum_name));
-        return Err(TargetNotFound::err("enum", enum_name));
+        return Err(ctx.unknown_target("enum", enum_name));
     }
 
     let mut all: Vec<Pair> = Vec::new();

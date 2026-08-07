@@ -140,6 +140,54 @@ impl AnalysisCtx<'_> {
             .hint(&format!("  // unruster: ok({}) {} — WHY?", spec, today));
     }
 
+    /// The target did not resolve: say which of the two reasons, and return the
+    /// error that exits 2.
+    ///
+    /// The two are not the same question and the old single message answered
+    /// only one of them. `unruster variants Defn` — a struct handed to an
+    /// enum-only command — reported "no enum `Defn` found in the scanned tree",
+    /// which is false: `Defn` is right there, as a struct. A reader who
+    /// believes it goes looking for a typo, or for a `--scope` problem, and
+    /// finds neither. Naming the kinds that *do* exist answers the question
+    /// they actually have, and near-name suggestions cover the real typo case.
+    ///
+    /// Every kind-requiring command returns this, so the exit code is the same
+    /// across all of them: an unanswerable query is 2, not a clean 0. A command
+    /// where any name could plausibly match (`callers`, `type-refs`) must NOT
+    /// use this for a zero-hit result — there, zero is a real answer.
+    pub fn unknown_target(&self, what: &str, name: &str) -> anyhow::Error {
+        let existing = self.idx.lookup(name);
+        if existing.is_empty() {
+            let near = self.idx.similar(name, 6);
+            if near.is_empty() {
+                self.out.note(&format!(
+                    "note: no {} `{}` in the scanned tree, and nothing close to it \
+                     (try --scope all if it is test-only)",
+                    what, name
+                ));
+            } else {
+                self.out
+                    .note(&format!("note: no {} `{}`. Did you mean:", what, name));
+                for d in &near {
+                    self.out
+                        .note(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));
+                }
+            }
+        } else {
+            let mut kinds: Vec<&str> = existing.iter().map(|d| d.kind).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            self.out.note(&format!(
+                "note: `{}` is in the scanned tree but not as {} {} — it is: {}",
+                name,
+                article(what),
+                what,
+                kinds.join(", ")
+            ));
+        }
+        TargetNotFound::err_owned(what, name)
+    }
+
     /// With `--changed-since`, keep only hits whose file is in the changed
     /// set (no-op otherwise). `file_of` extracts the hit's display path.
     pub fn retain_changed<T>(&self, items: &mut Vec<T>, file_of: impl Fn(&T) -> &str) {
@@ -239,7 +287,7 @@ pub enum GroupBy {
 /// itself is not printed again.
 #[derive(Debug)]
 pub struct TargetNotFound {
-    pub what: &'static str,
+    pub what: String,
     pub name: String,
 }
 
@@ -253,10 +301,25 @@ impl std::error::Error for TargetNotFound {}
 
 impl TargetNotFound {
     pub fn err(what: &'static str, name: &str) -> anyhow::Error {
+        Self::err_owned(what, name)
+    }
+
+    /// Same, for a `what` computed at run time.
+    pub fn err_owned(what: &str, name: &str) -> anyhow::Error {
         anyhow::Error::new(TargetNotFound {
-            what,
+            what: what.to_string(),
             name: name.to_string(),
         })
+    }
+}
+
+/// `a` or `an` for a target kind. The kinds are a fixed, tiny vocabulary
+/// (`enum`, `impl`, `struct with named fields`, …), so the vowel test is exact
+/// here rather than the usual approximation.
+fn article(what: &str) -> &'static str {
+    match what.chars().next() {
+        Some('a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U') => "an",
+        _ => "a",
     }
 }
 
@@ -264,6 +327,11 @@ impl TargetNotFound {
 /// still runs (macros and external names aren't indexed, so hits are possible);
 /// commands that then find zero hits return [`TargetNotFound::err`] so main
 /// exits with code 2.
+///
+/// Prefer [`AnalysisCtx::unknown_target`], which can tell "no such name" from
+/// "that name is something else" and routes through `out` so `--json` keeps it.
+/// This plain form remains for the few callers whose target is not an indexed
+/// item at all (a cohort glob, a constructor path).
 pub fn warn_unknown_target(what: &str, name: &str) {
     eprintln!(
         "warning: no {} `{}` found in the scanned tree; \

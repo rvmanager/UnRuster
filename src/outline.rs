@@ -29,8 +29,10 @@ pub struct OutlineOpts<'a> {
     pub root: &'a std::path::Path,
     /// Only rows of this kind.
     pub kind: Option<&'a str>,
-    /// Only `pub` items — the file's external surface.
-    pub pub_only: bool,
+    /// Keep only items of this visibility. `--pub-only` is the shorthand for
+    /// `--vis pub`; the long form exists so this command and `inventory` filter
+    /// the same way with the same word.
+    pub vis: Option<crate::inventory::VisFilter>,
     /// Append the first line of each item's doc comment.
     pub docs: bool,
     /// Flatten the nesting indent (nicer for `awk`, worse for reading).
@@ -75,8 +77,8 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
     if let Some(k) = opts.kind {
         items.retain(|d| d.kind == k);
     }
-    if opts.pub_only {
-        items.retain(|d| d.vis == "pub");
+    if let Some(v) = opts.vis {
+        items.retain(|d| d.vis == v.as_str());
     }
     // Source order. An outline read out of order is a list, not an outline.
     items.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));

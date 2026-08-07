@@ -1,7 +1,7 @@
 use syn::visit::Visit;
 
 use crate::ast::{line_of, type_to_string, vis_str};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::context::AnalysisCtx;
 use crate::parse::display_path;
 use crate::emit::{row, site};
 
@@ -57,9 +57,8 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
     }
 
     if defs.is_empty() {
-        warn_unknown_target("struct with named fields", ty);
         ctx.out.summary(&format!("(0 field(s) on `{}`)", ty));
-        return Err(TargetNotFound::err("struct with named fields", ty));
+        return Err(ctx.unknown_target("struct with named fields", ty));
     }
 
     // 2. Count read/write/init sites per field, via the same strict collector

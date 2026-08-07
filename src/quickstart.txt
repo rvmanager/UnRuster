@@ -10,7 +10,7 @@ AGENT QUICKSTART
   unruster explain <topic>           one repair recipe (cheap); `playbook` for all
   unruster outline <file>            the file's items, each with file:start-end
   unruster show <name>               one item's exact source (`explain reading-code`)
-  --json                             every command; keeps file/line as real fields
+  --json                             every command; named keys (TSV has no header row)
 
 HIGHEST-SIGNAL FIRST
   Divergence beats volume. A check that returns 400 rows returns ~1% real defects;

@@ -31,6 +31,38 @@ fn sections() -> Vec<(String, String)> {
     out
 }
 
+/// Does this section document the command `query`?
+///
+/// Read off the body rather than a hand-maintained table: a section that covers
+/// `clones` contains the literal text `unruster clones`, so the mapping is
+/// derived from the same prose a reader sees and cannot drift out of step with
+/// it. (A hand-written copy of the command list has drifted in this codebase
+/// before — see `CliGrammar`.)
+///
+/// The reason this exists: topics are titled by *defect* (`COPY-PASTED
+/// FUNCTIONS`), while a reader arrives holding the *command* they just ran.
+/// `explain clones` matched no heading and returned nothing, and so did
+/// `explain dead-code`, `explain metrics`, `explain callers` — the six most
+/// natural follow-ups to running those commands.
+fn body_documents_command(body: &str, query: &str) -> bool {
+    let q = query.trim();
+    // A command name, not a phrase — anything else is a heading search.
+    if q.is_empty() || !q.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+        return false;
+    }
+    let needle = format!("unruster {}", q);
+    body.lines().any(|l| {
+        l.match_indices(&needle).any(|(i, _)| {
+            // The next character must end the command token, so `unruster
+            // conversions` does not answer for `unruster conversion-pairs`.
+            l[i + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
+        })
+    })
+}
+
 /// Case-insensitive match: every word of the query (split on space and `-`)
 /// must appear in the heading.
 fn heading_matches(heading: &str, query: &str) -> bool {
@@ -54,10 +86,36 @@ pub fn run(out: &crate::emit::Out, topic: Option<&str>) -> anyhow::Result<usize>
             Ok(0)
         }
         Some(q) => {
-            let hits: Vec<_> = secs
+            // Heading first: `explain divergence` should give the DIVERGENCE
+            // topic, not every section that happens to invoke the command.
+            let mut hits: Vec<_> = secs
                 .iter()
                 .filter(|(h, _)| heading_matches(h, q))
                 .collect();
+            let by_command = hits.is_empty();
+            if by_command {
+                hits = secs
+                    .iter()
+                    .filter(|(_, body)| body_documents_command(body, q))
+                    .collect();
+            }
+            // A command match is "which recipes use this", not "explain this
+            // one thing" — a workhorse like `callers` appears in seven, and
+            // 4 KB of prose is the opposite of what `explain` is for. List the
+            // headings and let the reader name one, the same way `show` lists
+            // rather than concatenating when a name is ambiguous.
+            if by_command && hits.len() > 1 {
+                out.note(&format!(
+                    "note: `{}` appears in {} recipes — naming one prints it:",
+                    q,
+                    hits.len()
+                ));
+                for (h, _) in &hits {
+                    out.line(&format!("  {}", h));
+                }
+                out.summary(&format!("({} topic(s); none printed)", hits.len()));
+                return Ok(hits.len());
+            }
             if hits.is_empty() {
                 out.note(&format!("no playbook topic matching `{}`; topics are:", q));
                 for (h, _) in &secs {

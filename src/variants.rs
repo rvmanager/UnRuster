@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{enum_variant_of_path, line_of, scope_visits, ScopeTracker};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::context::AnalysisCtx;
 use crate::parse::display_path;
 use crate::emit::{row, site};
 
@@ -206,12 +206,11 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<usi
         defs.extend(v.out);
     }
     if defs.is_empty() {
-        warn_unknown_target("enum", enum_name);
         ctx.out.summary(&format!(
             "(0 variants; 0 ctor sites, 0 match sites; bare={})",
             bare
         ));
-        return Err(TargetNotFound::err("enum", enum_name));
+        return Err(ctx.unknown_target("enum", enum_name));
     }
 
     let variant_names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
