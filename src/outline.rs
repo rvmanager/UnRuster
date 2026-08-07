@@ -103,9 +103,13 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
             ctx.out.row(cells);
         }
     }
+    // The pointer sits here because this is where a reader *has* a list of
+    // names and is about to read several of them. Told only in `--help`, the
+    // batch form goes unused: one session made 34 `show` calls of which 23 sat
+    // in groups of two to four on a single shell line, each re-parsing the tree.
     ctx.out.summary(&format!(
-        "({} item(s) in {}; `at` is file:decl-end — `show <name>` prints one, \
-         docs included)",
+        "({} item(s) in {}; `at` is file:decl-end — `show <name>` prints one \
+         with its docs, `show <a> <b> <c>` several in one pass)",
         items.len(),
         files.join(", ")
     ));

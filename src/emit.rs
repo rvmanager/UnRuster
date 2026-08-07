@@ -471,6 +471,32 @@ impl Out {
         }
     }
 
+    /// A note that *is* the result, not commentary on it — the near-name list
+    /// for a lookup that found nothing, and anything else a caller would be
+    /// wrong to discard.
+    ///
+    /// Always stdout. `note` goes to stderr so that a piped run stays clean,
+    /// which is right for "blind spots" and "showing 20 of 87" and exactly
+    /// wrong here: agents suppress stderr routinely, and one session ran
+    /// `show <name> 2>/dev/null | head -30 || <fallback>` four times. Each got
+    /// total silence — the suggestion erased by the redirect, the `||` never
+    /// firing because a pipeline exits with `head`'s status — and each time the
+    /// reader concluded the tool had nothing and went back to `grep`. A failed
+    /// lookup's explanation is the answer to the question that was asked.
+    ///
+    /// JSON keeps it in `notes` alongside [`Out::note`], so a document consumer
+    /// reads both from one place.
+    pub fn answer(&self, text: &str) {
+        if self.silent {
+            return;
+        }
+        if self.json() {
+            self.state.borrow_mut().notes.push(text.to_string());
+            return;
+        }
+        println!("{}", text);
+    }
+
     /// A warning / note not tied to a row (unknown target, macro blind spots,
     /// "showing 20 of 87"). Follows `summary_inline`: inside an `audit`
     /// section a truncation note is only useful next to the rows it qualifies.

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, scope_visits, ScopeTracker};
+use crate::ast::{line_of, lit_str, scope_visits, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::{display_path, ParsedFile};
 use crate::emit::row;
@@ -220,14 +220,6 @@ fn extract_string_array(e: &syn::Expr) -> Option<Vec<String>> {
     }
 }
 
-fn lit_str(e: &syn::Expr) -> Option<String> {
-    if let syn::Expr::Lit(l) = e {
-        if let syn::Lit::Str(s) = &l.lit {
-            return Some(s.value());
-        }
-    }
-    None
-}
 
 /// A subcommand looks like `lowercase-with-hyphens`, doesn't start with `-`,
 /// and contains no `/` or `.`.

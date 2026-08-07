@@ -256,6 +256,9 @@ pub fn run_callers(
         direct.retain(|s| site_confidence(s, query, unique_name) >= min);
     }
     ctx.retain_changed(&mut direct, |s| &s.file);
+    if direct.is_empty() {
+        note_narrower_than_bare(ctx, &sites, query);
+    }
 
     if !transitive {
         emit_caller_rows(ctx, &direct, by, query, unique_name);
@@ -294,6 +297,39 @@ pub fn run_callers(
         return Err(TargetNotFound::err("fn, method, or macro matching", query));
     }
     Ok(direct.len() + rows.len())
+}
+
+/// A qualified query found nothing, but its bare name would have. Say so.
+///
+/// `Type::method` matches only where the receiver's type could be resolved,
+/// which is the APPROXIMATE tier: it misses a receiver reached through a field
+/// (`self.idx.similar(…)`), through a method chain, or through a generic. When
+/// that happens the command reports `(0 call site(s) across 0 caller(s))` —
+/// indistinguishable from a method nobody calls, and the qualified form is
+/// exactly what `show` and `outline` hand a reader to paste back in.
+///
+/// One session ran `callers 'Region::apply'` and `callers 'report::centre'`,
+/// got a confident zero from each, and went to `grep` — which found seven real
+/// call sites for the first. The zero was defensible; presenting it as the
+/// whole answer was not.
+fn note_narrower_than_bare(ctx: &AnalysisCtx, sites: &[CallSite], query: &str) {
+    let bare = crate::ast::last_segment(query);
+    if bare == query {
+        return;
+    }
+    let n = sites
+        .iter()
+        .filter(|s| matches_target(&s.target, bare))
+        .count();
+    if n == 0 {
+        return;
+    }
+    ctx.out.answer(&format!(
+        "note: no site resolves to `{}`, but {} site(s) call something named \
+         `{}` — receiver types are inferred, so a receiver reached through a \
+         field or a chain will not match the qualified form. Try `callers {}`.",
+        query, n, bare, bare
+    ));
 }
 
 /// Breadth-first transitive callers of `query` through the last-segment call

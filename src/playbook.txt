@@ -35,7 +35,13 @@ APPROXIMATE (semantic-lite, may have false positives/negatives):
 - type-refs `via=alias`: walks `type X = Y;` chains. Misses associated-
   type re-exports (`impl Foo { type Out = Bar; }`).
 - callers `Type::method`: also matches paths where the head segment is
-  renamed by `use foo::Type as Other`. Misses dyn-dispatch and generics.
+  renamed by `use foo::Type as Other`. Misses dyn-dispatch and generics,
+  and misses a receiver reached through a field (`self.idx.similar(…)`)
+  or a method chain. When the qualified form finds nothing but the bare
+  name would, the command now says so and names the broader query —
+  a zero from `Type::method` is a statement about what could be
+  *resolved*, not about what is called. Reach for the bare name to
+  widen, then read the `via` column to judge each row.
 - dead-code: last-segment name matching; pub items may have external
   callers we don't see; trait methods are skipped to cut false positives.
 
@@ -184,6 +190,16 @@ WHAT TO RUN INSTEAD
                                 what is worth reading around a call site is the
                                 fn containing it.
 
+WHAT IS NOT AN ITEM
+
+This tool indexes *items* — fn, struct, enum, trait, impl, const, mod. A
+`let` binding and a closure are neither, and never will be: they have no
+callers, fields, variants or visibility to report. Asking for one used to
+answer "no such name", which sends a reader hunting for a definition that
+is a few lines away; it now names the binding and says to use a text
+search. The same goes for a local you are renaming — `rg -w <name>` is the
+right tool, and no amount of AST indexing changes that.
+
 A NAME THAT DOES NOT RESOLVE
 
 `show` answers with the near names rather than with nothing:
@@ -198,6 +214,13 @@ after it is another search, and another. Matching is transposition-aware
 and prefix-weighted — `nwe` finds `new`, `contour_of` finds
 `contour_points` — because those are the two ways a name is actually
 mis-recalled.
+
+That explanation goes to **stdout**, not stderr, because it is the answer
+to the question you asked. It used to go to stderr, and a session running
+`show <name> 2>/dev/null | head -30 || <fallback>` got silence four times
+over: the note erased by the redirect, and the `||` never firing because a
+pipeline exits with `head`'s status. Suppress stderr freely — the summary
+and the blind-spot count live there, and losing them costs nothing.
 
 WHAT THIS IS NOT
 

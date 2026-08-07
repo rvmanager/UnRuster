@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string, scope_visits, ScopeTracker};
+use crate::ast::{line_of, path_to_string, peel_expr, scope_visits, ScopeTracker};
 use crate::config_drift::render_const;
 use crate::context::{AnalysisCtx, TargetNotFound};
 use crate::emit::{row, site};
@@ -84,7 +84,7 @@ impl<'ast, 'a> Visit<'ast> for ChainVisitor<'a> {
             self.consumed.insert(span_key(e));
             let mut node: &syn::Expr = &e.receiver;
             let root = loop {
-                match peel(node) {
+                match peel_expr(node) {
                     syn::Expr::MethodCall(mc) => {
                         methods.insert(mc.method.to_string());
                         self.consumed.insert(span_key(mc));
@@ -113,24 +113,16 @@ fn span_key<T: Spanned>(t: &T) -> (usize, usize) {
     (s.line, s.column)
 }
 
-fn peel(e: &syn::Expr) -> &syn::Expr {
-    match e {
-        syn::Expr::Paren(p) => peel(&p.expr),
-        syn::Expr::Group(g) => peel(&g.expr),
-        syn::Expr::Reference(r) => peel(&r.expr),
-        other => other,
-    }
-}
 
 /// `Type::ctor(const args…)` at the root of a chain, or `None`.
 ///
 /// Requires a `::`-qualified path: a chain rooted at a local (`self.out.push()`)
 /// is not a builder, and comparing those would drown the check.
 fn ctor_of(e: &syn::Expr) -> Option<(String, String)> {
-    let syn::Expr::Call(c) = peel(e) else {
+    let syn::Expr::Call(c) = peel_expr(e) else {
         return None;
     };
-    let syn::Expr::Path(p) = peel(&c.func) else {
+    let syn::Expr::Path(p) = peel_expr(&c.func) else {
         return None;
     };
     let path = path_to_string(&p.path);

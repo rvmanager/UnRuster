@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, line_of_span, scope_visits, ScopeTracker};
+use crate::ast::{line_of, line_of_span, pat_is_ok, peel_grouping, scope_visits, ScopeTracker};
 use crate::context::{AnalysisCtx, Counts};
 use crate::parse::display_path;
 use crate::emit::{row, site};
@@ -249,43 +249,7 @@ fn is_infallible_write(init: &syn::Expr) -> bool {
 /// is a *handled* fallback: the error was noticed and a policy applied. Rows
 /// like these were ~half the `.unwrap_or_else` bucket and none were defects.
 fn fallback_is_logged(e: &syn::ExprMethodCall) -> bool {
-    struct V {
-        found: bool,
-    }
-    impl<'ast> Visit<'ast> for V {
-        fn visit_macro(&mut self, m: &'ast syn::Macro) {
-            if let Some(seg) = m.path.segments.last() {
-                let n = seg.ident.to_string().to_lowercase();
-                // Match by name shape rather than an allow-list: every project
-                // spells its logger differently (`dbg_log`, `macos_warn`,
-                // `tracing::warn`), and an allow-list would silently fail on
-                // the next one.
-                if n.contains("log")
-                    || n.contains("warn")
-                    || n.contains("err")
-                    || n.contains("trace")
-                    || n.contains("debug")
-                    || n.contains("panic")
-                    || n.starts_with("eprint")
-                {
-                    self.found = true;
-                }
-            }
-            visit::visit_macro(self, m);
-        }
-        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
-            let n = c.method.to_string().to_lowercase();
-            if n.contains("log") || n.contains("warn") || n.contains("report") {
-                self.found = true;
-            }
-            visit::visit_expr_method_call(self, c);
-        }
-    }
-    let mut v = V { found: false };
-    for a in &e.args {
-        v.visit_expr(a);
-    }
-    v.found
+    e.args.iter().any(crate::ast::mentions_logging)
 }
 
 
@@ -314,7 +278,7 @@ const SHAPE_PRESERVING: &[&str] = &[
 /// `path.segments.last().map(…).unwrap_or_default()`.
 fn receiver_is_option(mut e: &syn::Expr) -> bool {
     for _ in 0..8 {
-        let syn::Expr::MethodCall(mc) = peel(e) else {
+        let syn::Expr::MethodCall(mc) = peel_grouping(e) else {
             return false;
         };
         let name = mc.method.to_string();
@@ -329,13 +293,6 @@ fn receiver_is_option(mut e: &syn::Expr) -> bool {
     false
 }
 
-fn peel(e: &syn::Expr) -> &syn::Expr {
-    match e {
-        syn::Expr::Paren(p) => peel(&p.expr),
-        syn::Expr::Group(g) => peel(&g.expr),
-        other => other,
-    }
-}
 
 /// Does every path out of this block leave the enclosing function or loop?
 /// Only the last statement is inspected: an early `return` buried mid-block
@@ -350,9 +307,9 @@ fn block_diverges(b: &syn::Block) -> bool {
         _ => return false,
     };
     matches!(
-        peel(e),
+        peel_grouping(e),
         syn::Expr::Return(_) | syn::Expr::Break(_) | syn::Expr::Continue(_)
-    ) || matches!(peel(e), syn::Expr::Macro(m)
+    ) || matches!(peel_grouping(e), syn::Expr::Macro(m)
         if m.mac.path.segments.last().is_some_and(|s| {
             let n = s.ident.to_string();
             n == "panic" || n == "unreachable" || n == "todo"
@@ -449,23 +406,9 @@ fn pat_is_err_swallow(p: &syn::Pat) -> bool {
     }
 }
 
-/// `Ok(_)` / `Ok(x)` head — used to identify if-let-ok / while-let-ok forms.
-fn pat_is_ok(p: &syn::Pat) -> bool {
-    match p {
-        syn::Pat::TupleStruct(ts) => ts
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident == "Ok")
-            .unwrap_or(false),
-        syn::Pat::Reference(r) => pat_is_ok(&r.pat),
-        syn::Pat::Paren(p) => pat_is_ok(&p.pat),
-        _ => false,
-    }
-}
 
 impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
-    scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn, trait_item_fn);
+    scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn, trait_item_fn, expr_closure_tail);
 
     fn visit_expr_try(&mut self, e: &'ast syn::ExprTry) {
         // Runs before the child method call is visited, so the mark is in
@@ -514,11 +457,6 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         self.closure_tail.pop();
     }
 
-    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
-        self.closure_tail.push(true);
-        visit::visit_expr_closure(self, c);
-        self.closure_tail.pop();
-    }
 
     fn visit_expr_match(&mut self, e: &'ast syn::ExprMatch) {
         for arm in &e.arms {

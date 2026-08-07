@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, scope_visits, ScopeTracker, trait_fn_span};
+use crate::ast::{line_of, pat_is_ok, scope_visits, trait_fn_span, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::emit::{row, site};
 use crate::parallel_matches::{
@@ -567,51 +567,14 @@ fn closure_inspects_error(args: &[syn::Expr]) -> bool {
     binds || body_logs(&c.body)
 }
 
-/// A log/warn/panic macro or method anywhere in the body makes the failure
-/// observable. Matched by name shape, not an allow-list: every project spells
-/// its logger differently.
+/// Does the body make the failure observable? Delegates to
+/// [`crate::ast::mentions_logging`] — the one definition both this check and
+/// `error-swallows` now share, after each had its own copy and they disagreed
+/// about whether a logging *method* counted.
 fn body_logs(body: &syn::Expr) -> bool {
-    struct V {
-        found: bool,
-    }
-    impl<'ast> Visit<'ast> for V {
-        fn visit_macro(&mut self, m: &'ast syn::Macro) {
-            if let Some(seg) = m.path.segments.last() {
-                let n = seg.ident.to_string().to_lowercase();
-                if n.contains("log")
-                    || n.contains("warn")
-                    || n.contains("err")
-                    || n.contains("trace")
-                    || n.contains("debug")
-                    || n.contains("panic")
-                    || n.starts_with("eprint")
-                {
-                    self.found = true;
-                }
-            }
-            visit::visit_macro(self, m);
-        }
-    }
-    let mut v = V { found: false };
-    v.visit_expr(body);
-    v.found
+    crate::ast::mentions_logging(body)
 }
 
-/// `Ok(..)` head of an `if let` — the pattern that makes the binding an error
-/// path rather than an optional lookup.
-fn pat_is_ok(p: &syn::Pat) -> bool {
-    match p {
-        syn::Pat::TupleStruct(ts) => ts
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident == "Ok")
-            .unwrap_or(false),
-        syn::Pat::Reference(r) => pat_is_ok(&r.pat),
-        syn::Pat::Paren(p) => pat_is_ok(&p.pat),
-        _ => false,
-    }
-}
 
 /// How much attention the failure got, on one axis: *did this code notice?*
 ///
@@ -662,20 +625,13 @@ fn in_combinator_position(stack: &[bool]) -> bool {
 }
 
 impl<'ast> Visit<'ast> for HandlingVisitor<'_> {
-    scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn);
+    scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn, expr_closure_tail);
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
         self.scope.enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
         visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
 
-    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
-        // Mark the closure's own tail position: a `.ok()` there is a
-        // Result→Option conversion feeding a combinator, not a dropped error.
-        self.closure_tail.push(true);
-        visit::visit_expr_closure(self, c);
-        self.closure_tail.pop();
-    }
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         let method = e.method.to_string();

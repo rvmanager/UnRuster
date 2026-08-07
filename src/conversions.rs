@@ -25,6 +25,13 @@ impl<'a> ConvVisitor<'a> {
         self.scope.enclosing()
     }
 
+    // unruster: ok(clones/record) 2026-08-07 — same shape as
+    // `stringly::StringlyVisitor::record`, different concept: `kind`/`target`
+    // classify a conversion and name its destination type, `class`/`literal`
+    // classify a string comparison and hold the literal. Unifying would need a
+    // generic `Hit<T>` whose fields could only be named `a`/`b`, which makes
+    // both call sites harder to read to remove a similarity that is not
+    // coupling — neither Hit changes when the other does.
     fn record(&mut self, kind: &'static str, target: String, line: usize) {
         let ctx = self.enclosing();
         self.hits.push(Hit {

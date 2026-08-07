@@ -658,6 +658,225 @@ macro_rules! scope_visits {
             self.scope.leave_fn();
         }
     };
+    // As above, but also maintains `self.fn_types_stack` — the local-type
+    // inference the receiver-typed checks need. Requires `self.fn_types_stack`
+    // and `self.fn_sigs`. A trait fn with no default body has nothing to infer
+    // over, so it is skipped rather than pushed empty.
+    (@emit trait_item_fn_typed) => {
+        fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+            // Trait default-method bodies count like any other fn body.
+            let Some(body) = &i.default else { return };
+            self.scope
+                .enter_fn(i.sig.ident.to_string(), $crate::ast::fn_span(&i.sig, body));
+            self.fn_types_stack.push(
+                $crate::semantic::FnTypes::build(&i.sig, body, self.fn_sigs, None),
+            );
+            syn::visit::visit_trait_item_fn(self, i);
+            self.fn_types_stack.pop();
+            self.scope.leave_fn();
+        }
+    };
+    // Mark the closure's own tail position: a `.ok()` there is a Result→Option
+    // conversion feeding a combinator, not a dropped error. Requires
+    // `self.closure_tail: Vec<bool>`.
+    (@emit expr_closure_tail) => {
+        fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+            self.closure_tail.push(true);
+            syn::visit::visit_expr_closure(self, c);
+            self.closure_tail.pop();
+        }
+    };
 }
 
 pub(crate) use scope_visits;
+
+// ---------------------------------------------------------------------------
+// Shared syntax predicates
+//
+// Each of these existed in two or three copies before `unruster clones` ranked
+// them among its own top findings. They are collected here not to save lines
+// but because every one of them is a *definition* two checks must agree on: if
+// one copy learns about a new shape and the other does not, the two checks
+// silently disagree about the same question, which is the exact defect class
+// this tool was built to find.
+// ---------------------------------------------------------------------------
+
+/// Peel parentheses and invisible groups: pure syntax noise, no change of value.
+pub fn peel_grouping(e: &syn::Expr) -> &syn::Expr {
+    match e {
+        syn::Expr::Paren(p) => peel_grouping(&p.expr),
+        syn::Expr::Group(g) => peel_grouping(&g.expr),
+        other => other,
+    }
+}
+
+/// Peel grouping *and* borrows and derefs, so `&node` / `*node` / `(node)` all
+/// compare structurally equal to the bare `node`. For comparing two expressions
+/// for identity; use [`peel_grouping`] when only the noise should go.
+pub fn peel_expr(mut e: &syn::Expr) -> &syn::Expr {
+    loop {
+        e = match e {
+            syn::Expr::Reference(r) => &r.expr,
+            syn::Expr::Paren(p) => &p.expr,
+            syn::Expr::Group(g) => &g.expr,
+            syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => &u.expr,
+            other => return other,
+        };
+    }
+}
+
+/// An `Ok(..)` pattern head, through references and parens — what makes an
+/// `if let` / `while let` an error path rather than an optional lookup.
+pub fn pat_is_ok(p: &syn::Pat) -> bool {
+    match p {
+        syn::Pat::TupleStruct(ts) => ts
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident == "Ok")
+            .unwrap_or(false),
+        syn::Pat::Reference(r) => pat_is_ok(&r.pat),
+        syn::Pat::Paren(p) => pat_is_ok(&p.pat),
+        _ => false,
+    }
+}
+
+/// The value of a string-literal expression, if it is one.
+pub fn lit_str(e: &syn::Expr) -> Option<String> {
+    match e {
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Str(s) => Some(s.value()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Does this name look like logging, warning, or panicking?
+///
+/// Matched by name *shape* rather than an allow-list: every project spells its
+/// logger differently (`dbg_log`, `macos_warn`, `tracing::warn`), and an
+/// allow-list silently fails on the next one.
+pub fn looks_like_logging(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("log")
+        || n.contains("warn")
+        || n.contains("err")
+        || n.contains("trace")
+        || n.contains("debug")
+        || n.contains("panic")
+        || n.contains("report")
+        || n.starts_with("eprint")
+}
+
+/// Does anything in this subtree make a failure observable — a logging macro,
+/// or a call to a logging-shaped method?
+///
+/// One definition rather than two. `divergence --handling` used to look only at
+/// macros while `error-swallows` looked at macros *and* method names, so the
+/// two checks disagreed about whether `.unwrap_or_else(|e| self.log_err(e))`
+/// counted as handled. Nothing chose that difference; it is what two copies of
+/// a heuristic do when only one of them is edited.
+pub fn mentions_logging(node: &syn::Expr) -> bool {
+    struct V {
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for V {
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if let Some(seg) = m.path.segments.last() {
+                if looks_like_logging(&seg.ident.to_string()) {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_macro(self, m);
+        }
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            if looks_like_logging(&c.method.to_string()) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_method_call(self, c);
+        }
+    }
+    let mut v = V { found: false };
+    syn::visit::Visit::visit_expr(&mut v, node);
+    v.found
+}
+
+#[cfg(test)]
+mod shared_predicate_tests {
+    use super::*;
+
+    fn expr(src: &str) -> syn::Expr {
+        syn::parse_str(src).expect("test expr must parse")
+    }
+
+    #[test]
+    fn grouping_peels_noise_but_not_borrows() {
+        // The distinction the two levels exist for: `peel_grouping` removes
+        // what the parser inserted, `peel_expr` also removes what changes the
+        // *reference* but not the value.
+        assert!(matches!(peel_grouping(&expr("((x))")), syn::Expr::Path(_)));
+        assert!(matches!(peel_grouping(&expr("&x")), syn::Expr::Reference(_)));
+        assert!(matches!(peel_expr(&expr("&(*x)")), syn::Expr::Path(_)));
+        assert!(matches!(peel_expr(&expr("*(&x)")), syn::Expr::Path(_)));
+    }
+
+    #[test]
+    fn ok_patterns_are_seen_through_refs_and_parens() {
+        // `syn::Pat` has no `Parse` impl (patterns are ambiguous standalone),
+        // so lift each one out of an `if let`, which is where they occur here.
+        let pat = |s: &str| -> syn::Pat {
+            let e: syn::Expr = syn::parse_str(&format!("if let {} = x {{}}", s)).unwrap();
+            match e {
+                syn::Expr::If(i) => match *i.cond {
+                    syn::Expr::Let(l) => *l.pat,
+                    _ => unreachable!("built an if-let"),
+                },
+                _ => unreachable!("built an if"),
+            }
+        };
+        assert!(pat_is_ok(&pat("Ok(v)")));
+        assert!(pat_is_ok(&pat("&Ok(v)")));
+        assert!(pat_is_ok(&pat("io::Result::Ok(v)")));
+        assert!(!pat_is_ok(&pat("Err(e)")));
+        assert!(!pat_is_ok(&pat("Some(v)")));
+    }
+
+    #[test]
+    fn a_string_literal_yields_its_value_and_nothing_else_does() {
+        assert_eq!(lit_str(&expr("\"hi\"")), Some("hi".to_string()));
+        assert_eq!(lit_str(&expr("42")), None);
+        assert_eq!(lit_str(&expr("name")), None);
+    }
+
+    #[test]
+    fn logging_is_recognised_as_a_macro_and_as_a_method() {
+        // The reason this is one function: `divergence --handling` looked only
+        // at macros while `error-swallows` looked at macros and methods, so the
+        // two disagreed about whether the same fallback was "handled".
+        assert!(mentions_logging(&expr("{ eprintln!(\"{e}\"); 0 }")));
+        assert!(mentions_logging(&expr("{ tracing::warn!(\"x\"); 0 }")));
+        assert!(mentions_logging(&expr("{ self.log_err(e); 0 }")));
+        assert!(mentions_logging(&expr("{ ctx.report_failure(e); 0 }")));
+        assert!(mentions_logging(&expr("{ panic!(\"no\") }")));
+    }
+
+    #[test]
+    fn a_silent_fallback_is_not_mistaken_for_a_logged_one() {
+        assert!(!mentions_logging(&expr("{ 0 }")));
+        assert!(!mentions_logging(&expr("{ String::new() }")));
+        assert!(!mentions_logging(&expr("{ self.count += 1; 0 }")));
+    }
+
+    #[test]
+    fn the_logging_name_test_is_shape_based_not_an_allow_list() {
+        // Every project spells its logger differently; an allow-list silently
+        // fails on the next one.
+        for n in ["log", "dbg_log", "macos_warn", "warn", "report_err", "eprintln", "panic"] {
+            assert!(looks_like_logging(n), "{} should read as logging", n);
+        }
+        for n in ["push", "insert", "len", "collect", "name"] {
+            assert!(!looks_like_logging(n), "{} should not", n);
+        }
+    }
+}

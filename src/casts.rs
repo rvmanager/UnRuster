@@ -212,7 +212,7 @@ fn classify(src: Option<&str>, dst: &str) -> &'static str {
 }
 
 impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
-    scope_visits!(item_mod, item_impl, item_trait);
+    scope_visits!(item_mod, item_impl, item_trait, trait_item_fn_typed);
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         let unsafe_fn = i.sig.unsafety.is_some();
         self.unsafe_depth += usize::from(unsafe_fn);
@@ -246,17 +246,6 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         self.fn_types_stack.pop();
         self.scope.leave_fn();
         self.unsafe_depth -= usize::from(unsafe_fn);
-    }
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        // Trait default-method bodies count like any other fn body.
-        let Some(body) = &i.default else { return };
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, body));
-        self.fn_types_stack
-            .push(FnTypes::build(&i.sig, body, self.fn_sigs, None));
-        visit::visit_trait_item_fn(self, i);
-        self.fn_types_stack.pop();
-        self.scope.leave_fn();
     }
 
     fn visit_expr_cast(&mut self, e: &'ast syn::ExprCast) {

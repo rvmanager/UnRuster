@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{doc_text, enum_variant_of_path, line_of, scope_visits, ScopeTracker};
+use crate::ast::{doc_text, enum_variant_of_path, line_of, peel_expr, scope_visits, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::emit::{row, site as site_cell};
 use crate::macro_scan::{macro_body, Body};
@@ -255,20 +255,6 @@ fn span_key<T: syn::spanned::Spanned>(t: &T) -> (usize, usize) {
     (s.line, s.column)
 }
 
-/// Peel borrows, derefs, parens, and groups so `&node` / `*node` / `(node)`
-/// all compare structurally equal to the bare `node`. Relies on syn's
-/// `extra-traits` `PartialEq`, which ignores spans.
-fn peel_expr(mut e: &syn::Expr) -> &syn::Expr {
-    loop {
-        e = match e {
-            syn::Expr::Reference(r) => &r.expr,
-            syn::Expr::Paren(p) => &p.expr,
-            syn::Expr::Group(g) => &g.expr,
-            syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => &u.expr,
-            other => return other,
-        };
-    }
-}
 
 /// Does `body` contain a method call whose receiver is the match scrutinee
 /// (e.g. the catch-all arm `_ => node.paintable_kind() == Path` where the

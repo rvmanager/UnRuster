@@ -181,6 +181,8 @@ enum Cmd {
     Inventory(InventoryArgs),
     /// Print one item's exact source, resolved by name through the AST:
     /// `show draft_regions`, `show Window::parse`, `show geom::window::Window`.
+    /// Takes several names at once — `show a b c` parses the tree once where
+    /// three separate calls parse it three times.
     /// Prints from the doc comment through the closing brace — no `+N` line
     /// budget to guess, no `^fn` anchor to miss an indented method. `--part
     /// sig` for the signature alone, `--part span` for just `file:start-end`.
@@ -371,6 +373,11 @@ const WAIVER_AWARE_CHECKS: &[&str] = &[
     "builder-drift",
     "error-swallows",
     "casts",
+    // Both consult waivers and both print suggestions; leaving them off this
+    // list made `--suggest-waivers` announce "does not support waivers" and
+    // then print one anyway, so a reader had no way to tell which to believe.
+    "clones",
+    "stringly",
 ];
 
 fn cmd_name(cmd: &Cmd) -> &'static str {

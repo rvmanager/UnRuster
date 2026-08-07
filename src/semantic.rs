@@ -627,3 +627,67 @@ impl Semantic {
     }
 }
 
+
+/// A `let` binding that shares a name with something the caller looked for.
+pub struct Binding {
+    /// `a closure` / `a local binding` / `a static-like const binding` — worded
+    /// to drop straight into a sentence.
+    pub kind: &'static str,
+    pub file: String,
+    pub line: usize,
+}
+
+/// Find `name` as a `let` binding somewhere in the tree.
+///
+/// Only ever called when a lookup has already failed, so the cost is paid on a
+/// path that was about to return nothing anyway. It exists to convert the worst
+/// answer the tool can give — silence, which reads as "no such concept here" —
+/// into "that is a local, and here it is".
+///
+/// Deliberately *not* part of the index. A local has no callers, no fields, no
+/// variants and no visibility; folding it in would make every command that
+/// takes a name answer questions it cannot actually answer. This is a
+/// signpost, not a new kind of target.
+pub fn find_binding(files: &[ParsedFile], name: &str) -> Option<Binding> {
+    struct V<'a> {
+        want: &'a str,
+        file: &'a str,
+        hit: Option<Binding>,
+    }
+    impl<'ast, 'a> Visit<'ast> for V<'a> {
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            if self.hit.is_none() {
+                // `let name = …` and `let mut name = …`; a destructuring
+                // pattern binds several, and none of them is what a reader
+                // means when they name one thing.
+                if let syn::Pat::Ident(i) = &l.pat {
+                    if i.ident == self.want {
+                        let closure = matches!(
+                            l.init.as_ref().map(|i| &*i.expr),
+                            Some(syn::Expr::Closure(_))
+                        );
+                        self.hit = Some(Binding {
+                            kind: if closure { "a closure" } else { "a local binding" },
+                            file: self.file.to_string(),
+                            line: crate::ast::line_of(&i.ident),
+                        });
+                    }
+                }
+            }
+            visit::visit_local(self, l);
+        }
+    }
+    for f in files {
+        let path = crate::parse::display_path(&f.path);
+        let mut v = V {
+            want: name,
+            file: &path,
+            hit: None,
+        };
+        v.visit_file(&f.ast);
+        if v.hit.is_some() {
+            return v.hit;
+        }
+    }
+    None
+}

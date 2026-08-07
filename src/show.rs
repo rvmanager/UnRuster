@@ -341,26 +341,13 @@ pub fn run(ctx: &AnalysisCtx, queries: &[String], opts: &ShowOpts) -> anyhow::Re
     Ok(shown)
 }
 
-/// Nothing matched: say what is near before giving up. Exits 2 via
-/// [`TargetNotFound`], the same code every other unknown target uses, so a
-/// script can still tell "no such name" from "found, nothing to report".
+/// Nothing matched: say why before giving up.
+///
+/// Defers to [`AnalysisCtx::unknown_target`] rather than phrasing its own
+/// version. `show` had a near-name list first and the shared one came later,
+/// which left two implementations of the same sentence — and only one of them
+/// learned to check for a closure, or to put the answer where `2>/dev/null`
+/// cannot erase it. Exits 2, the same code every other unknown target uses.
 fn not_found(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<()> {
-    let near = ctx.idx.similar(query, 8);
-    if near.is_empty() {
-        ctx.out.note(&format!(
-            "note: no item named `{}` in the scanned tree, and nothing close to it \
-             (try --scope all if it is test-only)",
-            query
-        ));
-    } else {
-        ctx.out
-            .note(&format!("note: no item named `{}`. Did you mean:", query));
-        for d in &near {
-            ctx.out.note(&format!(
-                "  {} {} {}\t{}:{}-{}",
-                d.kind, d.vis, d.qpath, d.file, d.doc_start, d.end
-            ));
-        }
-    }
-    Err(TargetNotFound::err("item", query))
+    Err(ctx.unknown_target("item named", query))
 }

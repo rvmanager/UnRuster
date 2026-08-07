@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string, scope_visits, ScopeTracker, trait_fn_span};
+use crate::ast::{line_of, path_to_string, peel_grouping, scope_visits, trait_fn_span, ScopeTracker};
 use crate::context::{AnalysisCtx, TargetNotFound};
 use crate::emit::{row, site};
 use crate::parse::display_path;
@@ -97,10 +97,15 @@ struct DriftVisitor<'a> {
 impl<'ast, 'a> Visit<'ast> for DriftVisitor<'a> {
     scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn);
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        let Some(body) = &i.default else { return };
+        // A trait fn with no default body has nothing to walk. Asked as a
+        // question rather than bound as `let Some(body) = …`, which forced a
+        // `let _ = body;` underneath purely to silence the unused warning — and
+        // that discard then read as a swallowed value to this tool's own check.
+        if i.default.is_none() {
+            return;
+        }
         self.scope
             .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
-        let _ = body;
         visit::visit_trait_item_fn(self, i);
         self.scope.leave_fn();
     }
@@ -154,13 +159,6 @@ pub(crate) fn module_of(context: &str) -> &str {
     context.rsplit_once("::").map(|(m, _)| m).unwrap_or("")
 }
 
-fn peel(e: &syn::Expr) -> &syn::Expr {
-    match e {
-        syn::Expr::Paren(p) => peel(&p.expr),
-        syn::Expr::Group(g) => peel(&g.expr),
-        other => other,
-    }
-}
 
 /// A path that names a constant rather than a local: qualified
 /// (`CastClass::Ptr`), SCREAMING_SNAKE (`MAX_DEPTH`), or a bare CamelCase
@@ -200,7 +198,7 @@ fn lit_str(l: &syn::Lit) -> String {
 /// rendering in one pass, so the two can never disagree about what is
 /// comparable.
 pub(crate) fn render_const(e: &syn::Expr) -> Option<String> {
-    Some(match peel(e) {
+    Some(match peel_grouping(e) {
         syn::Expr::Lit(l) => lit_str(&l.lit),
         syn::Expr::Path(p) => {
             let s = path_to_string(&p.path);

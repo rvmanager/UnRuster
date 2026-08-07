@@ -47,6 +47,21 @@ fn assert_summary_silent_stdout(args: &[&str]) {
     assert!(out.status.success(), "expected success");
 }
 
+/// Stdout of a run that may legitimately exit 2 (unknown target). The
+/// explanation for a failed lookup goes to stdout on purpose, so a test that
+/// reads it must tolerate the exit code that accompanies it.
+fn ur_output_allow_2(args: &[&str]) -> String {
+    let out = ur().args(args).output().unwrap();
+    let code = out.status.code();
+    assert!(
+        code == Some(0) || code == Some(2),
+        "command errored (exit {:?}): {:?}",
+        code,
+        args
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Run and return raw stdout, tolerating the exit-1 "findings remain" code.
 /// `audit` reports findings by failing, so asserting success on it would only
 /// pass against a fixture with nothing to find.
@@ -261,7 +276,9 @@ fn a_right_name_of_the_wrong_kind_gets_one_answer_everywhere() {
     for c in ["variants", "catch-all-arms", "parallel-matches", "enum-coverage", "divergence"] {
         let out = ur().args(["--root", FIXTURE, c, "Document"]).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{} exit", c);
-        let e = String::from_utf8_lossy(&out.stderr);
+        // The explanation is on stdout: it is the answer to the query, and a
+        // reader who redirected stderr away must still get it.
+        let e = String::from_utf8_lossy(&out.stdout);
         assert!(
             e.contains("is in the scanned tree but not as an enum") && e.contains("struct"),
             "{} said:\n{}",
@@ -292,8 +309,8 @@ fn an_unknown_target_suggests_near_names_on_every_kind_requiring_command() {
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("Did you mean"))
-        .stderr(contains("Token"));
+        .stdout(contains("Did you mean"))
+        .stdout(contains("Token"));
 }
 
 #[test]
@@ -346,7 +363,7 @@ fn every_name_taking_command_suggests_near_names() {
     // question, because only `show` had been taught to answer it.
     for c in ["callers", "callees", "type-refs", "takes-mut", "show"] {
         let out = ur().args(["--root", FIXTURE, c, "Documnet"]).output().unwrap();
-        let e = String::from_utf8_lossy(&out.stderr);
+        let e = String::from_utf8_lossy(&out.stdout);
         assert!(e.contains("Did you mean"), "{} gave no suggestions:\n{}", c, e);
         assert!(e.contains("Document"), "{} did not find the near name:\n{}", c, e);
     }
@@ -355,7 +372,7 @@ fn every_name_taking_command_suggests_near_names() {
         &ur().args(["--root", FIXTURE, "field-uses", "Documnet", "name"])
             .output()
             .unwrap()
-            .stderr,
+            .stdout,
     )
     .to_string();
     assert!(e.contains("Did you mean"), "{}", e);
@@ -385,6 +402,117 @@ fn a_cohort_glob_is_not_run_through_the_name_suggester() {
     .to_string();
     assert!(e.contains("cohort pattern"), "{}", e);
     assert!(!e.contains("Did you mean"), "suggested names for a glob:\n{}", e);
+}
+
+#[test]
+fn a_failed_lookup_answers_through_a_stderr_redirect() {
+    // The failure this closes: one session ran
+    //   show <name> 2>/dev/null | head -30 || <fallback>
+    // four times and got total silence each time — the suggestion erased by the
+    // redirect, the `||` never firing because a pipeline exits with `head`'s
+    // status. Every time, the reader concluded the tool had nothing.
+    for args in [
+        vec!["--root", FIXTURE, "show", "Documnet"],
+        vec!["--root", FIXTURE, "variants", "Tokne"],
+        vec!["--root", FIXTURE, "callers", "Documnet"],
+        vec!["--root", FIXTURE, "fields", "Documnet"],
+    ] {
+        let out = ur().args(&args).output().unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains("Did you mean") || s.contains("is in the scanned tree"),
+            "{:?} said nothing on stdout:\n{}",
+            args,
+            s
+        );
+    }
+}
+
+#[test]
+fn the_answer_is_still_in_the_json_notes() {
+    let out = ur()
+        .args(["--root", FIXTURE, "--json", "show", "Documnet"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("\"notes\""), "{}", s);
+    assert!(s.contains("Did you mean"), "{}", s);
+}
+
+#[test]
+fn a_name_that_is_only_a_closure_is_named_as_one() {
+    // A session hunted a fn that turned out to be `let push = |…|` a few lines
+    // away. The index holds items, not locals — but "no such name" sends the
+    // reader looking for a definition that is right there.
+    let root = std::env::temp_dir().join("unruster_closure_hint");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub fn build() -> u8 {\n    let tally = |a: u8| a + 1;\n    let plain = 3u8;\n    tally(plain)\n}\n",
+    )
+    .unwrap();
+    let r = root.to_str().unwrap();
+
+    let out = ur_output_allow_2(&["--root", r, "show", "tally"]);
+    assert!(out.contains("a closure"), "{}", out);
+    assert!(out.contains("lib.rs:2"), "{}", out);
+
+    let out = ur_output_allow_2(&["--root", r, "show", "plain"]);
+    assert!(out.contains("a local binding"), "{}", out);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_qualified_callers_query_that_finds_nothing_names_the_broader_form() {
+    // `Type::method` resolves through inferred receiver types, so a receiver
+    // reached through a field misses. Reporting `(0 call site(s))` made that
+    // indistinguishable from a method nobody calls — and the qualified form is
+    // exactly what `show`/`outline` hand you to paste back in. Two sessions
+    // took the zero at face value and went to `grep`.
+    let root = std::env::temp_dir().join("unruster_qualified_callers");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub struct Inner;\n\
+         impl Inner { pub fn ping(&self) -> u8 { 1 } }\n\
+         pub struct Outer { pub inner: Inner }\n\
+         impl Outer { pub fn go(&self) -> u8 { self.inner.ping() } }\n",
+    )
+    .unwrap();
+    let r = root.to_str().unwrap();
+
+    let qualified = ur_output_allow_2(&["--root", r, "callers", "Inner::ping"]);
+    assert!(
+        qualified.contains("Try `callers ping`"),
+        "no pointer to the broader form:\n{}",
+        qualified
+    );
+    // The broader form does find it.
+    let bare = ur_stdout(&["--root", r, "callers", "ping"]);
+    assert!(!rows_of(&bare).is_empty(), "{}", String::from_utf8_lossy(&bare));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_bare_callers_query_does_not_suggest_itself() {
+    let out = ur_output_allow_2(&["--root", FIXTURE, "callers", "no_such_fn_xyz"]);
+    assert!(!out.contains("Try `callers"), "{}", out);
+}
+
+#[test]
+fn outline_points_at_the_batch_form_where_a_reader_has_a_list() {
+    let e = String::from_utf8_lossy(
+        &ur().args(["--root", FIXTURE, "outline", "src/main.rs"])
+            .output()
+            .unwrap()
+            .stderr,
+    )
+    .to_string();
+    assert!(e.contains("show <a> <b> <c>"), "{}", e);
 }
 
 #[test]
@@ -572,8 +700,8 @@ fn show_suggests_near_names_instead_of_printing_nothing() {
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("Did you mean"))
-        .stderr(contains("new"));
+        .stdout(contains("Did you mean"))
+        .stdout(contains("new"));
 }
 
 #[test]
@@ -582,7 +710,7 @@ fn show_unknown_name_with_nothing_close_says_so_plainly() {
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("nothing close to it"));
+        .stdout(contains("nothing close to it"));
 }
 
 #[test]
@@ -797,7 +925,13 @@ fn a_batch_survives_one_unresolvable_name() {
     .output()
     .unwrap();
     assert!(out.status.success());
-    assert_eq!(rows_of(&out.stdout).len(), 1);
+    // One TSV row for the name that resolved, plus the explanation for the one
+    // that did not — which is on stdout on purpose, so `2>/dev/null` cannot
+    // erase it. Non-row lines are prefixed like `--context` snippets are.
+    let s = String::from_utf8_lossy(&out.stdout);
+    let data: Vec<&str> = s.lines().filter(|l| l.contains('\t')).collect();
+    assert_eq!(data.len(), 1, "{}", s);
+    assert!(s.contains("no item named `zzzznosuchname`"), "{}", s);
     assert!(String::from_utf8_lossy(&out.stderr).contains("1 unresolved"));
 }
 
@@ -1124,7 +1258,7 @@ fn co_call_unknown_symbol_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no fn, method, or macro `"));
+        .stdout(predicates::str::contains("no fn, method, or macro `"));
 }
 
 // ─── field / fields ────────────────────────────────────────────────────────
@@ -1343,7 +1477,7 @@ fn type_refs_unknown_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no type `NotAType`"));
+        .stdout(predicates::str::contains("no type `NotAType`"));
 }
 
 #[test]
@@ -1388,8 +1522,7 @@ fn takes_mut_unknown_type_warns_and_exits_2() {
         .args(["--root", FIXTURE, "takes-mut", "NoSuchType"])
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no type `NoSuchType`"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no type `NoSuchType`"));
     assert_eq!(out.status.code(), Some(2));
 }
 
@@ -1399,9 +1532,10 @@ fn callees_unknown_fn_warns_and_exits_2() {
         .args(["--root", FIXTURE, "callees", "no_such_fn_xyz"])
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no fn or method `"));
-    assert!(stderr.contains("0 distinct callees"));
+    // The explanation is the answer, so it goes to stdout where `2>/dev/null`
+    // cannot erase it; the summary line stays on stderr with every other summary.
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no fn or method `"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("0 distinct callees"));
     assert_eq!(out.status.code(), Some(2));
 }
 
@@ -1638,7 +1772,7 @@ fn enum_coverage_unknown_enum_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no enum `NotAnEnum`"));
+        .stdout(predicates::str::contains("no enum `NotAnEnum`"));
 }
 
 #[test]
@@ -2305,7 +2439,7 @@ fn variants_unknown_enum_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no enum `NotAnEnum`"));
+        .stdout(predicates::str::contains("no enum `NotAnEnum`"));
 }
 
 #[test]
@@ -2314,7 +2448,7 @@ fn catch_all_unknown_enum_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no enum `NotAnEnum`"));
+        .stdout(predicates::str::contains("no enum `NotAnEnum`"));
 }
 
 #[test]
@@ -2323,7 +2457,7 @@ fn parallel_matches_unknown_enum_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no enum `NotAnEnum`"));
+        .stdout(predicates::str::contains("no enum `NotAnEnum`"));
 }
 
 #[test]
@@ -2917,12 +3051,18 @@ fn field_uses_inits_only_filter() {
 
 #[test]
 fn field_uses_unknown_type_no_results_exits_2() {
-    // Querying a non-existent type: zero rows, warning, exit code 2.
+    // Querying a non-existent type: zero data rows, an explanation, exit 2.
     let out = ur()
         .args(["--root", FIXTURE, "field-uses", "NoSuchType", "no_field"])
         .output()
         .unwrap();
-    assert!(rows_of(&out.stdout).is_empty(), "expected no rows for unknown type");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !s.lines().any(|l| l.contains('\t')),
+        "expected no data rows for an unknown type:\n{}",
+        s
+    );
+    assert!(s.contains("NoSuchType"), "no explanation printed:\n{}", s);
     assert_eq!(out.status.code(), Some(2));
 }
 
@@ -2960,7 +3100,7 @@ fn fields_unknown_type_warns_and_exits_2() {
         .args(["--root", FIXTURE, "fields", "NoSuchStruct"])
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stdout);
     assert!(
         stderr.contains("no struct with named fields `NoSuchStruct`"),
         "expected unknown-struct warning, got:\n{}",
@@ -4110,9 +4250,90 @@ fn the_two_gating_checks_that_had_no_waiver_support_now_have_it() {
 }
 
 #[test]
+fn the_waiver_a_check_suggests_is_the_waiver_it_honours() {
+    // `clones` printed `ok(clones/<label>)` and then matched on an *empty* key,
+    // so the comment the tool told you to write did nothing and only a bare
+    // `ok(clones)` worked. A suggestion that is silently inert is worse than no
+    // suggestion: it looks like it succeeded.
+    //
+    // Asserted for every check that offers one — a key can only drift on the
+    // check where suggestion and filter are written apart.
+    let root = std::env::temp_dir().join("unruster_suggest_honoured");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // One duplicated body (clones) and one literal comparison (stringly).
+    // Bodies wide enough to clear `--min-tokens`, differing only in local names.
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+pub fn one(v: &[u8]) -> usize {
+    let mut n = 0usize;
+    for b in v {
+        if *b > 3 && *b < 200 { n += 1; } else { n += 2; }
+    }
+    n * 3 + v.len()
+}
+pub fn two(w: &[u8]) -> usize {
+    let mut m = 0usize;
+    for c in w {
+        if *c > 3 && *c < 200 { m += 1; } else { m += 2; }
+    }
+    m * 3 + w.len()
+}
+pub fn pick(k: &str) -> u8 { if k == "alpha" { 1 } else { 0 } }
+"#,
+    )
+    .unwrap();
+    let r = root.to_str().unwrap();
+
+    let original = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+
+    for check in ["clones", "stringly"] {
+        let suggested = ur_stdout(&["--root", r, "--suggest-waivers", check]);
+        let s = String::from_utf8_lossy(&suggested);
+        let mut lines = s.lines();
+        let row = lines
+            .by_ref()
+            .find(|l| l.contains('\t'))
+            .unwrap_or_else(|| panic!("{check} produced no row:\n{s}"))
+            .to_string();
+        let waiver = s
+            .lines()
+            .find(|l| l.contains("unruster: ok("))
+            .unwrap_or_else(|| panic!("{check} offered no waiver:\n{s}"))
+            .trim()
+            .replace("WHY?", "verified false positive");
+
+        // Paste it where the row points — above that line, which is what the
+        // waiver grammar means by "above the item" for a site-scoped finding.
+        let at = row
+            .split('\t')
+            .find_map(|c| c.rsplit_once(':').and_then(|(_, n)| n.parse::<usize>().ok()))
+            .unwrap_or_else(|| panic!("no file:line in row: {row}"));
+        let mut out: Vec<String> = original.lines().map(str::to_string).collect();
+        out.insert(at - 1, waiver.clone());
+        std::fs::write(src.join("lib.rs"), out.join("\n") + "\n").unwrap();
+
+        let after = rows_of(&ur_stdout(&["--root", r, check])).len();
+        let unwaived = rows_of(&ur_stdout(&["--root", r, "--no-suppress", check])).len();
+        assert!(
+            after < unwaived,
+            "{check} suggested `{waiver}` and then ignored it ({after} of {unwaived} rows remain)"
+        );
+        std::fs::write(src.join("lib.rs"), &original).unwrap();
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn suggest_waivers_says_so_when_a_check_cannot_use_them() {
     // Silence here is what sent a real agent off to invent its own format.
-    let out = ur().args(["--root", WV, "--suggest-waivers", "stringly"]).output().unwrap();
+    //
+    // The check named here must be one that genuinely ignores waivers.
+    // `stringly` used to stand in for that and does not: it filters on them and
+    // honours the key `--suggest-waivers` prints, so the note was false and the
+    // test was pinning the falsehood. `conversions` neither suggests nor filters.
+    let out = ur().args(["--root", WV, "--suggest-waivers", "conversions"]).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("does not support waivers"),

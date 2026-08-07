@@ -73,6 +73,10 @@ struct Group {
     /// Every member lives under the same directory — copies that a single
     /// `mod` could hold, which is where consolidation is cheapest and safest.
     same_dir: bool,
+    /// The shortest description of what is duplicated — also the waiver key,
+    /// which is why it is stored rather than recomputed: a `Site` borrows its
+    /// key, so a temporary `String` cannot be one.
+    label: String,
 }
 
 impl Group {
@@ -101,14 +105,13 @@ impl Group {
     }
 
     /// The shortest description of what is duplicated.
-    fn label(&self) -> String {
-        if self.same_name {
-            self.members[0].name.clone()
+    fn make_label(members: &[Body], same_name: bool) -> String {
+        if same_name {
+            members[0].name.clone()
         } else {
             // Distinct names: name the group by its members so the row is
             // still greppable.
-            let mut names: Vec<&str> =
-                self.members.iter().map(|m| m.name.as_str()).collect();
+            let mut names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
             names.sort_unstable();
             names.dedup();
             names.join("/")
@@ -355,11 +358,13 @@ pub fn run_counted(
             let same_name = members.iter().all(|m| m.name == members[0].name);
             let d = dir_of(&members[0].file);
             let same_dir = members.iter().all(|m| dir_of(&m.file) == d);
+            let label = Group::make_label(&members, same_name);
             Group {
                 members,
                 tokens,
                 same_name,
                 same_dir,
+                label,
             }
         })
         .collect();
@@ -378,8 +383,13 @@ pub fn run_counted(
     // retiring. Anchored at the *first* member: a group has several sites and
     // the waiver has to attach to a specific one, so it attaches to the one the
     // row leads with.
+    // Keyed on the group label — the same key `--suggest-waivers` prints.
+    // These two disagreed: the suggestion said `ok(clones/<label>)` while the
+    // filter matched on an empty key, so the comment the tool told you to write
+    // was inert and only a bare `ok(clones)` did anything. A suggestion that
+    // does nothing is worse than no suggestion, because it looks like it worked.
     let waived = ctx.retain_unsuppressed("clones", &mut groups, |g| {
-        crate::suppress::Site::keyed(g.members[0].file.as_str(), g.members[0].line, "")
+        crate::suppress::Site::keyed(g.members[0].file.as_str(), g.members[0].line, &g.label)
     });
 
     groups.sort_by(|a, b| {
@@ -402,7 +412,7 @@ pub fn run_counted(
         }
         let today = crate::suppress::Date::today();
         for g in &groups[..shown] {
-            let label = g.label();
+            let label = &g.label;
             let first = &g.members[0];
             // `at` stays a real site so `--json` keeps file and line as fields
             // and `--context` can quote the source. The remaining copies ride in
@@ -422,7 +432,7 @@ pub fn run_counted(
                     .collect::<Vec<_>>()
                     .join("  "),
             );
-            ctx.suggest("clones", Some(&label), today);
+            ctx.suggest("clones", Some(label), today);
         }
     }
 
@@ -529,11 +539,13 @@ mod tests {
         let same_name = members.iter().all(|m| m.name == members[0].name);
         let d = dir_of(&members[0].file);
         let same_dir = members.iter().all(|m| dir_of(&m.file) == d);
+        let label = Group::make_label(&members, same_name);
         Group {
             members,
             tokens,
             same_name,
             same_dir,
+            label,
         }
     }
 
@@ -607,11 +619,11 @@ mod tests {
             body("parse_uuid", "src/a.rs", 30),
             body("parse_uuid", "src/b.rs", 30),
         ]);
-        assert_eq!(g.label(), "parse_uuid");
+        assert_eq!(g.label, "parse_uuid");
         let g = group(vec![
             body("to_pb", "src/a.rs", 30),
             body("into_proto", "src/b.rs", 30),
         ]);
-        assert_eq!(g.label(), "into_proto/to_pb");
+        assert_eq!(g.label, "into_proto/to_pb");
     }
 }

@@ -107,7 +107,7 @@ fn recv_display(base: &syn::Expr) -> String {
 }
 
 impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
-    scope_visits!(item_mod, item_impl, item_trait);
+    scope_visits!(item_mod, item_impl, item_trait, trait_item_fn_typed);
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.scope
@@ -141,16 +141,6 @@ impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     }
 
 
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        let Some(body) = &i.default else { return };
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, body));
-        self.fn_types_stack
-            .push(FnTypes::build(&i.sig, body, self.fn_sigs, None));
-        visit::visit_trait_item_fn(self, i);
-        self.fn_types_stack.pop();
-        self.scope.leave_fn();
-    }
 
     fn visit_expr_assign(&mut self, e: &'ast syn::ExprAssign) {
         self.in_write_lhs = true;

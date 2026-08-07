@@ -173,14 +173,15 @@ impl AnalysisCtx<'_> {
         self.say_unknown(what, name);
     }
 
-    /// Which of the two things went wrong, said once.
+    /// Which of the three things went wrong, said once — on stdout, because
+    /// this is the answer rather than a remark about it (see [`Out::answer`]).
     fn say_unknown(&self, what: &str, name: &str) {
         let existing = self.idx.lookup(name);
         if !existing.is_empty() {
             let mut kinds: Vec<&str> = existing.iter().map(|d| d.kind).collect();
             kinds.sort_unstable();
             kinds.dedup();
-            self.out.note(&format!(
+            self.out.answer(&format!(
                 "note: `{}` is in the scanned tree but not as {} {} — it is: {}",
                 name,
                 article(what),
@@ -189,9 +190,25 @@ impl AnalysisCtx<'_> {
             ));
             return;
         }
+        // Not an item — but it may be a `let` binding or a closure, which the
+        // index does not hold and never will: those are not items and have no
+        // callers, fields or variants to report. Saying *that* ends the search;
+        // saying "no such name" sends the reader off to grep for a definition
+        // that is right there. One session hunted a `focus_regions` that turned
+        // out to be `let push = |…|` a few lines away.
+        if let Some(b) = crate::semantic::find_binding(self.files, name) {
+            self.out.answer(&format!(
+                "note: `{}` is not an item — it is {} at {}:{}. \
+                 This tool indexes items (fn, struct, enum, impl, …); locals and \
+                 closures have no callers or fields to report, so a text search \
+                 is the right tool for them.",
+                name, b.kind, b.file, b.line
+            ));
+            return;
+        }
         let near = self.idx.similar(name, 6);
         if near.is_empty() {
-            self.out.note(&format!(
+            self.out.answer(&format!(
                 "note: no {} `{}` in the scanned tree, and nothing close to it \
                  (try --scope all if it is test-only)",
                 what, name
@@ -199,10 +216,10 @@ impl AnalysisCtx<'_> {
             return;
         }
         self.out
-            .note(&format!("note: no {} `{}`. Did you mean:", what, name));
+            .answer(&format!("note: no {} `{}`. Did you mean:", what, name));
         for d in &near {
             self.out
-                .note(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));
+                .answer(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));
         }
     }
 

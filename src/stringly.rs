@@ -1,7 +1,7 @@
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::ast::{print_grouped_counts, scope_visits, ScopeTracker, top_module_of};
+use crate::ast::{lit_str, print_grouped_counts, scope_visits, top_module_of, ScopeTracker};
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 use crate::emit::{row, site};
@@ -41,14 +41,6 @@ impl<'a> StringlyVisitor<'a> {
     }
 }
 
-fn lit_str_value(e: &syn::Expr) -> Option<String> {
-    if let syn::Expr::Lit(el) = e {
-        if let syn::Lit::Str(s) = &el.lit {
-            return Some(s.value());
-        }
-    }
-    None
-}
 
 fn collect_str_lits_in_pat(p: &syn::Pat, out: &mut Vec<(String, usize)>) {
     match p {
@@ -84,9 +76,9 @@ impl<'ast, 'a> Visit<'ast> for StringlyVisitor<'a> {
 
     fn visit_expr_binary(&mut self, e: &'ast syn::ExprBinary) {
         if matches!(e.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
-            if let Some(s) = lit_str_value(&e.left) {
+            if let Some(s) = lit_str(&e.left) {
                 self.record("cmp-eq", truncate_lit(&s, 32), e.left.span().start().line);
-            } else if let Some(s) = lit_str_value(&e.right) {
+            } else if let Some(s) = lit_str(&e.right) {
                 self.record("cmp-eq", truncate_lit(&s, 32), e.right.span().start().line);
             }
         }
@@ -103,7 +95,7 @@ impl<'ast, 'a> Visit<'ast> for StringlyVisitor<'a> {
         };
         if let Some(c) = class {
             if let Some(arg) = e.args.first() {
-                if let Some(s) = lit_str_value(arg) {
+                if let Some(s) = lit_str(arg) {
                     self.record(c, truncate_lit(&s, 32), e.method.span().start().line);
                 }
             }
@@ -149,7 +141,7 @@ impl<'ast, 'a> Visit<'ast> for StringlyVisitor<'a> {
         if is_assert_cmp {
             // First two args are the operands; either being a str literal is a hit.
             for arg in exprs.iter().take(2) {
-                if let Some(s) = lit_str_value(arg) {
+                if let Some(s) = lit_str(arg) {
                     self.record(
                         "cmp-eq",
                         truncate_lit(&s, 32),
