@@ -224,6 +224,59 @@ impl ScopeTracker {
     }
 }
 
+/// Where an item begins, where it is declared, and where it ends.
+///
+/// Three numbers rather than one because the three questions a reader asks are
+/// different: *where do I read from* includes the doc comment and attributes,
+/// *which line is the item* is the declaration, and *where do I stop* is the
+/// closing brace. Collapsing them is how `grep -n 'fn foo' | sed -n "$n,+70p"`
+/// gets to be off by a line — every consumer picks the wrong one of the three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    /// First line including `///` docs and `#[attrs]`.
+    pub doc_start: usize,
+    /// The `fn`/`struct`/`impl` line itself.
+    pub decl: usize,
+    /// Last line of the item, closing brace included.
+    pub end: usize,
+}
+
+/// The [`Extent`] of a syn node whose declaration sits at `decl`.
+///
+/// `attrs` is passed separately rather than read back off `node` because syn
+/// has no one trait for "this item's attributes" — [`item_attrs`] covers
+/// `syn::Item` and nothing else, while impl/trait members carry their own.
+pub fn extent_of<T: Spanned>(node: &T, attrs: &[syn::Attribute], decl: usize) -> Extent {
+    let doc_start = attrs
+        .iter()
+        .map(line_of)
+        .min()
+        .unwrap_or(decl)
+        .min(decl);
+    Extent {
+        doc_start,
+        decl,
+        // `max(decl)`: a span that ends before it starts is not a range any
+        // reader can use, and an empty `sed` range reads as "nothing here".
+        end: node.span().end().line.max(decl),
+    }
+}
+
+/// The first line of an item's `///` doc comment, trimmed. `None` when the
+/// item has no doc — an outline row says nothing rather than inventing a
+/// summary from the code.
+pub fn doc_summary(attrs: &[syn::Attribute]) -> Option<String> {
+    let line = attrs.iter().find_map(doc_text)?;
+    let t = line.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Last line of a fn signature — through the return type and where-clause, so
+/// `show --sig` prints a complete header and none of the body.
+pub fn sig_end(sig: &syn::Signature, decl: usize) -> usize {
+    sig.span().end().line.max(decl)
+}
+
 /// (start, end) source lines of a fn: signature ident line through body end.
 pub fn fn_span(sig: &syn::Signature, block: &syn::Block) -> (usize, usize) {
     let start = line_of(&sig.ident);

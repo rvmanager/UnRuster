@@ -1,20 +1,16 @@
-use syn::visit::{self, Visit};
+//! `inventory` — every top-level item in the scanned tree.
+//!
+//! Reads [`crate::index::NameIndex`] rather than walking the AST itself. It
+//! used to have its own visitor, which was the same twelve `visit_item_*`
+//! bodies with the same qualification rules — and the two had already begun to
+//! answer differently, because only one of them knew where an item *ends*.
+//! Under `--spans` this command must report `file:start-end`, and a second
+//! opinion about where a `fn` stops is exactly the kind of drift that shows up
+//! as an off-by-a-few source range rather than as a failing test.
 
-use crate::ast::{
-    line_of, line_of_span, path_to_string, type_short, type_to_string, vis_str, ScopeTracker,
-};
 use crate::context::AnalysisCtx;
-use crate::parse::display_path;
-use crate::emit::{row, site};
-
-#[derive(Debug)]
-pub struct Item {
-    pub kind: &'static str,
-    pub name: String,
-    pub vis: &'static str,
-    pub file: String,
-    pub line: usize,
-}
+use crate::index::Defn;
+use crate::emit::row;
 
 /// `--kind` filter values. Kebab-cased by clap (TraitFn → `trait-fn`).
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -33,7 +29,7 @@ pub enum ItemKind {
 }
 
 impl ItemKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ItemKind::Struct => "struct",
             ItemKind::Enum => "enum",
@@ -68,131 +64,20 @@ impl VisFilter {
     }
 }
 
-struct InventoryVisitor<'a> {
-    file: &'a str,
-    scope: ScopeTracker,
-    items: Vec<Item>,
-}
-
-impl<'a> InventoryVisitor<'a> {
-    fn qualify(&self, name: &str) -> String {
-        self.scope.qualify(name)
-    }
-
-    fn push(&mut self, kind: &'static str, name: String, vis: &'static str, line: usize) {
-        self.items.push(Item {
-            kind,
-            name,
-            vis,
-            file: self.file.to_string(),
-            line,
-        });
-    }
-}
-
-impl<'ast, 'a> Visit<'ast> for InventoryVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        let name = i.ident.to_string();
-        self.push("mod", self.qualify(&name), vis_str(&i.vis), line_of(&i.ident));
-        self.scope.enter_mod(name);
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
-
-    fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
-        let name = i.ident.to_string();
-        self.push("struct", self.qualify(&name), vis_str(&i.vis), line_of(&i.ident));
-    }
-
-    fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
-        let name = i.ident.to_string();
-        self.push("enum", self.qualify(&name), vis_str(&i.vis), line_of(&i.ident));
-    }
-
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        let name = i.ident.to_string();
-        self.push("trait", self.qualify(&name), vis_str(&i.vis), line_of(&i.ident));
-        self.scope.enter_trait(name);
-        for item in &i.items {
-            if let syn::TraitItem::Fn(f) = item {
-                let qn = self.qualify(&f.sig.ident.to_string());
-                self.push("trait-fn", qn, "pub", line_of(&f.sig.ident));
-            }
-        }
-        self.scope.leave_trait();
-    }
-
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        let name = i.sig.ident.to_string();
-        self.push("fn", self.qualify(&name), vis_str(&i.vis), line_of(&i.sig.ident));
-    }
-
-    fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
-        let name = i.ident.to_string();
-        self.push("const", self.qualify(&name), vis_str(&i.vis), line_of(&i.ident));
-    }
-
-    fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
-        let name = i.ident.to_string();
-        self.push("static", self.qualify(&name), vis_str(&i.vis), line_of(&i.ident));
-    }
-
-    fn visit_item_type(&mut self, i: &'ast syn::ItemType) {
-        let name = i.ident.to_string();
-        self.push("type", self.qualify(&name), vis_str(&i.vis), line_of(&i.ident));
-    }
-
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        let self_ty = type_short(&i.self_ty);
-        let header = match &i.trait_ {
-            Some((bang, trait_path, _)) => {
-                let prefix = if bang.is_some() { "!" } else { "" };
-                format!(
-                    "impl {}{} for {}",
-                    prefix,
-                    path_to_string(trait_path),
-                    type_to_string(&i.self_ty)
-                )
-            }
-            None => format!("impl {}", type_to_string(&i.self_ty)),
-        };
-        self.push("impl", header, "—", line_of_span(i.impl_token.span));
-        self.scope.enter_impl(self_ty);
-        for item in &i.items {
-            if let syn::ImplItem::Fn(f) = item {
-                let qn = self.qualify(&f.sig.ident.to_string());
-                // "impl-fn", matching the NameIndex kind — `fn` means free fns.
-                self.push("impl-fn", qn, vis_str(&f.vis), line_of(&f.sig.ident));
-            }
-        }
-        self.scope.leave_impl();
-    }
-}
-
 pub fn run(
     ctx: &AnalysisCtx,
     kind_filter: Option<ItemKind>,
     vis_filter: Option<VisFilter>,
     tree: bool,
 ) -> anyhow::Result<usize> {
-    let files = ctx.files;
     let summary = ctx.summary;
-    let mut all = Vec::new();
-    for f in files {
-        let mut v = InventoryVisitor {
-            file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()),
-            items: Vec::new(),
-        };
-        v.visit_file(&f.ast);
-        all.extend(v.items);
-    }
+    let mut all: Vec<&Defn> = ctx.idx.iter().collect();
 
     if let Some(k) = kind_filter {
-        all.retain(|i| i.kind == k.as_str());
+        all.retain(|d| d.kind == k.as_str());
     }
     if let Some(v) = vis_filter {
-        all.retain(|i| i.vis == v.as_str());
+        all.retain(|d| d.vis == v.as_str());
     }
 
     if tree {
@@ -205,13 +90,13 @@ pub fn run(
                 .then_with(|| a.line.cmp(&b.line))
         });
         if !summary {
-            for it in &all {
+            for d in &all {
                 row!(
                     ctx.out,
-                    "kind" => it.kind,
-                    "vis" => it.vis,
-                    "name" => it.name.clone(),
-                    "at" => site(&it.file, it.line),
+                    "kind" => d.kind,
+                    "vis" => d.vis,
+                    "name" => d.qpath.clone(),
+                    "at" => ctx.at(&d.file, d.line, d.end),
                 );
             }
         }
@@ -220,13 +105,13 @@ pub fn run(
     Ok(all.len())
 }
 
-fn print_tree(items: &[Item], summary: bool) {
+fn print_tree(items: &[&Defn], summary: bool) {
     if summary {
         return;
     }
     use std::collections::BTreeMap;
     // Group by leading module path. Items with empty module path go under "<crate>".
-    let mut by_mod: BTreeMap<String, Vec<&Item>> = BTreeMap::new();
+    let mut by_mod: BTreeMap<String, Vec<&Defn>> = BTreeMap::new();
     for it in items {
         by_mod.entry(module_path_of(it)).or_default().push(it);
     }
@@ -239,11 +124,11 @@ fn print_tree(items: &[Item], summary: bool) {
 /// Leading module path of an item's qualified name — the prefix before the
 /// first uppercase (type) segment. `inventory::Visitor::push` → `inventory`;
 /// a bare `main` → `<crate>`; a `mod` item is its own path.
-fn module_path_of(it: &Item) -> String {
+fn module_path_of(it: &Defn) -> String {
     if it.kind == "mod" {
-        return it.name.clone();
+        return it.qpath.clone();
     }
-    let segs: Vec<&str> = it.name.split("::").collect();
+    let segs: Vec<&str> = it.qpath.split("::").collect();
     let keep: Vec<&str> = segs[..segs.len().saturating_sub(1)]
         .iter()
         .take_while(|s| !s.chars().next().unwrap_or('A').is_ascii_uppercase())
@@ -257,7 +142,7 @@ fn module_path_of(it: &Item) -> String {
 }
 
 /// Print one module's header, per-kind counts, and kind-grouped item rows.
-fn print_module(module: &str, items: &[&Item]) {
+fn print_module(module: &str, items: &[&Defn]) {
     use std::collections::BTreeMap;
     println!("{}\t({} items)", module, items.len());
     let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
@@ -268,14 +153,14 @@ fn print_module(module: &str, items: &[&Item]) {
         println!("  {}\t{}", n, kind);
     }
     // List items by kind, sorted within each group.
-    let mut grouped: BTreeMap<&str, Vec<&Item>> = BTreeMap::new();
+    let mut grouped: BTreeMap<&str, Vec<&Defn>> = BTreeMap::new();
     for it in items {
         grouped.entry(it.kind).or_default().push(it);
     }
     for (kind, mut its) in grouped {
-        its.sort_by_key(|i| &i.name);
+        its.sort_by_key(|i| &i.qpath);
         for it in its {
-            println!("    {}\t{}\t{}\t{}:{}", kind, it.vis, it.name, it.file, it.line);
+            println!("    {}\t{}\t{}\t{}:{}", kind, it.vis, it.qpath, it.file, it.line);
         }
     }
 }

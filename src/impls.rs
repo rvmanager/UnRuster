@@ -1,5 +1,5 @@
 use crate::context::AnalysisCtx;
-use crate::emit::{row, site};
+use crate::emit::row;
 
 pub fn run(
     ctx: &AnalysisCtx,
@@ -45,7 +45,7 @@ pub fn run(
                 "trait" => trait_disp,
                 "name" => d.name.clone(),
                 "qpath" => d.qpath.clone(),
-                "at" => site(&d.file, d.line),
+                "at" => ctx.at(&d.file, d.line, d.end),
             );
         }
     }

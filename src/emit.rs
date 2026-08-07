@@ -33,6 +33,15 @@ pub enum Val {
     Bool(bool),
     List(Vec<String>),
     Site { file: String, line: usize },
+    /// A site that knows where its item *ends*: `file:start-end`. The `--spans`
+    /// upgrade of [`Val::Site`], and the reason it is a separate variant rather
+    /// than an `Option<usize>` on `Site` is that the two render differently and
+    /// every consumer of `Site` already parses `file:line`.
+    Span {
+        file: String,
+        start: usize,
+        end: usize,
+    },
 }
 
 impl Val {
@@ -45,6 +54,19 @@ impl Val {
             Val::Bool(b) => b.to_string(),
             Val::List(v) => v.join(","),
             Val::Site { file, line } => format!("{}:{}", file, line),
+            Val::Span { file, start, end } => format!("{}:{}-{}", file, start, end),
+        }
+    }
+
+    /// The `(file, line)` this cell points at, for the machinery that keys off
+    /// a row's location — `--context` snippets and fingerprinting. A `Span`
+    /// answers with its start, so turning on `--spans` cannot silently switch
+    /// either of them off.
+    pub fn as_site(&self) -> Option<(&str, usize)> {
+        match self {
+            Val::Site { file, line } => Some((file.as_str(), *line)),
+            Val::Span { file, start, .. } => Some((file.as_str(), *start)),
+            _ => None,
         }
     }
 }
@@ -99,6 +121,17 @@ pub fn site(file: &str, line: usize) -> Val {
     Val::Site {
         file: file.to_string(),
         line,
+    }
+}
+
+/// A `file:start-end` cell: the same column, upgraded to say where the item
+/// ends. Emitted in place of [`site`] under `--spans` so a reader can fetch
+/// exactly the body a row names instead of guessing a line budget.
+pub fn span_site(file: &str, start: usize, end: usize) -> Val {
+    Val::Span {
+        file: file.to_string(),
+        start,
+        end,
     }
 }
 
@@ -262,10 +295,9 @@ impl Out {
     /// Fingerprint plus the bits a diff listing needs.
     fn finding_of(&self, cells: &[(&'static str, Val)]) -> Finding {
         let check = self.current_check.borrow().clone();
-        let site = cells.iter().find_map(|(_, v)| match v {
-            Val::Site { file, line } => Some((file.clone(), *line)),
-            _ => None,
-        });
+        let site = cells
+            .iter()
+            .find_map(|(_, v)| v.as_site().map(|(f, l)| (f.to_string(), l)));
         let text = site
             .as_ref()
             .and_then(|(f, l)| self.source_line(f, *l));
@@ -469,10 +501,7 @@ impl Out {
         let Some(n) = self.context_lines.get() else {
             return Vec::new();
         };
-        let Some((file, line)) = cells.iter().find_map(|(_, v)| match v {
-            Val::Site { file, line } => Some((file, *line)),
-            _ => None,
-        }) else {
+        let Some((file, line)) = cells.iter().find_map(|(_, v)| v.as_site()) else {
             return Vec::new();
         };
         snippet(file, line, n)
@@ -611,6 +640,17 @@ fn push_row(s: &mut String, r: &Row) {
                 s.push_str(", \"line\": ");
                 s.push_str(&line.to_string());
             }
+            // `line` stays the start, so a consumer written against `Site`
+            // keeps working and only gains `end_line`.
+            Val::Span { file, start, end } => {
+                sep(s, &mut first);
+                s.push_str("\"file\": ");
+                push_str(s, file);
+                s.push_str(", \"line\": ");
+                s.push_str(&start.to_string());
+                s.push_str(", \"end_line\": ");
+                s.push_str(&end.to_string());
+            }
             other => {
                 sep(s, &mut first);
                 push_str(s, k);
@@ -655,6 +695,9 @@ fn push_val(s: &mut String, v: &Val) {
         Val::Site { file, line } => {
             // Only reached for a Site nested where a scalar was expected.
             push_str(s, &format!("{}:{}", file, line));
+        }
+        Val::Span { file, start, end } => {
+            push_str(s, &format!("{}:{}-{}", file, start, end));
         }
     }
 }

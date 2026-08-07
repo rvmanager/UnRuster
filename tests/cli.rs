@@ -129,6 +129,319 @@ fn inventory_tree() {
         .stdout(contains("crate"));
 }
 
+#[test]
+fn inventory_spans_upgrades_the_at_column_to_start_end() {
+    let out = ur()
+        .args(["--root", FIXTURE, "--spans", "inventory", "--kind", "fn"])
+        .output()
+        .unwrap();
+    // Same four columns as without the flag — `--spans` widens the cell, it
+    // does not add one. A new column would break every caller's `awk`.
+    assert_tsv_cols(&out.stdout, 4);
+    for line in rows_of(&out.stdout) {
+        let at = line.split('\t').next_back().unwrap();
+        let (_, range) = at.rsplit_once(':').unwrap();
+        let (start, end) = range
+            .split_once('-')
+            .unwrap_or_else(|| panic!("expected file:start-end, got {:?}", at));
+        let (start, end) = (
+            start.parse::<usize>().unwrap(),
+            end.parse::<usize>().unwrap(),
+        );
+        assert!(end >= start, "end before start in {:?}", at);
+    }
+}
+
+#[test]
+fn without_spans_the_at_column_is_unchanged() {
+    let out = ur()
+        .args(["--root", FIXTURE, "inventory", "--kind", "fn"])
+        .output()
+        .unwrap();
+    for line in rows_of(&out.stdout) {
+        let at = line.split('\t').next_back().unwrap();
+        assert!(!at.contains('-'), "expected a bare file:line, got {:?}", at);
+    }
+}
+
+#[test]
+fn spans_does_not_move_a_finding_fingerprint() {
+    // A fingerprint exists so an edit above a finding doesn't make it look new.
+    // If `--spans` changed it, adding the flag would report the whole codebase
+    // as new against a stored baseline — a formatting flag must not be able to
+    // do that.
+    let fps = |extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["--root", FIXTURE, "--fingerprints"];
+        args.extend_from_slice(extra);
+        args.push("dead-code");
+        let out = ur().args(&args).output().unwrap();
+        let mut v: Vec<String> = rows_of(&out.stdout)
+            .iter()
+            .map(|l| l.split('\t').next_back().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let plain = fps(&[]);
+    assert!(!plain.is_empty(), "fixture should have dead-code rows");
+    assert_eq!(plain, fps(&["--spans"]));
+}
+
+#[test]
+fn context_still_fires_when_the_at_cell_carries_a_span() {
+    // `--context` finds its file/line by scanning the row's cells for a site.
+    // The `--spans` upgrade swaps that cell for a different variant, and the
+    // snippet would silently stop appearing if it only knew the old one.
+    ur().args([
+        "--root", FIXTURE, "--spans", "--context", "1", "inventory", "--kind", "fn",
+    ])
+    .assert()
+    .success()
+    .stdout(contains(">"));
+}
+
+// ─── show ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn show_prints_the_whole_item_and_stops_at_its_closing_brace() {
+    let out = ur()
+        .args(["--root", FIXTURE, "show", "Document::new"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("pub fn new(name: String) -> Self {"), "{}", s);
+    assert!(s.contains("transform: [0.0; 4]"), "{}", s);
+    // `touch` is the next item in the impl block. A `+N` line budget would
+    // either cut the body short or run into it; the AST range does neither.
+    assert!(!s.contains("pub fn touch"), "ran past the item:\n{}", s);
+}
+
+#[test]
+fn show_reports_the_exact_range_it_printed() {
+    let out = ur()
+        .args(["--root", FIXTURE, "show", "Document::new"])
+        .output()
+        .unwrap();
+    let rows = rows_of(&out.stdout);
+    let at = rows[0].split('\t').next_back().unwrap();
+    let (_, range) = at.rsplit_once(':').unwrap();
+    let (start, end) = range.split_once('-').unwrap();
+    let (start, end) = (
+        start.parse::<usize>().unwrap(),
+        end.parse::<usize>().unwrap(),
+    );
+    // Header row plus exactly the source lines the range names.
+    assert_eq!(rows.len() - 1, end - start + 1, "row count vs range:\n{:?}", rows);
+}
+
+#[test]
+fn show_sig_stops_before_the_body() {
+    let out = ur()
+        .args(["--root", FIXTURE, "show", "Document::new", "--part", "sig", "--no-doc"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("pub fn new(name: String) -> Self"), "{}", s);
+    assert!(!s.contains("transform: [0.0; 4]"), "body leaked in:\n{}", s);
+}
+
+#[test]
+fn show_span_prints_the_range_and_no_source() {
+    let out = ur()
+        .args(["--root", FIXTURE, "show", "Document::new", "--part", "span"])
+        .output()
+        .unwrap();
+    assert_eq!(rows_of(&out.stdout).len(), 1);
+    assert_tsv_cols(&out.stdout, 4);
+}
+
+#[test]
+fn show_finds_an_indented_method_that_a_caret_anchor_would_miss() {
+    // `^pub fn` never matches a method inside an `impl` block. This is the
+    // whole reason the grep idiom needs a per-file guess at indent width.
+    ur().args(["--root", FIXTURE, "show", "render_row"])
+        .assert()
+        .success();
+    ur().args(["--root", FIXTURE, "show", "Document::touch"])
+        .assert()
+        .success()
+        .stdout(contains("self.transform[0] += 1.0;"));
+}
+
+#[test]
+fn show_lists_rather_than_concatenating_when_a_name_is_ambiguous() {
+    // `render` is a trait fn and its impl. Printing both bodies under one
+    // header is the unreadable output this command exists to replace.
+    let out = ur()
+        .args(["--root", FIXTURE, "show", "render"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_tsv_cols(&out.stdout, 4);
+    assert!(rows_of(&out.stdout).len() > 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("names"));
+}
+
+#[test]
+fn show_kind_disambiguates() {
+    ur().args(["--root", FIXTURE, "show", "render", "--kind", "trait-fn"])
+        .assert()
+        .success()
+        .stdout(contains("trait-fn"));
+}
+
+#[test]
+fn show_says_which_kinds_exist_when_kind_filters_everything_out() {
+    ur().args(["--root", FIXTURE, "show", "Document", "--kind", "enum"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("exists but not as a `enum`"))
+        .stderr(contains("struct"));
+}
+
+#[test]
+fn show_suggests_near_names_instead_of_printing_nothing() {
+    // The expensive failure: a half-remembered name returns an empty result,
+    // which is indistinguishable from "no such concept here".
+    ur().args(["--root", FIXTURE, "show", "Document::nwe"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("Did you mean"))
+        .stderr(contains("new"));
+}
+
+#[test]
+fn show_unknown_name_with_nothing_close_says_so_plainly() {
+    ur().args(["--root", FIXTURE, "show", "zzzqqqwwwyyy"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("nothing close to it"));
+}
+
+#[test]
+fn show_json_carries_the_source_as_a_list_and_an_end_line() {
+    let out = ur()
+        .args(["--root", FIXTURE, "--json", "show", "Document::new"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("\"end_line\""), "{}", s);
+    assert!(s.contains("\"source\""), "{}", s);
+    // `line` still holds the start, so a consumer written against `Site`
+    // keeps working.
+    assert!(s.contains("\"line\""), "{}", s);
+}
+
+#[test]
+fn show_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "show", "Document::new"]);
+}
+
+// ─── outline ───────────────────────────────────────────────────────────────
+
+#[test]
+fn outline_lists_a_files_items_with_end_lines() {
+    let out = ur()
+        .args(["--root", FIXTURE, "outline", "src/main.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_tsv_cols(&out.stdout, 5);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("Document"), "{}", s);
+    assert!(s.contains("Token"), "{}", s);
+    // Private items too — the `^pub fn` anchor cannot see these.
+    assert!(s.contains("inner"), "{}", s);
+}
+
+#[test]
+fn outline_resolves_a_trailing_path_fragment() {
+    ur().args(["--root", FIXTURE, "outline", "main.rs"])
+        .assert()
+        .success()
+        .stdout(contains("Document"));
+}
+
+#[test]
+fn outline_matches_whole_path_components_only() {
+    // `ain.rs` is a substring of `main.rs` but not a component of it, and a
+    // command that silently resolved it would be answering about a file the
+    // caller did not name.
+    ur().args(["--root", FIXTURE, "outline", "ain.rs"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn outline_indents_impl_members_under_their_block() {
+    let out = ur()
+        .args(["--root", FIXTURE, "outline", "src/main.rs"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.lines().any(|l| l.contains("\t  new")),
+        "expected an indented impl member:\n{}",
+        s
+    );
+}
+
+#[test]
+fn outline_flat_drops_the_indent() {
+    let out = ur()
+        .args(["--root", FIXTURE, "outline", "src/main.rs", "--flat"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.contains("\t  "), "expected no indent:\n{}", s);
+}
+
+#[test]
+fn outline_docs_column_carries_the_doc_first_line() {
+    ur().args(["--root", FIXTURE, "outline", "src/main.rs", "--docs"])
+        .assert()
+        .success()
+        .stdout(contains("Top-level variant constant"));
+}
+
+#[test]
+fn outline_pub_only_narrows_to_the_files_surface() {
+    let out = ur()
+        .args(["--root", FIXTURE, "outline", "src/main.rs", "--pub-only"])
+        .output()
+        .unwrap();
+    for line in rows_of(&out.stdout) {
+        assert_eq!(line.split('\t').nth(1), Some("pub"), "{}", line);
+    }
+}
+
+#[test]
+fn outline_of_an_unscanned_file_says_why_rather_than_listing_nothing() {
+    ur().args(["--root", FIXTURE, "outline", "tests/dummy.rs"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("--scope all"));
+}
+
+#[test]
+fn outline_of_a_nonexistent_file_says_that_instead() {
+    ur().args(["--root", FIXTURE, "outline", "src/no_such_file.rs"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("no such path exists"));
+}
+
+#[test]
+fn outline_summary_mode() {
+    assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "outline", "src/main.rs"]);
+}
+
 // ─── callers / callees ─────────────────────────────────────────────────────
 
 #[test]
@@ -2595,7 +2908,14 @@ fn audit_puts_each_sections_summary_in_the_section() {
 #[test]
 fn help_shows_the_command_list_within_the_first_screen() {
     // The playbook used to occupy the first 296 lines of `--help`, so the
-    // command list was invisible to anyone piping through `head`.
+    // command list was invisible to anyone piping through `head`. That is the
+    // failure this guards against — the exact bound is a budget, not a
+    // measurement, and it is deliberately tight so that adding preamble is a
+    // decision someone makes rather than one that happens.
+    //
+    // Raised 60 → 62 when `show` and `outline` were added: two new top-level
+    // commands earn their two lines in a list of commands, and the rest of that
+    // feature's documentation went to `explain reading-code` rather than here.
     let out = ur_stdout(&["--help"]);
     let s = String::from_utf8_lossy(&out);
     let idx = s
@@ -2603,8 +2923,8 @@ fn help_shows_the_command_list_within_the_first_screen() {
         .position(|l| l.starts_with("Commands:"))
         .expect("expected a Commands: section in --help");
     assert!(
-        idx < 60,
-        "Commands: must appear within the first 60 help lines, found at {}",
+        idx < 62,
+        "Commands: must appear within the first 62 help lines, found at {}",
         idx
     );
 }

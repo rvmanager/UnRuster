@@ -8,6 +8,8 @@ AGENT QUICKSTART
   unruster config-drift              same struct built two ways (divergence, for values)
   unruster divergence --handling     one callee, different care (.expect vs .ok())
   unruster explain <topic>           one repair recipe (cheap); `playbook` for all
+  unruster outline <file>            the file's items, each with file:start-end
+  unruster show <name>               one item's exact source (`explain reading-code`)
   --json                             every command; keeps file/line as real fields
 
 HIGHEST-SIGNAL FIRST
@@ -27,7 +29,7 @@ GLOBAL FLAGS
   --changed-since <ref>  keep only rows in files changed vs a git ref
   --format tsv|json      output shape; --json is an alias for --format json
   --context N            print ±N source lines under each row
-  --spans                fn labels become `name@start-end`
+  --spans                fn labels `name@start-end`; item rows' `at` gains an end
   --summary              drop rows, keep the summary line
   --all-stdout           summaries/notes to stdout instead of stderr
   --exclude GLOB         drop matching files (repeatable)

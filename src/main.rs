@@ -29,10 +29,12 @@ mod index;
 mod inventory;
 mod macro_scan;
 mod metrics;
+mod outline;
 mod parallel_matches;
 mod parse;
 mod pass_through;
 mod semantic;
+mod show;
 mod stringly;
 mod suppress;
 mod takes_mut;
@@ -175,7 +177,21 @@ enum Cmd {
     /// same thing to the same APIs, not merely functions of the same shape.
     Clones(ClonesArgs),
     /// List all top-level items (struct, enum, trait, fn, impl, ...).
+    /// Under `--spans` the `at` column becomes `file:start-end`.
     Inventory(InventoryArgs),
+    /// Print one item's exact source, resolved by name through the AST:
+    /// `show draft_regions`, `show Window::parse`, `show geom::window::Window`.
+    /// Prints from the doc comment through the closing brace — no `+N` line
+    /// budget to guess, no `^fn` anchor to miss an indented method. `--part
+    /// sig` for the signature alone, `--part span` for just `file:start-end`.
+    /// A name that doesn't resolve answers with the near names, not silence.
+    Show(ShowArgs),
+    /// AST table of contents for one file: every item with `file:start-end`,
+    /// indented by scope. `outline src/trace.rs`. Complete where a
+    /// `grep -n '^pub fn'` anchor is not — it sees private items, indented
+    /// methods and multi-line signatures — and every row says where the item
+    /// ends, so the follow-up read is exact rather than a 150-line window.
+    Outline(OutlineArgs),
     /// Find call sites of a function, method, or macro.
     Callers(CallersArgs),
     /// List callees made from inside a function or method.
@@ -363,6 +379,8 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::ConfigDrift(_) => "config-drift",
         Cmd::Clones(_) => "clones",
         Cmd::Inventory(_) => "inventory",
+        Cmd::Show(_) => "show",
+        Cmd::Outline(_) => "outline",
         Cmd::Callers(_) => "callers",
         Cmd::Callees(_) => "callees",
         Cmd::CoCall(_) => "co-call",
@@ -403,6 +421,8 @@ impl Cmd {
             | Cmd::ConfigDrift(_)
             | Cmd::Clones(_)
             | Cmd::Inventory(_)
+            | Cmd::Show(_)
+            | Cmd::Outline(_)
             | Cmd::Callers(_)
             | Cmd::Callees(_)
             | Cmd::CoCall(_)
@@ -524,6 +544,67 @@ struct InventoryArgs {
     /// Render as a module tree instead of a flat list.
     #[arg(long)]
     tree: bool,
+}
+
+#[derive(Args)]
+struct ShowArgs {
+    /// The item: a bare name (`draft_regions`), a `Type::method`
+    /// (`Window::parse`), or any qualified suffix
+    /// (`geom::window::Window::parse`). Matching is on whole `::` segments, so
+    /// a suffix that isn't one won't silently resolve to something else.
+    name: String,
+
+    /// How much of the item to print. `full` = docs + signature + body;
+    /// `sig` = docs + signature (a fn's, through the return type); `doc` = the
+    /// doc comment and attributes alone; `span` = no source, just the
+    /// `file:start-end` row for a reader that will seek there itself.
+    #[arg(long, value_enum, default_value = "full")]
+    part: show::Part,
+
+    /// Only items of this kind, for the usual `Foo`-is-a-struct-and-an-impl
+    /// case. Same vocabulary as `inventory --kind`.
+    #[arg(long, short = 'k', value_enum)]
+    kind: Option<inventory::ItemKind>,
+
+    /// Print every match rather than listing them. Off by default: four fn
+    /// bodies concatenated under one header is exactly the unreadable output
+    /// this command exists to replace.
+    #[arg(long)]
+    all: bool,
+
+    /// Omit the leading doc comment and attributes.
+    #[arg(long)]
+    no_doc: bool,
+
+    /// Prefix each source line with its line number, so a follow-up edit can
+    /// be addressed without counting.
+    #[arg(long, short = 'n')]
+    number: bool,
+}
+
+#[derive(Args)]
+struct OutlineArgs {
+    /// The file, as a path or any trailing part of one: `src/geom/window.rs`,
+    /// `geom/window.rs` and `window.rs` all resolve. Matching is on whole path
+    /// components, so `dow.rs` does not.
+    file: String,
+
+    /// Only items of this kind.
+    #[arg(long, short = 'k', value_enum)]
+    kind: Option<inventory::ItemKind>,
+
+    /// Only `pub` items — the file's external surface.
+    #[arg(long)]
+    pub_only: bool,
+
+    /// Append each item's doc-comment first line as a final column.
+    #[arg(long)]
+    docs: bool,
+
+    /// Drop the nesting indent from the `name` column (friendlier to `awk`,
+    /// harder to read).
+    #[arg(long)]
+    flat: bool,
 }
 
 #[derive(Args)]
@@ -1021,6 +1102,28 @@ fn dispatch(
         Cmd::Clones(a) => clones::run(ctx, a.min_tokens, a.top),
         Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score, a.top),
         Cmd::Inventory(a) => inventory::run(ctx, a.kind, a.vis, a.tree),
+        Cmd::Show(a) => show::run(
+            ctx,
+            &a.name,
+            &show::ShowOpts {
+                part: a.part,
+                kind: a.kind.map(inventory::ItemKind::as_str),
+                all: a.all,
+                no_doc: a.no_doc,
+                number: a.number,
+            },
+        ),
+        Cmd::Outline(a) => outline::run(
+            ctx,
+            &a.file,
+            &outline::OutlineOpts {
+                root,
+                kind: a.kind.map(inventory::ItemKind::as_str),
+                pub_only: a.pub_only,
+                docs: a.docs,
+                flat: a.flat,
+            },
+        ),
         Cmd::Callers(a) => {
             if let Some(pattern) = a.among.as_deref() {
                 callers::run_callers_among(ctx, &a.name, pattern)

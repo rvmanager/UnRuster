@@ -93,6 +93,77 @@ Output for machines: `--json` on any command keeps `file`/`line` and the
 numeric columns as real fields, so ranking and filtering across rows need
 no `awk`. `--all-stdout` puts summary/note lines on stdout too.
 
+◇ READING CODE (locate an item before editing it — `outline`, `show`, `--spans`)
+The idiom this replaces, taken verbatim from an agent transcript:
+
+  grep -n "fn draft" x.rs && sed -n "$(grep -n 'fn draft' x.rs | cut -d: -f1),+70p" x.rs
+
+It is wrong in three ways and silent about all three.
+
+  1. `+70` is a guess. There is no N that is right, because grep cannot
+     know where a body ends — so the output either truncates the item or
+     runs into the next two, and nothing in it says which happened.
+  2. The name is a guess. When the fn is really `draft_regions` the grep
+     matches nothing, the command substitution yields an empty line
+     number, `sed` prints nothing, and the turn is spent learning that.
+  3. `^fn` misses a method. Anything inside an `impl` block is indented,
+     so a column-anchored pattern cannot see it, and an unanchored one
+     matches every call site as well as the definition.
+
+The same three failures apply to `grep -n "^pub fn\|^pub struct"` used as
+a file outline: it misses private items and multi-line signatures, and it
+matches `pub` on struct *fields*, so declarations arrive mixed in.
+
+WHAT TO RUN INSTEAD
+
+  unruster outline <file>       every item in the file, with `file:start-end`,
+                                indented by scope. `--docs` adds each doc
+                                comment's first line; `--pub-only` narrows to
+                                the file's external surface; `--kind fn` filters.
+                                Complete by construction — it is the same walk
+                                the rest of the tool indexes from.
+
+  unruster show <name>          that item's exact source: first doc-comment line
+                                through the closing brace. Takes a bare name
+                                (`draft_regions`), a `Type::method`
+                                (`Window::parse`), or any qualified suffix.
+                                `--part sig` for the signature alone, `--part
+                                span` for just the `file:start-end` row when
+                                your own reader will do the seeking, `-n` to
+                                number the lines you are about to edit against.
+
+  --spans                       on the commands that list *items* — inventory,
+                                dead-code, metrics, impls — upgrades the `at`
+                                column from `file:line` to `file:start-end`.
+                                Same column count, so existing `awk` still
+                                works; on site-listing commands it instead
+                                appends `@start-end` to the enclosing fn, since
+                                what is worth reading around a call site is the
+                                fn containing it.
+
+A NAME THAT DOES NOT RESOLVE
+
+`show` answers with the near names rather than with nothing:
+
+  $ unruster show contour_of
+  note: no item named `contour_of`. Did you mean:
+    fn pub contour_points   src/trace.rs:1694-1712
+
+This is the expensive failure, not a nicety. An empty result is
+indistinguishable from "this codebase has no such concept", so the move
+after it is another search, and another. Matching is transposition-aware
+and prefix-weighted — `nwe` finds `new`, `contour_of` finds
+`contour_points` — because those are the two ways a name is actually
+mis-recalled.
+
+WHAT THIS IS NOT
+
+`show` does not edit. It prints byte ranges out of the file as written —
+comments, formatting and all — because a `syn` round-trip would return
+the tokens and lose every one of those. Its job is to make the *target*
+exact; the edit itself stays with whatever tool you already use, which is
+already exact once it knows the right lines.
+
 ══════════════════════════════════════════════════════════════════════
 DESIGN AUDIT PLAYBOOK — pick the theme matching your concern.
 The tool finds candidates; you decide whether to act.

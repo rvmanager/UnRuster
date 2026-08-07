@@ -59,6 +59,32 @@ impl Counts {
 }
 
 impl AnalysisCtx<'_> {
+    /// The `at` cell for a row that names a whole *item* rather than a point in
+    /// one. Plain `file:line` by default; `file:start-end` under `--spans`.
+    ///
+    /// The column count does not change, which is the reason this is an upgrade
+    /// of the existing cell rather than a new one — every caller's `awk` and
+    /// every column-shape assertion keeps working, and a JSON consumer written
+    /// against `line` still reads the start.
+    ///
+    /// Site-listing commands do not use this: their `--spans` support comes
+    /// from [`crate::ast::ScopeTracker`], which appends `@start-end` to the
+    /// *enclosing fn*, since the thing worth reading around a call site is the
+    /// fn that contains it.
+    /// `line` stays the item's declaration line under both renderings. A flag
+    /// that only says where a row *ends* must not also move where it starts.
+    ///
+    /// A one-line item renders as `file:7-7`, not `file:7`: under one flag every
+    /// row has one shape, or a consumer has to handle both and the ones that
+    /// forget break on whichever item happens to be a one-liner.
+    pub fn at(&self, file: &str, line: usize, end: usize) -> crate::emit::Val {
+        if self.spans {
+            crate::emit::span_site(file, line, end.max(line))
+        } else {
+            crate::emit::site(file, line)
+        }
+    }
+
     /// With `--context N`, print the ±N source lines around `line` beneath a
     /// finding row (`>` marks the site line). No-op otherwise. Rows emitted
     /// through `out.row(…)` already carry their own context — this is only for

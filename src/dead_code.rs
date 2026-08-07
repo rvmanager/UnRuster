@@ -6,7 +6,7 @@ use syn::visit::{self, Visit};
 use crate::ast::path_to_string;
 use crate::context::AnalysisCtx;
 use crate::parse::ParsedFile;
-use crate::emit::{row, site};
+use crate::emit::row;
 
 /// Build a set of every "called" last-segment name we observe across the tree.
 struct CallSink {
@@ -222,7 +222,7 @@ pub fn run(
                 "kind" => *kind,
                 "vis" => d.vis,
                 "qpath" => d.qpath.clone(),
-                "at" => site(&d.file, d.line),
+                "at" => ctx.at(&d.file, d.line, d.end),
             );
             ctx.suggest("dead-code", Some(&d.name), today);
         }

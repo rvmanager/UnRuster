@@ -4,13 +4,17 @@ use syn::visit::{self, Visit};
 use crate::ast::{line_of, scope_visits, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
-use crate::emit::{row, site};
+use crate::emit::row;
 
 #[derive(Debug)]
 struct FnMetric {
     qpath: String,
     file: String,
     line: usize,
+    /// Last line of the body. Already computed to derive `loc`; kept so
+    /// `--spans` can report `file:start-end` instead of making the reader
+    /// re-derive it from `loc:`.
+    end: usize,
     loc: usize,
     params: usize,
     cyclo: usize,
@@ -22,6 +26,7 @@ struct StructMetric {
     qpath: String,
     file: String,
     line: usize,
+    end: usize,
     fields: usize,
 }
 
@@ -30,6 +35,7 @@ struct EnumMetric {
     qpath: String,
     file: String,
     line: usize,
+    end: usize,
     variants: usize,
 }
 
@@ -61,6 +67,7 @@ impl<'a> MetricsVisitor<'a> {
             qpath,
             file: self.file.to_string(),
             line: start,
+            end,
             loc,
             params,
             cyclo,
@@ -93,20 +100,24 @@ impl<'ast, 'a> Visit<'ast> for MetricsVisitor<'a> {
             syn::Fields::Unit => 0,
         };
         let qpath = self.qualify(&i.ident.to_string());
+        let line = line_of(&i.ident);
         self.structs.push(StructMetric {
             qpath,
             file: self.file.to_string(),
-            line: line_of(&i.ident),
+            line,
+            end: i.span().end().line.max(line),
             fields,
         });
     }
 
     fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
         let qpath = self.qualify(&i.ident.to_string());
+        let line = line_of(&i.ident);
         self.enums.push(EnumMetric {
             qpath,
             file: self.file.to_string(),
-            line: line_of(&i.ident),
+            line,
+            end: i.span().end().line.max(line),
             variants: i.variants.len(),
         });
     }
@@ -337,7 +348,7 @@ pub fn run(
                 "cyclo" => format!("cyclo:{}", m.cyclo),
                 "nesting" => format!("nesting:{}", m.nesting),
                 "qpath" => m.qpath.clone(),
-                "at" => site(&m.file, m.line),
+                "at" => ctx.at(&m.file, m.line, m.end),
             );
         }
         for m in structs.iter().take(if fns_only { 0 } else { top }) {
@@ -346,7 +357,7 @@ pub fn run(
                 "kind" => "struct",
                 "fields" => format!("fields:{}", m.fields),
                 "qpath" => m.qpath.clone(),
-                "at" => site(&m.file, m.line),
+                "at" => ctx.at(&m.file, m.line, m.end),
             );
         }
         for m in enums.iter().take(if fns_only { 0 } else { top }) {
@@ -355,7 +366,7 @@ pub fn run(
                 "kind" => "enum",
                 "variants" => format!("variants:{}", m.variants),
                 "qpath" => m.qpath.clone(),
-                "at" => site(&m.file, m.line),
+                "at" => ctx.at(&m.file, m.line, m.end),
             );
         }
     }

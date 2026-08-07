@@ -87,7 +87,13 @@ fn identity_cells(cells: &[(&'static str, Val)]) -> Vec<String> {
                     .collect::<Vec<_>>()
                     .join(","),
             ),
-            Val::Num(_) | Val::Float(_) | Val::Bool(_) | Val::Site { .. } => None,
+            // `Span` joins `Site` here for the same reason: it is line numbers,
+            // which is exactly what a fingerprint must not depend on.
+            Val::Num(_)
+            | Val::Float(_)
+            | Val::Bool(_)
+            | Val::Site { .. }
+            | Val::Span { .. } => None,
         })
         .collect()
 }
