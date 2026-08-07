@@ -49,6 +49,14 @@ pub struct ShowOpts<'a> {
     pub no_doc: bool,
     /// Prefix each source line with its number.
     pub number: bool,
+    /// Stop after this many source lines, saying so.
+    ///
+    /// There was nothing between `--part sig` (the signature) and the whole
+    /// body, so a reader wanting a bounded look at a 109-line fn reached for
+    /// `show … | head -40` — which cuts mid-body and says nothing about it. A
+    /// truncation the tool performs can announce itself and name the lines it
+    /// dropped, which a pipe cannot.
+    pub max_lines: Option<usize>,
 }
 
 /// The line range to print for one match, given the requested part.
@@ -73,6 +81,19 @@ fn prints_source(part: Part) -> bool {
     part != Part::Span
 }
 
+/// The item's whole extent — what a *catalogue* row must report.
+///
+/// [`range_of`] answers "what will I print", which is right for a row with
+/// source under it and wrong for a row without. An ambiguity listing prints no
+/// source, so under `--part sig` every listed span used to collapse to the
+/// declaration line: a 351-line `impl PathData` was catalogued as `51-51`, and
+/// the reader needed a second command (`outline`) to learn it was `51-401`.
+/// A silently wrong line range is the exact failure this command exists to end,
+/// and arriving from an AST tool makes it more credible, not less.
+fn extent_of(d: &Defn) -> Option<(usize, usize)> {
+    Some((d.doc_start, d.end.max(d.doc_start)))
+}
+
 /// The `at` cell: always `file:start-end`, and always the range this call
 /// actually printed rather than the item's full extent. `show` exists to answer
 /// "which lines", so a header that named a range wider than the output would be
@@ -92,7 +113,7 @@ fn at(d: &Defn, range: Option<(usize, usize)>) -> Val {
 /// Print `start..=end` of `file`. Reads the file rather than reconstructing
 /// from the AST on purpose: a `syn` round-trip would return the tokens, not the
 /// source — no comments, no formatting, no `#[rustfmt::skip]` block as written.
-fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, number: bool) {
+fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, opts: &ShowOpts) {
     let Ok(src) = std::fs::read_to_string(file) else {
         ctx.out.note(&format!("note: could not read {}", file));
         return;
@@ -103,17 +124,32 @@ fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, number:
     if lo >= hi {
         return;
     }
+    // `--max-lines` cuts here rather than in a pipe, so the cut can say where
+    // it happened and what is left. A silent truncation of a body is the same
+    // class of wrong answer as a guessed line range.
+    let cut = opts.max_lines.map_or(hi, |n| (lo + n).min(hi));
+    let dropped = hi - cut;
     if ctx.out.format == Format::Json {
-        let body: Vec<String> = lines[lo..hi].iter().map(|l| (*l).to_string()).collect();
-        ctx.out.row(vec![("source", Val::List(body))]);
+        let body: Vec<String> = lines[lo..cut].iter().map(|l| (*l).to_string()).collect();
+        let mut cells: Vec<(&'static str, Val)> = vec![("source", Val::List(body))];
+        if dropped > 0 {
+            cells.push(("truncated", Val::from(dropped)));
+        }
+        ctx.out.row(cells);
         return;
     }
-    for (i, l) in lines[lo..hi].iter().enumerate() {
-        if number {
+    for (i, l) in lines[lo..cut].iter().enumerate() {
+        if opts.number {
             ctx.out.line(&format!("{:>5}| {}", lo + i + 1, l));
         } else {
             ctx.out.line(l);
         }
+    }
+    if dropped > 0 {
+        ctx.out.line(&format!(
+            "… {} more line(s) to {} — re-run without --max-lines for the rest",
+            dropped, hi
+        ));
     }
 }
 
@@ -214,7 +250,7 @@ fn show_one(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
     header(ctx, d, range);
     match range {
         Some((start, end)) if prints_source(opts.part) => {
-            print_source(ctx, &d.file, start, end, opts.number)
+            print_source(ctx, &d.file, start, end, opts)
         }
         // A `--part doc` on an item with no doc. The header row already said the
         // item exists, so the only thing left to report is the absence — silence
@@ -240,7 +276,10 @@ fn emit_hits(ctx: &AnalysisCtx, query: &str, hits: &[&Defn], opts: &ShowOpts) ->
             hits.len()
         ));
         for d in hits {
-            header(ctx, d, range_of(d, opts));
+            // The item's extent, not `range_of` — see `extent_of`. Nothing is
+            // printed below these rows, so the span is a fact about the item
+            // rather than a promise about the output.
+            header(ctx, d, extent_of(d));
         }
         return hits.len();
     }

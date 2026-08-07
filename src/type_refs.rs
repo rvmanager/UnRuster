@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_to_string_with_args, scope_visits, ScopeTracker};
-use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
+use crate::context::{AnalysisCtx, Confidence, TargetNotFound};
 use crate::parse::display_path;
 use crate::emit::{row, site};
 
@@ -129,7 +129,7 @@ pub fn run(
     let summary = ctx.summary;
     let known = index.knows_name(ty);
     if !known {
-        warn_unknown_target("type", ty);
+        ctx.warn_unknown("type", ty);
     }
 
     let targets = aliases.synonyms(ty);

@@ -33,7 +33,7 @@ use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_to_string, scope_visits, ScopeTracker};
 use crate::config_drift::render_const;
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::context::{AnalysisCtx, TargetNotFound};
 use crate::emit::{row, site};
 use crate::parse::display_path;
 
@@ -214,7 +214,7 @@ pub fn run(
     }
     if let Some(r) = root_filter {
         if groups.is_empty() {
-            warn_unknown_target("builder chain rooted at", r);
+            ctx.warn_unknown("builder chain rooted at", r);
             ctx.out.summary(&format!("(0 drifting chain(s) on `{}`)", r));
             return Err(TargetNotFound::err("builder chain rooted at", r));
         }

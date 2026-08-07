@@ -340,6 +340,54 @@ fn vis_and_pub_only_together_are_rejected_rather_than_silently_ranked() {
 }
 
 #[test]
+fn every_name_taking_command_suggests_near_names() {
+    // One session ran `callers region_spec` (dead end, no suggestions) and then
+    // `show region_spec` (the near-name list it needed) — two calls for one
+    // question, because only `show` had been taught to answer it.
+    for c in ["callers", "callees", "type-refs", "takes-mut", "show"] {
+        let out = ur().args(["--root", FIXTURE, c, "Documnet"]).output().unwrap();
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(e.contains("Did you mean"), "{} gave no suggestions:\n{}", c, e);
+        assert!(e.contains("Document"), "{} did not find the near name:\n{}", c, e);
+    }
+    // …and the two-name and field forms.
+    let e = String::from_utf8_lossy(
+        &ur().args(["--root", FIXTURE, "field-uses", "Documnet", "name"])
+            .output()
+            .unwrap()
+            .stderr,
+    )
+    .to_string();
+    assert!(e.contains("Did you mean"), "{}", e);
+}
+
+#[test]
+fn a_warn_only_command_still_scans_after_suggesting() {
+    // These warn and keep going on purpose — a name the index has never seen
+    // can still be reached through a macro. The suggestion must not turn that
+    // into an early exit.
+    let out = ur().args(["--root", FIXTURE, "callers", "Documnet"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "unknown name is still exit 2");
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("0 call site(s)"), "the scan did not run:\n{}", e);
+}
+
+#[test]
+fn a_cohort_glob_is_not_run_through_the_name_suggester() {
+    // `--among 'wrap_in_*'` is a pattern, not an identifier; ranking near
+    // names against it would be nonsense.
+    let e = String::from_utf8_lossy(
+        &ur().args(["--root", FIXTURE, "callers", "mark_pending", "--among", "no_such_*"])
+            .output()
+            .unwrap()
+            .stderr,
+    )
+    .to_string();
+    assert!(e.contains("cohort pattern"), "{}", e);
+    assert!(!e.contains("Did you mean"), "suggested names for a glob:\n{}", e);
+}
+
+#[test]
 fn explain_resolves_a_command_name_not_just_a_defect_heading() {
     // Topics are titled by defect (`COPY-PASTED FUNCTIONS`); a reader arrives
     // holding the command they just ran. `explain clones` used to match nothing.
@@ -457,6 +505,45 @@ fn show_lists_rather_than_concatenating_when_a_name_is_ambiguous() {
     assert_tsv_cols(&out.stdout, 4);
     assert!(rows_of(&out.stdout).len() > 1);
     assert!(String::from_utf8_lossy(&out.stderr).contains("names"));
+}
+
+#[test]
+fn an_ambiguity_listing_reports_each_items_real_extent() {
+    // The crossed case that was missing: `--part sig` on an *ambiguous* name.
+    // The listing prints no source, so its span is a fact about the item — but
+    // it was taking the `--part` range, collapsing every non-fn row to its
+    // declaration line. On one real tree a 351-line `impl PathData` was
+    // catalogued as `51-51`, and the reader needed a second command to find out.
+    let full = ur_stdout(&["--root", FIXTURE, "show", "Document", "--part", "span"]);
+    let sig = ur_stdout(&["--root", FIXTURE, "show", "Document", "--part", "sig"]);
+    let spans = |o: &[u8]| -> Vec<String> {
+        rows_of(o)
+            .iter()
+            .map(|l| l.split('\t').next_back().unwrap().to_string())
+            .collect()
+    };
+    assert!(rows_of(&full).len() > 1, "expected an ambiguous name");
+    assert_eq!(
+        spans(&full),
+        spans(&sig),
+        "--part changed the catalogue's spans"
+    );
+}
+
+#[test]
+fn a_listed_impl_block_is_not_reported_as_one_line() {
+    // The concrete shape of the bug: an impl block's `sig_end` is its
+    // declaration line, so under `--part sig` it collapsed to `N-N`.
+    let out = ur_stdout(&["--root", FIXTURE, "show", "Document", "--part", "sig"]);
+    let impl_row = rows_of(&out)
+        .into_iter()
+        .find(|l| l.starts_with("impl\t"))
+        .expect("fixture should have an `impl Document`");
+    let at = impl_row.split('\t').next_back().unwrap();
+    let (_, range) = at.rsplit_once(':').unwrap();
+    let (s, e) = range.split_once('-').unwrap();
+    let (s, e) = (s.parse::<usize>().unwrap(), e.parse::<usize>().unwrap());
+    assert!(e > s, "impl block catalogued as {} line(s): {}", e - s + 1, at);
 }
 
 #[test]
@@ -720,6 +807,33 @@ fn a_batch_where_nothing_resolves_is_still_exit_2() {
         .assert()
         .failure()
         .code(2);
+}
+
+#[test]
+fn max_lines_bounds_a_long_body_and_says_it_did() {
+    // `show … | head -40` cuts mid-body in silence. A cut the tool makes can
+    // name what it dropped.
+    let out = ur_stdout(&["--root", FIXTURE, "show", "Document::new", "--max-lines", "2"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("more line(s) to"), "no truncation notice:\n{}", s);
+    assert!(!s.contains("children: vec![]"), "did not actually bound:\n{}", s);
+}
+
+#[test]
+fn max_lines_is_a_no_op_when_the_body_is_shorter() {
+    let bounded = ur_stdout(&["--root", FIXTURE, "show", "Document::touch", "--max-lines", "500"]);
+    let plain = ur_stdout(&["--root", FIXTURE, "show", "Document::touch"]);
+    assert_eq!(bounded, plain);
+    assert!(!String::from_utf8_lossy(&bounded).contains("more line(s)"));
+}
+
+#[test]
+fn max_lines_reports_the_drop_count_in_json() {
+    let out = ur_stdout(&[
+        "--root", FIXTURE, "--json", "show", "Document::new", "--max-lines", "2",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\"truncated\""), "{}", s);
 }
 
 #[test]
@@ -1010,7 +1124,7 @@ fn co_call_unknown_symbol_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no fn, method, or macro matching"));
+        .stderr(predicates::str::contains("no fn, method, or macro `"));
 }
 
 // ─── field / fields ────────────────────────────────────────────────────────
@@ -1229,7 +1343,7 @@ fn type_refs_unknown_warns_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("no type `NotAType` found"));
+        .stderr(predicates::str::contains("no type `NotAType`"));
 }
 
 #[test]
@@ -1275,7 +1389,7 @@ fn takes_mut_unknown_type_warns_and_exits_2() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no type `NoSuchType` found"));
+    assert!(stderr.contains("no type `NoSuchType`"));
     assert_eq!(out.status.code(), Some(2));
 }
 
@@ -1286,7 +1400,7 @@ fn callees_unknown_fn_warns_and_exits_2() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no fn or method matching"));
+    assert!(stderr.contains("no fn or method `"));
     assert!(stderr.contains("0 distinct callees"));
     assert_eq!(out.status.code(), Some(2));
 }

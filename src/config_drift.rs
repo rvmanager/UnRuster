@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_to_string, scope_visits, ScopeTracker, trait_fn_span};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::context::{AnalysisCtx, TargetNotFound};
 use crate::emit::{row, site};
 use crate::parse::display_path;
 
@@ -311,7 +311,7 @@ pub fn run(
     }
     if let Some(t) = ty_filter {
         if by_ty.is_empty() {
-            warn_unknown_target("struct literal of type", t);
+            ctx.warn_unknown("struct literal of type", t);
             ctx.out
                 .summary(&format!("(0 drifting field(s) on `{}`)", t));
             return Err(TargetNotFound::err("struct literal of type", t));

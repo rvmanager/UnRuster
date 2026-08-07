@@ -156,24 +156,27 @@ impl AnalysisCtx<'_> {
     /// where any name could plausibly match (`callers`, `type-refs`) must NOT
     /// use this for a zero-hit result — there, zero is a real answer.
     pub fn unknown_target(&self, what: &str, name: &str) -> anyhow::Error {
+        self.say_unknown(what, name);
+        TargetNotFound::err_owned(what, name)
+    }
+
+    /// The same explanation, without ending the run.
+    ///
+    /// Some commands warn and keep scanning on purpose: a name absent from the
+    /// index can still be reached through a macro or an external crate, so the
+    /// scan may yet find hits, and only a zero-hit result is an error. They get
+    /// the near-name list too — a typo is the likeliest reason the index has
+    /// never heard of the name, and finding that out at the end of the scan
+    /// rather than the start is what made `callers` a dead end while `show`
+    /// answered the same question.
+    pub fn warn_unknown(&self, what: &str, name: &str) {
+        self.say_unknown(what, name);
+    }
+
+    /// Which of the two things went wrong, said once.
+    fn say_unknown(&self, what: &str, name: &str) {
         let existing = self.idx.lookup(name);
-        if existing.is_empty() {
-            let near = self.idx.similar(name, 6);
-            if near.is_empty() {
-                self.out.note(&format!(
-                    "note: no {} `{}` in the scanned tree, and nothing close to it \
-                     (try --scope all if it is test-only)",
-                    what, name
-                ));
-            } else {
-                self.out
-                    .note(&format!("note: no {} `{}`. Did you mean:", what, name));
-                for d in &near {
-                    self.out
-                        .note(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));
-                }
-            }
-        } else {
+        if !existing.is_empty() {
             let mut kinds: Vec<&str> = existing.iter().map(|d| d.kind).collect();
             kinds.sort_unstable();
             kinds.dedup();
@@ -184,8 +187,23 @@ impl AnalysisCtx<'_> {
                 what,
                 kinds.join(", ")
             ));
+            return;
         }
-        TargetNotFound::err_owned(what, name)
+        let near = self.idx.similar(name, 6);
+        if near.is_empty() {
+            self.out.note(&format!(
+                "note: no {} `{}` in the scanned tree, and nothing close to it \
+                 (try --scope all if it is test-only)",
+                what, name
+            ));
+            return;
+        }
+        self.out
+            .note(&format!("note: no {} `{}`. Did you mean:", what, name));
+        for d in &near {
+            self.out
+                .note(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));
+        }
     }
 
     /// With `--changed-since`, keep only hits whose file is in the changed

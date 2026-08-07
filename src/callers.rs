@@ -236,7 +236,7 @@ pub fn run_callers(
     let summary = ctx.summary;
     let known = query_known(index, query);
     if !known {
-        warn_unknown_target("fn, method, or macro matching", query);
+        ctx.warn_unknown("fn, method, or macro", query);
     }
 
     let sites = collect_sites(files, sem, index, ctx.spans);
@@ -725,7 +725,7 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<usize>
     let known_b = query_known(index, b);
     for (known, q) in [(known_a, a), (known_b, b)] {
         if !known {
-            warn_unknown_target("fn, method, or macro matching", q);
+            ctx.warn_unknown("fn, method, or macro", q);
         }
     }
 
@@ -817,7 +817,7 @@ pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<usize> {
     if hits.is_empty() {
         let known = query_known(index, query);
         if !known {
-            warn_unknown_target("fn or method matching", query);
+            ctx.warn_unknown("fn or method", query);
         } else {
             ctx.out.note(&format!("note: `{}` makes no calls", query));
         }

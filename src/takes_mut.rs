@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{is_mut_ref, line_of, scope_visits, ScopeTracker, type_last_segment, type_short, type_to_string};
-use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
+use crate::context::{AnalysisCtx, TargetNotFound};
 use crate::parse::display_path;
 use crate::emit::{row, site};
 
@@ -184,7 +184,7 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
     let summary = ctx.summary;
     let known = index.knows_name(ty);
     if !known {
-        warn_unknown_target("type", ty);
+        ctx.warn_unknown("type", ty);
     }
     let mut all: Vec<Hit> = Vec::new();
     for f in files {

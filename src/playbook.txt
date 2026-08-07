@@ -149,12 +149,24 @@ WHAT TO RUN INSTEAD
                                 `--part sig` for the signature alone, `--part
                                 span` for just the `file:start-end` row when
                                 your own reader will do the seeking, `-n` to
-                                number the lines you are about to edit against.
-                                Takes several names at once — the tree is
-                                parsed once per invocation, so `show a b c` is
-                                far cheaper than three calls, and a name that
-                                does not resolve is reported without stopping
-                                the rest.
+                                number the lines you are about to edit against,
+                                `--max-lines N` for a bounded look at a long
+                                body (the cut says how many it dropped — a
+                                `| head -N` ends mid-body in silence).
+
+  NAME SEVERAL AT ONCE
+  `show a b c` resolves all three in one invocation. The tree is parsed once
+  per run, so the parse — not the lookup — is the cost, and three separate
+  calls pay it three times. A name that does not resolve is reported and the
+  rest still run. Reach for this whenever you have a list: the alternative
+  people actually write is a loop of single calls, and one session sized that
+  at "about 115 calls, which is slow but manageable".
+
+  READING A BIG REPORT
+  `audit … | head -60` followed by the same command `| tail -25` scans the
+  tree twice to read one report. Redirect once instead:
+      unruster audit --all-stdout > /tmp/audit.txt; grep -n '^## ' /tmp/audit.txt
+  then page the file.
 
   A NOTE ON DUPLICATED NAMES
   `clones` reports a duplicated fn by its *qualified* path, so the obvious

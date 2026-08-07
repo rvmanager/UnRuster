@@ -1,7 +1,7 @@
 use syn::visit::{self, Visit};
 
 use crate::ast::{fn_span, line_of, path_last, path_to_string, scope_visits, ScopeTracker};
-use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
+use crate::context::{AnalysisCtx, Confidence, TargetNotFound};
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{FnSigIndex, FnTypes};
 use crate::emit::{row, site};
@@ -375,7 +375,7 @@ pub fn run(
     let fn_sigs = &ctx.sem.fn_sigs;
     let known = ctx.idx.knows_name(ty);
     if !known {
-        warn_unknown_target("type", ty);
+        ctx.warn_unknown("type", ty);
     }
     let mut all = collect(files, ty, field, opts.strict, fn_sigs, ctx.spans);
 

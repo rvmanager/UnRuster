@@ -591,6 +591,12 @@ struct ShowArgs {
     /// be addressed without counting.
     #[arg(long, short = 'n')]
     number: bool,
+
+    /// Stop after N source lines and say how many were left. The bounded look
+    /// between `--part sig` and the whole body — and unlike `| head -N`, the
+    /// cut announces itself instead of ending mid-body in silence.
+    #[arg(long, value_name = "N")]
+    max_lines: Option<usize>,
 }
 
 #[derive(Args)]
@@ -1214,6 +1220,7 @@ fn dispatch(
                 all: a.all,
                 no_doc: a.no_doc,
                 number: a.number,
+                max_lines: a.max_lines,
             },
         ),
         Cmd::Outline(a) => outline::run(
