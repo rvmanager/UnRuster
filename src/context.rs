@@ -33,6 +33,31 @@ pub struct AnalysisCtx<'a> {
     pub suggest_waivers: bool,
 }
 
+/// A check's findings, split by whether they clear that check's gating
+/// threshold.
+///
+/// Only the ranked checks distinguish the two. Everything else reports the same
+/// number twice (all-gating) or reports zero gating (all-advisory), because for
+/// an unranked check "which rows matter" is not a question the tool can answer
+/// — which is exactly why the ranked ones were built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Rows reported, after waivers and filters.
+    pub total: usize,
+    /// Of those, the ones above the check's gating threshold.
+    pub gating: usize,
+}
+
+impl Counts {
+    /// A check with no tiers: every row counts the same.
+    pub fn flat(total: usize) -> Self {
+        Counts {
+            total,
+            gating: total,
+        }
+    }
+}
+
 impl AnalysisCtx<'_> {
     /// With `--context N`, print the ±N source lines around `line` beneath a
     /// finding row (`>` marks the site line). No-op otherwise. Rows emitted

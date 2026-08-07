@@ -46,6 +46,18 @@ sections and exits 1 while gating findings remain —
 `unruster explain <topic>` prints one repair recipe instead of this whole
 text.
 
+What gates. Five checks gate on every row (divergence, divergence
+--handling, enum-coverage, dead-code, conversion-pairs). Two rank their
+own rows and gate on the top tier only: `error-swallows` above 0.55 and
+`clones` above 0.75. The rest is advisory, and `--strict` promotes all of
+it. That split exists because the all-or-nothing version failed both
+ways at once on a real twelve-crate workspace: the five row-gating checks
+all returned zero while `error-swallows` returned 89 rows containing a
+permanent loss of Stripe payment confirmations, so the loop above would
+have exited on iteration one — and making that whole check gate instead
+would have demanded 89 judgments, most of them correct as written.
+A gate nobody can clear is a gate nobody runs.
+
 Start with `unruster divergence` (see DISPATCH & CONTROL FLOW below), and
 scope to fresh code with `--changed-since HEAD~1`. Measured on a large
 real codebase: the volume checks (casts, conversions, pass-through)
@@ -176,6 +188,27 @@ structs should split, or duplicate concepts should merge.
 ◇ DEAD ENUM VARIANTS
   unruster variants <Enum>
   Signal: 0 ctor sites + only seen in `_ =>` arms → drop the variant.
+
+◇ COPY-PASTED FUNCTIONS (the same body, written out N times)
+  unruster clones                                 # groups, ranked
+  unruster clones --min-tokens 40                 # only substantial ones
+  unruster callers <the-name>                     # who uses each copy
+  Bodies are compared after alpha-renaming every binding the function
+  introduces, so a copy-paste that renamed the variables still groups.
+  Called names and literals are compared verbatim — a group is functions
+  doing the same thing to the same APIs, not functions of the same shape.
+  Signals: `copies` ≥ 3 with one shared name = extract to a shared module
+  and `use` it (the score's top tier); a same-name pair in two modules =
+  a real drift risk, lower urgency; different names, same body = two
+  people solved one problem twice and neither knows about the other.
+  Repair: move one copy to the nearest common ancestor module, delete the
+  rest, re-run. This *deletes* findings rather than waiving them, and it
+  tends to delete unrelated ones too — sixteen copies of three helpers on
+  one real workspace were also sixteen copies of the same eleven
+  error-swallow rows.
+  Waive when the repetition is structural: a trait impl that must restate
+  a default, a macro-shaped body, two crates deliberately kept
+  independent. `ok(clones/<name>)` above the first listed site.
 
 ◇ REDUCE DATA REPLICATION / REPETITION / CONVERSION
   unruster impls --trait From / Into / TryFrom / AsRef
@@ -367,6 +400,32 @@ loss from casts and conversions.
   `.unwrap_or_default()` hits. Some are intentional (parse cascades,
   drop guards) — review per site.
 
+  READ IT IN ORDER. Rows are ranked, highest first, on two axes shown in
+  columns 2 and 3:
+    effect   what the discarded Result was reporting on —
+             mutation (a row written, a message sent, a file replaced) >
+             io (a fetch, a query, a read) > unknown > decode (a parse
+             or convert of data already in hand)
+    kind     how completely the failure vanished — `let _` and
+             `match … Err(_) =>` drop error and value and carry on;
+             `.map_err(|_|)` replaces the cause but still propagates, so
+             the caller can act
+  `audit` gates at 0.55, which is "an external effect happened and the
+  only report of whether it worked was discarded".
+  The two ends of that scale look identical without it. On one workspace
+  the same 89 rows held a `let _ = sqlx::query("DELETE FROM
+  stripe_events …").execute(…)` — every Stripe retry then hit ON CONFLICT
+  DO NOTHING and returned 200 without running the effect, losing the
+  payment confirmation permanently — and thirteen `Uuid::from_slice(b)
+  .map_err(|_| Malformed)?` in crypto verification, where collapsing the
+  cause is *required* so a scanned QR can't be used as a probing oracle.
+  Sorted alphabetically the first sat at row 62 and the second filled
+  rows 1–13. Sorted by score they are 0.90 and 0.10.
+  Repair for the top tier: log the error with enough identity to act on
+  (the event id, the row key) and decide explicitly whether to retry,
+  propagate, or continue. Repair for the bottom tier: usually nothing —
+  waive it with the reason, which is what the reason field is for.
+
 ◇ CAST CLASSES — what is and isn't reported by default
   `casts` reports data-loss classes. `usize-widen` (`u32 as usize`,
   `u32 as u64` — lossless on a 64-bit target) is computed but hidden
@@ -518,7 +577,7 @@ today's date already filled in.
   a group name waives all of them at once:
     partial-enumeration  divergence + enum-coverage
     silent-fallbacks     error-swallows + divergence-handling
-    replication          conversion-pairs + pass-through
+    replication          conversion-pairs + pass-through + clones
   These are the `explain:` topics already printed on each check's audit
   header. Without them, verifying "this fn deliberately omits Group"
   cost two comments — and on a real ledger six of thirty-three had the
@@ -526,10 +585,15 @@ today's date already filled in.
   `unruster waivers` points out sites where a group key would collapse
   two comments into one.
 
-  Checks WITHOUT waiver support: stringly, metrics, pass-through,
-  cohort-callees, co-call, and every query command. `--suggest-waivers`
-  says so rather than printing nothing. A waiver naming a check that
-  does not exist waives nothing; every run reports those by name.
+  Checks WITHOUT waiver support: metrics, pass-through, cohort-callees,
+  co-call, and every query command. `--suggest-waivers` says so rather
+  than printing nothing. A waiver naming a check that does not exist
+  waives nothing; every run reports those by name.
+
+  KEYS ARE RUST, sometimes. `ok(error-swallows/.map_err(|_|))` and
+  `ok(stringly/"payment_intent.succeeded")` are legal: the spec is read
+  with balanced parens and quote awareness, so a key carrying its own
+  punctuation round-trips. Paste what `--suggest-waivers` prints.
 
   REASONS may wrap onto following comment lines: a waiver a human or
   rustfmt broke across lines parses the same as a one-liner. Absorption

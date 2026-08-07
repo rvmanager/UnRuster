@@ -427,7 +427,7 @@ const CHECK_GROUPS: &[(&str, &[&str])] = &[
         "silent-fallbacks",
         &["error-swallows", "divergence-handling"],
     ),
-    ("replication", &["conversion-pairs", "pass-through"]),
+    ("replication", &["conversion-pairs", "pass-through", "clones"]),
 ];
 
 /// The group a check belongs to, if any. Lets `waivers` spot two waivers that
@@ -439,12 +439,39 @@ pub fn group_of(check: &str) -> Option<&'static str> {
         .map(|(g, _)| *g)
 }
 
+/// Every check that consults the waiver ledger, i.e. every name that may
+/// legally appear inside `ok(<check>)`.
+///
+/// This list is the registry, not a convenience copy of one: a check whose name
+/// is missing here is reported by every run as "names a check this tool does
+/// not have", so its working waivers read as typos and an agent acting on the
+/// note deletes them. That happened — `config-drift` and `builder-drift` both
+/// honoured their waivers while the note called them unknown, because the list
+/// was hand-maintained and the two newest checks were never added.
+///
+/// `checks_are_registered` in the tests below fails the build if a check calls
+/// `retain_unsuppressed` under a name that is not here.
+pub const WAIVABLE_CHECKS: &[&str] = &[
+    "builder-drift",
+    "casts",
+    "clones",
+    "config-drift",
+    "conversion-pairs",
+    "dead-code",
+    "divergence",
+    "divergence-handling",
+    "enum-coverage",
+    "error-swallows",
+    "pass-through",
+    "stringly",
+];
+
 /// Every check a waiver key may name, group aliases included — used to warn
 /// about a misspelled check rather than silently waiving nothing.
 pub fn known_check_names() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = CHECK_GROUPS.iter().map(|(g, _)| *g).collect();
     v.extend(CHECK_GROUPS.iter().flat_map(|(_, m)| m.iter().copied()));
-    v.extend(["dead-code", "casts", "stringly"]);
+    v.extend(WAIVABLE_CHECKS.iter().copied());
     v.sort_unstable();
     v.dedup();
     v
@@ -509,6 +536,56 @@ struct Head {
     trailing: bool,
 }
 
+/// Offset of the `)` that closes an `ok(…)` spec, given everything after the
+/// opening paren. Returns `None` when the spec never closes.
+///
+/// Nested parens have to nest: several waiver keys are literally Rust syntax.
+/// `error-swallows` keys on the swallow kind, and one of those kinds is spelled
+/// `.map_err(|_|)` — so `--suggest-waivers` emits
+///
+/// ```text
+/// // unruster: ok(error-swallows/.map_err(|_|)) 2026-08-06 — …
+/// ```
+///
+/// A first-`)` scan cuts that at the paren inside `|_|`, yielding the key
+/// `.map_err(|_|` and leaving `") 2026-08-06 — …"` as the tail — so the date
+/// fails to parse and the whole head lands in the reason. On a real ledger
+/// seven waivers landed undated and suppressing nothing before anyone noticed
+/// the tool could not read back what it had just printed. The key is also
+/// unwritable by hand: no balanced spelling survives the cut.
+///
+/// Depth counting fixes both directions at once. `waiver_roundtrip_survives_
+/// parenthesised_keys` pins it against every key `--suggest-waivers` emits.
+fn spec_close(inner: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut chars = inner.char_indices();
+    while let Some((i, c)) = chars.next() {
+        // `stringly` keys on the literal itself, quotes included, so
+        // `ok(stringly/"(unknown)")` is a legal spelling and the parens inside
+        // the quotes are data. Escapes are stepped over so `"\""` doesn't
+        // reopen the string.
+        if in_str {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(i),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Parse a source line into a waiver head, if it carries one.
 ///
 /// String-literal awareness matters: `println!("// unruster: ok")` is data, not
@@ -544,7 +621,7 @@ fn parse_head(line: &str) -> Option<Head> {
     // optional (check[/key])
     let (mut check, mut key) = (None, None);
     if let Some(inner) = tail.strip_prefix('(') {
-        let close = inner.find(')')?;
+        let close = spec_close(inner)?;
         let spec = inner[..close].trim();
         if !spec.is_empty() {
             match spec.split_once('/') {
@@ -1005,6 +1082,201 @@ mod tests {
         assert!(h.trailing);
         assert_eq!(h.reason, "infallible");
         assert_eq!(h.check, None);
+    }
+
+    /// Every `(check, key)` pair `--suggest-waivers` can print, spelled exactly
+    /// as the emitting check spells it. Extend this when a check gains a new
+    /// key shape — the round-trip test below is only as good as this list.
+    const EMITTED_KEYS: &[(&str, Option<&str>)] = &[
+        // error-swallows — the swallow kind, one of which is Rust syntax
+        // carrying its own parens.
+        ("error-swallows", Some(".ok")),
+        ("error-swallows", Some(".err")),
+        ("error-swallows", Some(".unwrap_or")),
+        ("error-swallows", Some(".unwrap_or_default")),
+        ("error-swallows", Some(".unwrap_or_else")),
+        ("error-swallows", Some(".map_err(|_|)")),
+        ("error-swallows", Some("match-err-wild")),
+        ("error-swallows", Some("if-let-ok")),
+        ("error-swallows", Some("while-let-ok")),
+        ("error-swallows", Some("let-_")),
+        ("error-swallows", None),
+        // casts — the cast class.
+        ("casts", Some("narrow-int")),
+        ("casts", Some("signed-flip")),
+        ("casts", Some("float-int")),
+        ("casts", Some("narrow-float")),
+        ("casts", Some("ptr")),
+        // enum dispatch — `Enum::Variant`, bare variant, or bare enum.
+        ("divergence", Some("NodeContent::Group")),
+        ("enum-coverage", Some("QrError::KeyBlocked")),
+        ("enum-coverage", Some("QrError")),
+        ("partial-enumeration", Some("QrError")),
+        // divergence-handling — the callee being handled.
+        ("divergence-handling", Some("SnagPinDomain::activate")),
+        // structural checks — the type, the constructor, the pair, the item.
+        ("config-drift", Some("ImageTransform")),
+        ("builder-drift", Some("Command::new")),
+        ("conversion-pairs", Some("Foo<->Bar")),
+        ("dead-code", Some("parse_uuid")),
+        ("stringly", Some("\"payment_intent.succeeded\"")),
+    ];
+
+    /// The head this tool prints must be the head this tool reads back.
+    ///
+    /// `--suggest-waivers` exists so nobody hand-writes the grammar, which
+    /// makes an unparseable suggestion the worst possible bug in it: the user
+    /// pastes exactly what they were told to and gets a waiver that silently
+    /// suppresses nothing. That shipped once, for the `.map_err(|_|)` key.
+    #[test]
+    fn waiver_roundtrip_survives_parenthesised_keys() {
+        let today = Date { y: 2026, m: 8, d: 6 };
+        for (check, key) in EMITTED_KEYS {
+            let spec = match key {
+                Some(k) => format!("{}/{}", check, k),
+                None => (*check).to_string(),
+            };
+            // Byte-identical to `AnalysisCtx::suggest`.
+            let line = format!("  // unruster: ok({}) {} — WHY?", spec, today);
+            let h = head(&line)
+                .unwrap_or_else(|| panic!("suggested waiver did not parse at all: {line}"));
+            assert_eq!(
+                h.check.as_deref(),
+                Some(*check),
+                "check did not round-trip: {line}"
+            );
+            assert_eq!(h.key.as_deref(), *key, "key did not round-trip: {line}");
+            assert_eq!(
+                h.date,
+                Some(today),
+                "date did not round-trip (the head ran long): {line}"
+            );
+            assert_eq!(h.reason, "WHY?", "reason absorbed the head: {line}");
+        }
+    }
+
+    /// A check whose name is missing from the registry has working waivers that
+    /// every run denounces as typos. Keep the two in step mechanically.
+    #[test]
+    fn checks_are_registered() {
+        let known = known_check_names();
+        for c in WAIVABLE_CHECKS {
+            assert!(
+                known.contains(c),
+                "{c} consults the waiver ledger but is not in known_check_names()"
+            );
+        }
+        // The groups are aliases for members, so every member must exist as a
+        // check in its own right or the alias resolves to nothing.
+        for (group, members) in CHECK_GROUPS {
+            for m in *members {
+                assert!(
+                    WAIVABLE_CHECKS.contains(m),
+                    "group {group} names {m}, which is not a waivable check"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registry_names_are_well_formed() {
+        for c in WAIVABLE_CHECKS {
+            assert!(
+                !c.contains(|ch: char| ch.is_whitespace() || ch == '/' || ch == '(' || ch == ')'),
+                "{c} is not spellable inside ok(<check>)"
+            );
+        }
+        let mut sorted = WAIVABLE_CHECKS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            WAIVABLE_CHECKS.to_vec(),
+            "keep WAIVABLE_CHECKS sorted so additions are a clean diff"
+        );
+    }
+
+    /// Every `retain_unsuppressed("<name>"` / `suggest("<name>"` literal in
+    /// `src/`, excluding this module (which names every check by construction).
+    fn checks_used_in_source() -> std::collections::BTreeSet<String> {
+        const CALLS: &[&str] = &["retain_unsuppressed(\"", "suggest(\""];
+        let mut found = std::collections::BTreeSet::new();
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path.ends_with("suppress.rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                for call in CALLS {
+                    let mut rest = text.as_str();
+                    while let Some(at) = rest.find(call) {
+                        let after = &rest[at + call.len()..];
+                        match after.find('"') {
+                            Some(end) => {
+                                found.insert(after[..end].to_string());
+                                rest = &after[end..];
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// The check names are string literals at their call sites, so the only way
+    /// to catch an unregistered one mechanically is to read the source. This is
+    /// a lint over `src/`, not a behavioural test — and it is the test that
+    /// would have caught `config-drift` and `builder-drift` shipping as
+    /// "a check this tool does not have" while their waivers worked fine.
+    #[test]
+    fn every_check_that_waives_is_registered() {
+        let known = known_check_names();
+        let used = checks_used_in_source();
+        assert!(
+            !used.is_empty(),
+            "found no retain_unsuppressed/suggest call sites — the scan broke, \
+             not the registry"
+        );
+        let missing: Vec<&String> = used
+            .iter()
+            .filter(|c| !known.contains(&c.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these checks consult the waiver ledger but are absent from \
+             WAIVABLE_CHECKS, so every run reports their working waivers as \
+             naming an unknown check: {missing:?}"
+        );
+    }
+
+    /// The mirror direction: a registered name nothing emits is a spelling
+    /// users will try and that will never match a finding.
+    #[test]
+    fn every_registered_check_is_used() {
+        let used = checks_used_in_source();
+        // `pass-through` is registered because it is a member of the
+        // `replication` group and a waiver may legally name it; it filters no
+        // rows of its own.
+        let exempt = ["pass-through"];
+        let unused: Vec<&&str> = WAIVABLE_CHECKS
+            .iter()
+            .filter(|c| !used.contains(**c) && !exempt.contains(*c))
+            .collect();
+        assert!(
+            unused.is_empty(),
+            "registered but never emitted — a waiver naming one of these \
+             matches nothing: {unused:?}"
+        );
     }
 
     #[test]

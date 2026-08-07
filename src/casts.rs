@@ -1,6 +1,6 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{fn_span, print_grouped_counts, top_module_of, type_short, type_to_string, ScopeTracker};
+use crate::ast::{fn_span, print_grouped_counts, scope_visits, ScopeTracker, top_module_of, type_to_string};
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 use crate::semantic::{FnSigIndex, FnTypes};
@@ -212,11 +212,7 @@ fn classify(src: Option<&str>, dst: &str) -> &'static str {
 }
 
 impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.scope.enter_mod(i.ident.to_string());
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
+    scope_visits!(item_mod, item_impl, item_trait);
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         let unsafe_fn = i.sig.unsafety.is_some();
         self.unsafe_depth += usize::from(unsafe_fn);
@@ -233,16 +229,6 @@ impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
         self.fn_types_stack.pop();
         self.scope.leave_fn();
         self.unsafe_depth -= usize::from(unsafe_fn);
-    }
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.scope.enter_impl(type_short(&i.self_ty));
-        visit::visit_item_impl(self, i);
-        self.scope.leave_impl();
-    }
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        self.scope.enter_trait(i.ident.to_string());
-        visit::visit_item_trait(self, i);
-        self.scope.leave_trait();
     }
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         let unsafe_fn = i.sig.unsafety.is_some();

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, ScopeTracker};
+use crate::ast::{line_of, scope_visits, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::{display_path, ParsedFile};
 use crate::emit::row;
@@ -64,11 +64,7 @@ impl<'a> TestVisitor<'a> {
 }
 
 impl<'ast, 'a> Visit<'ast> for TestVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.scope.enter_mod(i.ident.to_string());
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
+    scope_visits!(item_mod);
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.handle_fn(&i.attrs, &i.sig, &i.block);

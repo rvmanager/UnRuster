@@ -1,7 +1,7 @@
 use syn::spanned::Spanned;
-use syn::visit::{self, Visit};
+use syn::visit::Visit;
 
-use crate::ast::{line_of, path_to_string, type_short, ScopeTracker};
+use crate::ast::{line_of, path_to_string, scope_visits, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
 use crate::emit::{row, site};
@@ -87,21 +87,7 @@ fn describe_call(e: &syn::Expr) -> String {
 }
 
 impl<'ast, 'a> Visit<'ast> for PTVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.scope.enter_mod(i.ident.to_string());
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.scope.enter_impl(type_short(&i.self_ty));
-        visit::visit_item_impl(self, i);
-        self.scope.leave_impl();
-    }
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        self.scope.enter_trait(i.ident.to_string());
-        visit::visit_item_trait(self, i);
-        self.scope.leave_trait();
-    }
+    scope_visits!(item_mod, item_impl, item_trait);
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.check(&i.sig, &i.block);
     }

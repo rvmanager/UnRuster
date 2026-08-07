@@ -4,17 +4,18 @@ AGENT QUICKSTART
   unruster audit                     ranked battery, exit 1 while gating findings remain
   unruster audit --changed-since HEAD~1    same, scoped to your last commit — highest yield
   unruster divergence                sibling paths that disagree — highest yield, start here
+  unruster clones                    the same body written out more than once
   unruster config-drift              same struct built two ways (divergence, for values)
   unruster divergence --handling     one callee, different care (.expect vs .ok())
-  unruster explain <topic>           one repair recipe (cheap; skip this help)
-  unruster playbook                  the full design-audit playbook
+  unruster explain <topic>           one repair recipe (cheap); `playbook` for all
   --json                             every command; keeps file/line as real fields
 
 HIGHEST-SIGNAL FIRST
   Divergence beats volume. A check that returns 400 rows returns ~1% real defects;
-  two sibling functions handling the same enum, Result, or index differently is a
-  defect far more often than not. Start with `divergence`, then `audit`.
-  Fresh code beats old code: `--changed-since` before anything else.
+  two siblings handling the same enum, Result, or index differently is a defect
+  far more often than not. Fresh code beats old: `--changed-since` first.
+  `error-swallows` and `clones` rank their own rows (score in column 2) and
+  `audit` gates on those top tiers only — read them top-down, never by grep.
 
 PRECISION (the `via` column says which tier fired; `explain precision` for the table)
   Rows tagged APPROXIMATE/BEST-EFFORT are leads to verify, not facts. Every run

@@ -20,7 +20,8 @@
 
 use crate::casts::CastClass;
 use crate::emit::{row, site};
-use crate::context::AnalysisCtx;
+use crate::clones;
+use crate::context::{AnalysisCtx, Counts};
 use crate::builder_drift;
 use crate::config_drift;
 use crate::divergence;
@@ -59,14 +60,31 @@ const CONTEXT_LINES: usize = 2;
 const DIVERGENCE_MIN_SCORE: f64 = 0.45;
 
 /// Whether a section's findings gate the exit code. Deterministic defect
-/// classes gate; candidate classes that need per-site judgment (stringly,
-/// error-swallows, god fns, …) are advisory unless `--strict` — otherwise an
-/// `until unruster audit` loop could never converge on a healthy codebase
-/// whose domain legitimately triggers candidates.
+/// classes gate; candidate classes that need per-site judgment (stringly, god
+/// fns, …) are advisory unless `--strict` — otherwise an `until unruster audit`
+/// loop could never converge on a healthy codebase whose domain legitimately
+/// triggers candidates.
+///
+/// The third state exists because "does this check gate?" was the wrong
+/// question for the two highest-volume ones. On a twelve-crate workspace the
+/// five gating checks all returned zero while `error-swallows` returned 89 rows
+/// containing a permanent loss of Stripe payment confirmations — so `audit`
+/// printed `0 gating + 128 advisory … clean, exit 0` and the advertised
+/// `until unruster audit; do <fix>; done` loop would have terminated on
+/// iteration one, on a codebase with a live money bug in it.
+///
+/// Making the whole check gate was not the fix either: most of those 89 rows
+/// were correct by design, and a gate nobody can clear is a gate nobody runs.
+/// `Tiered` gates on the check's own ranking instead, so the gate is the rows
+/// where something external happened and nobody checked whether it worked.
 #[derive(Clone, Copy, PartialEq)]
 enum Gate {
+    /// Every row gates.
     Gating,
+    /// No row gates (unless `--strict`).
     Advisory,
+    /// The check ranks its own rows; the ones above its threshold gate.
+    Tiered,
 }
 
 /// The battery's per-check configuration, defined once.
@@ -176,7 +194,7 @@ impl BatteryConfig {
 pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cfg: BatteryConfig) {
     // `--top` is a display cap applied after waiver matching, so omitting it
     // changes no hit count.
-    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 12] = [
+    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 13] = [
         ("divergence", &|| {
             divergence::run(ctx, None, cfg.divergence_min_score, None)
         }),
@@ -190,6 +208,9 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
             dead_code::run(ctx, dead_call_source, false, false)
         }),
         ("conversion-pairs", &|| conversion_pairs::run(ctx)),
+        ("clones", &|| {
+            clones::run(ctx, clones::DEFAULT_MIN_TOKENS, None)
+        }),
         ("error-swallows", &|| error_swallows::run(ctx, cfg.swallows)),
         ("casts", &|| {
             casts::run(ctx, cfg.cast_classes, None, false, cfg.include_unsafe_ptr, None)
@@ -251,10 +272,15 @@ pub fn run(
     let prev_inline = ctx.out.set_summary_inline(true);
 
     // `count` is a closure so the header prints first. See the module note.
+    //
+    // It returns [`Counts`] rather than a bare total because two checks are
+    // ranked and gate only on their top tier: every row still prints, but a
+    // `.map_err(|_|)` on a base64 decode must not hold the loop open next to a
+    // discarded `DELETE`. For every other check the two numbers are equal.
     let mut section = |title: &str,
                        check: &str,
                        gate: Gate,
-                       count: &mut dyn FnMut() -> anyhow::Result<usize>|
+                       count: &mut dyn FnMut() -> anyhow::Result<Counts>|
      -> anyhow::Result<()> {
         ctx.out.section(title);
         // The check name is part of every fingerprint: two checks reporting the
@@ -262,11 +288,19 @@ pub fn run(
         let prev = ctx.out.set_check(check);
         let n = count()?;
         ctx.out.set_check(&prev);
-        if gate == Gate::Gating || strict {
-            gating += n;
+        // `--strict` promotes every advisory row, so it wants the total, not
+        // the tier: the flag means "nothing at all", not "nothing important".
+        let g = if strict {
+            n.total
         } else {
-            advisory += n;
-        }
+            match gate {
+                Gate::Gating => n.total,
+                Gate::Advisory => 0,
+                Gate::Tiered => n.gating,
+            }
+        };
+        gating += g;
+        advisory += n.total - g;
         checks += 1;
         ctx.out.section_end();
         Ok(())
@@ -279,27 +313,31 @@ pub fn run(
         "[high] divergence — sibling paths that disagree (explain: partial-enumeration)",
         "divergence",
         Gate::Gating,
-        &mut || divergence::run(ctx, None, DIVERGENCE_MIN_SCORE, top.or(Some(40))),
+        &mut || Ok(Counts::flat(divergence::run(ctx, None, DIVERGENCE_MIN_SCORE, top.or(Some(40)))?)),
     )?;
     section(
         "[high] divergence --handling — one callee, different care (explain: silent-fallbacks)",
         "divergence-handling",
         Gate::Gating,
-        &mut || divergence::run_handling(ctx, HANDLING_MIN_CARE_GAP),
+        &mut || Ok(Counts::flat(divergence::run_handling(ctx, HANDLING_MIN_CARE_GAP)?)),
     )?;
     section(
         "[high] enum-coverage --all — partial enum dispatch (explain: partial-enumeration)",
         "enum-coverage",
         Gate::Gating,
         &mut || {
-            parallel_matches::run_enum_coverage(ctx, None, coverage_opts())
+            Ok(Counts::flat(parallel_matches::run_enum_coverage(
+                ctx,
+                None,
+                coverage_opts(),
+            )?))
         },
     )?;
     section(
         "[high] dead-code — fns with no observed caller",
         "dead-code",
         Gate::Gating,
-        &mut || dead_code::run(ctx, dead_call_source, false, false),
+        &mut || Ok(Counts::flat(dead_code::run(ctx, dead_call_source, false, false)?)),
     )?;
     section(
         "[high] conversion-pairs — one concept in two shapes (explain: replication)",
@@ -313,16 +351,33 @@ pub fn run(
             };
             let r = conversion_pairs::run(ctx);
             ctx.out.set_context_lines(prev);
-            r
+            Ok(Counts::flat(r?))
         },
     )?;
     section(
-        "[medium] error-swallows — silently dropped Results (explain: silent-fallbacks)",
+        &format!(
+            "[high] error-swallows — silently dropped Results; gating at score >= {:.2} \
+             (explain: silent-fallbacks)",
+            error_swallows::GATING_SCORE
+        ),
         "error-swallows",
-        Gate::Advisory,
-        &mut || {
-            error_swallows::run(ctx, swallow_opts())
-        },
+        // Tiered, not advisory. Every row prints, ranked; the ones that gate are
+        // the ones where an external effect happened and the only report of
+        // whether it worked was discarded. That tier is where the dropped
+        // `DELETE FROM stripe_events` lived while this whole check sat in the
+        // advisory pile and `audit` exited 0.
+        Gate::Tiered,
+        &mut || error_swallows::run_counted(ctx, swallow_opts()),
+    )?;
+    section(
+        &format!(
+            "[high] clones — the same body written out more than once; gating at score \
+             >= {:.2} (explain: replication)",
+            clones::GATING_SCORE
+        ),
+        "clones",
+        Gate::Tiered,
+        &mut || clones::run_counted(ctx, clones::DEFAULT_MIN_TOKENS, top.or(Some(20))),
     )?;
     section(
         "[medium] config-drift — same struct, two configurations (explain: config-drift)",
@@ -333,7 +388,7 @@ pub fn run(
         // audit line — but a codebase can hold correct ones indefinitely, and a
         // gating check that can never reach zero is one nobody runs.
         Gate::Advisory,
-        &mut || config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, top.or(Some(10))),
+        &mut || Ok(Counts::flat(config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, top.or(Some(10)))?)),
     )?;
     section(
         "[medium] builder-drift — sibling chains, one missing a step (explain: builder-drift)",
@@ -343,15 +398,13 @@ pub fn run(
         // check exists because a `Command::new("git")` chain that forgot
         // `.current_dir()` resolved the wrong repository.
         Gate::Advisory,
-        &mut || builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE, top.or(Some(10))),
+        &mut || Ok(Counts::flat(builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE, top.or(Some(10)))?)),
     )?;
     section(
         "[medium] casts — data-loss classes only (explain: casts)",
         "casts",
         Gate::Advisory,
-        &mut || {
-            casts::run(ctx, CAST_CLASSES, None, false, false, top)
-        },
+        &mut || Ok(Counts::flat(casts::run(ctx, CAST_CLASSES, None, false, false, top)?)),
     )?;
     // Low-volume checks: show the offending line inline. Skipped when the
     // caller set `--context` themselves — their choice wins.
@@ -368,7 +421,7 @@ pub fn run(
             };
             let r = stringly::run(ctx, false, false, None, top.or(Some(CONTEXTED_TOP)));
             ctx.out.set_context_lines(prev);
-            r
+            Ok(Counts::flat(r?))
         },
     )?;
     section(
@@ -378,13 +431,13 @@ pub fn run(
         ),
         "metrics",
         Gate::Advisory,
-        &mut || metrics::run(ctx, SortKey::Cyclo, metrics_top, Some(CYCLO_THRESHOLD), true),
+        &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, metrics_top, Some(CYCLO_THRESHOLD), true)?)),
     )?;
     section(
         "[low] pass-through — single-call wrapper fns (explain: replication)",
         "pass-through",
         Gate::Advisory,
-        &mut || pass_through::run(ctx, 1),
+        &mut || Ok(Counts::flat(pass_through::run(ctx, 1)?)),
     )?;
 
     // The battery-wide line goes back to the normal stream: it is the one an

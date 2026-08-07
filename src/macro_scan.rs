@@ -7,24 +7,93 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 
-/// Macro bodies whose tokens could not be parsed as expressions this run —
-/// code inside them was NOT analyzed. Surfaced by main as a blind-spot count
-/// so "0 findings" is never silently mistaken for "0 findings in code we
-/// couldn't see". Keyed by (line, column, token hash) so a macro visited by
-/// several checks in one run counts once. (Quoting macros like `quote!` are
-/// skipped on purpose and not counted.)
-static UNPARSED_MACRO_BODIES: Mutex<Option<HashSet<(usize, usize, u64)>>> = Mutex::new(None);
+/// Macro bodies whose tokens could not be parsed as expressions — code inside
+/// them was NOT analyzed. Surfaced by main as a blind-spot count so "0
+/// findings" is never silently mistaken for "0 findings in code we couldn't
+/// see". (Quoting macros like `quote!` are skipped on purpose and not counted.)
+///
+/// Keyed by **file** plus (line, column, token hash). The file used to be
+/// absent, so two identical macros at the same line and column in different
+/// files collided into one entry and the count silently ran low — an
+/// undercount in the one number whose whole job is to bound what the run did
+/// not see.
+type BlindSpot = (String, usize, usize, u64);
+static UNPARSED_MACRO_BODIES: Mutex<Option<HashSet<BlindSpot>>> = Mutex::new(None);
+
+/// Set once [`survey`] has walked the tree. After that the count is a closed
+/// property of the scanned files and incidental visits must not extend it.
+///
+/// Before this existed, the counter accumulated as checks happened to reach
+/// macros, so the number was a function of *which checks ran*: the same tree at
+/// the same commit reported 21 under `audit`, 18 under `error-swallows` and 17
+/// under `enum-coverage`, while the note claimed each was the count of macro
+/// bodies in the code. Three answers to one question reads as instability in
+/// exactly the number a reader has to trust.
+static SURVEYED: Mutex<bool> = Mutex::new(false);
 
 fn record_blind_spot(m: &syn::Macro) {
+    // Outside the survey the visit set is arbitrary, so recording would make
+    // the total depend on the subcommand. `survey` has already seen every
+    // macro in the tree; there is nothing here it missed.
+    if *SURVEYED.lock().unwrap() {
+        return;
+    }
+    record_in(m, "");
+}
+
+fn record_in(m: &syn::Macro, file: &str) {
     let start = m.path.span().start();
     let mut h = DefaultHasher::new();
     m.tokens.to_string().hash(&mut h);
-    let key = (start.line, start.column, h.finish());
+    let key = (file.to_string(), start.line, start.column, h.finish());
     let mut guard = UNPARSED_MACRO_BODIES.lock().unwrap();
     guard.get_or_insert_with(HashSet::new).insert(key);
 }
 
-/// Number of distinct macro bodies that resisted expression parsing this run.
+/// Walk every macro in the scanned tree and record the ones that resist
+/// expression parsing, then seal the count.
+///
+/// Called once, from `main`, immediately after parsing — so every subcommand
+/// reports the same number for the same tree, and that number is the whole
+/// tree's rather than whatever subset the chosen checks happened to touch.
+pub fn survey(files: &[crate::parse::ParsedFile]) {
+    {
+        let mut sealed = SURVEYED.lock().unwrap();
+        if *sealed {
+            return;
+        }
+        // Recording stays open for the duration of the walk below.
+        *sealed = false;
+    }
+    for f in files {
+        let display = crate::parse::display_path(&f.path);
+        let mut v = SurveyVisitor { file: &display };
+        syn::visit::Visit::visit_file(&mut v, &f.ast);
+    }
+    *SURVEYED.lock().unwrap() = true;
+}
+
+/// Classifies every macro exactly as the checks do — same [`macro_body`]
+/// entry point — so the survey can never disagree with them about what is a
+/// blind spot.
+struct SurveyVisitor<'a> {
+    file: &'a str,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for SurveyVisitor<'_> {
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        if !is_quoting_macro(m) && !is_matches_macro(m) {
+            let exprs = parse_exprs(&m.tokens);
+            if exprs.is_empty() && tokens_have_substance(&m.tokens) {
+                record_in(m, self.file);
+            }
+        }
+        syn::visit::visit_macro(self, m);
+    }
+}
+
+/// Number of distinct macro bodies in the scanned tree that resisted
+/// expression parsing.
 pub fn blind_spots() -> usize {
     UNPARSED_MACRO_BODIES
         .lock()

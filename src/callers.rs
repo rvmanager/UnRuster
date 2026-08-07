@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{fn_span, trait_fn_span, line_of, path_to_string, print_grouped_counts, type_short, ScopeTracker};
+use crate::ast::{line_of, path_to_string, print_grouped_counts, scope_visits, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
 
 /// `--by` grouping for `callers`. `fn` is not offered — the default listing is
@@ -51,38 +51,11 @@ impl<'a> CallVisitor<'a> {
 }
 
 impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.scope.enter_mod(i.ident.to_string());
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
+    scope_visits!(item_mod, item_impl, item_fn, impl_item_fn, trait_item_fn);
 
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        visit::visit_item_fn(self, i);
-        self.scope.leave_fn();
-    }
 
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.scope.enter_impl(type_short(&i.self_ty));
-        visit::visit_item_impl(self, i);
-        self.scope.leave_impl();
-    }
 
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        visit::visit_impl_item_fn(self, i);
-        self.scope.leave_fn();
-    }
 
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
-        visit::visit_trait_item_fn(self, i);
-        self.scope.leave_fn();
-    }
 
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*e.func {

@@ -1026,7 +1026,240 @@ fn parallel_matches_include_if_chains_summary_silent() {
     ]);
 }
 
+// ─── global flags ──────────────────────────────────────────────────────────
+
+/// `-r`/`--root` is documented under GLOBAL FLAGS and has to behave like one.
+/// It was the only flag on `Cli` without `global = true`, so every
+/// `unruster <cmd> -r <path>` — the order the help implies — was a hard clap
+/// error.
+#[test]
+fn root_is_accepted_after_the_subcommand() {
+    for args in [
+        vec!["metrics", "--root", FIXTURE],
+        vec!["metrics", "-r", FIXTURE],
+        vec!["error-swallows", "-r", FIXTURE],
+        vec!["stringly", "-r", FIXTURE],
+    ] {
+        let out = ur().args(&args).output().unwrap();
+        let code = out.status.code();
+        assert!(
+            code == Some(0) || code == Some(1),
+            "{args:?} exited {code:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `builder-drift` takes a positional constructor filter. It used to be called
+/// `root`, which collided with the newly-global `--root` — and clap reports an
+/// id/type mismatch by panicking at *access* time, so the subcommand built
+/// fine and died on use.
+#[test]
+fn builder_drift_positional_does_not_collide_with_global_root() {
+    ur().args(["--root", "fixtures/drift/src", "builder-drift", "Cmd::new"])
+        .assert()
+        .success()
+        .stdout(contains("Cmd::new"));
+    // And the same filter with the root supplied *after* the subcommand.
+    ur().args(["builder-drift", "Cmd::new", "-r", "fixtures/drift/src"])
+        .assert()
+        .success()
+        .stdout(contains("Cmd::new"));
+}
+
+// ─── clones ────────────────────────────────────────────────────────────────
+
+/// A fresh scratch tree under the system temp dir, named after the caller so
+/// two tests never share one. Matches the inline pattern used elsewhere in this
+/// file; extracted because the clone tests need four of them.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("unruster-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    dir
+}
+
+/// The finding the check exists for: one helper, several copies, locals
+/// renamed. The fixture carries three copies of a `parse_id`-shaped body.
+#[test]
+fn clones_groups_copy_pasted_bodies() {
+    let dir = scratch("clone-group");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod a {
+    pub fn parse_id(bytes: &[u8], field: &'static str) -> Result<Id, Err> {
+        let trimmed = bytes.strip_prefix(b"id:").unwrap_or(bytes);
+        Id::from_slice(trimmed).map_err(|_| Err::bad(field))
+    }
+}
+pub mod b {
+    pub fn parse_id(raw: &[u8], name: &'static str) -> Result<Id, Err> {
+        let cut = raw.strip_prefix(b"id:").unwrap_or(raw);
+        Id::from_slice(cut).map_err(|_| Err::bad(name))
+    }
+}
+pub mod c {
+    pub fn parse_id(input: &[u8], label: &'static str) -> Result<Id, Err> {
+        let body = input.strip_prefix(b"id:").unwrap_or(input);
+        Id::from_slice(body).map_err(|_| Err::bad(label))
+    }
+}
+pub fn unrelated(v: &[u8]) -> usize {
+    v.iter().filter(|b| **b != 0).map(|b| *b as usize).sum()
+}
+"#,
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "clones", "--all-stdout"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("parse_id"), "expected the group: {text}");
+    assert!(
+        text.contains('\t'),
+        "expected a TSV row, got: {text}"
+    );
+    // Three copies, and the lone `unrelated` fn is not dragged in.
+    let row = text.lines().find(|l| l.contains("parse_id")).unwrap();
+    let cols: Vec<&str> = row.split('\t').collect();
+    assert_eq!(cols[2], "3", "copies column: {row}");
+    assert!(!text.contains("unrelated"), "false grouping: {text}");
+}
+
+/// Renaming what a function *calls* is a different function, not a clone.
+/// Without this the check degrades into a shape-similarity metric.
+#[test]
+fn clones_does_not_group_different_callees() {
+    let dir = scratch("clone-callees");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn area(s: &Shape) -> u32 {
+    let w = s.width();
+    let h = s.height();
+    let border = s.width() + s.height();
+    w * h + border * 2 + s.width()
+}
+pub fn cells(t: &Table) -> u32 {
+    let r = t.rows();
+    let c = t.cols();
+    let edge = t.rows() + t.cols();
+    r * c + edge * 2 + t.rows()
+}
+"#,
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "clones", "--all-stdout"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains("2 fn(s) scanned"),
+        "both bodies must clear --min-tokens or this proves nothing: {text}"
+    );
+    assert!(
+        text.contains("across 0 group(s)"),
+        "same shape, different callees — must not group: {text}"
+    );
+}
+
+/// `audit` gates on the top tier of the ranked checks. Before this, five
+/// row-gating checks returning zero meant `exit 0` on a tree whose
+/// `error-swallows` section held a real defect.
+#[test]
+fn audit_gates_on_top_tier_of_ranked_checks() {
+    let dir = scratch("audit-gate-on");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+// `#[allow(dead_code)]` so the dead-code check stays silent and the exit
+// code isolates the tier under test.
+#[allow(dead_code)]
+pub fn settle(db: &Db, id: u64) {
+    // A discarded external mutation: the gating tier.
+    let _ = db.query("DELETE FROM events WHERE id = $1").bind(id).execute();
+}
+"#,
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "audit", "--all-stdout"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a discarded DELETE must hold the loop open: {text}"
+    );
+    assert!(
+        text.contains("exit 1 while gating findings remain"),
+        "summary should say the gate is held: {text}"
+    );
+    // The section *header* also names the threshold, so match the summary's
+    // own phrasing or this passes on every tree.
+    assert!(
+        text.contains("(discarded external effects"),
+        "the error-swallows summary should report a gating tier: {text}"
+    );
+}
+
+/// The converse: a tree whose only swallows are deliberate cause-collapsing
+/// must not hold the loop open, or the gate is one nobody can clear.
+#[test]
+fn audit_does_not_gate_on_deliberate_sanitization() {
+    let dir = scratch("audit-gate-off");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+#[allow(dead_code)]
+pub fn verify(raw: &[u8]) -> Result<Id, Bad> {
+    Id::from_slice(raw).map_err(|_| Bad::Malformed)
+}
+#[allow(dead_code)]
+pub fn decode_count(text: &str) -> Result<u32, Bad> {
+    text.parse::<u32>().map_err(|_| Bad::Malformed)
+}
+"#,
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "audit", "--all-stdout"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collapsing a decode cause is correct and must not gate: {text}"
+    );
+    assert!(
+        !text.contains("(discarded external effects"),
+        "no row should have reached the gating tier: {text}"
+    );
+}
+
 // ─── error-swallows ────────────────────────────────────────────────────────
+
+/// The list is long and converts at a few percent, so order is the product.
+/// A discarded external mutation must outrank a deliberately-collapsed decode
+/// error no matter where either sits in the file.
+#[test]
+fn error_swallows_ranks_discarded_effects_first() {
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "error-swallows"]);
+    let scores: Vec<f64> = rows_of(&out)
+        .iter()
+        .filter_map(|l| l.split('\t').nth(1)?.parse().ok())
+        .collect();
+    assert!(scores.len() > 1, "expected several ranked rows");
+    assert!(
+        scores.windows(2).all(|w| w[0] >= w[1]),
+        "rows are not in descending score order: {scores:?}"
+    );
+}
 
 #[test]
 fn error_swallows_finds_methods() {

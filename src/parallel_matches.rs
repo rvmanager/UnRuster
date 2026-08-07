@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{doc_text, enum_variant_of_path, fn_span, line_of, trait_fn_span, type_short, ScopeTracker};
+use crate::ast::{doc_text, enum_variant_of_path, line_of, scope_visits, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::emit::{row, site as site_cell};
 use crate::macro_scan::{macro_body, Body};
@@ -296,39 +296,7 @@ fn arm_routes_through_scrutinee(body: &syn::Expr, scrutinee: &syn::Expr) -> bool
 }
 
 impl<'ast, 'a> Visit<'ast> for ParaVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.scope.enter_mod(i.ident.to_string());
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        visit::visit_item_fn(self, i);
-        self.scope.leave_fn();
-    }
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.scope.enter_impl(type_short(&i.self_ty));
-        visit::visit_item_impl(self, i);
-        self.scope.leave_impl();
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        visit::visit_impl_item_fn(self, i);
-        self.scope.leave_fn();
-    }
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        self.scope.enter_trait(i.ident.to_string());
-        visit::visit_item_trait(self, i);
-        self.scope.leave_trait();
-    }
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
-        visit::visit_trait_item_fn(self, i);
-        self.scope.leave_fn();
-    }
+    scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn, trait_item_fn);
 
     fn visit_expr_match(&mut self, e: &'ast syn::ExprMatch) {
         let mut variants: Vec<String> = Vec::new();

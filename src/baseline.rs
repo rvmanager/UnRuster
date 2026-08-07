@@ -224,6 +224,11 @@ pub struct Snapshot {
 }
 
 impl Drop for Snapshot {
+    // unruster: ok(error-swallows/let-_) 2026-08-06 — `drop` cannot report and
+    // has no caller to report to; the worst case is a temp directory left in
+    // `std::env::temp_dir()`, which the next run with this pid clears (and now
+    // checks — see `snapshot`). Escalating here would mean panicking in a
+    // destructor.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -268,7 +273,23 @@ pub fn snapshot(git_ref: &str, root: &Path) -> Result<Snapshot> {
         std::process::id(),
         git_ref.replace(['/', '~', '^', ':'], "_")
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    // Not `let _ =`. `create_dir_all` below returns Ok when the directory
+    // already exists, so a failed removal is NOT caught by it: the tar would
+    // extract over whatever a previous run left behind, and files deleted
+    // between the two refs would survive into the snapshot. The baseline would
+    // then contain items that were never in `git_ref`, and `--since` would
+    // report them as `gone` — the exact phantom this feature exists to rule
+    // out. Reported by `unruster error-swallows` at score 0.90.
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        // Nothing to clear is the normal case.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("clearing the stale snapshot directory {}", dir.display())
+            })
+        }
+    }
     std::fs::create_dir_all(&dir)?;
 
     let archive = Command::new("git")
@@ -277,6 +298,11 @@ pub fn snapshot(git_ref: &str, root: &Path) -> Result<Snapshot> {
         .output()
         .context("running git archive")?;
     if !archive.status.success() {
+        // unruster: ok(error-swallows/let-_) 2026-08-06 — best-effort cleanup on
+        // an error path: the `bail!` on the next line carries the failure the
+        // caller needs, and surfacing a cleanup error here would replace a
+        // diagnosable cause with an incidental one. The `Drop` impl and the
+        // next run both retry the removal.
         let _ = std::fs::remove_dir_all(&dir);
         bail!(
             "git archive {} failed: {}",
@@ -297,12 +323,22 @@ pub fn snapshot(git_ref: &str, root: &Path) -> Result<Snapshot> {
         stdin.write_all(&archive.stdout)?;
     }
     if !tar.wait()?.success() {
+        // unruster: ok(error-swallows/let-_) 2026-08-06 — best-effort cleanup on
+        // an error path: the `bail!` on the next line carries the failure the
+        // caller needs, and surfacing a cleanup error here would replace a
+        // diagnosable cause with an incidental one. The `Drop` impl and the
+        // next run both retry the removal.
         let _ = std::fs::remove_dir_all(&dir);
         bail!("extracting the {} snapshot failed", git_ref);
     }
 
     let scan_root = dir.join(&rel);
     if !scan_root.exists() {
+        // unruster: ok(error-swallows/let-_) 2026-08-06 — best-effort cleanup on
+        // an error path: the `bail!` on the next line carries the failure the
+        // caller needs, and surfacing a cleanup error here would replace a
+        // diagnosable cause with an incidental one. The `Drop` impl and the
+        // next run both retry the removal.
         let _ = std::fs::remove_dir_all(&dir);
         bail!(
             "{} did not exist at {} — nothing to compare against",

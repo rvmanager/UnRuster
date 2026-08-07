@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{fn_span, trait_fn_span, line_of, line_of_span, type_short, ScopeTracker};
-use crate::context::AnalysisCtx;
+use crate::ast::{line_of, line_of_span, scope_visits, ScopeTracker};
+use crate::context::{AnalysisCtx, Counts};
 use crate::parse::display_path;
 use crate::emit::{row, site};
 
@@ -23,6 +23,190 @@ struct Hit {
     /// Kept as a flag rather than dropped at scan time so the summary can say
     /// how many were filtered and `--include-*` can restore them.
     benign: Option<&'static str>,
+    /// What the discarded `Result` was reporting on. See [`Effect`].
+    effect: Effect,
+}
+
+impl Hit {
+    /// How much this site deserves a reader's attention, 0.0–1.0.
+    ///
+    /// Two independent questions, added:
+    ///
+    /// * **What failed** ([`Effect`]) — an external mutation that nobody
+    ///   checked is a different animal from a base64 decode that returned
+    ///   `None`, even though both are `.ok()`.
+    /// * **How completely the failure vanished** (the swallow kind) — `let _ =`
+    ///   drops the error *and* continues; `.map_err(|_|)` replaces the cause but
+    ///   still propagates the failure, so the caller can act.
+    ///
+    /// The second term is why the crypto-sanitization family sorts to the
+    /// bottom on its own: those sites collapse causes deliberately and the
+    /// failure still travels. That family was 13 of the 89 rows on the codebase
+    /// this ranking was built against, all correct, all previously
+    /// indistinguishable from the money bug.
+    fn score(&self) -> f64 {
+        let kind = match self.kind {
+            // Error and value both gone, control continues on the happy path.
+            "let-_" | "match-err-wild" => 0.30,
+            // The failure becomes a `None` the caller may or may not check.
+            ".ok" | ".err" | "if-let-ok" | "while-let-ok" => 0.20,
+            // A substituted value: execution continues as if it had succeeded.
+            ".unwrap_or_default" | ".unwrap_or_else" | ".unwrap_or" => 0.15,
+            // Cause replaced, failure still propagates — the sanitization shape.
+            ".map_err(|_|)" => 0.05,
+            _ => 0.15,
+        };
+        (self.effect.weight() + kind).min(1.0)
+    }
+}
+
+/// What the discarded `Result` was reporting on — the single feature that
+/// separated the real defects from the correct-by-design sites on the codebase
+/// this was calibrated against.
+///
+/// Classified from the swallowed expression's call chain, so it is a
+/// BEST-EFFORT signal: a project that wraps its database in `fn persist()`
+/// reads as `Unknown`, not `Mutation`. It ranks, it does not adjudicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Effect {
+    /// External state was changed — a row written, a message sent, a file
+    /// replaced. If this `Result` is dropped, the only record that the effect
+    /// did or did not happen is gone with it. `let _ = sqlx::query("DELETE
+    /// FROM stripe_events …").execute(&db).await` is this class, and it was a
+    /// permanent loss of Stripe payment confirmations.
+    Mutation,
+    /// An external interaction that only reads — a fetch, a query, a file read.
+    /// Dropping it degrades behaviour but leaves the world consistent.
+    Io,
+    /// A pure transformation of data already in hand: parse, decode, convert.
+    /// Nothing outside the process was touched, and on a validation path
+    /// "it didn't parse" is frequently the whole answer.
+    Decode,
+    /// The chain named nothing recognizable.
+    Unknown,
+}
+
+impl Effect {
+    fn weight(self) -> f64 {
+        match self {
+            Effect::Mutation => 0.60,
+            Effect::Io => 0.35,
+            Effect::Unknown => 0.20,
+            Effect::Decode => 0.05,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Effect::Mutation => "mutation",
+            Effect::Io => "io",
+            Effect::Decode => "decode",
+            Effect::Unknown => "unknown",
+        }
+    }
+}
+
+/// Verbs that change state outside this process. Matched on the method or
+/// call-path segment, by whole name or as a leading word (`send_batch`,
+/// `write_all`), so a project's own spellings mostly land without an
+/// allow-list entry.
+const MUTATION_VERBS: &[&str] = &[
+    "execute", "commit", "rollback", "send", "publish", "emit", "dispatch", "write", "write_all",
+    "flush", "insert", "remove", "delete", "update", "upsert", "persist", "save", "store",
+    "create", "create_dir", "create_dir_all", "remove_file", "remove_dir", "remove_dir_all",
+    "rename", "copy", "set_permissions", "set_len", "truncate", "sync_all", "sync_data",
+    "spawn", "kill", "wait", "notify", "ack", "commit_async", "bind_execute",
+];
+
+/// Verbs that reach outside the process without changing it.
+const IO_VERBS: &[&str] = &[
+    "fetch", "fetch_one", "fetch_all", "fetch_optional", "query", "query_as", "query_scalar",
+    "get", "post", "put", "patch", "head", "request", "call", "connect", "read", "read_to_string",
+    "read_to_end", "read_dir", "recv", "receive", "poll", "load", "open", "metadata", "canonicalize",
+    "lock", "acquire", "begin",
+];
+
+/// Verbs that only reshape data the process already holds.
+const DECODE_VERBS: &[&str] = &[
+    "parse", "parse_str", "from_str", "from_slice", "from_bytes", "from_utf8", "decode",
+    "deserialize", "try_into", "try_from", "into", "to_str", "as_str", "encode", "serialize",
+    "to_string", "strip_prefix", "strip_suffix", "split_once", "from_hex", "to_vec",
+];
+
+/// Does `name` name one of `verbs`, either exactly or as its leading word?
+fn verb_matches(name: &str, verbs: &[&str]) -> bool {
+    verbs.iter().any(|v| {
+        name == *v
+            || name
+                .strip_prefix(v)
+                .is_some_and(|rest| rest.starts_with('_'))
+    })
+}
+
+/// Classify the swallowed expression by the strongest effect anywhere in its
+/// call chain.
+///
+/// The whole subtree is walked rather than just the outermost call: the effect
+/// in `sqlx::query(…).bind(id).execute(&mut *tx).await` sits three links down,
+/// and `query` alone would read as a plain read. Mutation wins over IO wins
+/// over decode, because a chain that both queries and executes did mutate.
+fn classify_effect(expr: &syn::Expr) -> Effect {
+    struct V {
+        mutation: bool,
+        io: bool,
+        decode: bool,
+    }
+    impl V {
+        fn note(&mut self, name: &str) {
+            if verb_matches(name, MUTATION_VERBS) {
+                self.mutation = true;
+            } else if verb_matches(name, IO_VERBS) {
+                self.io = true;
+            } else if verb_matches(name, DECODE_VERBS) {
+                self.decode = true;
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            self.note(&c.method.to_string());
+            visit::visit_expr_method_call(self, c);
+        }
+        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*c.func {
+                if let Some(seg) = p.path.segments.last() {
+                    self.note(&seg.ident.to_string());
+                }
+            }
+            visit::visit_expr_call(self, c);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            // `let _ = writeln!(file, …)` is a write; the benign filter already
+            // spares the in-memory buffers.
+            if let Some(seg) = m.path.segments.last() {
+                self.note(&seg.ident.to_string());
+            }
+            for e in crate::macro_scan::macro_exprs(m) {
+                self.visit_expr(&e);
+            }
+        }
+        // A closure inside the chain is the *handler*, not the effect — it is
+        // what runs when the thing failed. Walking into it would let a
+        // `.unwrap_or_else(|| String::new())` read as whatever the fallback does.
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    }
+    let mut v = V {
+        mutation: false,
+        io: false,
+        decode: false,
+    };
+    v.visit_expr(expr);
+    match (v.mutation, v.io, v.decode) {
+        (true, _, _) => Effect::Mutation,
+        (_, true, _) => Effect::Io,
+        (_, _, true) => Effect::Decode,
+        _ => Effect::Unknown,
+    }
 }
 
 struct SwallowVisitor<'a> {
@@ -194,11 +378,21 @@ impl<'a> SwallowVisitor<'a> {
         self.propagated.contains(&(s.line, s.column))
     }
 
-    fn record(&mut self, kind: &'static str, line: usize) {
-        self.record_tagged(kind, line, None);
+    fn record(&mut self, kind: &'static str, line: usize, swallowed: &syn::Expr) {
+        self.record_tagged(kind, line, None, swallowed);
     }
 
-    fn record_tagged(&mut self, kind: &'static str, line: usize, benign: Option<&'static str>) {
+    /// `swallowed` is the expression whose `Result` is being dropped — the
+    /// method receiver, the `let` initialiser, the match scrutinee. It is the
+    /// only thing that distinguishes a discarded DELETE from a discarded
+    /// base64 decode, so every record path has to supply it.
+    fn record_tagged(
+        &mut self,
+        kind: &'static str,
+        line: usize,
+        benign: Option<&'static str>,
+        swallowed: &syn::Expr,
+    ) {
         let ctx = self.enclosing();
         self.hits.push(Hit {
             kind,
@@ -206,6 +400,7 @@ impl<'a> SwallowVisitor<'a> {
             line,
             context: ctx,
             benign,
+            effect: classify_effect(swallowed),
         });
     }
 }
@@ -270,39 +465,7 @@ fn pat_is_ok(p: &syn::Pat) -> bool {
 }
 
 impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.scope.enter_mod(i.ident.to_string());
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        visit::visit_item_fn(self, i);
-        self.scope.leave_fn();
-    }
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.scope.enter_impl(type_short(&i.self_ty));
-        visit::visit_item_impl(self, i);
-        self.scope.leave_impl();
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        visit::visit_impl_item_fn(self, i);
-        self.scope.leave_fn();
-    }
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        self.scope.enter_trait(i.ident.to_string());
-        visit::visit_item_trait(self, i);
-        self.scope.leave_trait();
-    }
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
-        visit::visit_trait_item_fn(self, i);
-        self.scope.leave_fn();
-    }
+    scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn, trait_item_fn);
 
     fn visit_expr_try(&mut self, e: &'ast syn::ExprTry) {
         // Runs before the child method call is visited, so the mark is in
@@ -340,7 +503,10 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
             } else {
                 None
             };
-            self.record_tagged(k, line_of(&e.method), benign);
+            // The receiver, not the whole call: the closure argument of
+            // `.map_err(|_| …)` / `.unwrap_or_else(|| …)` is the handler that
+            // runs on failure, not the thing that failed.
+            self.record_tagged(k, line_of(&e.method), benign, &e.receiver);
         }
         // A closure passed as an argument is not in *this* call's tail slot.
         self.closure_tail.push(false);
@@ -358,7 +524,7 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
         for arm in &e.arms {
             if pat_is_err_swallow(&arm.pat) {
                 let line = line_of_span(arm.fat_arrow_token.spans[0]);
-                self.record("match-err-wild", line);
+                self.record("match-err-wild", line, &e.expr);
                 break; // one report per match site
             }
         }
@@ -380,7 +546,7 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
                     } else {
                         None
                     };
-                    self.record_tagged("if-let-ok", line_of(&e.if_token), benign);
+                    self.record_tagged("if-let-ok", line_of(&e.if_token), benign, &le.expr);
                 }
             }
         }
@@ -390,7 +556,7 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
     fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
         if let syn::Expr::Let(le) = &*e.cond {
             if pat_is_ok(&le.pat) {
-                self.record("while-let-ok", line_of(&e.while_token));
+                self.record("while-let-ok", line_of(&e.while_token), &le.expr);
             }
         }
         visit::visit_expr_while(self, e);
@@ -419,12 +585,27 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
                 } else {
                     None
                 };
-                self.record_tagged("let-_", line_of(&l.let_token), benign);
+                self.record_tagged("let-_", line_of(&l.let_token), benign, &init.expr);
             }
         }
         visit::visit_local(self, l);
     }
 }
+
+/// The score at or above which a swallow is a gating audit finding.
+///
+/// Placed so that the class it admits is "an external effect happened and the
+/// only report of whether it worked was discarded" — mutation at any kind,
+/// plus IO that vanished completely (`let _`, `match … Err(_) =>`). On the
+/// workspace this was calibrated against that is ~8 rows out of 89, and the two
+/// highest were both real production defects: a dropped `DELETE FROM
+/// stripe_events` that permanently lost payment confirmations, and a dropped
+/// dead-APNs-token delete whose sibling arm logged.
+///
+/// Deliberately above `Unknown + let-_` (0.50). An unrecognised call chain is
+/// the common case in a codebase with its own wrappers, and gating on it would
+/// reproduce the unranked list this score exists to replace.
+pub const GATING_SCORE: f64 = 0.55;
 
 /// Which families of swallow site to report.
 #[derive(Clone, Copy)]
@@ -451,6 +632,14 @@ impl Default for SwallowOpts {
 }
 
 pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
+    Ok(run_counted(ctx, opts)?.total)
+}
+
+/// As [`run`], but also reporting how many rows clear [`GATING_SCORE`] — the
+/// split `audit` gates on. Every row is still printed; the tier only decides
+/// which ones hold the loop open.
+pub fn run_counted(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<Counts> {
+    let mut counts = Counts::default();
     let include_unwrap_or = opts.include_unwrap_or;
     let files = ctx.files;
     let summary = ctx.summary;
@@ -482,11 +671,19 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
     });
     let benign_hidden = before - all.len();
     let benign_shown = all.iter().filter(|h| h.benign.is_some()).count();
+    // Ranked, not alphabetical. This list runs to ~90 rows on a mid-size
+    // workspace and converts at a few percent; sorted by kind, the one row that
+    // was losing money sat at position 62, wedged between `db_clean` cleanup
+    // noise, and the only way to find it was to read all 89 sites and their
+    // surrounding source. Score first, then file/line so a given score is
+    // stable to read and to diff.
     all.sort_by(|a, b| {
-        a.kind
-            .cmp(b.kind)
+        b.score()
+            .partial_cmp(&a.score())
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.kind.cmp(b.kind))
     });
     if !summary {
         let today = crate::suppress::Date::today();
@@ -494,6 +691,8 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
             row!(
                 ctx.out,
                 "kind" => h.kind,
+                "score" => format!("{:.2}", h.score()),
+                "effect" => h.effect.as_str(),
                 "context" => h.context.clone(),
                 "at" => site(&h.file, h.line),
             );
@@ -509,9 +708,21 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
         .iter()
         .map(|(k, n)| format!("{}={}", k, n))
         .collect();
+    let top_tier = all.iter().filter(|h| h.score() >= GATING_SCORE).count();
+    counts.total = all.len();
+    counts.gating = top_tier;
     ctx.out.summary(&format!(
-        "({} swallow site(s); {}; include_unwrap_or={}{}{}; explain: silent-fallbacks)",
+        "({} swallow site(s){}; {}; include_unwrap_or={}{}{}; explain: silent-fallbacks)",
         all.len(),
+        if top_tier > 0 {
+            format!(
+                ", {} at score >= {:.2} (discarded external effects — the tier \
+                 `audit` gates on)",
+                top_tier, GATING_SCORE
+            )
+        } else {
+            String::new()
+        },
         breakdown.join(", "),
         include_unwrap_or,
         ctx.waived_note(waived),
@@ -535,5 +746,107 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
             String::new()
         }
     ));
-    Ok(all.len())
+    Ok(counts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn effect_of(expr_src: &str) -> Effect {
+        let e: syn::Expr = syn::parse_str(expr_src).expect("parse");
+        classify_effect(&e)
+    }
+
+    /// The distinction the ranking exists to draw. Both of these are a
+    /// discarded `Result`; only one of them can lose a payment.
+    #[test]
+    fn effect_separates_external_mutation_from_local_decode() {
+        assert_eq!(
+            effect_of(r#"sqlx::query("DELETE FROM stripe_events WHERE id = $1").bind(id).execute(&mut *tx).await"#),
+            Effect::Mutation
+        );
+        assert_eq!(effect_of("std::fs::remove_dir_all(&self.dir)"), Effect::Mutation);
+        assert_eq!(effect_of("client.send(&payload).await"), Effect::Mutation);
+
+        assert_eq!(
+            effect_of(r#"sqlx::query_scalar("SELECT 1").fetch_one(&db).await"#),
+            Effect::Io
+        );
+        assert_eq!(effect_of("std::fs::read_to_string(path)"), Effect::Io);
+
+        assert_eq!(effect_of("Uuid::from_slice(&scanned.snagpin_id)"), Effect::Decode);
+        assert_eq!(effect_of("s.parse::<u32>()"), Effect::Decode);
+        assert_eq!(effect_of("base64::decode(token)"), Effect::Decode);
+
+        assert_eq!(effect_of("self.require_business(sponsor).await"), Effect::Unknown);
+    }
+
+    /// A chain that both reads and writes has written. `query(...).execute()`
+    /// must not read as a plain query because `query` came first.
+    #[test]
+    fn mutation_outranks_io_within_one_chain() {
+        assert_eq!(
+            effect_of(r#"sqlx::query("UPDATE t SET a = 1").execute(&db).await"#),
+            Effect::Mutation
+        );
+    }
+
+    /// The closure is what runs *because* the thing failed. Classifying by it
+    /// would let the fallback's verbs stand in for the effect's.
+    #[test]
+    fn handler_closures_do_not_contribute_effect() {
+        // `.unwrap_or_else(|| fs::remove_dir_all(p))` — the receiver decodes,
+        // the handler mutates. Only the receiver is passed in, but guard the
+        // visitor directly too.
+        let e: syn::Expr =
+            syn::parse_str("foo.map(|x| std::fs::remove_dir_all(x))").expect("parse");
+        assert_eq!(classify_effect(&e), Effect::Unknown);
+    }
+
+    fn hit(kind: &'static str, effect: Effect) -> Hit {
+        Hit {
+            kind,
+            file: "f.rs".into(),
+            line: 1,
+            context: "f".into(),
+            benign: None,
+            effect,
+        }
+    }
+
+    /// The row that was losing money must outrank the rows that were correct
+    /// by design. This is the whole point of the score, stated as an ordering.
+    #[test]
+    fn discarded_mutation_outranks_deliberate_sanitization() {
+        // `let _ = sqlx::query("DELETE …").execute(&db).await;`
+        let webhook = hit("let-_", Effect::Mutation);
+        // `Uuid::from_slice(b).map_err(|_| QrError::Malformed)?`
+        let sanitize = hit(".map_err(|_|)", Effect::Decode);
+        assert!(webhook.score() > sanitize.score());
+        assert!(webhook.score() >= GATING_SCORE, "the defect must gate");
+        assert!(
+            sanitize.score() < GATING_SCORE,
+            "collapsing crypto causes must not gate — it is correct and there \
+             were 13 of them"
+        );
+    }
+
+    /// `.map_err(|_|)` still propagates the failure, so it is the mildest
+    /// swallow at equal effect. That is what put the sanitization family at the
+    /// bottom without needing a special case for it.
+    #[test]
+    fn propagating_kinds_rank_below_vanishing_ones() {
+        for e in [Effect::Mutation, Effect::Io, Effect::Decode, Effect::Unknown] {
+            assert!(hit(".map_err(|_|)", e).score() < hit("let-_", e).score());
+        }
+    }
+
+    /// An unrecognised call chain is the common case in a codebase with its own
+    /// wrappers. Gating on it would rebuild the flat list.
+    #[test]
+    fn unknown_chains_do_not_gate() {
+        assert!(hit("let-_", Effect::Unknown).score() < GATING_SCORE);
+        assert!(hit(".unwrap_or_default", Effect::Io).score() < GATING_SCORE);
+    }
 }

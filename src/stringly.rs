@@ -1,7 +1,7 @@
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::ast::{fn_span, trait_fn_span, print_grouped_counts, top_module_of, type_short, ScopeTracker};
+use crate::ast::{print_grouped_counts, scope_visits, ScopeTracker, top_module_of};
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 use crate::emit::{row, site};
@@ -80,39 +80,7 @@ fn truncate_lit(s: &str, max: usize) -> String {
 }
 
 impl<'ast, 'a> Visit<'ast> for StringlyVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.scope.enter_mod(i.ident.to_string());
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        visit::visit_item_fn(self, i);
-        self.scope.leave_fn();
-    }
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.scope.enter_impl(type_short(&i.self_ty));
-        visit::visit_item_impl(self, i);
-        self.scope.leave_impl();
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        visit::visit_impl_item_fn(self, i);
-        self.scope.leave_fn();
-    }
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        self.scope.enter_trait(i.ident.to_string());
-        visit::visit_item_trait(self, i);
-        self.scope.leave_trait();
-    }
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), trait_fn_span(i));
-        visit::visit_trait_item_fn(self, i);
-        self.scope.leave_fn();
-    }
+    scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn, trait_item_fn);
 
     fn visit_expr_binary(&mut self, e: &'ast syn::ExprBinary) {
         if matches!(e.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
@@ -219,6 +187,20 @@ pub fn run(
     }
 
     ctx.retain_changed(&mut all, |h| &h.file);
+    // Keyed on the literal, so waiving the Stripe event name on a line leaves
+    // any other literal branch on it flagged. An unkeyed `ok(stringly)` above
+    // a fn retires the whole cluster in one comment, which is the shape most
+    // of these come in: a `match` over a wire protocol's vocabulary is one
+    // judgment, not eight.
+    //
+    // The check had no waiver mechanism at all until now. That was load-bearing
+    // in the wrong direction: `stringly` hits are frequently correct (external
+    // protocol strings genuinely are strings), so its count could never reach
+    // zero, so it could never gate, so the audit's advisory tier stayed
+    // permanently non-empty and there was nothing a reader could do about it.
+    let waived = ctx.retain_unsuppressed("stringly", &mut all, |h| {
+        crate::suppress::Site::keyed(h.file.as_str(), h.line, h.literal.as_str())
+    });
     all.sort_by(|a, b| {
         a.class
             .cmp(b.class)
@@ -249,6 +231,7 @@ pub fn run(
                         all.len()
                     ));
                 }
+                let today = crate::suppress::Date::today();
                 for h in rows {
                     row!(
                         ctx.out,
@@ -257,6 +240,7 @@ pub fn run(
                         "context" => h.context.clone(),
                         "at" => site(&h.file, h.line),
                     );
+                    ctx.suggest("stringly", Some(&h.literal), today);
                 }
             }
         }
@@ -272,11 +256,12 @@ pub fn run(
         .map(|(k, n)| format!("{}={}", k, n))
         .collect();
     ctx.out.summary(&format!(
-        "({} stringly hit(s); {}; include_substring={}, include_map_keys={}; explain: stringly)",
+        "({} stringly hit(s); {}; include_substring={}, include_map_keys={}{}; explain: stringly)",
         all.len(),
         break_str.join(", "),
         include_substring,
-        include_map_keys
+        include_map_keys,
+        ctx.waived_note(waived)
     ));
     Ok(all.len())
 }

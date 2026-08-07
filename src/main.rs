@@ -11,6 +11,7 @@ mod callers;
 mod casts;
 mod catch_all;
 mod cfg_eval;
+mod clones;
 mod context;
 mod config_drift;
 mod conversion_pairs;
@@ -58,7 +59,11 @@ use parse::Scope;
 )]
 struct Cli {
     /// Root directory (or file) to scan. Respects .gitignore.
-    #[arg(long, short = 'r', default_value = ".")]
+    // `global` like every other flag here. Without it `unruster metrics -r
+    // Warden` is a hard clap error ("unexpected argument '-r' found") while
+    // the quickstart lists `-r/--root` under GLOBAL FLAGS — so the help was
+    // wrong about the one flag people reach for first.
+    #[arg(long, short = 'r', global = true, default_value = ".")]
     root: PathBuf,
 
     /// Test-code scope: production (default), tests, or all.
@@ -141,11 +146,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// One-shot ranked sweep: run the whole check battery (enum-coverage
-    /// --all, dead-code, conversion-pairs, error-swallows, data-loss casts,
-    /// stringly, god fns, pass-through) as severity-ordered sections. Exits 1
-    /// while any finding remains — the agent-loop entry point:
-    /// `until unruster audit; do <fix>; done`.
+    /// One-shot ranked sweep: run the whole check battery (divergence,
+    /// enum-coverage --all, dead-code, conversion-pairs, error-swallows,
+    /// clones, config-drift, builder-drift, data-loss casts, stringly, god
+    /// fns, pass-through) as severity-ordered sections. Exits 1 while gating
+    /// findings remain — the agent-loop entry point:
+    /// `until unruster audit; do <fix>; done`. `error-swallows` and `clones`
+    /// gate on their top-scoring rows only; `--strict` promotes every advisory
+    /// row to gating.
     Audit(AuditArgs),
     /// Sibling builder chains, one missing a step. `config-drift` for method
     /// chains: groups every `Type::ctor(args).a().b()` by constructor *and its
@@ -159,6 +167,13 @@ enum Cmd {
     /// dispatch. Ranks a one-field disagreement between two configurations
     /// above a broad one, and demotes literals that vary on purpose.
     ConfigDrift(ConfigDriftArgs),
+    /// The same function body written out more than once. Groups every fn by
+    /// its body after alpha-renaming locals — so a copy-paste that renamed the
+    /// variables still groups — and ranks by how much is duplicated, how many
+    /// times, and whether the copies share a name and a directory. Called names
+    /// and literals are compared verbatim, so a group is functions that do the
+    /// same thing to the same APIs, not merely functions of the same shape.
+    Clones(ClonesArgs),
     /// List all top-level items (struct, enum, trait, fn, impl, ...).
     Inventory(InventoryArgs),
     /// Find call sites of a function, method, or macro.
@@ -346,6 +361,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::Audit(_) => "audit",
         Cmd::BuilderDrift(_) => "builder-drift",
         Cmd::ConfigDrift(_) => "config-drift",
+        Cmd::Clones(_) => "clones",
         Cmd::Inventory(_) => "inventory",
         Cmd::Callers(_) => "callers",
         Cmd::Callees(_) => "callees",
@@ -385,6 +401,7 @@ impl Cmd {
             Cmd::Audit(_) => true,
             Cmd::BuilderDrift(_)
             | Cmd::ConfigDrift(_)
+            | Cmd::Clones(_)
             | Cmd::Inventory(_)
             | Cmd::Callers(_)
             | Cmd::Callees(_)
@@ -453,9 +470,25 @@ struct AuditArgs {
 }
 
 #[derive(Args)]
+struct ClonesArgs {
+    /// Ignore bodies smaller than this many canonical tokens. Two copies of a
+    /// three-token accessor say something about Rust, not about the codebase.
+    #[arg(long, default_value_t = clones::DEFAULT_MIN_TOKENS)]
+    min_tokens: usize,
+
+    /// Stop after N groups; the cap is announced.
+    #[arg(long)]
+    top: Option<usize>,
+}
+
+#[derive(Args)]
 struct BuilderDriftArgs {
     /// Only chains rooted at this constructor path (e.g. `Command::new`).
-    root: Option<String>,
+    // Named `ctor`, shown as `ROOT`: the arg id has to differ from the global
+    // `--root`, and clap panics at access time rather than at definition time
+    // when two args share an id with different types.
+    #[arg(value_name = "ROOT")]
+    ctor: Option<String>,
 
     /// Drop rows scoring below this.
     #[arg(long, default_value_t = 0.05)]
@@ -915,12 +948,18 @@ fn full_tree_if_needed(
 /// Report the macro blind-spot count, if any. Emitted on every path including
 /// error exits: a reader must know what was *not* analyzed regardless of how
 /// the run ended.
+///
+/// The number comes from `macro_scan::survey`, a single pass over the whole
+/// scanned tree, so it is the same for every subcommand at a given commit and
+/// scope. It used to accumulate as checks happened to reach macros, which made
+/// it a fact about the check battery wearing the phrasing of a fact about the
+/// code — one tree reported 21, 18 and 17 in the same session.
 fn report_blind_spots(out: &emit::Out) {
     let blind = macro_scan::blind_spots();
     if blind > 0 {
         out.note(&format!(
-            "(blind spots: {} macro body(ies) could not be parsed as expressions — \
-             code inside them was not analyzed)",
+            "(blind spots: {} macro body(ies) in the scanned tree could not be parsed as \
+             expressions — code inside them was not analyzed by any check)",
             blind
         ));
     }
@@ -978,7 +1017,8 @@ fn dispatch(
             }
             Ok(gating)
         }
-        Cmd::BuilderDrift(a) => builder_drift::run(ctx, a.root.as_deref(), a.min_score, a.top),
+        Cmd::BuilderDrift(a) => builder_drift::run(ctx, a.ctor.as_deref(), a.min_score, a.top),
+        Cmd::Clones(a) => clones::run(ctx, a.min_tokens, a.top),
         Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score, a.top),
         Cmd::Inventory(a) => inventory::run(ctx, a.kind, a.vis, a.tree),
         Cmd::Callers(a) => {
@@ -1231,6 +1271,10 @@ fn main() -> Result<()> {
         );
         std::process::exit(2);
     }
+    // Before any check runs. The blind-spot count is a property of the tree,
+    // not of the subcommand, and the only way to keep it that way is to take
+    // it in one pass over everything that was parsed — see `macro_scan::survey`.
+    macro_scan::survey(&files);
     let idx = index::NameIndex::build(&files);
     let sem = semantic::Semantic::build(&files);
     // Waivers are read from the same files that were scanned, so a `//

@@ -1,6 +1,6 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{is_mut_ref, line_of, type_last_segment, type_short, type_to_string, ScopeTracker};
+use crate::ast::{is_mut_ref, line_of, scope_visits, ScopeTracker, type_last_segment, type_short, type_to_string};
 use crate::context::{warn_unknown_target, AnalysisCtx, TargetNotFound};
 use crate::parse::display_path;
 use crate::emit::{row, site};
@@ -85,21 +85,7 @@ impl<'a> TakesMutVisitor<'a> {
 }
 
 impl<'ast, 'a> Visit<'ast> for TakesMutVisitor<'a> {
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.scope.enter_mod(i.ident.to_string());
-        visit::visit_item_mod(self, i);
-        self.scope.leave_mod();
-    }
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.scope.enter_impl(type_short(&i.self_ty));
-        visit::visit_item_impl(self, i);
-        self.scope.leave_impl();
-    }
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        self.scope.enter_trait(i.ident.to_string());
-        visit::visit_item_trait(self, i);
-        self.scope.leave_trait();
-    }
+    scope_visits!(item_mod, item_impl, item_trait);
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         self.check_sig(&i.sig);
     }

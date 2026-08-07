@@ -506,3 +506,105 @@ pub fn type_short(t: &syn::Type) -> String {
         _ => type_to_string(t),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scope-tracking visitor boilerplate
+// ---------------------------------------------------------------------------
+
+/// Emit the `syn::visit::Visit` methods that do nothing but keep a
+/// [`ScopeTracker`] in step with the traversal.
+///
+/// Every check that reports an *enclosing* item — which is nearly all of them —
+/// needs the same six methods, and each body is push, recurse, pop. Written out
+/// by hand that came to 77 identical bodies across 17 files: 18 copies of
+/// `visit_item_mod`, 17 of `visit_item_impl`, 14 of `visit_item_trait`, 10 each
+/// of `visit_item_fn` and `visit_impl_item_fn`, 8 of `visit_trait_item_fn`.
+/// `unruster clones` ranked them as its own top six findings, at 0.82–0.88.
+///
+/// The hazard is drift, not volume: a visitor that pushes without popping, or
+/// that omits one of the six, reports qualified paths that are silently wrong
+/// for every row it emits — and there is nothing in the output to say so.
+///
+/// Name the methods you want, inside the `impl Visit` block:
+///
+/// ```ignore
+/// impl<'ast> Visit<'ast> for MyVisitor<'_> {
+///     scope_visits!(item_mod, item_impl, item_trait);
+///     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) { /* custom */ }
+/// }
+/// ```
+///
+/// A visitor that needs to do work *around* the scope push — `casts` tracks
+/// unsafe depth, `clones` records the body — writes that method out and takes
+/// the rest from here. Paths are fully qualified so the call site needs no
+/// imports beyond what it already has.
+///
+/// # The trade this makes
+///
+/// `unruster` is syntactic: it reads source, not expansions. Moving these
+/// bodies into a macro therefore hides them from the tool's own checks — this
+/// definition is one of the two `blind spots` a self-audit now reports, and the
+/// 74 fn bodies it replaces no longer appear in `clones`' scanned count.
+///
+/// That is the right trade here and it is worth being explicit about why:
+/// the code is now written once, in one place, where a reviewer can check the
+/// push/pop pairing by eye — which is the only property that mattered. Reaching
+/// for a macro to make a finding go away, on code that genuinely differs per
+/// call site, would be the same move with none of the benefit.
+macro_rules! scope_visits {
+    ($($which:ident),+ $(,)?) => {
+        $(scope_visits!(@emit $which);)+
+    };
+
+    (@emit item_mod) => {
+        fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
+            self.scope.enter_mod(i.ident.to_string());
+            syn::visit::visit_item_mod(self, i);
+            self.scope.leave_mod();
+        }
+    };
+    (@emit item_impl) => {
+        fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+            self.scope.enter_impl($crate::ast::type_short(&i.self_ty));
+            syn::visit::visit_item_impl(self, i);
+            self.scope.leave_impl();
+        }
+    };
+    (@emit item_trait) => {
+        fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+            self.scope.enter_trait(i.ident.to_string());
+            syn::visit::visit_item_trait(self, i);
+            self.scope.leave_trait();
+        }
+    };
+    (@emit item_fn) => {
+        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+            self.scope.enter_fn(
+                i.sig.ident.to_string(),
+                $crate::ast::fn_span(&i.sig, &i.block),
+            );
+            syn::visit::visit_item_fn(self, i);
+            self.scope.leave_fn();
+        }
+    };
+    (@emit impl_item_fn) => {
+        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+            self.scope.enter_fn(
+                i.sig.ident.to_string(),
+                $crate::ast::fn_span(&i.sig, &i.block),
+            );
+            syn::visit::visit_impl_item_fn(self, i);
+            self.scope.leave_fn();
+        }
+    };
+    (@emit trait_item_fn) => {
+        fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+            self.scope
+                .enter_fn(i.sig.ident.to_string(), $crate::ast::trait_fn_span(i));
+            syn::visit::visit_trait_item_fn(self, i);
+            self.scope.leave_fn();
+        }
+    };
+}
+
+pub(crate) use scope_visits;
