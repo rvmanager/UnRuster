@@ -427,11 +427,12 @@ pub fn run(
         }
     }
     ctx.out.summary(&format!(
-        "({} drifting type(s) across {} multi-site type(s); min_score={:.2}{}{}; \
+        "({} drifting type(s) across {} multi-site type(s); min_score={:.2}{}{}{}; \
          explain: config-drift)",
         found,
         by_ty.values().filter(|v| v.len() >= 2).count(),
         min_score,
+        ctx.threshold_note(min_score, crate::audit::CONFIG_DRIFT_MIN_SCORE),
         ctx.waived_note(waived),
         if naming_only > 0 {
             format!(

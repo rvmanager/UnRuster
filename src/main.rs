@@ -234,20 +234,28 @@ enum Cmd {
 
     /// List fns with no caller in the scanned tree (heuristic; pub items may have external callers).
     DeadCode(DeadCodeArgs),
-    /// Find match sites on a given enum that contain a wildcard `_ =>` arm.
+    /// Dispatch sites on an enum that carry a wildcard `_ =>` arm — the sites a
+    /// new variant falls through on. One of three views over the same scan:
+    /// `catch-all-arms` filters to wildcard arms, `parallel-matches` groups
+    /// every site by the variant set it covers, and `enum-coverage` keeps only
+    /// the non-exhaustive sites and scores them. Omit the enum to sweep the
+    /// tree; every view emits an `enum` column either way.
     CatchAllArms(CatchAllArgs),
-    /// Group match sites on an enum by which variants they cover (shotgun-surgery candidates).
-    /// `--hide-exhaustive` hides compiler-protected exhaustive groups; `--rank-by-gap`
-    /// sorts by coverage ratio; `--show-missing` lists uncovered variants;
-    /// `--include-matches-macro` also scans `matches!()`.
+    /// Dispatch sites on an enum grouped by which variants they cover — two
+    /// groups on one enum is shotgun surgery waiting to happen. The unfiltered
+    /// view of the three (see `catch-all-arms`): it keeps exhaustive sites too,
+    /// since the point is to compare variant sets rather than to judge any one
+    /// site. `--hide-exhaustive` drops the compiler-protected ones,
+    /// `--rank-by-gap` sorts by coverage ratio, `--show-missing` lists the
+    /// uncovered variants, `--include-matches-macro` also scans `matches!()`.
     ParallelMatches(ParallelMatchesArgs),
-    /// Score every PARTIAL match / `matches!` site on an enum by coverage
-    /// (gap_score = covered/total), sorted descending. Top rows are the
-    /// predicates closest to exhaustive — the ones a newly-added variant would
-    /// silently mis-bind. Synthesis of `parallel-matches --hide-exhaustive
-    /// --rank-by-gap --show-missing --include-matches-macro`.
-    /// `--hide-trait-routed-catchalls` drops rows whose `_` arm calls a method
-    /// on the scrutinee (structurally-safe false positives).
+    /// Non-exhaustive dispatch sites on an enum, scored by coverage
+    /// (gap = covered/total) and sorted descending. Top rows are the predicates
+    /// closest to exhaustive — the ones a newly-added variant would silently
+    /// mis-bind. The scored view of the three (see `catch-all-arms`): it drops
+    /// exhaustive sites, adds `gap`/`covered`/`missing` columns, and is the one
+    /// `audit` gates on. `--hide-trait-routed` drops rows whose `_` arm calls a
+    /// method on the scrutinee (structurally safe, so a false positive here).
     EnumCoverage(EnumCoverageArgs),
     /// Sibling paths that disagree. Pairs up dispatch sites on one enum whose
     /// enclosing fns look like siblings (same scope and/or a shared name word)
@@ -558,7 +566,19 @@ struct InventoryArgs {
     // of one idea.
     #[arg(long, conflicts_with = "vis")]
     pub_only: bool,
-    /// Render as a module tree instead of a flat list.
+    /// Row order: by kind (a census) or by source position (an outline).
+    #[arg(long, value_enum, default_value = "kind")]
+    sort: inventory::ItemSort,
+
+    /// Append each item's doc-comment first line as a final column. The same
+    /// flag `outline` carries, so the two listings differ in their defaults
+    /// rather than in what they can show.
+    #[arg(long, alias = "docs")]
+    include_docs: bool,
+
+    /// Group the flat listing under a per-module header with per-kind counts.
+    /// The rows are the same rows; this adds headers, it does not replace the
+    /// listing with a summary.
     #[arg(long)]
     tree: bool,
 }
@@ -634,6 +654,11 @@ struct OutlineArgs {
     /// Append each item's doc-comment first line as a final column.
     #[arg(long, alias = "docs")]
     include_docs: bool,
+
+    /// Row order: by source position (an outline) or by kind (a census). The
+    /// same flag `inventory` carries; only the default differs.
+    #[arg(long, value_enum, default_value = "source")]
+    sort: inventory::ItemSort,
 
     /// Drop the nesting indent from the `name` column (friendlier to `awk`,
     /// harder to read).
@@ -1226,6 +1251,8 @@ fn dispatch(
             a.kind,
             a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
             a.tree,
+            a.sort,
+            a.include_docs,
         ),
         Cmd::Show(a) => show::run(
             ctx,
@@ -1247,6 +1274,7 @@ fn dispatch(
                 kind: a.kind.map(inventory::ItemKind::as_str),
                 // `--pub-only` is `--vis pub`; clap has already rejected both.
                 vis: a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
+                sort: a.sort,
                 docs: a.include_docs,
                 flat: a.flat,
             },

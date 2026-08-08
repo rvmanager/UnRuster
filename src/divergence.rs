@@ -436,20 +436,22 @@ pub fn run(
     };
     if single {
         ctx.out.summary(&format!(
-            "({} divergent pair(s) on `{}`; {} variant(s); min_score={:.2}{}{}; explain: partial-enumeration)",
+            "({} divergent pair(s) on `{}`; {} variant(s); min_score={:.2}{}{}{}; explain: partial-enumeration)",
             found,
             per_enum[0].0,
             per_enum[0].1.len(),
             min_score,
+            ctx.threshold_note(min_score, crate::audit::DIVERGENCE_MIN_SCORE),
             ctx.waived_note(waived),
             sealed_note
         ));
     } else {
         ctx.out.summary(&format!(
-            "({} divergent pair(s) across {} enum(s); min_score={:.2}{}{}; explain: partial-enumeration)",
+            "({} divergent pair(s) across {} enum(s); min_score={:.2}{}{}{}; explain: partial-enumeration)",
             found,
             per_enum.len(),
             min_score,
+            ctx.threshold_note(min_score, crate::audit::DIVERGENCE_MIN_SCORE),
             ctx.waived_note(waived),
             sealed_note
         ));

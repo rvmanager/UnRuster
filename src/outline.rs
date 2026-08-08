@@ -18,7 +18,7 @@
 //! read is exact instead of exploratory.
 
 use crate::context::AnalysisCtx;
-use crate::emit::{span_site, Val};
+use crate::emit::Val;
 use crate::index::Defn;
 
 pub struct OutlineOpts<'a> {
@@ -33,6 +33,8 @@ pub struct OutlineOpts<'a> {
     /// `--vis pub`; the long form exists so this command and `inventory` filter
     /// the same way with the same word.
     pub vis: Option<crate::inventory::VisFilter>,
+    /// Row order. Shared with `inventory`; the two differ only in the default.
+    pub sort: crate::inventory::ItemSort,
     /// Append the first line of each item's doc comment.
     pub docs: bool,
     /// Flatten the nesting indent (nicer for `awk`, worse for reading).
@@ -80,22 +82,44 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
     if let Some(v) = opts.vis {
         items.retain(|d| d.vis == v.as_str());
     }
-    // Source order. An outline read out of order is a list, not an outline.
-    items.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+    // Source order by default: an outline read out of order is a list, not an
+    // outline. `--sort kind` gives `inventory`'s census ordering on one file.
+    match opts.sort {
+        crate::inventory::ItemSort::Source => {
+            items.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)))
+        }
+        crate::inventory::ItemSort::Kind => items.sort_by(|a, b| {
+            a.kind
+                .cmp(b.kind)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line.cmp(&b.line))
+        }),
+    }
 
     if !ctx.summary {
         for d in &items {
-            let indent = if opts.flat { 0 } else { d.depth };
-            let name = format!("{}{}", "  ".repeat(indent), short_name(d));
+            // Indented: the short name, because the indent says whose it is.
+            // Flat: the qualified path, because nothing else would — `score`
+            // and `make_label` on their own name no owner, and `--flat` exists
+            // precisely so the rows can be fed to `awk`. Flat rows are then
+            // byte-identical to `inventory --sort source` over the same file.
+            let name = if opts.flat {
+                d.qpath.clone()
+            } else {
+                format!("{}{}", "  ".repeat(d.depth), short_name(d))
+            };
             let mut cells: Vec<(&'static str, Val)> = vec![
                 ("kind", Val::from(d.kind)),
                 ("vis", Val::from(d.vis)),
                 ("loc", Val::from(d.end.saturating_sub(d.line) + 1)),
                 ("name", Val::from(name)),
-                // Declaration line, not `doc_start` — the same first number
-                // every other listing command reports, so `at` means one thing
-                // across the tool. `show` prints the docs anyway.
-                ("at", span_site(&d.file, d.line, d.end.max(d.line))),
+                // Through `ctx.at`, like every other item-listing command:
+                // `file:line` by default, `file:start-end` under `--spans`.
+                // This alone rendered an unconditional range, so `--spans` was
+                // a no-op here and the same item read two ways depending only
+                // on which command you asked. The extent is still in the row —
+                // `loc` carries it as a number.
+                ("at", ctx.at(&d.file, d.line, d.end)),
             ];
             if opts.docs {
                 cells.push(("doc", Val::from(d.doc.clone().unwrap_or_else(|| "—".into()))));

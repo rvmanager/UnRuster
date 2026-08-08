@@ -141,12 +141,19 @@ matches `pub` on struct *fields*, so declarations arrive mixed in.
 
 WHAT TO RUN INSTEAD
 
-  unruster outline <file>       every item in the file, with `file:start-end`,
-                                indented by scope. `--docs` adds each doc
-                                comment's first line; `--pub-only` narrows to
-                                the file's external surface; `--kind fn` filters.
+  unruster outline <file>       every item in the file, indented by scope,
+                                with a `loc` column giving each item's length —
+                                so the end line is `at + loc - 1` and no `+70`
+                                guess is needed. `--spans` renders `at` as
+                                `file:start-end` directly. `--include-docs` adds
+                                each doc comment's first line; `--pub-only`
+                                narrows to the file's external surface;
+                                `--kind fn` filters; `--sort kind` gives the
+                                census ordering.
                                 Complete by construction — it is the same walk
                                 the rest of the tool indexes from.
+                                `inventory` emits the identical five columns for
+                                the whole tree, so one parser reads both.
 
   unruster show <name>          that item's exact source: first doc-comment line
                                 through the closing brace. Takes a bare name
@@ -739,6 +746,21 @@ today's date already filled in.
   co-call, and every query command. `--suggest-waivers` says so rather
   than printing nothing. A waiver naming a check that does not exist
   waives nothing; every run reports those by name.
+
+  CHECK NAMES ARE FROZEN. A waiver lives in your source, so the name
+  inside `ok(...)` is a persisted identifier, not a command-line spelling.
+  Flags get renamed with aliases when the surface needs tidying; check
+  names do not get renamed at all. The cost of breaking that is silent:
+  an `ok(enum-coverage/QrError)` written a year ago stops matching, the
+  finding comes back, and nothing says the comment is now inert — only
+  the run-wide "names a check this tool does not have" note, which reads
+  like a typo rather than a migration.
+
+  This is the rule that decides command mergers. `enum-coverage`,
+  `divergence`, `error-swallows` and the rest earn their names by being
+  waivable; a redesign that would fold one of them into another has to
+  keep the check name intact or not happen. `parallel-matches` and
+  `catch-all-arms` consult no ledger, so they are free to move.
 
   KEYS ARE RUST, sometimes. `ok(error-swallows/.map_err(|_|))` and
   `ok(stringly/"payment_intent.succeeded")` are legal: the spec is read

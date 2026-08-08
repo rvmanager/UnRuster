@@ -59,6 +59,26 @@ impl Counts {
 }
 
 impl AnalysisCtx<'_> {
+    /// `min_score=0.05 (audit gates at 0.40)` — the check's own threshold, plus
+    /// the one `audit` uses when they differ.
+    ///
+    /// The dedicated commands deliberately run looser than the battery so they
+    /// can show the long tail, but the gap was invisible and uneven: 1.8x on
+    /// `divergence`, 2.4x on `config-drift` and 8x on `builder-drift`. A reader
+    /// comparing a command's output against an audit section had no way to know
+    /// the two were asking different questions, and the 8x one looked like a
+    /// bug in the audit rather than a wider net here.
+    ///
+    /// Prints nothing when the two agree — which is the case when `audit`
+    /// itself is the caller, so its own sections stay uncluttered.
+    pub fn threshold_note(&self, used: f64, audit_gate: f64) -> String {
+        if (used - audit_gate).abs() < f64::EPSILON {
+            String::new()
+        } else {
+            format!(" (audit gates at {:.2})", audit_gate)
+        }
+    }
+
     /// The `at` cell for a row that names a whole *item* rather than a point in
     /// one. Plain `file:line` by default; `file:start-end` under `--spans`.
     ///

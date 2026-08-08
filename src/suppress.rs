@@ -451,6 +451,19 @@ pub fn group_of(check: &str) -> Option<&'static str> {
 ///
 /// `checks_are_registered` in the tests below fails the build if a check calls
 /// `retain_unsuppressed` under a name that is not here.
+///
+/// # These names are frozen
+///
+/// Every entry is a persisted identifier: it appears inside `// unruster:
+/// ok(...)` comments in user source, which this tool does not own and cannot
+/// migrate. Flags may be renamed with a `#[arg(alias)]`; a check name may not
+/// be renamed at all. Removing or renaming one silently un-waives every
+/// judgment recorded against it — the finding returns and the comment becomes
+/// inert, reported only as "names a check this tool does not have", which reads
+/// as a typo rather than as a migration.
+///
+/// Adding is always safe. Reordering is cosmetic. Renaming is a breaking change
+/// to files this tool does not control, so the answer is no.
 pub const WAIVABLE_CHECKS: &[&str] = &[
     "builder-drift",
     "casts",

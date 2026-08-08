@@ -626,9 +626,12 @@ fn scan_groups(
                     "sites" => format!("{} site(s)", sites.len()),
                 );
             } else {
+                // Same width whether or not an enum was named — see
+                // `print_coverage_row`.
                 row!(
                     ctx.out,
                     "kind" => "group",
+                    "enum" => enum_name,
                     "variants" => key,
                     "sites" => format!("{} site(s)", sites.len()),
                 );
@@ -681,16 +684,24 @@ fn print_coverage_row(
     let context = format!("{}{}", r.site.context, tag);
     let covered = format!("{}/{}", r.site.variants.len(), total);
     let at = site_cell(&r.site.file, r.site.line);
-    match (prefixed, compact) {
-        (true, true) => row!(
+    // `enum` is always emitted, whether or not the caller named one. It used
+    // to be dropped when a single enum was named, so `enum-coverage Foo` and
+    // `enum-coverage` returned rows of different widths — the column a TSV
+    // consumer indexes by moved depending on the argument, and nothing in the
+    // output said so. A constant column costs one repeated word; a shifting
+    // shape costs a parser.
+    let _ = prefixed;
+    if compact {
+        row!(
             ctx.out,
             "enum" => enum_name,
             "gap" => r.gap,
             "covered" => covered,
             "at" => at,
             "context" => context,
-        ),
-        (true, false) => row!(
+        );
+    } else {
+        row!(
             ctx.out,
             "enum" => enum_name,
             "gap" => r.gap,
@@ -699,23 +710,7 @@ fn print_coverage_row(
             "missing" => r.missing.clone(),
             "at" => at,
             "context" => context,
-        ),
-        (false, true) => row!(
-            ctx.out,
-            "gap" => r.gap,
-            "covered" => covered,
-            "at" => at,
-            "context" => context,
-        ),
-        (false, false) => row!(
-            ctx.out,
-            "gap" => r.gap,
-            "covered" => covered,
-            "variants" => r.site.variants.clone(),
-            "missing" => r.missing.clone(),
-            "at" => at,
-            "context" => context,
-        ),
+        );
     }
 }
 

@@ -150,9 +150,9 @@ fn inventory_spans_upgrades_the_at_column_to_start_end() {
         .args(["--root", FIXTURE, "--spans", "inventory", "--kind", "fn"])
         .output()
         .unwrap();
-    // Same four columns as without the flag — `--spans` widens the cell, it
+    // Same five columns as without the flag — `--spans` widens the cell, it
     // does not add one. A new column would break every caller's `awk`.
-    assert_tsv_cols(&out.stdout, 4);
+    assert_tsv_cols(&out.stdout, 5);
     for line in rows_of(&out.stdout) {
         let at = line.split('\t').next_back().unwrap();
         let (_, range) = at.rsplit_once(':').unwrap();
@@ -1421,9 +1421,11 @@ fn every_impl_header_in_the_fixture_is_distinct() {
     // to the same string unless they really are two inherent blocks on one type
     // (which the fixture has none of).
     let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "impl"]);
+    // Column 3, not 2: `inventory` now carries `loc` between `vis` and `name`,
+    // the same five cells `outline` emits.
     let mut headers: Vec<String> = rows_of(&out)
         .iter()
-        .map(|l| l.split('\t').nth(2).unwrap().to_string())
+        .map(|l| l.split('\t').nth(3).unwrap().to_string())
         .collect();
     assert!(!headers.is_empty(), "fixture should have impl blocks");
     headers.sort();
@@ -1448,7 +1450,7 @@ fn nested_and_elided_generics_render_without_panicking() {
     // it must stay an elision — never a panic, and never silently empty.
     let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "impl"]);
     for line in rows_of(&out) {
-        let header = line.split('\t').nth(2).unwrap();
+        let header = line.split('\t').nth(3).unwrap();
         assert!(header.starts_with("impl "), "{}", header);
         assert!(header.len() > "impl ".len(), "empty header: {:?}", header);
     }
@@ -2121,6 +2123,42 @@ fn builder_drift_positional_does_not_collide_with_global_root() {
         .assert()
         .success()
         .stdout(contains("Cmd::new"));
+}
+
+/// The three enum views share one scan, so a consumer should not have to learn
+/// three row shapes — and, more sharply, the shape must not change with the
+/// *argument*. Naming an enum used to drop the `enum` column, so
+/// `enum-coverage Foo` and `enum-coverage` returned rows of different widths
+/// and a TSV consumer indexing by position silently read the wrong cell.
+#[test]
+fn enum_views_keep_one_row_shape_whether_or_not_an_enum_is_named() {
+    for (cmd, enum_name) in [
+        ("catch-all-arms", "Sig"),
+        ("enum-coverage", "DragHandle"),
+        ("parallel-matches", "Shape"),
+    ] {
+        let named = ur_stdout_allow_findings(&["--root", FIXTURE, cmd, enum_name]);
+        let swept = ur_stdout_allow_findings(&["--root", FIXTURE, cmd]);
+        let width = |b: &[u8]| -> Option<usize> {
+            rows_of(b)
+                .iter()
+                .find(|l| !l.starts_with('#') && !l.starts_with(' '))
+                .map(|l| l.split('\t').count())
+        };
+        let (a, b) = (width(&named), width(&swept));
+        assert!(a.is_some(), "{cmd} {enum_name} produced no rows to compare");
+        assert_eq!(a, b, "{cmd}: row width changes with the argument");
+        // And every view leads with the enum it is talking about.
+        let first = rows_of(&named)
+            .into_iter()
+            .find(|l| !l.starts_with('#') && !l.starts_with(' '))
+            .unwrap();
+        let lead = first.split('\t').next().unwrap();
+        assert!(
+            lead == enum_name || lead == "group",
+            "{cmd}: expected the enum column to lead, got {lead:?}"
+        );
+    }
 }
 
 // ─── clones ────────────────────────────────────────────────────────────────
@@ -3179,10 +3217,11 @@ fn impls_unknown_trait_no_results_but_success() {
 
 #[test]
 fn inventory_kind_struct_row_shape() {
-    // Every row should be 4 tab-separated columns: kind, vis, name, file:line.
+    // Five tab-separated columns: kind, vis, loc, name, file:line — the same
+    // five `outline` emits, so one parser reads both listings.
     let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "struct"]);
     assert!(!rows_of(&out).is_empty(), "expected at least one struct row");
-    assert_tsv_cols(&out, 4);
+    assert_tsv_cols(&out, 5);
 }
 
 #[test]
@@ -3859,8 +3898,10 @@ fn enum_coverage_max_missing_isolates_the_forgot_one_shape() {
         "--max-missing 1 should drop wider-gap rows"
     );
     for line in rows_of(&one) {
-        // Column 4 is the missing-variant list; exactly one entry.
-        let missing = line.split('\t').nth(3).unwrap_or("");
+        // Column 5 is the missing-variant list; exactly one entry. (Index 4,
+        // not 3: every enum row now leads with the `enum` column whether or not
+        // one was named, so the width no longer depends on the argument.)
+        let missing = line.split('\t').nth(4).unwrap_or("");
         assert_eq!(
             missing.split(',').count(),
             1,
@@ -3902,7 +3943,8 @@ fn enum_coverage_compact_drops_the_repeated_variant_columns() {
         s
     );
     for line in rows_of(&out).into_iter().filter(|l| !l.starts_with('#')) {
-        assert_eq!(line.split('\t').count(), 4, "compact row shape: {:?}", line);
+        // enum, gap, covered, at, context — `enum` is always present now.
+        assert_eq!(line.split('\t').count(), 5, "compact row shape: {:?}", line);
     }
 }
 

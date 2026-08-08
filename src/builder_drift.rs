@@ -288,11 +288,12 @@ pub fn run(
         }
     }
     ctx.out.summary(&format!(
-        "({} drifting builder(s) across {} multi-use constructor(s); min_score={:.2}{}; \
+        "({} drifting builder(s) across {} multi-use constructor(s); min_score={:.2}{}{}; \
          explain: builder-drift)",
         found,
         groups.values().filter(|v| v.len() >= 2).count(),
         min_score,
+        ctx.threshold_note(min_score, crate::audit::BUILDER_DRIFT_MIN_SCORE),
         ctx.waived_note(waived)
     ));
     Ok(found)

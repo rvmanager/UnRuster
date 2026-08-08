@@ -93,8 +93,12 @@ fn scan_one(
                     "at" => at,
                 );
             } else {
+                // `enum` is emitted whether or not one was named, so the row
+                // width does not depend on the argument. See
+                // `parallel_matches::print_coverage_row`.
                 row!(
                     ctx.out,
+                    "enum" => enum_name,
                     "context" => h.context.clone(),
                     "variants" => h.variants.join(","),
                     "at" => at,

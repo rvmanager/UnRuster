@@ -57,7 +57,7 @@ const CONTEXT_LINES: usize = 2;
 /// on a 170-enum tree the distribution went 0.35 → 79 pairs, 0.40 → 41,
 /// 0.45 → 16. The knee is at 0.45, and the dedicated command (default 0.25)
 /// is where someone goes for the long tail.
-const DIVERGENCE_MIN_SCORE: f64 = 0.45;
+pub const DIVERGENCE_MIN_SCORE: f64 = 0.45;
 
 /// Whether a section's findings gate the exit code. Deterministic defect
 /// classes gate; candidate classes that need per-site judgment (stringly, god
@@ -242,16 +242,16 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
 /// Drift score below which rows are dropped from the audit section. The two
 /// genuine finds on this codebase scored 0.18 and 0.23; ordinary two-preset
 /// structs land under 0.10.
-const CONFIG_DRIFT_MIN_SCORE: f64 = 0.12;
+pub const CONFIG_DRIFT_MIN_SCORE: f64 = 0.12;
 
 /// One missing call between two chains scores 0.85 in one function and 0.48
 /// across two — both worth reading. Two spellings of the same helper
 /// (`context` vs `with_context`) land near 0.28, which is the noise this cut
 /// is placed to exclude.
-const BUILDER_DRIFT_MIN_SCORE: f64 = 0.4;
+pub const BUILDER_DRIFT_MIN_SCORE: f64 = 0.4;
 
 /// Minimum care distance for the `--handling` axis.
-const HANDLING_MIN_CARE_GAP: u8 = 2;
+pub const HANDLING_MIN_CARE_GAP: u8 = 2;
 
 pub fn run(
     ctx: &AnalysisCtx,
