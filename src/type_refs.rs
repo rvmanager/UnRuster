@@ -186,26 +186,13 @@ pub fn run(
             .then_with(|| a.line.cmp(&b.line))
     });
 
-    let mut alias_hits = 0usize;
-    if !summary {
-        for r in &all {
-            if r.matched_via == "alias" {
-                alias_hits += 1;
-            }
-            row!(
-                ctx.out,
-                "role" => r.role,
-                "via" => r.matched_via,
-                "confidence" => conf_of(r.matched_via).as_str(),
-                "written" => r.written.clone(),
-                "context" => r.context.clone(),
-                "at" => site(&r.file, r.line),
-            );
-        }
-    } else {
-        alias_hits = all.iter().filter(|r| r.matched_via == "alias").count();
-    }
-
+    // Every summary statistic is taken from the full result set, before the
+    // cap: `--top 5` bounds what is listed, not what was found. Counting
+    // inside the print loop (as `alias_hits` used to) makes the two disagree
+    // the moment a cap is applied — and `--summary` already had its own
+    // second copy of the count for exactly that reason.
+    let total = all.len();
+    let alias_hits = all.iter().filter(|r| r.matched_via == "alias").count();
     let mut by_module = std::collections::BTreeMap::<String, usize>::new();
     for r in &all {
         let module_of = r
@@ -216,14 +203,27 @@ pub fn run(
             .join("::");
         *by_module.entry(module_of).or_default() += 1;
     }
+    if !summary {
+        for r in &all {
+            row!(
+                ctx.out,
+                "role" => r.role,
+                "via" => r.matched_via,
+                "confidence" => conf_of(r.matched_via).as_str(),
+                "written" => r.written.clone(),
+                "context" => r.context.clone(),
+                "at" => site(&r.file, r.line),
+            );
+        }
+    }
     ctx.out.summary(&format!(
         "({} reference(s) across {} module(s); {} via alias)",
-        all.len(),
+        total,
         by_module.len(),
         alias_hits
     ));
-    if !known && all.is_empty() {
+    if !known && total == 0 {
         return Err(TargetNotFound::err("type", ty));
     }
-    Ok(all.len())
+    Ok(total)
 }

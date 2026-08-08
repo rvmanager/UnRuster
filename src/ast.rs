@@ -504,7 +504,7 @@ pub fn doc_text(attr: &syn::Attribute) -> Option<String> {
 /// print one row per group as `<count>\t<key>` on stdout.
 ///
 /// Shared by commands that support `--by fn|file|module`.
-pub fn print_grouped_counts<T, F>(items: &[T], top: Option<usize>, key: F)
+pub fn print_grouped_counts<T, F>(out: &crate::emit::Out, items: &[T], key: F)
 where
     F: Fn(&T) -> String,
 {
@@ -515,11 +515,14 @@ where
     }
     let mut rows: Vec<(String, usize)> = counts.into_iter().collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    if let Some(n) = top {
-        rows.truncate(n);
-    }
+    // Through `out`, not `println!`. Writing straight to stdout meant
+    // `--by <x> --json` emitted raw TSV *and then* the JSON envelope — a
+    // document no parser accepts — on all four grouping commands (`casts`,
+    // `stringly`, `conversions`, `callers`). `--fingerprints` was dropped the
+    // same way. A helper that renders its own output cannot honour the global
+    // output flags, so it does not render its own output.
     for (k, n) in rows {
-        println!("{}\t{}", n, k);
+        crate::emit::row!(out, "count" => n.to_string(), "group" => k);
     }
 }
 

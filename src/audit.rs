@@ -192,11 +192,11 @@ impl BatteryConfig {
 // its effect on waiver hit counts; a check that fails contributes no hits,
 // which is the correct outcome, and there is no caller to report to.
 pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cfg: BatteryConfig) {
-    // `--top` is a display cap applied after waiver matching, so omitting it
-    // changes no hit count.
+    // `--top` is enforced in the emitter, after fingerprint recording, so it
+    // cannot affect hit counts or baselines however this battery is invoked.
     let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 13] = [
         ("divergence", &|| {
-            divergence::run(ctx, None, cfg.divergence_min_score, None)
+            divergence::run(ctx, None, cfg.divergence_min_score)
         }),
         ("divergence-handling", &|| {
             divergence::run_handling(ctx, cfg.handling_min_care_gap)
@@ -209,29 +209,26 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
         }),
         ("conversion-pairs", &|| conversion_pairs::run(ctx)),
         ("clones", &|| {
-            clones::run(ctx, clones::DEFAULT_MIN_TOKENS, None)
+            clones::run(ctx, clones::DEFAULT_MIN_TOKENS)
         }),
         ("error-swallows", &|| error_swallows::run(ctx, cfg.swallows)),
         ("casts", &|| {
-            casts::run(ctx, cfg.cast_classes, None, false, cfg.include_unsafe_ptr, None)
+            casts::run(ctx, cfg.cast_classes, None, false, cfg.include_unsafe_ptr)
         }),
         ("config-drift", &|| {
-            config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, None)
+            config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE)
         }),
         ("builder-drift", &|| {
-            builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE, None)
+            builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE)
         }),
         // The advisory three too. They consult no waivers, so they add nothing
         // to hit counting — but a *baseline* comparison that omitted them would
         // report every stringly and metrics row as new on the first run.
-        // Same caps as the printed run. A cap means "we did not look past
-        // here"; comparing a capped run against an uncapped one would report
-        // the tail as `gone` the moment anything shifted into view.
         ("stringly", &|| {
-            stringly::run(ctx, false, false, None, Some(CONTEXTED_TOP))
+            stringly::run(ctx, false, false, None)
         }),
         ("metrics", &|| {
-            metrics::run(ctx, SortKey::Cyclo, DEFAULT_METRICS_TOP, Some(CYCLO_THRESHOLD), true)
+            metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true)
         }),
         ("pass-through", &|| pass_through::run(ctx, 1)),
     ];
@@ -262,7 +259,6 @@ pub fn run(
     top: Option<usize>,
     strict: bool,
 ) -> anyhow::Result<usize> {
-    let metrics_top = top.unwrap_or(DEFAULT_METRICS_TOP);
     let mut gating = 0usize;
     let mut advisory = 0usize;
     let mut checks = 0usize;
@@ -277,12 +273,19 @@ pub fn run(
     // ranked and gate only on their top tier: every row still prints, but a
     // `.map_err(|_|)` on a base64 decode must not hold the loop open next to a
     // discarded `DELETE`. For every other check the two numbers are equal.
+    // `cap` is this section's default row budget, used when the caller gave no
+    // `--top`. Sections that can run long carry one so the battery stays
+    // readable in full; the rest are uncapped. `--top` overrides every one of
+    // them, and the emitter enforces it after fingerprint recording, so no cap
+    // can affect a count, a waiver hit, or a `--since` baseline.
     let mut section = |title: &str,
                        check: &str,
                        gate: Gate,
+                       cap: Option<usize>,
                        count: &mut dyn FnMut() -> anyhow::Result<Counts>|
      -> anyhow::Result<()> {
         ctx.out.section(title);
+        ctx.out.set_row_budget(top.or(cap));
         // The check name is part of every fingerprint: two checks reporting the
         // same line must not collapse into one identity.
         let prev = ctx.out.set_check(check);
@@ -302,6 +305,10 @@ pub fn run(
         gating += g;
         advisory += n.total - g;
         checks += 1;
+        if let Some(note) = ctx.out.cap_note() {
+            ctx.out.note(&note);
+        }
+        ctx.out.set_row_budget(None);
         ctx.out.section_end();
         Ok(())
     };
@@ -313,18 +320,21 @@ pub fn run(
         "[high] divergence — sibling paths that disagree (explain: partial-enumeration)",
         "divergence",
         Gate::Gating,
-        &mut || Ok(Counts::flat(divergence::run(ctx, None, DIVERGENCE_MIN_SCORE, top.or(Some(40)))?)),
+        Some(40),
+        &mut || Ok(Counts::flat(divergence::run(ctx, None, DIVERGENCE_MIN_SCORE)?)),
     )?;
     section(
         "[high] divergence --handling — one callee, different care (explain: silent-fallbacks)",
         "divergence-handling",
         Gate::Gating,
+        None,
         &mut || Ok(Counts::flat(divergence::run_handling(ctx, HANDLING_MIN_CARE_GAP)?)),
     )?;
     section(
         "[high] enum-coverage --all — partial enum dispatch (explain: partial-enumeration)",
         "enum-coverage",
         Gate::Gating,
+        None,
         &mut || {
             Ok(Counts::flat(parallel_matches::run_enum_coverage(
                 ctx,
@@ -337,12 +347,14 @@ pub fn run(
         "[high] dead-code — fns with no observed caller",
         "dead-code",
         Gate::Gating,
+        None,
         &mut || Ok(Counts::flat(dead_code::run(ctx, dead_call_source, None, false)?)),
     )?;
     section(
         "[high] conversion-pairs — one concept in two shapes (explain: replication)",
         "conversion-pairs",
         Gate::Gating,
+        None,
         &mut || {
             let prev = if ctx.out.context_lines().is_none() {
                 ctx.out.set_context_lines(Some(CONTEXT_LINES))
@@ -367,6 +379,7 @@ pub fn run(
         // `DELETE FROM stripe_events` lived while this whole check sat in the
         // advisory pile and `audit` exited 0.
         Gate::Tiered,
+        None,
         &mut || error_swallows::run_counted(ctx, swallow_opts()),
     )?;
     section(
@@ -377,7 +390,8 @@ pub fn run(
         ),
         "clones",
         Gate::Tiered,
-        &mut || clones::run_counted(ctx, clones::DEFAULT_MIN_TOKENS, top.or(Some(20))),
+        Some(20),
+        &mut || clones::run_counted(ctx, clones::DEFAULT_MIN_TOKENS),
     )?;
     section(
         "[medium] config-drift — same struct, two configurations (explain: config-drift)",
@@ -388,7 +402,8 @@ pub fn run(
         // audit line — but a codebase can hold correct ones indefinitely, and a
         // gating check that can never reach zero is one nobody runs.
         Gate::Advisory,
-        &mut || Ok(Counts::flat(config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE, top.or(Some(10)))?)),
+        Some(10),
+        &mut || Ok(Counts::flat(config_drift::run(ctx, None, CONFIG_DRIFT_MIN_SCORE)?)),
     )?;
     section(
         "[medium] builder-drift — sibling chains, one missing a step (explain: builder-drift)",
@@ -398,13 +413,15 @@ pub fn run(
         // check exists because a `Command::new("git")` chain that forgot
         // `.current_dir()` resolved the wrong repository.
         Gate::Advisory,
-        &mut || Ok(Counts::flat(builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE, top.or(Some(10)))?)),
+        Some(10),
+        &mut || Ok(Counts::flat(builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE)?)),
     )?;
     section(
         "[medium] casts — data-loss classes only (explain: casts)",
         "casts",
         Gate::Advisory,
-        &mut || Ok(Counts::flat(casts::run(ctx, CAST_CLASSES, None, false, false, top)?)),
+        None,
+        &mut || Ok(Counts::flat(casts::run(ctx, CAST_CLASSES, None, false, false)?)),
     )?;
     // Low-volume checks: show the offending line inline. Skipped when the
     // caller set `--context` themselves — their choice wins.
@@ -413,13 +430,14 @@ pub fn run(
         "[medium] stringly — logic branching on string literals (explain: stringly)",
         "stringly",
         Gate::Advisory,
+        Some(CONTEXTED_TOP),
         &mut || {
             let prev = if auto_context {
                 ctx.out.set_context_lines(Some(CONTEXT_LINES))
             } else {
                 ctx.out.context_lines()
             };
-            let r = stringly::run(ctx, false, false, None, top.or(Some(CONTEXTED_TOP)));
+            let r = stringly::run(ctx, false, false, None);
             ctx.out.set_context_lines(prev);
             Ok(Counts::flat(r?))
         },
@@ -431,12 +449,14 @@ pub fn run(
         ),
         "metrics",
         Gate::Advisory,
-        &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, metrics_top, Some(CYCLO_THRESHOLD), true)?)),
+        Some(DEFAULT_METRICS_TOP),
+        &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true)?)),
     )?;
     section(
         "[low] pass-through — single-call wrapper fns (explain: replication)",
         "pass-through",
         Gate::Advisory,
+        None,
         &mut || Ok(Counts::flat(pass_through::run(ctx, 1)?)),
     )?;
 

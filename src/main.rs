@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
 mod ast;
 mod audit;
@@ -67,6 +67,16 @@ struct Cli {
     // wrong about the one flag people reach for first.
     #[arg(long, short = 'r', global = true, default_value = ".")]
     root: PathBuf,
+
+    /// Cap how many rows each section lists. The summary still counts every
+    /// finding, and the cap announces itself — a silent truncation reads as
+    /// "that is all there is".
+    ///
+    /// Global because it was 23 per-command copies that had drifted into three
+    /// behaviours: uncapped, capped-at-20 (`metrics`), and absent from
+    /// `error-swallows`, the highest-volume check in the tool.
+    #[arg(long, global = true, value_name = "N")]
+    top: Option<usize>,
 
     /// Test-code scope: production (default), tests, or all.
     /// Aliases: `prod` = production, `test` = tests.
@@ -487,9 +497,6 @@ struct AuditArgs {
     #[arg(long)]
     fail_on_new: bool,
 
-    /// Cap per-section rows where the underlying check supports it.
-    #[arg(long)]
-    top: Option<usize>,
     /// Advisory (candidate-class) findings gate the exit code too. By
     /// default only [high] deterministic defect classes do, so the agent
     /// loop converges on a healthy codebase.
@@ -504,9 +511,6 @@ struct ClonesArgs {
     #[arg(long, default_value_t = clones::DEFAULT_MIN_TOKENS)]
     min_tokens: usize,
 
-    /// Stop after N groups; the cap is announced.
-    #[arg(long)]
-    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -526,9 +530,6 @@ struct BuilderDriftArgs {
     #[arg(long, default_value_t = 0.05)]
     min_score: f64,
 
-    /// Stop after N rows; the cap is announced.
-    #[arg(long)]
-    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -540,9 +541,6 @@ struct ConfigDriftArgs {
     #[arg(long, default_value_t = 0.05)]
     min_score: f64,
 
-    /// Stop after N rows; the cap is announced.
-    #[arg(long)]
-    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -553,6 +551,13 @@ struct InventoryArgs {
     /// Filter by visibility.
     #[arg(long, value_enum)]
     vis: Option<inventory::VisFilter>,
+
+    /// Shorthand for `--vis pub`: the tree's external surface.
+    // The same pair `outline` and `dead-code` offer. `--vis` was here and this
+    // was not, so the three vis-filtering commands each took a different subset
+    // of one idea.
+    #[arg(long, conflicts_with = "vis")]
+    pub_only: bool,
     /// Render as a module tree instead of a flat list.
     #[arg(long)]
     tree: bool,
@@ -591,8 +596,8 @@ struct ShowArgs {
     all: bool,
 
     /// Omit the leading doc comment and attributes.
-    #[arg(long)]
-    no_doc: bool,
+    #[arg(long, alias = "no-doc")]
+    hide_doc: bool,
 
     /// Prefix each source line with its line number, so a follow-up edit can
     /// be addressed without counting.
@@ -627,8 +632,8 @@ struct OutlineArgs {
     pub_only: bool,
 
     /// Append each item's doc-comment first line as a final column.
-    #[arg(long)]
-    docs: bool,
+    #[arg(long, alias = "docs")]
+    include_docs: bool,
 
     /// Drop the nesting indent from the `name` column (friendlier to `awk`,
     /// harder to read).
@@ -651,9 +656,9 @@ struct CallersArgs {
     /// Maximum transitive depth (default: unlimited).
     #[arg(long)]
     depth: Option<usize>,
-    /// Group results by file (path) or module (top-level module).
+    /// Group call sites by the calling fn, by file, or by top-level module.
     #[arg(long, value_enum)]
-    by: Option<callers::CallersBy>,
+    by: Option<context::GroupBy>,
     /// Keep only rows at or above this confidence tier
     /// (heuristic < inferred < resolved < exact).
     #[arg(long, value_enum)]
@@ -692,8 +697,8 @@ struct FieldUsesArgs {
     #[arg(long)]
     candidates: bool,
     /// Filter to one or more comma-separated access kinds (e.g. `read,write`).
-    #[arg(long, value_enum, value_delimiter = ',')]
-    kind: Vec<field_uses::FieldKind>,
+    #[arg(long = "class", alias = "kind", value_enum, value_delimiter = ',')]
+    class: Vec<field_uses::FieldKind>,
     /// (With --candidates) restrict hits to a substring of the receiver
     /// expression — e.g. `--via-receiver common` keeps `x.common.transform` but
     /// drops `node.transform`.
@@ -713,9 +718,11 @@ struct FieldsArgs {
 
 #[derive(Args)]
 struct VariantsArgs {
-    /// Enum name (last segment, e.g. `Token`).
+    /// Enum name (last segment, e.g. `Token`). Omit to sweep every enum in the
+    /// tree — the same contract as `catch-all-arms`, `enum-coverage` and
+    /// `divergence`, which this command alone used to differ from.
     #[arg(value_name = "ENUM")]
-    name: String,
+    name: Option<String>,
     /// Match bare variant names too (e.g. `V1` in addition to `Enum::V1`).
     /// Useful when callers `use Enum::*;` — noisier.
     #[arg(long)]
@@ -757,9 +764,6 @@ struct MetricsArgs {
     /// `nesting` (max control-flow nesting depth).
     #[arg(long, value_enum, default_value = "loc")]
     sort: metrics::SortKey,
-    /// Top N per category to print.
-    #[arg(long, default_value_t = 20)]
-    top: usize,
     /// Only show fns where the sort metric is >= N. E.g. with
     /// `--sort cyclo --threshold 15`, only fns with cyclo >= 15.
     #[arg(long)]
@@ -797,10 +801,19 @@ struct CatchAllArgs {
 
 #[derive(Args)]
 struct ParallelMatchesArgs {
-    /// Enum name (last segment). Omit with --all.
-    #[arg(value_name = "ENUM", required_unless_present = "all", conflicts_with = "all")]
+    /// Enum name (last segment). Omit to scan every enum (group rows gain a
+    /// leading enum column) — the same as `--all`, which is kept as an
+    /// explicit spelling. Naming an enum *and* passing `--all` is a
+    /// contradiction, so it errors.
+    // Bare invocation used to be a hard error here while `catch-all-arms`,
+    // `enum-coverage` and `divergence` all treated it as "every enum". Four
+    // commands over one subject, and this was the only one that made you read
+    // its help to run it.
+    #[arg(value_name = "ENUM", conflicts_with = "all")]
     name: Option<String>,
-    /// Scan every enum defined in the tree; group rows gain a leading enum column.
+    /// Scan every enum defined in the tree; group rows gain a leading enum
+    /// column. The default when no name is given; accepted for symmetry with
+    /// the sibling enum commands.
     #[arg(long)]
     all: bool,
     /// Hide exhaustive groups (variant set == the full enum). Exhaustive
@@ -867,8 +880,8 @@ struct EnumCoverageArgs {
     /// method, so the catch-all picks up its behavior automatically — but the
     /// tool can't see through the call and would otherwise flag them. Cuts the
     /// noise; read the remaining rows' `_` arms to confirm.
-    #[arg(long)]
-    hide_trait_routed_catchalls: bool,
+    #[arg(long, alias = "hide-trait-routed-catchalls")]
+    hide_trait_routed: bool,
 }
 
 #[derive(Args)]
@@ -893,10 +906,6 @@ struct DivergenceArgs {
     /// (0 = dropped, 1 = unwrap, 2 = default, 3 = fallback, 4 = expect).
     #[arg(long, default_value_t = 2)]
     min_care_gap: u8,
-    /// Stop after roughly N rows when scanning every enum. The cap is
-    /// announced in the output — a silent truncation reads as "that's all".
-    #[arg(long)]
-    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -912,14 +921,21 @@ struct ErrorSwallowsArgs {
     #[arg(long)]
     include_unwrap_or: bool,
     /// Hide `let _ = write!(buf, …)` into an in-memory buffer — infallible, so
-    /// the discard is idiomatic rather than a swallowed error. On by default
-    /// here; `audit` hides them.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    include_infallible: bool,
+    /// the discard is idiomatic rather than a swallowed error. Shown by
+    /// default here; `audit` hides them.
+    // Was `--include-infallible <BOOL>`. A value-taking switch sat next to
+    // `--include-unwrap-or`, a bare one, on the same command with the opposite
+    // default — so `--include-infallible` alone was a *parse error* while
+    // `--include-unwrap-or` alone was the whole flag. The convention is that
+    // the name states the direction and every switch is bare: `--include-X`
+    // when X is off by default, `--hide-X` when it is on.
+    #[arg(long, alias = "no-infallible")]
+    hide_infallible: bool,
     /// Hide `.unwrap_or_else(|| { log!(…); … })` — the failure is already
-    /// observable, so the fallback is a policy, not a silent drop.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    include_logged: bool,
+    /// observable, so the fallback is a policy, not a silent drop. Shown by
+    /// default here; `audit` hides them.
+    #[arg(long, alias = "no-logged")]
+    hide_logged: bool,
 }
 
 #[derive(Args)]
@@ -953,9 +969,6 @@ struct CastsArgs {
     /// Hide safe-widening rows (widen-int / widen-float).
     #[arg(long, alias = "no-widen")]
     hide_widen: bool,
-    /// Show only the top N rows (applies after --by grouping if set).
-    #[arg(long)]
-    top: Option<usize>,
 }
 
 #[derive(Args)]
@@ -964,23 +977,19 @@ struct TestsArgs {
     /// call (the `--root <path>` / `--scope <val>` prefix is stripped).
     #[arg(long)]
     with_hint: bool,
-    /// Group + count tests by a dimension. `subcommand`: which CLI subcommand
-    /// each test invokes (heuristic: scans `.args([...])` calls in the body
-    /// for a known-subcommand-shaped string literal). Drops the per-test
-    /// list, prints a histogram.
-    #[arg(long, value_enum)]
-    by: Option<TestsBy>,
+    /// Group + count tests by which CLI subcommand each invokes (heuristic:
+    /// scans `.args([...])` calls in the body for a known-subcommand-shaped
+    /// string literal). Drops the per-test list, prints a histogram.
+    // Was `--by <TestsBy>` over a single-variant enum — a boolean wearing an
+    // enum's clothes, and the only `--by` in the tool that was not `GroupBy`.
+    #[arg(long, conflicts_with = "subcommand")]
+    by_subcommand: bool,
     /// List the tests that invoke this subcommand — the drill-in for a row of
-    /// `--by subcommand`, which counts them but cannot say which they are.
+    /// `--by-subcommand`, which counts them but cannot say which they are.
     /// `--subcommand none` lists the tests whose subcommand went undetected.
     /// Composes with `--with-hint` and with `--context N` to read the bodies.
-    #[arg(long, value_name = "NAME", conflicts_with = "by")]
+    #[arg(long, value_name = "NAME")]
     subcommand: Option<String>,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum TestsBy {
-    Subcommand,
 }
 
 #[derive(Args)]
@@ -996,22 +1005,16 @@ struct StringlyArgs {
     /// Group + count: fn, file, or module.
     #[arg(long, value_enum)]
     by: Option<context::GroupBy>,
-    /// Show only the top N rows (applies after --by grouping if set).
-    #[arg(long)]
-    top: Option<usize>,
 }
 
 #[derive(Args)]
 struct ConversionsArgs {
     /// Filter to one or more comma-separated kinds (e.g. `.into,::from`).
-    #[arg(long, value_enum, value_delimiter = ',')]
-    kind: Vec<conversions::ConvKind>,
+    #[arg(long = "class", alias = "kind", value_enum, value_delimiter = ',')]
+    class: Vec<conversions::ConvKind>,
     /// Group + count: fn, file, or module. Without --by, lists every site.
     #[arg(long, value_enum)]
     by: Option<context::GroupBy>,
-    /// Show only the top N rows (applies after --by grouping if set).
-    #[arg(long)]
-    top: Option<usize>,
 }
 
 /// Derive the CLI's own grammar (subcommand names + which flags consume a
@@ -1174,6 +1177,7 @@ fn dispatch(
     scope: Scope,
     cfg: &[String],
     exclude: &[String],
+    top: Option<usize>,
 ) -> Result<usize> {
     match cmd {
         Cmd::Audit(a) => {
@@ -1184,7 +1188,7 @@ fn dispatch(
             if comparing || a.write_baseline.is_some() {
                 ctx.out.start_recording();
             }
-            let gating = audit::run(ctx, call_source, a.top, a.strict)?;
+            let gating = audit::run(ctx, call_source, top, a.strict)?;
             let current = ctx.out.take_recording();
 
             if let Some(p) = a.write_baseline.as_deref() {
@@ -1214,10 +1218,15 @@ fn dispatch(
             }
             Ok(gating)
         }
-        Cmd::BuilderDrift(a) => builder_drift::run(ctx, a.ctor.as_deref(), a.min_score, a.top),
-        Cmd::Clones(a) => clones::run(ctx, a.min_tokens, a.top),
-        Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score, a.top),
-        Cmd::Inventory(a) => inventory::run(ctx, a.kind, a.vis, a.tree),
+        Cmd::BuilderDrift(a) => builder_drift::run(ctx, a.ctor.as_deref(), a.min_score),
+        Cmd::Clones(a) => clones::run(ctx, a.min_tokens),
+        Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score),
+        Cmd::Inventory(a) => inventory::run(
+            ctx,
+            a.kind,
+            a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
+            a.tree,
+        ),
         Cmd::Show(a) => show::run(
             ctx,
             &a.name,
@@ -1225,7 +1234,7 @@ fn dispatch(
                 part: a.part,
                 kind: a.kind.map(inventory::ItemKind::as_str),
                 all: a.all,
-                no_doc: a.no_doc,
+                no_doc: a.hide_doc,
                 number: a.number,
                 max_lines: a.max_lines,
             },
@@ -1238,7 +1247,7 @@ fn dispatch(
                 kind: a.kind.map(inventory::ItemKind::as_str),
                 // `--pub-only` is `--vis pub`; clap has already rejected both.
                 vis: a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
-                docs: a.docs,
+                docs: a.include_docs,
                 flat: a.flat,
             },
         ),
@@ -1257,20 +1266,20 @@ fn dispatch(
             &a.field,
             field_uses::FieldUsesOpts {
                 strict: !a.candidates,
-                kinds: &a.kind,
+                kinds: &a.class,
                 via_receiver: a.via_receiver.as_deref(),
                 min_confidence: a.min_confidence,
             },
         ),
         Cmd::Fields(a) => fields::run(ctx, &a.ty),
-        Cmd::Variants(a) => variants::run(ctx, &a.name, a.bare),
+        Cmd::Variants(a) => variants::run(ctx, a.name.as_deref(), a.bare),
         Cmd::Impls(a) => impls::run(ctx, a.of.as_deref(), a.trait_.as_deref()),
         Cmd::TypeRefs(a) => type_refs::run(ctx, &a.ty, a.min_confidence),
         Cmd::TakesMut(a) => match a.ty.as_deref() {
             Some(ty) => takes_mut::run(ctx, ty),
             None => takes_mut::run_candidates(ctx),
         },
-        Cmd::Metrics(a) => metrics::run(ctx, a.sort, a.top, a.threshold, false),
+        Cmd::Metrics(a) => metrics::run(ctx, a.sort, a.threshold, false),
         Cmd::DeadCode(a) => {
             // Build the call-set from the FULL tree so production items called
             // only from tests aren't false-flagged as dead.
@@ -1295,7 +1304,7 @@ fn dispatch(
             ctx,
             a.name.as_deref(),
             parallel_matches::CoverageOpts {
-                hide_trait_routed: a.hide_trait_routed_catchalls,
+                hide_trait_routed: a.hide_trait_routed,
                 max_missing: a.max_missing,
                 // Ranking enums implies the per-site variant lists are noise.
                 compact: a.compact || a.rank_enums,
@@ -1312,7 +1321,7 @@ fn dispatch(
             if a.handling {
                 divergence::run_handling(ctx, a.min_care_gap)
             } else {
-                divergence::run(ctx, a.name.as_deref(), a.min_score, a.top)
+                divergence::run(ctx, a.name.as_deref(), a.min_score)
             }
         }
         Cmd::Playbook => unreachable!("handled before the tree scan"),
@@ -1321,17 +1330,18 @@ fn dispatch(
             ctx,
             error_swallows::SwallowOpts {
                 include_unwrap_or: a.include_unwrap_or,
-                include_infallible: a.include_infallible,
-                include_logged: a.include_logged,
+                // The flag says "hide"; the option says "include".
+                include_infallible: !a.hide_infallible,
+                include_logged: !a.hide_logged,
             },
         ),
         Cmd::PassThrough(a) => pass_through::run(ctx, a.max_loc),
         Cmd::Explain(_) => unreachable!("handled before the tree scan"),
-        Cmd::Casts(a) => casts::run(ctx, &a.class, a.by, a.hide_widen, a.include_unsafe_ptr, a.top),
-        Cmd::Conversions(a) => conversions::run(ctx, &a.kind, a.by, a.top),
+        Cmd::Casts(a) => casts::run(ctx, &a.class, a.by, a.hide_widen, a.include_unsafe_ptr),
+        Cmd::Conversions(a) => conversions::run(ctx, &a.class, a.by),
         Cmd::ConversionPairs => conversion_pairs::run(ctx),
         Cmd::Stringly(a) => {
-            stringly::run(ctx, a.include_substring, a.include_map_keys, a.by, a.top)
+            stringly::run(ctx, a.include_substring, a.include_map_keys, a.by)
         }
         Cmd::Tests(a) => {
             // Always scan the full tree — under --scope production the tests we
@@ -1343,7 +1353,7 @@ fn dispatch(
                 source,
                 &tests_cmd::TestsOpts {
                     with_hint: a.with_hint,
-                    by_subcommand: matches!(a.by, Some(TestsBy::Subcommand)),
+                    by_subcommand: a.by_subcommand,
                     only: a.subcommand.as_deref(),
                 },
                 &cli_grammar(),
@@ -1467,6 +1477,7 @@ fn main() -> Result<()> {
         fail_on_findings,
         no_suppress,
         suggest_waivers,
+        top,
         cmd,
         ..
     } = cli;
@@ -1554,7 +1565,13 @@ fn main() -> Result<()> {
     let fail_on_findings = fail_on_findings || cmd.implies_fail_on_findings();
     let command_name = cmd_name(&cmd);
     out.set_check(command_name);
-    let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude);
+    // Single-command runs never open a section, so the budget set here covers
+    // the whole run. `audit` re-sets it per section from its own defaults.
+    out.set_row_budget(top);
+    let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude, top);
+    if let Some(note) = out.cap_note() {
+        out.note(&note);
+    }
     if analyses_code(command_name) {
         report_blind_spots(&out);
     }

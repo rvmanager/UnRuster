@@ -117,6 +117,8 @@ pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<usize> {
     }
     ctx.retain_changed(&mut all, |h| &h.file);
     all.sort_by(|a, b| a.qpath.cmp(&b.qpath));
+    // The summary counts the whole result set; `--top` only bounds the list.
+    let total = all.len();
     if !summary {
         for h in &all {
             row!(
@@ -131,8 +133,8 @@ pub fn run(ctx: &AnalysisCtx, max_loc: usize) -> anyhow::Result<usize> {
     }
     ctx.out.summary(&format!(
         "({} pass-through fn(s); max_loc={})",
-        all.len(),
+        total,
         max_loc
     ));
-    Ok(all.len())
+    Ok(total)
 }

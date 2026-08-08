@@ -496,7 +496,7 @@ pub fn run(
             ));
             Ok(groups)
         }
-        // `--all`: every enum in the index; group rows gain a leading enum column.
+        // The sweep branch — every enum in the index; group rows gain a leading enum column.
         None => {
             let mut total_sites = 0usize;
             let mut total_groups = 0usize;
@@ -512,7 +512,7 @@ pub fn run(
                 total_groups += groups;
             }
             ctx.out.summary(&format!(
-                "({} match site(s) across {} group(s) on {} enum(s); --all{})",
+                "({} match site(s) across {} group(s) on {} enum(s); every enum{})",
                 total_sites,
                 total_groups,
                 scanned,
@@ -864,7 +864,7 @@ pub fn run_enum_coverage(
             ));
             Ok(scan.shown)
         }
-        // `--all`: every enum in the index; rows gain a leading enum column.
+        // The sweep branch — every enum in the index; rows gain a leading enum column.
         None => {
             let mut shown = 0usize;
             let mut hidden = 0usize;
@@ -916,7 +916,7 @@ pub fn run_enum_coverage(
                 }
             }
             ctx.out.summary(&format!(
-                "({} partial site(s) across {} enum(s); --all; exhaustive sites hidden{}{}{}{}{}; explain: partial-enumeration)",
+                "({} partial site(s) across {} enum(s); every enum; exhaustive sites hidden{}{}{}{}{}; explain: partial-enumeration)",
                 shown,
                 scanned,
                 if opts.hide_trait_routed {

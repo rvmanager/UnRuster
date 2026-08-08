@@ -286,7 +286,6 @@ pub fn run(
     ctx: &AnalysisCtx,
     ty_filter: Option<&str>,
     min_score: f64,
-    top: Option<usize>,
 ) -> anyhow::Result<usize> {
     let mut all: Vec<Literal> = Vec::new();
     for f in ctx.files {
@@ -408,10 +407,9 @@ pub fn run(
     });
 
     let found = drifts.len();
-    let shown = top.map(|n| found.min(n)).unwrap_or(found);
     if !ctx.summary {
         let today = crate::suppress::Date::today();
-        for d in drifts.iter().take(shown) {
+        for d in drifts.iter() {
             row!(
                 ctx.out,
                 "type" => d.ty.clone(),
@@ -428,17 +426,10 @@ pub fn run(
             ctx.suggest("config-drift", Some(&d.ty), today);
         }
     }
-    if shown < found {
-        ctx.out.note(&format!(
-            "(note: showing the {} highest-scoring of {} drifting type(s) — raise --top \
-             for the rest)",
-            shown, found
-        ));
-    }
     ctx.out.summary(&format!(
         "({} drifting type(s) across {} multi-site type(s); min_score={:.2}{}{}; \
          explain: config-drift)",
-        shown,
+        found,
         by_ty.values().filter(|v| v.len() >= 2).count(),
         min_score,
         ctx.waived_note(waived),
@@ -452,7 +443,7 @@ pub fn run(
             String::new()
         }
     ));
-    Ok(shown)
+    Ok(found)
 }
 
 /// Two sites with different signatures — the pair a reader should diff.

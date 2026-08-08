@@ -2032,6 +2032,58 @@ fn parallel_matches_include_if_chains_summary_silent() {
 
 // ─── global flags ──────────────────────────────────────────────────────────
 
+/// The same file must render one way, whatever `--root` was spelled as.
+/// `--root .` used to yield `./src/a.rs:12` and `--root src` `src/a.rs:12` for
+/// the same item, so two runs could not be diffed and a path grep had to allow
+/// for both spellings.
+#[test]
+fn site_paths_do_not_depend_on_how_root_was_spelled() {
+    let plain = ur_stdout_allow_findings(&["--root", FIXTURE, "inventory", "--top", "3"]);
+    let dotted = ur_stdout_allow_findings(&["--root", &format!("./{FIXTURE}"), "inventory", "--top", "3"]);
+    assert_eq!(
+        String::from_utf8_lossy(&plain),
+        String::from_utf8_lossy(&dotted),
+        "`--root X` and `--root ./X` must render identical rows"
+    );
+    assert!(
+        !String::from_utf8_lossy(&plain).contains("\t./"),
+        "no site cell should carry a `./` prefix"
+    );
+}
+
+/// `--top` is one global flag, so it has to work on every command — including
+/// the enum sweeps, which emit rows while scanning and could not be capped at
+/// all before the budget moved into the emitter.
+#[test]
+fn top_caps_every_command_and_announces_it() {
+    for args in [
+        vec!["error-swallows"],
+        vec!["dead-code"],
+        vec!["enum-coverage"],
+        vec!["catch-all-arms"],
+        vec!["inventory"],
+        vec!["impls"],
+        vec!["stringly"],
+        vec!["casts"],
+        vec!["metrics"],
+    ] {
+        let mut full = vec!["--root", FIXTURE];
+        full.extend(args.iter().copied());
+        full.extend(["--top", "1"]);
+        let out = ur().args(&full).output().unwrap();
+        let rows = rows_of(&out.stdout).len();
+        assert!(rows <= 1, "{args:?} listed {rows} rows under --top 1");
+        let err = String::from_utf8_lossy(&out.stderr);
+        if rows == 1 && err.contains("showing") {
+            assert!(
+                err.contains("raise or drop --top"),
+                "{args:?} truncated without saying so: {err}"
+            );
+        }
+    }
+}
+
+
 /// `-r`/`--root` is documented under GLOBAL FLAGS and has to behave like one.
 /// It was the only flag on `Cli` without `global = true`, so every
 /// `unruster <cmd> -r <path>` — the order the help implies — was a hard clap
@@ -3270,7 +3322,7 @@ fn tests_with_hint_includes_args() {
 #[test]
 fn tests_by_subcommand_groups() {
     // Histogram should mention inventory (heavily tested subcommand).
-    ur().args(["--root", ".", "tests", "--by", "subcommand"])
+    ur().args(["--root", ".", "tests", "--by-subcommand"])
         .assert()
         .success()
         .stdout(contains("inventory"));
@@ -3283,7 +3335,7 @@ fn tests_summary_mode() {
 
 #[test]
 fn tests_subcommand_names_the_tests_the_histogram_only_counted() {
-    // `--by subcommand` says `8  impls`; this says which eight. Without it the
+    // `--by-subcommand` says `8  impls`; this says which eight. Without it the
     // only route from the count to the tests was to grep the test file for the
     // subcommand string — the locate-by-guessing this tool exists to end.
     let out = ur_stdout(&["--root", ".", "tests", "--subcommand", "impls"]);
@@ -3299,7 +3351,7 @@ fn tests_subcommand_names_the_tests_the_histogram_only_counted() {
 fn tests_subcommand_count_agrees_with_the_histogram() {
     // The drill-in and the overview must not be able to disagree — a listing
     // that quietly dropped a row would be worse than no listing.
-    let hist = ur_stdout(&["--root", ".", "tests", "--by", "subcommand"]);
+    let hist = ur_stdout(&["--root", ".", "tests", "--by-subcommand"]);
     let counted: usize = rows_of(&hist)
         .iter()
         .find(|l| l.ends_with("\timpls"))
@@ -3348,7 +3400,7 @@ fn tests_subcommand_with_no_coverage_lists_what_is_covered() {
 
 #[test]
 fn tests_subcommand_conflicts_with_by() {
-    ur().args(["--root", ".", "tests", "--by", "subcommand", "--subcommand", "impls"])
+    ur().args(["--root", ".", "tests", "--by-subcommand", "--subcommand", "impls"])
         .assert()
         .failure();
 }
@@ -3903,10 +3955,8 @@ fn error_swallows_keeps_benign_families_by_default_and_audit_drops_them() {
         "--root",
         DIV,
         "error-swallows",
-        "--include-infallible",
-        "false",
-        "--include-logged",
-        "false",
+        "--hide-infallible",
+        "--hide-logged",
     ]);
     assert!(
         rows_of(&strict).len() < rows_of(&default).len(),

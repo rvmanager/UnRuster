@@ -237,6 +237,8 @@ pub fn run(
     });
     hits.sort_by(|a, b| a.1.file.cmp(&b.1.file).then_with(|| a.1.line.cmp(&b.1.line)));
 
+    // The summary counts the whole result set; `--top` only bounds the list.
+    let total = hits.len();
     if !summary {
         let today = crate::suppress::Date::today();
         for (kind, d) in &hits {
@@ -254,10 +256,10 @@ pub fn run(
         "({} candidate dead fn(s); vis={}; include_trait_impls={}{}; heuristic — call-set \
          built from full tree incl. tests; `#[allow(dead_code)]` skipped; pub items may still \
          have external callers we can't see.)",
-        hits.len(),
+        total,
         vis.map_or("any", crate::inventory::VisFilter::as_str),
         include_trait_impls,
         ctx.waived_note(waived)
     ));
-    Ok(hits.len())
+    Ok(total)
 }

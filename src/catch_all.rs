@@ -31,7 +31,7 @@ pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
             ));
             Ok(count)
         }
-        // `--all`: every enum in the index; rows gain a leading enum column.
+        // The sweep branch — every enum in the index; rows gain a leading enum column.
         None => {
             let mut count = 0usize;
             let mut sealed_rows = 0usize;
@@ -47,7 +47,7 @@ pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
                 sealed_rows += s;
             }
             ctx.out.summary(&format!(
-                "({} match site(s) with a wildcard arm across {} enum(s); --all{}; explain: partial-enumeration)",
+                "({} match site(s) with a wildcard arm across {} enum(s); every enum{}; explain: partial-enumeration)",
                 count,
                 scanned,
                 if sealed_rows > 0 {

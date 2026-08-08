@@ -119,7 +119,14 @@ pub fn parse_dir(
 }
 
 pub fn display_path(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
+    let s = p.to_string_lossy();
+    // Strip the `./` the walker inherits from `--root .`. Without this the same
+    // file renders two ways depending only on how the root was spelled —
+    // `unruster --root . inventory` gave `./src/a.rs:12` and
+    // `unruster --root src inventory` gave `src/a.rs:12` for the same item —
+    // so two runs could not be diffed and a path grep had to allow for both.
+    // Fingerprints already normalise, so this changes no baseline.
+    s.strip_prefix("./").unwrap_or(&s).to_string()
 }
 
 fn build_cfg_env(scope: Scope, user_cfgs: &[String]) -> CfgEnv {

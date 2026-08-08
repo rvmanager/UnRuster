@@ -11,7 +11,7 @@
 //! TSV output is byte-identical to what each command printed before this
 //! module existed — the column shapes are asserted in `tests/cli.rs`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// How rows are rendered. `Tsv` writes as it goes; `Json` buffers the whole
 /// run and emits one document at the end (a valid document can't be streamed
@@ -208,6 +208,24 @@ pub struct Out {
     /// adding a column unconditionally breaks every caller's `awk` and every
     /// column-count assertion. JSON always carries it.
     pub show_fingerprints: bool,
+    /// `--top N`: how many more rows this section may *display*.
+    ///
+    /// Lives here rather than in each check because every row in the tool goes
+    /// through [`Out::row`], and 23 per-command copies of the same flag had
+    /// already drifted into three behaviours (uncapped, capped-at-20, and
+    /// absent on the highest-volume check of all). Reset by [`Out::section`],
+    /// so `audit --top N` means N rows per section and a single command means
+    /// N rows for the run.
+    ///
+    /// Applied *after* fingerprint recording: a cap bounds what is listed, not
+    /// what was found, so `--since` baselines and summary counts are unaffected.
+    row_budget: Cell<Option<usize>>,
+    /// Rows the budget suppressed in the current section, so the cap can
+    /// announce itself. A silent truncation reads as "that is all there is".
+    dropped: Cell<usize>,
+    /// Rows the budget let through, so the note can say "showing N of M"
+    /// rather than making the reader add two numbers together.
+    emitted: Cell<usize>,
     /// Which check is producing rows right now. `audit` sets it per section; a
     /// single-command run sets it once. Part of every fingerprint, so two
     /// checks reporting the same line stay distinguishable.
@@ -241,6 +259,9 @@ impl Out {
             summary_inline: std::cell::Cell::new(false),
             silent: false,
             show_fingerprints: false,
+            row_budget: Cell::new(None),
+            dropped: Cell::new(0),
+            emitted: Cell::new(0),
             current_check: RefCell::new(String::new()),
             recorded: RefCell::new(None),
             line_cache: RefCell::new(std::collections::HashMap::new()),
@@ -258,6 +279,9 @@ impl Out {
             summary_inline: std::cell::Cell::new(false),
             silent: true,
             show_fingerprints: false,
+            row_budget: Cell::new(None),
+            dropped: Cell::new(0),
+            emitted: Cell::new(0),
             current_check: RefCell::new(String::new()),
             recorded: RefCell::new(None),
             line_cache: RefCell::new(std::collections::HashMap::new()),
@@ -345,6 +369,27 @@ impl Out {
     /// Open a named section. In TSV this prints the `## title` header — and it
     /// must be called *before* the section's rows, which is exactly the bug
     /// `audit` had when it passed an eagerly-evaluated count as an argument.
+    /// Set the display cap for the rows that follow. `None` lifts it.
+    pub fn set_row_budget(&self, n: Option<usize>) {
+        self.row_budget.set(n);
+        self.dropped.set(0);
+        self.emitted.set(0);
+    }
+
+    /// The `--top` note for the rows since the budget was last set, or `None`
+    /// when nothing was dropped. Both numbers, so the reader does no arithmetic.
+    pub fn cap_note(&self) -> Option<String> {
+        let dropped = self.dropped.get();
+        if dropped == 0 {
+            return None;
+        }
+        Some(format!(
+            "(note: showing {} of {} row(s) — raise or drop --top for the rest)",
+            self.emitted.get(),
+            self.emitted.get() + dropped
+        ))
+    }
+
     pub fn section(&self, title: &str) {
         if self.silent {
             return;
@@ -388,6 +433,18 @@ impl Out {
         if self.silent || self.summary_only {
             return;
         }
+        // The cap. After recording (above) so fingerprints and `--since`
+        // baselines still see every finding, and before rendering so the cap
+        // only bounds the listing.
+        match self.row_budget.get() {
+            Some(0) => {
+                self.dropped.set(self.dropped.get() + 1);
+                return;
+            }
+            Some(n) => self.row_budget.set(Some(n - 1)),
+            None => {}
+        }
+        self.emitted.set(self.emitted.get() + 1);
         let context = self.context_for(&cells);
         if self.json() {
             let mut cells = cells;

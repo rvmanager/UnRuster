@@ -37,6 +37,8 @@ pub fn run(
             .then_with(|| a.line.cmp(&b.line))
     });
 
+    // The summary counts the whole result set; `--top` only bounds the list.
+    let total = hits.len();
     if !summary {
         for d in &hits {
             let trait_disp = d.trait_name.as_deref().unwrap_or("—");
@@ -49,6 +51,6 @@ pub fn run(
             );
         }
     }
-    ctx.out.summary(&format!("({} impl block(s))", hits.len()));
-    Ok(hits.len())
+    ctx.out.summary(&format!("({} impl block(s))", total));
+    Ok(total)
 }

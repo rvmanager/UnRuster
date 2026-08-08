@@ -290,7 +290,6 @@ pub fn run(
     by: Option<GroupBy>,
     hide_widen: bool,
     include_unsafe_ptr: bool,
-    top: Option<usize>,
 ) -> anyhow::Result<usize> {
     let files = ctx.files;
     let fn_sigs = &ctx.sem.fn_sigs;
@@ -350,29 +349,14 @@ pub fn run(
 
     if !summary {
         match by {
-            Some(GroupBy::Fn) => print_grouped_counts(&all, top, |h| h.context.clone()),
-            Some(GroupBy::File) => print_grouped_counts(&all, top, |h| h.file.clone()),
+            Some(GroupBy::Fn) => print_grouped_counts(ctx.out, &all, |h| h.context.clone()),
+            Some(GroupBy::File) => print_grouped_counts(ctx.out, &all, |h| h.file.clone()),
             Some(GroupBy::Module) => {
-                print_grouped_counts(&all, top, |h| top_module_of(&h.context).to_string())
+                print_grouped_counts(ctx.out, &all, |h| top_module_of(&h.context).to_string())
             }
             None => {
-                let rows: &[Hit] = if let Some(n) = top {
-                    &all[..all.len().min(n)]
-                } else {
-                    &all
-                };
-                let shown = rows.len();
-                if shown < all.len() {
-                    // Never truncate silently: a capped list reads as the whole
-                    // result set, and "20 rows" then gets treated as "20 hits".
-                    ctx.out.note(&format!(
-                        "(note: showing {} of {} row(s) — raise or drop --top for the rest)",
-                        shown,
-                        all.len()
-                    ));
-                }
                 let today = crate::suppress::Date::today();
-                for h in rows {
+                for h in &all {
                     row!(
                         ctx.out,
                         "class" => h.class,

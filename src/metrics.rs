@@ -307,7 +307,6 @@ fn sort_fns(fns: &mut [FnMetric], sort: SortKey) {
 pub fn run(
     ctx: &AnalysisCtx,
     sort: SortKey,
-    top: usize,
     threshold: Option<usize>,
     fns_only: bool,
 ) -> anyhow::Result<usize> {
@@ -339,7 +338,7 @@ pub fn run(
     enums.sort_by_key(|e| std::cmp::Reverse(e.variants));
 
     if !summary {
-        for m in fns.iter().take(top) {
+        for m in fns.iter() {
             row!(
                 ctx.out,
                 "kind" => "fn",
@@ -351,7 +350,7 @@ pub fn run(
                 "at" => ctx.at(&m.file, m.line, m.end),
             );
         }
-        for m in structs.iter().take(if fns_only { 0 } else { top }) {
+        for m in structs.iter().take(if fns_only { 0 } else { usize::MAX }) {
             row!(
                 ctx.out,
                 "kind" => "struct",
@@ -360,7 +359,7 @@ pub fn run(
                 "at" => ctx.at(&m.file, m.line, m.end),
             );
         }
-        for m in enums.iter().take(if fns_only { 0 } else { top }) {
+        for m in enums.iter().take(if fns_only { 0 } else { usize::MAX }) {
             row!(
                 ctx.out,
                 "kind" => "enum",
@@ -372,11 +371,10 @@ pub fn run(
     }
 
     ctx.out.summary(&format!(
-        "({} fns, {} structs, {} enums; showing top {} each; sort={}{})",
+        "({} fns, {} structs, {} enums; sort={}{})",
         fns.len(),
         structs.len(),
         enums.len(),
-        top,
         sort.as_str(),
         threshold
             .map(|t| format!("; threshold={}", t))

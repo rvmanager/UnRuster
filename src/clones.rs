@@ -321,15 +321,14 @@ pub const DEFAULT_MIN_TOKENS: usize = 24;
 /// bulk has already answered the question.
 pub const GATING_SCORE: f64 = 0.75;
 
-pub fn run(ctx: &AnalysisCtx, min_tokens: usize, top: Option<usize>) -> anyhow::Result<usize> {
-    Ok(run_counted(ctx, min_tokens, top)?.total)
+pub fn run(ctx: &AnalysisCtx, min_tokens: usize) -> anyhow::Result<usize> {
+    Ok(run_counted(ctx, min_tokens)?.total)
 }
 
 /// As [`run`], but also reporting how many groups clear [`GATING_SCORE`].
 pub fn run_counted(
     ctx: &AnalysisCtx,
     min_tokens: usize,
-    top: Option<usize>,
 ) -> anyhow::Result<Counts> {
     let mut bodies: Vec<Body> = Vec::new();
     for f in ctx.files {
@@ -401,17 +400,9 @@ pub fn run_counted(
             .then_with(|| a.members[0].line.cmp(&b.members[0].line))
     });
 
-    let shown = top.map_or(groups.len(), |n| n.min(groups.len()));
     if !ctx.summary {
-        if shown < groups.len() {
-            ctx.out.note(&format!(
-                "(note: showing {} of {} group(s) — raise or drop --top for the rest)",
-                shown,
-                groups.len()
-            ));
-        }
         let today = crate::suppress::Date::today();
-        for g in &groups[..shown] {
+        for g in &groups {
             let label = &g.label;
             let first = &g.members[0];
             // `at` stays a real site so `--json` keeps file and line as fields

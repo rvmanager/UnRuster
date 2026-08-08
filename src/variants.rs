@@ -192,7 +192,26 @@ impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<usize> {
+/// `enum_name` of `None` sweeps every enum in the tree, matching
+/// `catch-all-arms`, `enum-coverage` and `divergence`. This command alone used
+/// to *require* the name, so the four commands over one subject took two
+/// different contracts and only one of them made you read its help to run it.
+pub fn run(ctx: &AnalysisCtx, enum_name: Option<&str>, bare: bool) -> anyhow::Result<usize> {
+    match enum_name {
+        Some(n) => run_one(ctx, n, bare, false),
+        None => run_all(ctx, bare),
+    }
+}
+
+/// One enum. `sweeping` suppresses the per-enum summary line so the sweep can
+/// print a single one for the whole run — the same shape the sibling enum
+/// commands use.
+fn run_one(
+    ctx: &AnalysisCtx,
+    enum_name: &str,
+    bare: bool,
+    sweeping: bool,
+) -> anyhow::Result<usize> {
     let files = ctx.files;
     let summary = ctx.summary;
     let mut defs: Vec<VariantDef> = Vec::new();
@@ -272,12 +291,33 @@ pub fn run(ctx: &AnalysisCtx, enum_name: &str, bare: bool) -> anyhow::Result<usi
             matches += 1;
         }
     }
-    ctx.out.summary(&format!(
-        "({} variants; {} ctor sites, {} match sites; bare={})",
-        defs.len(),
-        ctors,
-        matches,
-        bare
-    ));
+    if !sweeping {
+        ctx.out.summary(&format!(
+            "({} variants; {} ctor sites, {} match sites; bare={})",
+            defs.len(),
+            ctors,
+            matches,
+            bare
+        ));
+    }
     Ok(sites.len())
+}
+
+
+/// The sweep: every enum in the tree, one after another.
+fn run_all(ctx: &AnalysisCtx, bare: bool) -> anyhow::Result<usize> {
+    let mut total = 0usize;
+    let mut scanned = 0usize;
+    for name in ctx.idx.enum_names() {
+        let n = run_one(ctx, &name, bare, true).unwrap_or(0);
+        if n > 0 {
+            scanned += 1;
+            total += n;
+        }
+    }
+    ctx.out.summary(&format!(
+        "({} variant row(s) across {} enum(s); every enum)",
+        total, scanned
+    ));
+    Ok(total)
 }

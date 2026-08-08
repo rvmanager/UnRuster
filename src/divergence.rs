@@ -351,7 +351,6 @@ pub fn run(
     ctx: &AnalysisCtx,
     target: Option<&str>,
     min_score: f64,
-    top: Option<usize>,
 ) -> anyhow::Result<usize> {
     // Sites are collected up front and held for the whole run so pairs can
     // borrow them across enums.
@@ -417,9 +416,8 @@ pub fn run(
 
     let grouped = group_by_lean(all);
     let found = grouped.len();
-    let shown = top.map(|n| found.min(n)).unwrap_or(found);
     let today = crate::suppress::Date::today();
-    for (p, others) in grouped.iter().take(shown) {
+    for (p, others) in grouped.iter() {
         print_pair(ctx, p, !single, *others);
         for v in &p.delta {
             ctx.suggest(
@@ -429,15 +427,8 @@ pub fn run(
             );
         }
     }
-    if shown < found {
-        ctx.out.note(&format!(
-            "(note: showing the {} highest-scoring of {} pair(s) — raise --top for the rest; \
-             the ranking covers every enum, so these are the loudest in the tree)",
-            shown, found
-        ));
-    }
 
-    let sealed_rows = grouped.iter().take(shown).filter(|(p, _)| p.sealed).count();
+    let sealed_rows = grouped.iter().filter(|(p, _)| p.sealed).count();
     let sealed_note = if sealed_rows > 0 {
         format!("; {} on SEALED enum(s)", sealed_rows)
     } else {
@@ -446,7 +437,7 @@ pub fn run(
     if single {
         ctx.out.summary(&format!(
             "({} divergent pair(s) on `{}`; {} variant(s); min_score={:.2}{}{}; explain: partial-enumeration)",
-            shown,
+            found,
             per_enum[0].0,
             per_enum[0].1.len(),
             min_score,
@@ -456,14 +447,14 @@ pub fn run(
     } else {
         ctx.out.summary(&format!(
             "({} divergent pair(s) across {} enum(s); min_score={:.2}{}{}; explain: partial-enumeration)",
-            shown,
+            found,
             per_enum.len(),
             min_score,
             ctx.waived_note(waived),
             sealed_note
         ));
     }
-    Ok(shown)
+    Ok(found)
 }
 
 // ─── sibling-handling divergence ────────────────────────────────────────────

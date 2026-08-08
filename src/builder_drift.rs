@@ -182,7 +182,6 @@ pub fn run(
     ctx: &AnalysisCtx,
     root_filter: Option<&str>,
     min_score: f64,
-    top: Option<usize>,
 ) -> anyhow::Result<usize> {
     let mut all: Vec<Chain> = Vec::new();
     for f in ctx.files {
@@ -271,10 +270,9 @@ pub fn run(
     });
 
     let found = drifts.len();
-    let shown = top.map(|n| found.min(n)).unwrap_or(found);
     if !ctx.summary {
         let today = crate::suppress::Date::today();
-        for d in drifts.iter().take(shown) {
+        for d in drifts.iter() {
             row!(
                 ctx.out,
                 "builder" => d.group.clone(),
@@ -289,22 +287,15 @@ pub fn run(
             ctx.suggest("builder-drift", Some(&d.group), today);
         }
     }
-    if shown < found {
-        ctx.out.note(&format!(
-            "(note: showing the {} highest-scoring of {} drifting builder(s) — raise \
-             --top for the rest)",
-            shown, found
-        ));
-    }
     ctx.out.summary(&format!(
         "({} drifting builder(s) across {} multi-use constructor(s); min_score={:.2}{}; \
          explain: builder-drift)",
-        shown,
+        found,
         groups.values().filter(|v| v.len() >= 2).count(),
         min_score,
         ctx.waived_note(waived)
     ));
-    Ok(shown)
+    Ok(found)
 }
 
 #[cfg(test)]

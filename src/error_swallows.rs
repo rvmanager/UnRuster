@@ -660,7 +660,10 @@ pub fn run(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<usize> {
 /// As [`run`], but also reporting how many rows clear [`GATING_SCORE`] — the
 /// split `audit` gates on. Every row is still printed; the tier only decides
 /// which ones hold the loop open.
-pub fn run_counted(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<Counts> {
+pub fn run_counted(
+    ctx: &AnalysisCtx,
+    opts: SwallowOpts,
+) -> anyhow::Result<Counts> {
     let mut counts = Counts::default();
     let include_unwrap_or = opts.include_unwrap_or;
     let files = ctx.files;
@@ -707,6 +710,21 @@ pub fn run_counted(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<Count
             .then_with(|| a.line.cmp(&b.line))
             .then_with(|| a.kind.cmp(b.kind))
     });
+    // Counts describe the whole result set; the cap only bounds what is
+    // listed. Taken before truncating so `--top 5` still reports "42 sites".
+    use std::collections::BTreeMap;
+    let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
+    for h in &all {
+        *by_kind.entry(h.kind).or_insert(0) += 1;
+    }
+    let breakdown: Vec<String> = by_kind
+        .iter()
+        .map(|(k, n)| format!("{}={}", k, n))
+        .collect();
+    let top_tier = all.iter().filter(|h| h.score() >= GATING_SCORE).count();
+    counts.total = all.len();
+    counts.gating = top_tier;
+    let total = all.len();
     if !summary {
         let today = crate::suppress::Date::today();
         for h in &all {
@@ -721,21 +739,9 @@ pub fn run_counted(ctx: &AnalysisCtx, opts: SwallowOpts) -> anyhow::Result<Count
             ctx.suggest("error-swallows", Some(h.kind), today);
         }
     }
-    use std::collections::BTreeMap;
-    let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
-    for h in &all {
-        *by_kind.entry(h.kind).or_insert(0) += 1;
-    }
-    let breakdown: Vec<String> = by_kind
-        .iter()
-        .map(|(k, n)| format!("{}={}", k, n))
-        .collect();
-    let top_tier = all.iter().filter(|h| h.score() >= GATING_SCORE).count();
-    counts.total = all.len();
-    counts.gating = top_tier;
     ctx.out.summary(&format!(
         "({} swallow site(s){}; {}; include_unwrap_or={}{}{}; explain: silent-fallbacks)",
-        all.len(),
+        total,
         if top_tier > 0 {
             format!(
                 ", {} at score >= {:.2} (discarded external effects — the tier \

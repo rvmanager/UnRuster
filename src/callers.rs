@@ -3,15 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use syn::visit::{self, Visit};
 
 use crate::ast::{line_of, path_to_string, print_grouped_counts, scope_visits, ScopeTracker};
-use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, TargetNotFound};
+use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, GroupBy, TargetNotFound};
 
-/// `--by` grouping for `callers`. `fn` is not offered — the default listing is
-/// already one row per call site labelled with its caller fn.
-#[derive(Clone, Copy, clap::ValueEnum)]
-pub enum CallersBy {
-    File,
-    Module,
-}
 use crate::index::NameIndex;
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{Semantic, UseMap};
@@ -227,7 +220,7 @@ pub fn run_callers(
     query: &str,
     transitive: bool,
     depth: Option<usize>,
-    by: Option<CallersBy>,
+    by: Option<GroupBy>,
     min_confidence: Option<Confidence>,
 ) -> anyhow::Result<usize> {
     let files = ctx.files;
@@ -391,7 +384,7 @@ fn transitive_callers(
 fn emit_caller_rows(
     ctx: &AnalysisCtx,
     hits: &[&CallSite],
-    by: Option<CallersBy>,
+    by: Option<GroupBy>,
     query: &str,
     unique_name: bool,
 ) {
@@ -399,9 +392,12 @@ fn emit_caller_rows(
         return;
     }
     match by {
-        Some(CallersBy::File) => print_grouped_counts(hits, None, |h| h.file.clone()),
-        Some(CallersBy::Module) => {
-            print_grouped_counts(hits, None, |h| top_module(&h.caller).to_string())
+        Some(GroupBy::Fn) => {
+            print_grouped_counts(ctx.out, hits, |h| h.caller.clone())
+        }
+        Some(GroupBy::File) => print_grouped_counts(ctx.out, hits, |h| h.file.clone()),
+        Some(GroupBy::Module) => {
+            print_grouped_counts(ctx.out, hits, |h| top_module(&h.caller).to_string())
         }
         None => {
             let mut sorted: Vec<&&CallSite> = hits.iter().collect();
