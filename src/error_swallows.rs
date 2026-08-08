@@ -159,16 +159,24 @@ const WEAK_MUTATION_VERBS: &[&str] = &[
 const IO_ROOTS: &[&str] = &[
     "fs", "File", "OpenOptions", "Path", "PathBuf", "io", "net", "process", "Command", "sqlx",
     "diesel", "reqwest", "hyper", "client", "conn", "connection", "db", "pool", "socket", "stream",
-    "writer", "sink", "channel", "producer", "publisher", "tx", "transaction", "session",
-    "storage", "bucket", "s3", "redis", "cache_dir", "tokio",
+    "writer", "sink", "producer", "publisher", "transaction", "session", "storage", "bucket",
+    "s3", "redis", "cache_dir", "tokio",
+    // `tx` and `channel` are deliberately absent. `tx` reads as "transaction"
+    // but in Rust it is overwhelmingly an `mpsc::Sender`, and
+    // `let _ = tx.send(v)` — whose failure means only that the receiver was
+    // dropped — scored 0.90 and gated on a GUI codebase where the very next
+    // line matched on `rx.recv()`. An in-process channel is not the outside.
 ];
 
 /// Verbs that reach outside the process without changing it.
 const IO_VERBS: &[&str] = &[
     "fetch", "fetch_one", "fetch_all", "fetch_optional", "query", "query_as", "query_scalar",
     "get", "post", "put", "patch", "head", "request", "call", "connect", "read", "read_to_string",
-    "read_to_end", "read_dir", "recv", "receive", "poll", "load", "open", "metadata", "canonicalize",
-    "lock", "acquire", "begin",
+    "read_to_end", "read_dir", "load", "open", "metadata", "canonicalize", "lock", "acquire",
+    "begin",
+    // `recv` and `poll` are deliberately absent: `mpsc::Receiver::recv` and
+    // `Future::poll` are in-process, and `wgpu::Device::poll` is a synchronous
+    // wait. A socket read spells itself `read`/`read_to_end`, which stay.
 ];
 
 /// Verbs that only reshape data the process already holds.
@@ -224,9 +232,31 @@ fn classify_effect(expr: &syn::Expr) -> Effect {
             }
         }
     }
+    /// `.create(true)` / `.append(true)` / `.write(true)` — a builder flag, not
+    /// an action.
+    ///
+    /// `OpenOptions::new().create(true).append(true).open(p)` names two weak
+    /// mutation verbs and an IO root, so it classified as an external mutation
+    /// and gated — on a fn whose whole job is to *try* to open a log. The
+    /// action in that chain is `open`; `create` and `append` are arguments to
+    /// it that happen to be spelled as methods. A single boolean literal is the
+    /// tell: a real `write` takes bytes, a configuring `write` takes `true`.
+    fn is_builder_flag(c: &syn::ExprMethodCall) -> bool {
+        c.args.len() == 1
+            && matches!(
+                c.args.first(),
+                Some(syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Bool(_),
+                    ..
+                }))
+            )
+    }
+
     impl<'ast> Visit<'ast> for V {
         fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
-            self.note(&c.method.to_string());
+            if !is_builder_flag(c) {
+                self.note(&c.method.to_string());
+            }
             // `self.db.insert(…)` — the receiver names the destination.
             if let syn::Expr::Field(f) = &*c.receiver {
                 if let syn::Member::Named(n) = &f.member {
@@ -869,6 +899,43 @@ mod tests {
         let real = hit(".unwrap_or_default", Effect::Io);
         assert!(benign.score() < real.score());
         assert!(benign.score() < GATING_SCORE, "a benign site must not gate");
+    }
+
+    /// In-process plumbing is not the outside world.
+    ///
+    /// All five gating rows on one real GUI codebase were this shape, and all
+    /// five were false positives: a channel send whose result the next line
+    /// matches on, a `Device::poll` that is a synchronous wait, and an
+    /// `OpenOptions` builder whose `create(true)` flag read as an action.
+    #[test]
+    fn in_process_plumbing_is_not_external() {
+        for src in [
+            "tx.send(value)",
+            "rx.recv()",
+            "device.poll(Maintain::Wait)",
+            "future.poll(cx)",
+        ] {
+            assert_eq!(effect_of(src), Effect::Unknown, "{src}");
+            assert!(
+                hit("let-_", effect_of(src)).score() < GATING_SCORE,
+                "{src} must not gate"
+            );
+        }
+    }
+
+    /// A builder flag is an argument, not an action. `.create(true)` and
+    /// `.append(true)` are how you *describe* an open, and reading them as two
+    /// mutation verbs gated a fn whose whole job is to try to open a log file.
+    #[test]
+    fn builder_flags_are_not_actions() {
+        assert_eq!(
+            effect_of(r#"std::fs::OpenOptions::new().create(true).append(true).open(p)"#),
+            Effect::Io,
+            "the action in that chain is `open`, not `create`"
+        );
+        // A real write still takes bytes, and still counts.
+        assert_eq!(effect_of("f.write(buf)"), Effect::Unknown);
+        assert_eq!(effect_of("f.write_all(buf)"), Effect::Mutation);
     }
 
     /// A chain that both reads and writes has written. `query(...).execute()`

@@ -226,6 +226,12 @@ pub struct Out {
     /// Rows the budget let through, so the note can say "showing N of M"
     /// rather than making the reader add two numbers together.
     emitted: Cell<usize>,
+    /// Note texts already emitted this run, so a note is said once.
+    ///
+    /// `show a::f b::f` fired the "N other items are also named `f`" note once
+    /// per argument — the same sentence, twice, above one listing. Notes are
+    /// run-level commentary; a repeat carries no information the first did not.
+    said: RefCell<std::collections::HashSet<String>>,
     /// Which check is producing rows right now. `audit` sets it per section; a
     /// single-command run sets it once. Part of every fingerprint, so two
     /// checks reporting the same line stay distinguishable.
@@ -262,6 +268,7 @@ impl Out {
             row_budget: Cell::new(None),
             dropped: Cell::new(0),
             emitted: Cell::new(0),
+            said: RefCell::new(std::collections::HashSet::new()),
             current_check: RefCell::new(String::new()),
             recorded: RefCell::new(None),
             line_cache: RefCell::new(std::collections::HashMap::new()),
@@ -282,6 +289,7 @@ impl Out {
             row_budget: Cell::new(None),
             dropped: Cell::new(0),
             emitted: Cell::new(0),
+            said: RefCell::new(std::collections::HashSet::new()),
             current_check: RefCell::new(String::new()),
             recorded: RefCell::new(None),
             line_cache: RefCell::new(std::collections::HashMap::new()),
@@ -559,6 +567,9 @@ impl Out {
     /// section a truncation note is only useful next to the rows it qualifies.
     pub fn note(&self, text: &str) {
         if self.silent {
+            return;
+        }
+        if !self.said.borrow_mut().insert(text.to_string()) {
             return;
         }
         if self.json() {

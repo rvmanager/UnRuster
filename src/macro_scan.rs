@@ -17,7 +17,12 @@ use syn::spanned::Spanned;
 /// files collided into one entry and the count silently ran low — an
 /// undercount in the one number whose whole job is to bound what the run did
 /// not see.
-type BlindSpot = (String, usize, usize, u64);
+/// (file, line, column, macro name, token hash). The name is carried so the
+/// listing can say *which* macro is dark — a bare count is a fact nobody can
+/// act on, and on a real 6k-item codebase "45 macro bodies" left the reader
+/// writing "a `dbg_log!`/`format!`-heavy region could be hiding something none
+/// of this saw" with no way to check.
+type BlindSpot = (String, usize, usize, String, u64);
 static UNPARSED_MACRO_BODIES: Mutex<Option<HashSet<BlindSpot>>> = Mutex::new(None);
 
 /// Set once [`survey`] has walked the tree. After that the count is a closed
@@ -45,7 +50,13 @@ fn record_in(m: &syn::Macro, file: &str) {
     let start = m.path.span().start();
     let mut h = DefaultHasher::new();
     m.tokens.to_string().hash(&mut h);
-    let key = (file.to_string(), start.line, start.column, h.finish());
+    let name = m
+        .path
+        .segments
+        .last()
+        .map(|s| format!("{}!", s.ident))
+        .unwrap_or_else(|| "?!".to_string());
+    let key = (file.to_string(), start.line, start.column, name, h.finish());
     let mut guard = UNPARSED_MACRO_BODIES.lock().unwrap();
     guard.get_or_insert_with(HashSet::new).insert(key);
 }
@@ -94,6 +105,21 @@ impl<'ast> syn::visit::Visit<'ast> for SurveyVisitor<'_> {
 
 /// Number of distinct macro bodies in the scanned tree that resisted
 /// expression parsing.
+/// Every blind spot, as `(file, line, macro)`, sorted for a stable listing.
+pub fn blind_spot_sites() -> Vec<(String, usize, String)> {
+    let guard = UNPARSED_MACRO_BODIES.lock().unwrap();
+    let mut out: Vec<(String, usize, String)> = guard
+        .as_ref()
+        .map(|s| {
+            s.iter()
+                .map(|(f, l, _, n, _)| (f.clone(), *l, n.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
 pub fn blind_spots() -> usize {
     UNPARSED_MACRO_BODIES
         .lock()

@@ -43,6 +43,8 @@ mod type_refs;
 mod variants;
 mod waivers_cmd;
 
+use crate::emit::row;
+
 use context::AnalysisCtx;
 use emit::Format;
 use parse::Scope;
@@ -186,6 +188,14 @@ enum Cmd {
     /// and literals are compared verbatim, so a group is functions that do the
     /// same thing to the same APIs, not merely functions of the same shape.
     Clones(ClonesArgs),
+    /// The macro bodies no check could read — where this tool is blind.
+    ///
+    /// Every run already reports the *count*; this says where. A bare "45 macro
+    /// bodies could not be parsed" is a caveat nobody can act on: on a real
+    /// codebase it left the reader writing "a `dbg_log!`-heavy region could be
+    /// hiding something none of this saw" with no way to check which region.
+    /// Rows are `macro, at` — read them as "the checks did not look here".
+    BlindSpots,
     /// List all top-level items (struct, enum, trait, fn, impl, ...).
     /// Under `--spans` the `at` column becomes `file:start-end`.
     Inventory(InventoryArgs),
@@ -404,6 +414,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::BuilderDrift(_) => "builder-drift",
         Cmd::ConfigDrift(_) => "config-drift",
         Cmd::Clones(_) => "clones",
+        Cmd::BlindSpots => "blind-spots",
         Cmd::Inventory(_) => "inventory",
         Cmd::Show(_) => "show",
         Cmd::Outline(_) => "outline",
@@ -446,6 +457,7 @@ impl Cmd {
             Cmd::BuilderDrift(_)
             | Cmd::ConfigDrift(_)
             | Cmd::Clones(_)
+            | Cmd::BlindSpots
             | Cmd::Inventory(_)
             | Cmd::Show(_)
             | Cmd::Outline(_)
@@ -1184,7 +1196,8 @@ fn report_blind_spots(out: &emit::Out) {
     if blind > 0 {
         out.note(&format!(
             "(blind spots: {} macro body(ies) in the scanned tree could not be parsed as \
-             expressions — code inside them was not analyzed by any check)",
+             expressions — code inside them was not analyzed by any check; \
+             `unruster blind-spots` lists them)",
             blind
         ));
     }
@@ -1246,6 +1259,22 @@ fn dispatch(
         Cmd::BuilderDrift(a) => builder_drift::run(ctx, a.ctor.as_deref(), a.min_score),
         Cmd::Clones(a) => clones::run(ctx, a.min_tokens),
         Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score),
+        Cmd::BlindSpots => {
+            let sites = macro_scan::blind_spot_sites();
+            for (file, line, name) in &sites {
+                row!(
+                    ctx.out,
+                    "macro" => name.clone(),
+                    "at" => emit::site(file, *line),
+                );
+            }
+            ctx.out.summary(&format!(
+                "({} blind spot(s) — macro bodies no check could read; their \
+                 contents were not analysed)",
+                sites.len()
+            ));
+            Ok(sites.len())
+        }
         Cmd::Inventory(a) => inventory::run(
             ctx,
             a.kind,

@@ -2161,6 +2161,36 @@ fn enum_views_keep_one_row_shape_whether_or_not_an_enum_is_named() {
     }
 }
 
+/// The blind-spot count is the tool's one statement about its own coverage, and
+/// a count alone is not actionable: on a real 6k-item codebase "45 macro bodies
+/// could not be parsed" left the reader unable to say which regions were dark,
+/// and it talked a contributor out of an otherwise-idiomatic `macro_rules!`
+/// because it would add one more unlocatable hole.
+#[test]
+fn blind_spots_can_be_located_not_just_counted() {
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "blind-spots"]);
+    let rows = rows_of(&out);
+    assert!(!rows.is_empty(), "the fixture has unparseable macro bodies");
+    for line in &rows {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 2, "macro, at: {line:?}");
+        assert!(cols[0].ends_with('!'), "first column names the macro: {line:?}");
+        assert!(cols[1].contains(".rs:"), "second column is a site: {line:?}");
+    }
+    // And the count matches what every other command reports in its note.
+    let note = String::from_utf8_lossy(
+        &ur().args(["--root", FIXTURE, "inventory"]).output().unwrap().stderr,
+    )
+    .to_string();
+    let n = note
+        .split("blind spots: ")
+        .nth(1)
+        .and_then(|t| t.split(' ').next())
+        .and_then(|t| t.parse::<usize>().ok())
+        .expect("every run reports a blind-spot count");
+    assert_eq!(n, rows.len(), "the listing and the count must agree");
+}
+
 // ─── clones ────────────────────────────────────────────────────────────────
 
 /// A fresh scratch tree under the system temp dir, named after the caller so
