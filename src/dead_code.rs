@@ -60,7 +60,7 @@ impl<'ast> Visit<'ast> for CallSink {
         collect_idents(&m.tokens, &mut self.called);
     }
 
-    /// Functions named by a string inside an attribute.
+    /// Functions named inside an attribute — as a string, or as an expression.
     ///
     /// `#[serde(default = "default_true")]` is a real call — the derive expands
     /// it into one — but the name lives in a string literal, so no amount of
@@ -72,10 +72,31 @@ impl<'ast> Visit<'ast> for CallSink {
     /// parses as a path, count its last segment as called. A string that is a
     /// bare identifier is almost never prose, and the cost of being wrong is a
     /// missed dead fn rather than a live one reported dead.
+    ///
+    /// The other half is bare expressions. `clap` spells the same idea without
+    /// quotes:
+    ///
+    /// ```ignore
+    /// #[arg(long, default_value_t = svggen_points())]
+    /// pub points: usize,
+    /// ```
+    ///
+    /// The derive expands that into a call, but it lives in an attribute's
+    /// token stream, which the AST walk does not enter — so on a real
+    /// `clap`-derive CLI all four default helpers were reported dead, in a
+    /// *gating* check, holding the agent loop open on code where deleting any
+    /// of them is a compile error. Every identifier in the token stream is
+    /// counted, the same treatment macro bodies already get above: the bias is
+    /// deliberately toward missing a dead fn over reporting a live one.
     fn visit_attribute(&mut self, a: &'ast syn::Attribute) {
         match &a.meta {
             // `#[serde(default = "f", with = "m")]` — the interesting case.
-            syn::Meta::List(ml) => collect_path_strings(&ml.tokens, &mut self.called),
+            syn::Meta::List(ml) => {
+                collect_path_strings(&ml.tokens, &mut self.called);
+                // `#[arg(default_value_t = f())]`, `#[arg(value_parser = f)]`.
+                // Doc comments are `Meta::NameValue`, so no prose reaches here.
+                collect_idents(&ml.tokens, &mut self.called);
+            }
             // `#[doc = "…"]` lands here too; prose fails the path test.
             syn::Meta::NameValue(nv) => {
                 if let syn::Expr::Lit(syn::ExprLit {

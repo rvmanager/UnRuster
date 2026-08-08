@@ -56,7 +56,20 @@ impl Hit {
             ".map_err(|_|)" => 0.05,
             _ => 0.15,
         };
-        (self.effect.weight() + kind).min(1.0)
+        // A site the benign classifier already cleared contributes no effect
+        // risk: it has answered the question the effect term is asking.
+        //
+        // Without this, `let _ = write!(buf, "{c}")` into an in-memory `String`
+        // scored 0.90 — `write` reads as a mutation — and led the standalone
+        // list, above every real finding, while `audit` hid it as benign. The
+        // two views disagreed about the single most important row, and the
+        // standalone one is what `--suggest-waivers` is run against.
+        let effect = if self.benign.is_some() {
+            0.0
+        } else {
+            self.effect.weight()
+        };
+        (effect + kind).min(1.0)
     }
 }
 
@@ -106,16 +119,48 @@ impl Effect {
     }
 }
 
-/// Verbs that change state outside this process. Matched on the method or
-/// call-path segment, by whole name or as a leading word (`send_batch`,
-/// `write_all`), so a project's own spellings mostly land without an
-/// allow-list entry.
-const MUTATION_VERBS: &[&str] = &[
-    "execute", "commit", "rollback", "send", "publish", "emit", "dispatch", "write", "write_all",
-    "flush", "insert", "remove", "delete", "update", "upsert", "persist", "save", "store",
-    "create", "create_dir", "create_dir_all", "remove_file", "remove_dir", "remove_dir_all",
-    "rename", "copy", "set_permissions", "set_len", "truncate", "sync_all", "sync_data",
-    "spawn", "kill", "wait", "notify", "ack", "commit_async", "bind_execute",
+/// Verbs that are external state changes on sight — no other Rust API spells
+/// them, so seeing one anywhere in the chain settles the question.
+const STRONG_MUTATION_VERBS: &[&str] = &[
+    "execute", "commit", "rollback", "publish", "upsert", "persist", "write_all", "flush",
+    "sync_all", "sync_data", "set_permissions", "set_len", "create_dir", "create_dir_all",
+    "remove_file", "remove_dir", "remove_dir_all", "hard_link", "symlink", "spawn", "kill",
+    "commit_async", "bind_execute",
+];
+
+/// Verbs that name an external mutation *in an external context* and an
+/// ordinary in-memory operation everywhere else.
+///
+/// This distinction is the difference between a check that gates on real
+/// defects and one that gates on `HashMap::insert`. Treating these as external
+/// on sight scored four idiomatic lines —
+///
+/// ```ignore
+/// let _ = self.map.insert(k, v);      // returns the PREVIOUS value, an Option
+/// let _ = self.seen.insert(k);        // returns bool
+/// let _ = self.order.remove(0);       // returns T
+/// self.rename(from, to).unwrap_or_else(…)   // an in-memory model edit
+/// ```
+///
+/// — at 0.75–0.90, all four above the gate, on code with nothing wrong with it.
+/// A weak verb needs [`IO_ROOTS`] corroboration in the same chain to count.
+const WEAK_MUTATION_VERBS: &[&str] = &[
+    "write", "send", "insert", "remove", "delete", "update", "create", "rename", "copy", "save",
+    "store", "emit", "dispatch", "notify", "ack", "truncate", "wait",
+];
+
+/// Path segments and receiver names that mark a chain as reaching outside the
+/// process. Presence of one promotes a [`WEAK_MUTATION_VERBS`] hit to
+/// [`Effect::Mutation`]; absence leaves it `Unknown`.
+///
+/// Matched against every path segment and method receiver in the chain, so
+/// `std::fs::write(…)` and `self.db.insert(…)` both qualify while
+/// `self.map.insert(…)` does not.
+const IO_ROOTS: &[&str] = &[
+    "fs", "File", "OpenOptions", "Path", "PathBuf", "io", "net", "process", "Command", "sqlx",
+    "diesel", "reqwest", "hyper", "client", "conn", "connection", "db", "pool", "socket", "stream",
+    "writer", "sink", "channel", "producer", "publisher", "tx", "transaction", "session",
+    "storage", "bucket", "s3", "redis", "cache_dir", "tokio",
 ];
 
 /// Verbs that reach outside the process without changing it.
@@ -152,30 +197,57 @@ fn verb_matches(name: &str, verbs: &[&str]) -> bool {
 /// over decode, because a chain that both queries and executes did mutate.
 fn classify_effect(expr: &syn::Expr) -> Effect {
     struct V {
-        mutation: bool,
+        strong: bool,
+        weak: bool,
+        io_root: bool,
         io: bool,
         decode: bool,
     }
     impl V {
         fn note(&mut self, name: &str) {
-            if verb_matches(name, MUTATION_VERBS) {
-                self.mutation = true;
+            if verb_matches(name, STRONG_MUTATION_VERBS) {
+                self.strong = true;
+            } else if verb_matches(name, WEAK_MUTATION_VERBS) {
+                self.weak = true;
             } else if verb_matches(name, IO_VERBS) {
                 self.io = true;
             } else if verb_matches(name, DECODE_VERBS) {
                 self.decode = true;
             }
         }
+        /// Any path segment or receiver name that says "this leaves the
+        /// process". Checked separately from the verb so `std::fs::write` and
+        /// `map.write` are told apart.
+        fn note_root(&mut self, name: &str) {
+            if IO_ROOTS.contains(&name) {
+                self.io_root = true;
+            }
+        }
     }
     impl<'ast> Visit<'ast> for V {
         fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
             self.note(&c.method.to_string());
+            // `self.db.insert(…)` — the receiver names the destination.
+            if let syn::Expr::Field(f) = &*c.receiver {
+                if let syn::Member::Named(n) = &f.member {
+                    self.note_root(&n.to_string());
+                }
+            }
+            if let syn::Expr::Path(p) = &*c.receiver {
+                for seg in &p.path.segments {
+                    self.note_root(&seg.ident.to_string());
+                }
+            }
             visit::visit_expr_method_call(self, c);
         }
         fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
             if let syn::Expr::Path(p) = &*c.func {
                 if let Some(seg) = p.path.segments.last() {
                     self.note(&seg.ident.to_string());
+                }
+                // `std::fs::write(…)` — every segment but the verb itself.
+                for seg in p.path.segments.iter().rev().skip(1) {
+                    self.note_root(&seg.ident.to_string());
                 }
             }
             visit::visit_expr_call(self, c);
@@ -196,16 +268,28 @@ fn classify_effect(expr: &syn::Expr) -> Effect {
         fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
     }
     let mut v = V {
-        mutation: false,
+        strong: false,
+        weak: false,
+        io_root: false,
         io: false,
         decode: false,
     };
     v.visit_expr(expr);
-    match (v.mutation, v.io, v.decode) {
-        (true, _, _) => Effect::Mutation,
-        (_, true, _) => Effect::Io,
-        (_, _, true) => Effect::Decode,
-        _ => Effect::Unknown,
+    // A weak verb with no external context is left `Unknown` rather than
+    // promoted: at 0.20 it lands below the gate, so it is still reported and
+    // still ranked above a plain decode, but it does not hold the loop open.
+    if v.strong || (v.weak && v.io_root) {
+        Effect::Mutation
+    } else if v.io {
+        Effect::Io
+    } else if v.weak {
+        // A mutation verb we could not place. Not `Decode` — something was
+        // being changed — but not evidence of an external effect either.
+        Effect::Unknown
+    } else if v.decode {
+        Effect::Decode
+    } else {
+        Effect::Unknown
     }
 }
 
@@ -718,6 +802,67 @@ mod tests {
         assert_eq!(effect_of("base64::decode(token)"), Effect::Decode);
 
         assert_eq!(effect_of("self.require_business(sponsor).await"), Effect::Unknown);
+    }
+
+    /// The regression this whole strong/weak split exists to prevent.
+    ///
+    /// Every one of these is idiomatic Rust over in-memory state, none is even
+    /// fallible — `HashMap::insert` returns the previous value, `HashSet::insert`
+    /// a bool, `Vec::remove` a `T` — and all four were scored as external
+    /// mutations at 0.75–0.90 and *gated* `audit`, holding an agent loop open
+    /// on correct code.
+    #[test]
+    fn in_memory_mutations_are_not_external_effects() {
+        for src in [
+            "self.map.insert(k, v)",
+            "self.seen.insert(k)",
+            "self.order.remove(0)",
+            "self.rename(from, to)",
+            "buf.write(bytes)",
+            "list.update(i, v)",
+        ] {
+            assert_eq!(effect_of(src), Effect::Unknown, "{src}");
+            assert!(
+                hit("let-_", effect_of(src)).score() < GATING_SCORE,
+                "{src} must not gate"
+            );
+        }
+    }
+
+    /// The other direction: an external mutation still has to be unmistakable,
+    /// whether it is named by a strong verb or by a weak one in an `fs`/db
+    /// context.
+    #[test]
+    fn external_mutations_still_classify_and_gate() {
+        for src in [
+            "std::fs::write(p, b)",
+            "std::fs::rename(a, b)",
+            "std::fs::remove_dir_all(&dir)",
+            "f.write_all(bytes)",
+            "f.flush()",
+            "sqlx::query(\"DELETE FROM t\").bind(id).execute(&mut *tx).await",
+            "self.db.insert(id, row)",
+        ] {
+            assert_eq!(effect_of(src), Effect::Mutation, "{src}");
+            assert!(
+                hit("let-_", effect_of(src)).score() >= GATING_SCORE,
+                "{src} must gate"
+            );
+        }
+    }
+
+    /// A site the benign classifier already cleared must not lead the list.
+    /// `let _ = write!(buf, …)` into a `String` scored 0.90 and outranked every
+    /// real finding in the standalone view, while `audit` hid it entirely.
+    #[test]
+    fn benign_sites_sort_below_real_ones() {
+        let benign = Hit {
+            benign: Some("infallible-write"),
+            ..hit("let-_", Effect::Mutation)
+        };
+        let real = hit(".unwrap_or_default", Effect::Io);
+        assert!(benign.score() < real.score());
+        assert!(benign.score() < GATING_SCORE, "a benign site must not gate");
     }
 
     /// A chain that both reads and writes has written. `query(...).execute()`
