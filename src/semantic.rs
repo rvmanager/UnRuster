@@ -131,14 +131,17 @@ impl AliasGraph {
     pub fn synonyms(&self, name: &str) -> Vec<String> {
         let canon = self.canonical(name);
         let mut out: Vec<String> = vec![canon.clone()];
-        // Forward chain (from `name` through to canonical).
+        // Forward chain (from `name` through to canonical). Cycle-safe like
+        // `canonical`: the scanned tree may not compile, and `type A = B;
+        // type B = A;` must not spin this walk forever.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut cur = name.to_string();
         while let Some(next) = self.aliases.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
             if !out.contains(&cur) {
                 out.push(cur.clone());
-            }
-            if next == &cur {
-                break;
             }
             cur = next.clone();
         }
@@ -690,4 +693,197 @@ pub fn find_binding(files: &[ParsedFile], name: &str) -> Option<Binding> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pf(path: &str, module: &str, src: &str) -> ParsedFile {
+        ParsedFile {
+            path: PathBuf::from(path),
+            ast: syn::parse_str(src).expect("test source must parse"),
+            module: module.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_glob_import_resolves_through_the_name_index() {
+        let files = vec![pf("src/geom.rs", "geom", "pub struct Shape;")];
+        let idx = NameIndex::build(&files);
+        let um = UseMap::build(
+            &syn::parse_str("use geom::*;\nuse std::fmt::{Display, Write as FmtWrite};").unwrap(),
+        );
+        // The glob arm: `Shape` is not aliased, so it resolves only because
+        // `geom::Shape` exists in the index.
+        assert_eq!(um.resolve("Shape", &idx).as_deref(), Some("geom::Shape"));
+        // Group + rename arms of `collect_uses`.
+        assert_eq!(um.resolve("Display", &idx).as_deref(), Some("std::fmt::Display"));
+        assert_eq!(um.resolve("FmtWrite", &idx).as_deref(), Some("std::fmt::Write"));
+        assert_eq!(um.resolve("Nope", &idx), None);
+    }
+
+    #[test]
+    fn alias_chains_terminate_on_cycles_and_self_loops() {
+        // `type A = B; type B = A;` never compiles, but this tool scans code
+        // that may not compile — canonicalisation must not spin on it.
+        let g = AliasGraph::build(&[pf("src/lib.rs", "", "type A = B;\ntype B = A;")]);
+        assert_eq!(g.canonical("A"), "A");
+        // The forward walk of `synonyms` must terminate on the same cycle,
+        // and both names still count as one synonym set.
+        let mut s = g.synonyms("A");
+        s.sort();
+        assert_eq!(s, vec!["A".to_string(), "B".to_string()]);
+        let selfy = AliasGraph::build(&[pf("src/lib.rs", "", "type S = S;")]);
+        assert_eq!(selfy.canonical("S"), "S");
+        assert_eq!(selfy.synonyms("S"), vec!["S".to_string()]);
+    }
+
+    #[test]
+    fn synonyms_walks_both_directions_of_the_alias_chain() {
+        let g = AliasGraph::build(&[pf(
+            "src/lib.rs",
+            "",
+            "type Old = Real;\ntype Older = Old;",
+        )]);
+        let mut s = g.synonyms("Old");
+        s.sort();
+        assert_eq!(s, vec!["Old".to_string(), "Older".to_string(), "Real".to_string()]);
+    }
+
+    #[test]
+    fn conflicting_return_types_drop_the_entry_and_field_types_survive() {
+        let files = vec![pf(
+            "src/lib.rs",
+            "",
+            "struct Px { w: u32 }\n\
+             fn a() -> u32 { 0 }\n\
+             fn a() -> u64 { 0 }\n\
+             fn b() -> Px { loop {} }",
+        )];
+        let sigs = FnSigIndex::build(&files);
+        assert_eq!(sigs.return_type("a"), None, "ambiguous return must be dropped");
+        assert_eq!(sigs.return_type("b"), Some("Px"));
+        assert_eq!(sigs.field_type("Px", "w"), Some("u32"));
+        assert_eq!(sigs.field_type("Px", "h"), None);
+    }
+
+    /// Parse one fn against one tree and hand back its inferred bindings.
+    fn infer(tree: &str, self_ty: Option<&str>, body_fn: &str) -> (FnTypes, FnSigIndex) {
+        let files = vec![pf("src/lib.rs", "", tree)];
+        let sigs = FnSigIndex::build(&files);
+        let f: syn::ItemFn = syn::parse_str(body_fn).expect("test fn must parse");
+        let ft = FnTypes::build(&f.sig, &f.block, &sigs, self_ty);
+        (ft, sigs)
+    }
+
+    #[test]
+    fn loop_bindings_take_the_type_of_their_bound() {
+        let (ft, _) = infer(
+            "",
+            None,
+            "fn f(xs: Vec<u8>, n: u32) {\n\
+                 for (i, _x) in xs.iter().enumerate() { let _ = i; }\n\
+                 for j in 0..n { let _ = j; }\n\
+             }",
+        );
+        // The enumerate index is usize by definition; the range variable
+        // inherits its bound's declared type.
+        assert_eq!(ft.bindings.get("i").map(String::as_str), Some("usize"));
+        assert_eq!(ft.bindings.get("j").map(String::as_str), Some("u32"));
+    }
+
+    #[test]
+    fn declared_sources_ground_the_inference_chain() {
+        let tree = "pub struct Px { w: u32 }\n\
+                    impl Px { pub fn new() -> Px { loop {} } }";
+        let (ft, _) = infer(
+            tree,
+            Some("Px"),
+            "fn f(p: Px) {\n\
+                 let s = Self {};\n\
+                 let c = Self::new();\n\
+                 let m = Px::new();\n\
+                 let w = p.w;\n\
+                 let both = w + w;\n\
+                 let half = w * 2;\n\
+                 let flip = 2 * w;\n\
+                 let neg = -half;\n\
+                 let lit = 1.5f32;\n\
+                 let (par) = 4u8;\n\
+                 let &byref = &p;\n\
+             }",
+        );
+        for (name, ty) in [
+            ("s", "Px"),
+            ("c", "Px"),
+            ("m", "Px"),
+            ("w", "u32"),
+            ("both", "u32"),
+            ("half", "u32"),
+            ("flip", "u32"),
+            ("neg", "u32"),
+            ("lit", "f32"),
+            ("par", "u8"),
+            ("byref", "Px"),
+        ] {
+            assert_eq!(
+                ft.bindings.get(name).map(String::as_str),
+                Some(ty),
+                "binding `{}`",
+                name
+            );
+        }
+        // Every one of those traces to a declaration — none is a name guess.
+        assert!(ft.guessed.is_empty(), "{:?}", ft.guessed);
+    }
+
+    #[test]
+    fn type_of_grounded_refuses_a_bare_name_guess() {
+        let tree = "pub struct Px { w: u32 }\n\
+                    impl Px { pub fn area(&self) -> u64 { 0 } }";
+        let (ft, sigs) = infer(
+            tree,
+            None,
+            "fn f(p: Px, xs: Vec<u8>) {\n\
+                 let a = p.area();\n\
+                 let n = xs.len();\n\
+             }",
+        );
+        // `area` resolved by name alone is a guess; `.len()` is usize by
+        // convention and stays grounded.
+        assert!(ft.guessed.contains("a"), "{:?}", ft.guessed);
+        assert!(!ft.guessed.contains("n"));
+        let a: syn::Expr = syn::parse_str("a").unwrap();
+        assert_eq!(ft.type_of(&a, &sigs).as_deref(), Some("u64"));
+        assert_eq!(ft.type_of_grounded(&a, &sigs), None);
+        // Grounded compound: field access + literal arithmetic.
+        let e: syn::Expr = syn::parse_str("p.w + 2").unwrap();
+        assert_eq!(ft.type_of_grounded(&e, &sigs).as_deref(), Some("u32"));
+        // A call through a non-path callee types as unknown, quietly.
+        let odd: syn::Expr = syn::parse_str("(callback)()").unwrap();
+        assert_eq!(ft.type_of(&odd, &sigs), None);
+    }
+
+    #[test]
+    fn a_projects_own_len_overrides_the_usize_convention() {
+        let (ft, sigs) = infer(
+            "pub struct Odd; impl Odd { pub fn len(&self) -> f64 { 0.0 } }",
+            None,
+            "fn f(o: Odd) { let n = o.len(); }",
+        );
+        // The tree defines `len -> f64`, so the convention yields to it — and
+        // a name-resolved return type is a guess, not grounded.
+        assert_eq!(ft.bindings.get("n").map(String::as_str), Some("f64"));
+        assert!(ft.guessed.contains("n"));
+        // And a tree that agrees with the convention keeps it grounded.
+        let (ft2, sigs2) = infer(
+            "pub struct Buf; impl Buf { pub fn len(&self) -> usize { 0 } }",
+            None,
+            "fn f(b: Buf) { let n = b.len(); }",
+        );
+        assert_eq!(ft2.bindings.get("n").map(String::as_str), Some("usize"));
+        assert!(!ft2.guessed.contains("n"));
+        let _ = (sigs, sigs2);
+    }
 }

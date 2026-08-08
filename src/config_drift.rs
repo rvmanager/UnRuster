@@ -492,6 +492,56 @@ mod tests {
     }
 
     #[test]
+    fn every_constant_shape_renders_and_deref_does_not() {
+        // Literal kinds beyond int/bool.
+        assert_eq!(render_const(&expr("1.5")).as_deref(), Some("1.5"));
+        assert_eq!(render_const(&expr("'c'")).as_deref(), Some("'c'"));
+        assert_eq!(render_const(&expr("b'x'")).as_deref(), Some("120"));
+        assert_eq!(render_const(&expr("b\"raw\"")).as_deref(), Some("b\"…\""));
+        // Compound constant shapes.
+        assert_eq!(render_const(&expr("-3")).as_deref(), Some("-3"));
+        assert_eq!(render_const(&expr("!true")).as_deref(), Some("!true"));
+        assert_eq!(render_const(&expr("&MAX")).as_deref(), Some("&MAX"));
+        assert_eq!(render_const(&expr("(1, 2)")).as_deref(), Some("(1,2)"));
+        assert_eq!(render_const(&expr("[1, 2]")).as_deref(), Some("[1,2]"));
+        // A deref reads a runtime value; a call over a computed arg abstains
+        // as a whole rather than rendering half a constant.
+        assert_eq!(render_const(&expr("*p")), None);
+        assert_eq!(render_const(&expr("Some(x)")), None);
+        assert_eq!(render_const(&expr("(1, x)")), None);
+        assert_eq!(render_const(&expr("[1, x]")), None);
+    }
+
+    fn literal(fields: &[(&str, &str)], computed: &[&str], has_rest: bool) -> Literal {
+        Literal {
+            ty: "T".to_string(),
+            file: "f.rs".to_string(),
+            line: 1,
+            context: "m::build".to_string(),
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            computed: computed.iter().map(|s| s.to_string()).collect(),
+            has_rest,
+        }
+    }
+
+    #[test]
+    fn a_computed_field_abstains_even_behind_a_rest_expression() {
+        // `speed: compute()` is an opinion the scan cannot read — the site
+        // abstains on that field, even though `..Default::default()` would
+        // otherwise vote `(default)` for everything absent.
+        let l = literal(&[("depth", "3")], &["speed"], true);
+        assert_eq!(l.vote("depth"), Some("3"));
+        assert_eq!(l.vote("speed"), None);
+        assert_eq!(l.vote("width"), Some(DEFAULTED));
+        // Without a rest-expression an absent field is simply no vote.
+        let bare = literal(&[], &[], false);
+        assert_eq!(bare.vote("depth"), None);
+    }
+
+    #[test]
     fn one_field_apart_outranks_six() {
         // The ordering the check exists to produce.
         let near = score(6, 1, 2, 2, 2);

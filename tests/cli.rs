@@ -5021,3 +5021,327 @@ fn handling_divergence_reports_one_row_per_careless_site() {
     sites.dedup();
     assert_eq!(before, sites.len(), "duplicate careless sites in output");
 }
+
+// ─── coverage: outline filters, ambiguity, conversions classes ─────────────
+
+#[test]
+fn outline_kind_filter_keeps_only_that_kind() {
+    let out = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--kind", "struct"]);
+    let rows = rows_of(&out);
+    assert!(!rows.is_empty(), "fixture main.rs defines structs");
+    for r in &rows {
+        assert!(r.starts_with("struct"), "non-struct row leaked through: {r}");
+    }
+}
+
+#[test]
+fn outline_sort_kind_groups_rows_into_a_census() {
+    let out = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--sort", "kind"]);
+    let kinds: Vec<String> = rows_of(&out)
+        .iter()
+        .map(|r| r.split('\t').next().unwrap().to_string())
+        .collect();
+    // Grouped means each kind appears in one contiguous run.
+    let mut seen: Vec<&String> = Vec::new();
+    for k in &kinds {
+        if seen.last() != Some(&k) {
+            assert!(!seen.contains(&k), "kind `{k}` appears in two separate runs: {kinds:?}");
+            seen.push(k);
+        }
+    }
+}
+
+#[test]
+fn outline_names_every_file_an_ambiguous_suffix_matches() {
+    let root = std::env::temp_dir().join("unruster_outline_ambig");
+    let _ = std::fs::remove_dir_all(&root);
+    for m in ["alpha", "beta"] {
+        let d = root.join("src").join(m);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("util.rs"), "pub fn helper() {}\n").unwrap();
+    }
+    let out = ur()
+        .args(["--root", root.to_str().unwrap(), "outline", "util.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("matches 2 files"), "expected ambiguity note, got: {err}");
+    // Both files are outlined rather than one silently winning.
+    let rows = rows_of(&out.stdout);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+}
+
+#[test]
+fn conversions_class_filter_accepts_every_kind() {
+    for k in [
+        ".into", ".try_into", ".to_string", ".to_owned", ".to_vec", ".as_str", ".as_bytes",
+        ".as_ref", ".as_mut", ".parse", ".cloned", ".copied", ".collect", "::from", "::try_from",
+    ] {
+        ur().args(["--root", FIXTURE, "conversions", "--class", k])
+            .assert()
+            .success();
+    }
+}
+
+// ─── coverage: config-drift targeting, ranking, waivers ────────────────────
+
+#[test]
+fn config_drift_unknown_type_reports_and_exits_2() {
+    let out = ur()
+        .args(["--root", "fixtures/drift", "config-drift", "NoSuchOpts"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("NoSuchOpts"), "{err}");
+}
+
+#[test]
+fn config_drift_min_score_gate_drops_everything_below_it() {
+    let out = ur_stdout(&["--root", "fixtures/drift", "config-drift", "--min-score", "9999"]);
+    assert!(rows_of(&out).is_empty(), "a 9999 gate must drop every row");
+}
+
+/// Two drifting types rank against each other; identical literals and
+/// single-site types stay silent; a waiver retires its row.
+fn drift_pair_fixture(name: &str, waiver: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let waiver_line = if waiver.is_empty() {
+        String::new()
+    } else {
+        format!("        {waiver}\n")
+    };
+    std::fs::write(
+        src.join("lib.rs"),
+        format!(
+            "pub struct A {{ pub depth: u32, pub wide: bool }}\n\
+             pub struct B {{ pub max: u32, pub loud: bool }}\n\
+             pub struct C {{ pub k: u32 }}\n\
+             pub struct D {{ pub only: u32 }}\n\
+             pub struct T(pub u32);\n\
+             pub mod one {{\n\
+                 pub fn a() -> crate::A {{\n\
+             {waiver_line}        crate::A {{ depth: 3, wide: true }}\n\
+                 }}\n\
+                 pub fn b() -> crate::B {{ crate::B {{ max: 10, loud: true }} }}\n\
+                 pub fn c() -> crate::C {{ crate::C {{ k: 1 }} }}\n\
+                 pub fn t() -> crate::T {{ crate::T {{ 0: 1 }} }}\n\
+             }}\n\
+             pub mod two {{\n\
+                 pub fn a() -> crate::A {{ crate::A {{ depth: 9, wide: true }} }}\n\
+                 pub fn b() -> crate::B {{ crate::B {{ max: 99, loud: false }} }}\n\
+                 pub fn c() -> crate::C {{ crate::C {{ k: 1 }} }}\n\
+                 pub fn d() -> crate::D {{ crate::D {{ only: 7 }} }}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn config_drift_ranks_two_drifting_types_and_stays_quiet_on_agreement() {
+    let root = drift_pair_fixture("unruster_drift_two", "");
+    let out = ur_stdout(&["--root", root.to_str().unwrap(), "config-drift"]);
+    let rows = rows_of(&out);
+    let tys: Vec<&str> = rows
+        .iter()
+        .map(|r| r.split('\t').next().unwrap())
+        .collect();
+    // Both drifting types rank; the agreeing pair (C), the single-site
+    // type (D), and the tuple-struct literal (T) do not.
+    assert!(rows.len() >= 2, "{rows:?}");
+    assert!(tys.contains(&"A") && tys.contains(&"B"), "{rows:?}");
+    assert!(!tys.contains(&"C") && !tys.contains(&"D") && !tys.contains(&"T"), "{rows:?}");
+}
+
+#[test]
+fn config_drift_honours_a_site_waiver() {
+    let root = drift_pair_fixture(
+        "unruster_drift_waived",
+        "// unruster: ok(config-drift/A) 2026-01-01 — presets differ on purpose\n                 ",
+    );
+    let out = ur_stdout(&["--root", root.to_str().unwrap(), "config-drift"]);
+    let tys: Vec<String> = rows_of(&out)
+        .iter()
+        .map(|r| r.split('\t').next().unwrap().to_string())
+        .collect();
+    assert!(!tys.contains(&"A".to_string()), "waived type still listed: {tys:?}");
+    assert!(tys.contains(&"B".to_string()), "unwaived type must survive: {tys:?}");
+}
+
+// ─── coverage: waiver ledger edges ─────────────────────────────────────────
+
+#[test]
+fn waivers_with_no_ledger_says_how_to_start_one() {
+    let err = ur_stderr(&["--root", FIXTURE, "waivers", "--today", TODAY]);
+    assert!(err.contains("0 waiver(s)"), "{err}");
+    assert!(err.contains("--suggest-waivers"), "{err}");
+}
+
+/// A scratch tree whose ledger has: a future-dated waiver, a reasonless one,
+/// and one whose check differs from the other rows'.
+fn waiver_edges_fixture() -> std::path::PathBuf {
+    let root = std::env::temp_dir().join("unruster_waiver_edges");
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "// unruster: ok(dead-code) 2030-01-01\n\
+         fn unused_future() {}\n\
+         // unruster: ok(dead-code) 2026-01-01 — verified: called from build.rs\n\
+         fn unused_dated() {}\n\
+         pub fn keep(p: &std::path::Path) {\n\
+             let _ = std::fs::remove_file(p); // unruster: ok(error-swallows/let-_) 2026-01-01 — absence is fine\n\
+         }\n",
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn waiver_listing_flags_future_dates_and_missing_reasons() {
+    let root = waiver_edges_fixture();
+    let out = ur_stdout(&["--root", root.to_str().unwrap(), "waivers", "--today", TODAY]);
+    let s = String::from_utf8_lossy(&out);
+    // A date ahead of the clock renders `+Nd`, not a silent `0d`.
+    assert!(
+        s.lines().any(|l| l.starts_with('+')),
+        "future date must announce itself:\n{s}"
+    );
+    assert!(s.contains("(none)"), "missing reason must render as (none):\n{s}");
+}
+
+#[test]
+fn waivers_check_filter_drops_other_checks_rows() {
+    let root = waiver_edges_fixture();
+    let out = ur_stdout(&[
+        "--root",
+        root.to_str().unwrap(),
+        "waivers",
+        "--check",
+        "dead-code",
+        "--today",
+        TODAY,
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("dead-code"), "{s}");
+    assert!(!s.contains("error-swallows"), "other check's row leaked:\n{s}");
+}
+
+#[test]
+fn a_ledger_dated_in_one_session_gets_the_herd_note() {
+    let root = std::env::temp_dir().join("unruster_waiver_herd");
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let body: String = (0..5)
+        .map(|i| {
+            format!(
+                "// unruster: ok(dead-code) 2026-01-01 — case {i}\n\
+                 fn unused_{i}() {{}}\n"
+            )
+        })
+        .collect();
+    std::fs::write(src.join("lib.rs"), body).unwrap();
+    let err = ur_stderr(&["--root", root.to_str().unwrap(), "waivers", "--today", TODAY]);
+    assert!(err.contains("dated waiver(s) carry"), "{err}");
+}
+
+#[test]
+fn waivers_note_the_pair_a_group_key_would_retire() {
+    let root = std::env::temp_dir().join("unruster_waiver_groupable");
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub enum Node { A, B, C }\n\
+         pub fn strip_rich(n: &Node) -> u8 {\n\
+             match n { Node::A => 1, Node::B => 2, Node::C => 3 }\n\
+         }\n\
+         // unruster: ok(divergence/Node::C) 2026-01-01 — deliberate omission\n\
+         // unruster: ok(enum-coverage/Node::C) 2026-01-01 — same.\n\
+         pub fn strip_lean(n: &Node) -> u8 {\n\
+             match n { Node::A => 1, Node::B => 2, _ => 0 }\n\
+         }\n",
+    )
+    .unwrap();
+    let err = ur_stderr(&["--root", root.to_str().unwrap(), "waivers", "--today", TODAY]);
+    assert!(
+        err.contains("single group key") && err.contains("ok(partial-enumeration/Node::C)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn upgrade_leaves_an_unhit_legacy_waiver_alone_and_says_why() {
+    let root = std::env::temp_dir().join("unruster_upgrade_ambig");
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // `helper` is called, so no check fires on its line: the legacy waiver
+    // suppresses nothing and no check name can be inferred for it.
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub fn caller() -> u8 { helper() }\n\
+         fn helper() -> u8 { 7 } // unruster: ok — stale note from an old sweep\n",
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+    let out = ur()
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "waivers",
+            "--upgrade",
+            "--write",
+            "--today",
+            TODAY,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    // Zero hits means no check can be named — the waiver must survive, and
+    // the run must say so rather than silently skipping it.
+    assert!(err.contains("not upgraded"), "{err}");
+    assert!(err.contains("left alone as ambiguous"), "{err}");
+    let after = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert_eq!(before, after, "an ambiguous waiver must not be rewritten");
+}
+
+#[test]
+fn upgrade_of_a_reasonless_waiver_stamps_check_and_date_only() {
+    let root = std::env::temp_dir().join("unruster_upgrade_bare");
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub fn keep(p: &std::path::Path) {\n\
+             let _ = std::fs::remove_file(p); // unruster: ok\n\
+         }\n",
+    )
+    .unwrap();
+    ur_stdout(&[
+        "--root",
+        root.to_str().unwrap(),
+        "waivers",
+        "--upgrade",
+        "--write",
+        "--today",
+        TODAY,
+    ]);
+    let after = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+    assert!(
+        after.contains(&format!("// unruster: ok(error-swallows) {TODAY}")),
+        "expected an upgraded, reasonless waiver:\n{after}"
+    );
+    assert!(!after.contains(" — \n"), "no dangling reason separator:\n{after}");
+}
