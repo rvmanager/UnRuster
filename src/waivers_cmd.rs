@@ -78,6 +78,11 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
         sem: ctx.sem,
         summary: true,
         spans: false,
+        // Deliberately unscoped even when the run carries `--changed-since`.
+        // Whether a waiver suppresses anything is a property of the tree; a
+        // probe that inherited the diff scope would report every waiver outside
+        // it as orphaned, which is the bug this command exists to detect and
+        // not one it should manufacture. `run` scopes the *rows* instead.
         changed: None,
         out: &quiet,
         suppressions: ctx.suppressions,
@@ -161,6 +166,17 @@ pub fn run(ctx: &AnalysisCtx, call_source: &[ParsedFile], opts: WaiverOpts) -> R
         .iter()
         .filter(|w| selected(w, &opts))
         .collect();
+    // `--changed-since` is a global flag whose help promises it "applies to
+    // site-listing commands", and this is one — but it used to fall through
+    // here, so a scoped run listed the whole ledger and disagreed with the
+    // scoped `audit` line that sent the reader over. The scoping goes on the
+    // rows only: `populate_hits` deliberately probes with `changed: None`
+    // (below), because whether a waiver is orphaned is a fact about the tree
+    // and not about this diff. So a scoped listing is "the waivers in my
+    // changed files, judged against everything".
+    let ledger = chosen.len();
+    ctx.retain_changed(&mut chosen, |w| w.file.as_str());
+    let out_of_scope = ledger - chosen.len();
     // Oldest first: the listing exists to surface decay, so the rows most
     // likely to need re-reading lead.
     chosen.sort_by(|a, b| {
@@ -173,6 +189,23 @@ pub fn run(ctx: &AnalysisCtx, call_source: &[ParsedFile], opts: WaiverOpts) -> R
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.comment_line.cmp(&b.comment_line))
     });
+
+    // Said before the rows, and said for the mutating actions too: `--remove`
+    // now rewrites only files in the diff, which is the useful reading of the
+    // flag and also a silent one if nobody names it.
+    if out_of_scope > 0 {
+        ctx.out.note(&format!(
+            "(note: --changed-since held back {} waiver(s) outside the changed files{}. \
+             The counts below are the whole ledger's, and every hit count is measured \
+             against the whole tree — orphaned is a fact about the code, not about this \
+             diff.)",
+            out_of_scope,
+            match opts.action {
+                Action::List => "",
+                _ => ", so this acts on the changed files alone",
+            }
+        ));
+    }
 
     match opts.action {
         Action::List => list(ctx, &chosen, &opts),

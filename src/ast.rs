@@ -364,6 +364,48 @@ pub fn last_segment(path: &str) -> &str {
     path.rsplit("::").next().unwrap_or(path)
 }
 
+/// Last-segment glob match. `*` matches any (possibly empty) run of chars.
+/// No other metacharacters. `name` is the bare last segment of an item.
+///
+/// One implementation for every command that takes a name pattern, so `*`
+/// means the same thing in `callers --among` and `inventory --name`. It is
+/// deliberately not a regex: the patterns people actually write for this are
+/// `wrap_in_*` and `*_opts`, and a regex dialect would have to be documented,
+/// escaped and got wrong.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    // Fast path: no wildcard means exact match.
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    // Anchored prefix (text before the first `*`).
+    let mut rest = name;
+    if let Some(first) = parts.first() {
+        if !rest.starts_with(first) {
+            return false;
+        }
+        rest = &rest[first.len()..];
+    }
+    // Anchored suffix (text after the last `*`).
+    if let Some(last) = parts.last() {
+        if !rest.ends_with(last) {
+            return false;
+        }
+        rest = &rest[..rest.len() - last.len()];
+    }
+    // Interior literals must appear in order.
+    for mid in &parts[1..parts.len().saturating_sub(1)] {
+        if mid.is_empty() {
+            continue;
+        }
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 pub fn path_last(p: &syn::Path) -> String {
     p.segments
         .last()

@@ -29,7 +29,8 @@ pub enum Part {
     /// Docs, signature, and body — the whole item.
     Full,
     /// Docs and the signature, no body. For "what does this take and return"
-    /// without paying for a 200-line body.
+    /// without paying for a 200-line body. Only a fn has a body to drop, so on
+    /// a struct/enum/const this is the whole declaration — see [`sig_shape`].
     Sig,
     /// The doc comment alone.
     Doc,
@@ -59,6 +60,46 @@ pub struct ShowOpts<'a> {
     pub max_lines: Option<usize>,
 }
 
+/// What `--part sig` can honestly print for one kind of item.
+///
+/// Only a fn has a signature the body hangs off, and cutting at `sig_end` is
+/// the whole point of the flag. Nothing else in Rust is shaped that way, and
+/// treating every non-fn as "a fn whose signature is its first line" is what
+/// this used to do: `show measure::Composed --part sig` answered with
+///
+/// ```text
+/// struct  pub  measure::Composed  src/measure.rs:3271-3282
+/// pub struct Composed {
+/// ```
+///
+/// — an unclosed brace, no fields, and a header claiming a range twelve lines
+/// short of the item. It was wrong in the direction that costs most: the reader
+/// gets a plausible answer, not an error. In one real session three consecutive
+/// `--part sig` calls landed on structs and all three were followed by a
+/// `sed -n 'A,Bp'` fallback in the very next command.
+///
+/// A struct's fields, an enum's variants and a const's value *are* the
+/// declaration, so `sig` prints them whole. A container (`impl`, `trait`,
+/// `mod`) is the one kind where the whole item is the wrong answer *and* the
+/// header line answers nothing — that case keeps the header and says which
+/// command lists members instead.
+enum SigShape {
+    /// Cut at the return type.
+    Fn,
+    /// The declaration is the signature: print all of it.
+    Whole,
+    /// Header line only, plus a pointer to the command that lists members.
+    Container,
+}
+
+fn sig_shape(kind: &str) -> SigShape {
+    match kind {
+        "fn" | "impl-fn" | "trait-fn" => SigShape::Fn,
+        "impl" | "trait" | "mod" => SigShape::Container,
+        _ => SigShape::Whole,
+    }
+}
+
 /// The line range to print for one match, given the requested part.
 ///
 /// `Part::Span` prints nothing but still answers with the `full` range: "which
@@ -68,10 +109,11 @@ fn range_of(d: &Defn, o: &ShowOpts) -> Option<(usize, usize)> {
     let start = if o.no_doc { d.line } else { d.doc_start };
     match o.part {
         Part::Full | Part::Span => Some((start, d.end.max(start))),
-        // `sig_end` is the declaration line for every non-fn item, so this
-        // yields the `pub struct Foo {` header — the item's own first line —
-        // rather than pretending a struct has a signature.
-        Part::Sig => Some((start, d.sig_end.max(d.line))),
+        Part::Sig => Some(match sig_shape(d.kind) {
+            SigShape::Fn => (start, d.sig_end.max(d.line)),
+            SigShape::Whole => (start, d.end.max(start)),
+            SigShape::Container => (start, d.line.max(start)),
+        }),
         Part::Doc => (d.doc_start < d.line).then_some((d.doc_start, d.line - 1)),
     }
 }
@@ -260,6 +302,32 @@ fn show_one(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
             .note(&format!("note: `{}` has no doc comment", d.qpath)),
         _ => {}
     }
+    note_container_sig(ctx, d, opts);
+}
+
+/// `--part sig` on an `impl`/`trait`/`mod` prints its header line and stops.
+///
+/// That range is honest — a container has no signature past its own first line
+/// — but a lone `impl Mask {` answers no question anyone asked it, and silence
+/// about that reads as "there was nothing more". The observed escape was
+/// `unruster impls | grep -A30 "impl Mask"`, which returns the thirty rows that
+/// happen to sort after `Mask` rather than any of its members. Both commands
+/// that would have worked are named here, at the moment the reader needs them.
+fn note_container_sig(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
+    if opts.part != Part::Sig || !matches!(sig_shape(d.kind), SigShape::Container) {
+        return;
+    }
+    ctx.out.note(&format!(
+        "note: `{}` is an item container, so its signature is the header line above and \
+         nothing more. `outline {}` lists its members with their spans{}; `--part full` \
+         prints the block.",
+        d.qpath,
+        d.file,
+        match (d.kind, d.owner.as_deref()) {
+            ("impl", Some(t)) => format!(", `impls --of {}` its other blocks", t),
+            _ => String::new(),
+        }
+    ));
 }
 
 /// Render one query's resolved matches. Returns how many rows it emitted.

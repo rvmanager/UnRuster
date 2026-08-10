@@ -36,6 +36,19 @@ fn build_walker(root: &Path, excludes: &[String]) -> anyhow::Result<ignore::Walk
     Ok(walker.build())
 }
 
+/// Files the last non-`All` scan walked past because of `--scope`.
+///
+/// Recorded rather than returned so `parse_dir`'s signature stays what it is:
+/// three call sites, only one of which is the run's real scan. Written only
+/// when `scope != Scope::All`, so the `Scope::All` pass a few commands make for
+/// their call graph cannot zero it.
+static SCOPE_SKIPPED: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+/// How many files the run's scope excluded. See [`SCOPE_SKIPPED`].
+pub fn scope_skipped() -> usize {
+    *SCOPE_SKIPPED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Should `path` be skipped entirely under this scope? Exhaustive (no `_`)
 /// so a new Scope variant forces a decision here.
 fn out_of_scope(path: &Path, scope: Scope) -> bool {
@@ -58,6 +71,7 @@ pub fn parse_dir(
     let mut walk_errs = 0usize;
     let mut read_errs = 0usize;
     let mut parse_errs = 0usize;
+    let mut scope_skips = 0usize;
     for entry in build_walker(root, excludes)? {
         let entry = match entry {
             Ok(e) => e,
@@ -75,6 +89,7 @@ pub fn parse_dir(
             continue;
         }
         if out_of_scope(path, scope) {
+            scope_skips += 1;
             continue;
         }
 
@@ -103,6 +118,9 @@ pub fn parse_dir(
                 eprintln!("warning: parse failed for {}: {}", path.display(), e);
             }
         }
+    }
+    if scope != Scope::All {
+        *SCOPE_SKIPPED.lock().unwrap_or_else(|e| e.into_inner()) = scope_skips;
     }
     let skipped = walk_errs + read_errs + parse_errs;
     if skipped > 0 {

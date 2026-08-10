@@ -62,7 +62,11 @@ Top-level flags:
 - --spans: enclosing-fn labels become `name@start-end` (fetch the body via
   `sed -n 'start,endp' file`).
 - --changed-since GIT_REF: keep only rows in files changed vs that ref
-  (untracked files count); git is the only state read.
+  (untracked files count); git is the only state read, and it is read in
+  --root's repository, not the shell's. `waivers` scopes its rows too, but
+  never its hit counts: whether a waiver still suppresses anything is a fact
+  about the tree, so `audit`'s "N suppressing nothing" and the ledger both stay
+  measured whole-tree.
 - --context N: print ±N source lines beneath each finding row.
 
 Agent loop: `unruster audit` runs the whole battery as severity-ranked
@@ -154,12 +158,26 @@ WHAT TO RUN INSTEAD
                                 the rest of the tool indexes from.
                                 `inventory` emits the identical five columns for
                                 the whole tree, so one parser reads both.
+                                `inventory --name <glob>` narrows by name
+                                (`*` is the only metacharacter): bare matches
+                                the last segment, `Type::*` any qualified
+                                suffix. Reach for it rather than
+                                `inventory | grep` — a grep also matches the
+                                path and the doc column, and it discards the
+                                item count and the `--top` cut along with the
+                                stderr it redirects.
 
   unruster show <name>          that item's exact source: first doc-comment line
                                 through the closing brace. Takes a bare name
                                 (`draft_regions`), a `Type::method`
                                 (`Window::parse`), or any qualified suffix.
-                                `--part sig` for the signature alone, `--part
+                                `--part sig` for the signature alone — a fn's
+                                through the return type, and a struct's or
+                                enum's whole declaration, since its fields or
+                                variants are what a signature would say. On an
+                                `impl`/`trait`/`mod` there is no signature past
+                                the header line, and it says so and points at
+                                `outline <file>`. `--part
                                 span` for just the `file:start-end` row when
                                 your own reader will do the seeking, `-n` to
                                 number the lines you are about to edit against,
@@ -310,7 +328,7 @@ structs should split, or duplicate concepts should merge.
   unruster takes-mut <Type>                       # mutation surface
   unruster type-refs <Type>                       # modules naming it
   unruster callers --by module <Type>::<method>   # per-method caller spread
-  unruster inventory --kind impl-fn | grep '<Type>::'   # method count
+  unruster inventory --kind impl-fn --name '<Type>::*'  # method count
   Signal: many `&mut Type` fns + many naming modules + most callers
   touch only a subset → extract trait(s); callers depend on interface.
 

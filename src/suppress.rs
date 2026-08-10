@@ -353,13 +353,6 @@ impl Suppressions {
         self.waivers.iter().filter(|w| w.is_legacy()).count()
     }
 
-    /// Findings suppressed so far this run, across every waiver. Meaningful
-    /// only after the checks have run; `audit` reads it at the end so its
-    /// summary can state reach rather than just how many comments exist.
-    pub fn total_hits(&self) -> usize {
-        self.waivers.iter().map(Waiver::hits).sum()
-    }
-
     /// Route subsequent `matches` hits to the given counter; returns the
     /// previous mode so a caller can restore it.
     pub fn set_hit_mode(&self, m: HitMode) -> HitMode {

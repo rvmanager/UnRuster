@@ -127,6 +127,16 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
             .then_with(|| x.0.dst.cmp(&y.0.dst))
     });
 
+    // The only check in the audit battery that was not honouring
+    // `--changed-since`, and a gating one — so a scoped run leaked whole-tree
+    // rows and exited 1 over code the caller had not touched, which is exactly
+    // the `until unruster --fail-on-findings audit` loop failing to be able to
+    // go green. Either side counts: a pair is a relationship between two impls,
+    // and editing one half is what makes it this diff's business.
+    if ctx.changed.is_some() {
+        pairs.retain(|(a, b, _)| ctx.in_scope(&a.file) || ctx.in_scope(&b.file));
+    }
+
     // Keyed by the type pair, and matched against the *forward* impl's site so
     // one waiver above `impl From<A> for B` retires the pair. A gating check
     // whose commonest true verdict is "one of these types is foreign, so they

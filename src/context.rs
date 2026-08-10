@@ -243,15 +243,30 @@ impl AnalysisCtx<'_> {
         }
     }
 
+    /// Is this file inside the run's `--changed-since` scope? Always true when
+    /// there is no filter.
+    ///
+    /// Split out of [`retain_changed`](Self::retain_changed) because not
+    /// everything scoping applies to arrives as a `Vec` of rows. The waiver
+    /// ledger is the case that forced it: `audit`'s closing line tallies
+    /// waivers that suppressed nothing, and under a scoped run every waiver in
+    /// an unchanged file has zero hits by construction — the check dropped its
+    /// rows there before the waiver could ever be consulted. Asking this per
+    /// waiver is what keeps that tally from calling a live ledger dead.
+    pub fn in_scope(&self, file: &str) -> bool {
+        match &self.changed {
+            None => true,
+            Some(set) => std::fs::canonicalize(file)
+                .map(|p| set.contains(&p))
+                .unwrap_or(false),
+        }
+    }
+
     /// With `--changed-since`, keep only hits whose file is in the changed
     /// set (no-op otherwise). `file_of` extracts the hit's display path.
     pub fn retain_changed<T>(&self, items: &mut Vec<T>, file_of: impl Fn(&T) -> &str) {
-        if let Some(set) = &self.changed {
-            items.retain(|it| {
-                std::fs::canonicalize(file_of(it))
-                    .map(|p| set.contains(&p))
-                    .unwrap_or(false)
-            });
+        if self.changed.is_some() {
+            items.retain(|it| self.in_scope(file_of(it)));
         }
     }
 }
@@ -260,15 +275,28 @@ impl AnalysisCtx<'_> {
 /// <ref>` (tracked changes, staged or not) plus untracked files. Paths are
 /// resolved against the repo top-level, so this works from any CWD. Git is
 /// the only state consulted — there is no tracking file.
+///
+/// Asked of `root`'s repository, not the process's. Reading the CWD's repo
+/// instead is the same failure the empty-`files` guard in `main` exists to
+/// catch, one layer down and quieter: `unruster -r ../other/src
+/// --changed-since HEAD audit` diffed *this* checkout, none of whose paths are
+/// under `../other`, so every check dropped every row and the run reported
+/// "0 gating + 0 advisory; clean; exit 0" over a tree it had not looked at.
 // unruster: ok(error-swallows/if-let-ok) 2026-08-06 — a path that will not
 // canonicalize is not in the working tree, which is precisely the reason to
 // leave it out of the changed set.
 pub fn changed_set(
     git_ref: &str,
+    root: &std::path::Path,
 ) -> anyhow::Result<std::collections::HashSet<std::path::PathBuf>> {
     use std::process::Command;
+    // `--root` may name a file; git wants a directory.
+    let at = match root.is_dir() {
+        true => root,
+        false => root.parent().unwrap_or(std::path::Path::new(".")),
+    };
     let git = |args: &[&str]| -> anyhow::Result<String> {
-        let out = Command::new("git").args(args).output()?;
+        let out = Command::new("git").arg("-C").arg(at).args(args).output()?;
         if !out.status.success() {
             anyhow::bail!(
                 "git {} failed: {}",

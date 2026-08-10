@@ -306,7 +306,7 @@ pub fn run(
         advisory += n.total - g;
         checks += 1;
         if let Some(note) = ctx.out.cap_note() {
-            ctx.out.note(&note);
+            ctx.out.row_note(&note);
         }
         ctx.out.set_row_budget(None);
         ctx.out.section_end();
@@ -466,8 +466,24 @@ pub fn run(
     // Both numbers, not just the waiver count: two item-scoped waivers hiding
     // seven findings reported as "2 site(s) waived" understates the reach by
     // 3.5x, which is the exact failure this line exists to prevent.
-    let waivers = ctx.suppressions.len();
-    let hidden = ctx.suppressions.total_hits();
+    //
+    // The ledger this run could actually exercise, not the whole file of them.
+    // Under `--changed-since` every check calls `retain_changed` *before*
+    // `retain_unsuppressed`, so a waiver in an unchanged file never sees a
+    // finding and its hit count is zero by construction — not by decay. Tallied
+    // whole-ledger, a scoped run on this very tree reported "25 waiver(s) …, 24
+    // of them suppressing nothing" where the unscoped answer is 4: a number
+    // that reads as a demand to delete two dozen live waivers. `hits` was
+    // already scoped (it is counted during the run); this puts the count that
+    // divides it on the same footing.
+    let ledger: Vec<&crate::suppress::Waiver> = ctx
+        .suppressions
+        .all()
+        .iter()
+        .filter(|w| ctx.in_scope(&w.file))
+        .collect();
+    let waivers = ledger.len();
+    let hidden: usize = ledger.iter().map(|w| w.hits()).sum();
     ctx.out.summary(&format!(
         "(audit: {} gating + {} advisory finding(s) across {} check(s); {}{}{})",
         gating,
@@ -487,21 +503,30 @@ pub fn run(
             // scope that missed. Saying only "N waivers hiding M findings"
             // left a real codebase with 33 waivers hiding 30 findings and
             // nobody noticing that at least three of them did nothing.
-            let dead = ctx
-                .suppressions
-                .all()
-                .iter()
-                .filter(|w| w.hits() == 0)
-                .count();
+            let dead = ledger.iter().filter(|w| w.hits() == 0).count();
             format!(
-                "; {} waiver(s) hiding {} finding(s){} — `unruster waivers` to review",
+                "; {} waiver(s){} hiding {} finding(s){} — `unruster waivers` to review",
                 waivers,
+                // Say which ledger, so a count far below the file's own is read
+                // as a scope and not as waivers having gone missing.
+                if ctx.changed.is_some() {
+                    " in the changed files"
+                } else {
+                    ""
+                },
                 hidden,
                 if dead > 0 {
                     format!(", {} of them suppressing nothing", dead)
                 } else {
                     String::new()
                 }
+            )
+        } else if !ctx.suppressions.is_empty() {
+            // Scoped past every waiver there is. Silence here reads as "this
+            // tree has no waivers", which is the opposite of true.
+            format!(
+                "; none of the {} waiver(s) in this tree are in the changed files",
+                ctx.suppressions.len()
             )
         } else {
             String::new()

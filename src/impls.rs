@@ -52,5 +52,21 @@ pub fn run(
         }
     }
     ctx.out.summary(&format!("({} impl block(s))", total));
+    // An unfiltered listing is a wall, and the escape people write is
+    // `impls | grep -A30 "impl Mask"` — which returns the thirty rows that
+    // happen to *sort* after `Mask` rather than any of its members, because a
+    // two-column TSV cannot express "the contents of this block" and grep
+    // cannot know that. Both commands that answer the question are named here,
+    // and only when the listing is big enough for the question to arise.
+    // Ten because that is roughly where a two-column listing stops being
+    // something you take in at a glance and starts being something you pipe.
+    if of_type.is_none() && of_trait.is_none() && total > 10 {
+        ctx.out.note(
+            "note: unfiltered. `impls --of <Type>` lists one type's blocks and \
+             `impls --trait <Trait>` one trait's implementors; for the *members* of a \
+             block it is `outline <file>` — a grep over these rows returns whatever sorts \
+             next to the name, not what the block contains.",
+        );
+    }
     Ok(total)
 }

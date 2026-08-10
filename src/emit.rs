@@ -562,9 +562,41 @@ impl Out {
         println!("{}", text);
     }
 
-    /// A warning / note not tied to a row (unknown target, macro blind spots,
-    /// "showing 20 of 87"). Follows `summary_inline`: inside an `audit`
-    /// section a truncation note is only useful next to the rows it qualifies.
+    /// A note about the **rows themselves** — that they were cut short. Goes to
+    /// stdout, beside the rows it qualifies, where [`note`](Self::note) goes to
+    /// stderr.
+    ///
+    /// The rule that decides which: everything on stderr is commentary a caller
+    /// can discard and still hold a correct answer. A truncation is not that.
+    /// `2>/dev/null` is what a caller writes to silence the near-name
+    /// suggestions and the blind-spot paragraph, and in one real session it was
+    /// paired with `| head -N` on five of seven invocations — so the
+    /// `(showing 3 of 36 row(s))` line, the only thing saying the answer was
+    /// partial, was the first casualty, and three rows read as "that is all
+    /// there is". A cut this tool performed has to survive the redirect the
+    /// caller reaches for. Under `--summary` there are no rows on stdout to sit
+    /// beside, so it rejoins the summary on stderr.
+    pub fn row_note(&self, text: &str) {
+        if self.silent {
+            return;
+        }
+        if !self.said.borrow_mut().insert(text.to_string()) {
+            return;
+        }
+        if self.json() {
+            self.state.borrow_mut().notes.push(text.to_string());
+            return;
+        }
+        if self.summary_only {
+            eprintln!("{}", text);
+        } else {
+            println!("{}", text);
+        }
+    }
+
+    /// A warning / note not tied to a row (unknown target, macro blind spots).
+    /// Follows `summary_inline`: inside an `audit` section a note is only
+    /// useful next to the rows it qualifies.
     pub fn note(&self, text: &str) {
         if self.silent {
             return;

@@ -14,11 +14,17 @@ fn ur() -> Command {
 
 // ── row / column assertion helpers (catch shape regressions) ──────────────
 
-/// Non-blank lines of `out` as Strings.
+/// Non-blank data lines of `out`.
+///
+/// `(note: …)` lines are dropped: the `--top` truncation note is emitted on
+/// *stdout* on purpose (a caller who writes `2>/dev/null` must still learn the
+/// answer was cut), but it is commentary about the rows and not one of them.
+/// No TSV row can collide with the prefix — a row's first cell is a kind, a
+/// visibility or a name.
 fn rows_of(out: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(out)
         .lines()
-        .filter(|l| !l.trim().is_empty())
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("(note:"))
         .map(str::to_string)
         .collect()
 }
@@ -134,6 +140,54 @@ fn inventory_vis_pub() {
         .assert()
         .success()
         .stdout(contains("Document::new"));
+}
+
+#[test]
+fn inventory_name_filters_on_the_bare_name_not_the_whole_row() {
+    // The gap that produced `unruster inventory | grep -iE "profile|span"` in a
+    // real session: `--kind`/`--vis` narrow by category and nothing narrowed by
+    // name. A grep also matches the path and the doc column, and it takes the
+    // row count and the `--top` cut down with the stderr it redirects.
+    let out = ur_stdout(&["--root", FIXTURE, "inventory", "--name", "Document"]);
+    let rows = rows_of(&out);
+    assert!(!rows.is_empty(), "expected the fixture's `Document` items");
+    for r in &rows {
+        let name = r.split('\t').nth(3).unwrap();
+        assert_eq!(
+            name.rsplit("::").next().unwrap(),
+            "Document",
+            "matched something that is not the bare name: {}",
+            r
+        );
+    }
+    // A path segment must not match — that is the grep behaviour being replaced.
+    assert!(
+        rows_of(&ur_stdout(&["--root", FIXTURE, "inventory", "--name", "main"]))
+            .iter()
+            .all(|r| !r.contains("\tDocument\t")),
+        "`--name main` matched by file path"
+    );
+}
+
+#[test]
+fn inventory_name_takes_a_glob_and_says_when_it_matches_nothing() {
+    let globbed = rows_of(&ur_stdout(&["--root", FIXTURE, "inventory", "--name", "Doc*"]));
+    assert!(
+        globbed.iter().any(|r| r.contains("Document")),
+        "`Doc*` should reach `Document`:\n{:?}",
+        globbed
+    );
+    // A glob matching nothing is a typo more often than a fact about the tree,
+    // and an empty listing under `(0 items)` says neither.
+    let out = ur()
+        .args(["--root", FIXTURE, "inventory", "--name", "Documnet"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(rows_of(&out.stdout).is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--name Documnet"), "the filter is unnamed:\n{}", err);
+    assert!(err.contains("no item's bare name matches"), "{}", err);
 }
 
 #[test]
@@ -672,6 +726,85 @@ fn a_listed_impl_block_is_not_reported_as_one_line() {
     let (s, e) = range.split_once('-').unwrap();
     let (s, e) = (s.parse::<usize>().unwrap(), e.parse::<usize>().unwrap());
     assert!(e > s, "impl block catalogued as {} line(s): {}", e - s + 1, at);
+}
+
+#[test]
+fn sig_of_a_struct_is_its_fields_and_not_an_unclosed_brace() {
+    // `--part sig` treated every non-fn as "a fn whose signature is its first
+    // line", so a struct answered with `pub struct Document {` and stopped —
+    // an unclosed brace, no fields, and a header row claiming a range that
+    // ended four lines short of the item. Wrong in the direction that costs
+    // most: it reads as an answer. Three consecutive `--part sig` calls on
+    // structs in one real session were each followed by a `sed -n 'A,Bp'`.
+    let out = ur_stdout(&["--root", FIXTURE, "show", "Document", "--kind", "struct", "--part", "sig"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("pub struct Document {"), "{}", s);
+    assert!(s.contains("pub transform: [f32; 4]"), "fields missing:\n{}", s);
+    assert!(s.contains("children: Vec<Document>"), "fields missing:\n{}", s);
+    assert!(
+        s.lines().any(|l| l.trim_end() == "}"),
+        "left the brace open:\n{}",
+        s
+    );
+}
+
+#[test]
+fn sig_of_a_data_item_reports_the_same_span_as_the_item() {
+    // The header row is a promise about the bytes below it. When `sig` stopped
+    // at the declaration line the promise was still made — `681-682` for an
+    // item running to 710 — and an AST tool saying that is worse than a grep
+    // saying nothing.
+    for kind in ["struct", "enum"] {
+        let name = if kind == "struct" { "Document" } else { "Token" };
+        let at = |part: &str| -> String {
+            let out = ur_stdout(&["--root", FIXTURE, "show", name, "--kind", kind, "--part", part]);
+            rows_of(&out)[0].split('\t').next_back().unwrap().to_string()
+        };
+        assert_eq!(at("sig"), at("span"), "`{}` sig span != item span", name);
+    }
+}
+
+#[test]
+fn sig_of_an_enum_is_its_variants() {
+    let out = ur_stdout(&["--root", FIXTURE, "show", "Token", "--kind", "enum", "--part", "sig"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("pub enum Token {"), "{}", s);
+    assert!(
+        s.lines().filter(|l| l.starts_with("    ")).count() >= 2,
+        "no variants under the header:\n{}",
+        s
+    );
+}
+
+#[test]
+fn sig_of_a_container_says_which_command_lists_its_members() {
+    // An `impl` is the one kind where the whole item is the wrong answer and
+    // the header line answers nothing either. The range stays honest and the
+    // note carries the way out, because the observed escape was
+    // `impls | grep -A30 "impl Foo"` — thirty rows that sort after `Foo`.
+    let out = ur()
+        .args(["--root", FIXTURE, "show", "Document", "--kind", "impl", "--part", "sig", "--all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("impl Document {"),
+        "{:?}",
+        out
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("outline "), "no route to the members:\n{}", err);
+    assert!(err.contains("impls --of Document"), "{}", err);
+}
+
+#[test]
+fn sig_of_a_fn_still_stops_at_the_return_type() {
+    // The fix must not turn `sig` into `full` for the one kind it was right
+    // about — that would delete the flag's whole reason to exist.
+    let out = ur_stdout(&["--root", FIXTURE, "show", "Document::new", "--part", "sig"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("pub fn new(name: String) -> Self"), "{}", s);
+    assert!(!s.contains("transform: [0.0; 4]"), "body leaked in:\n{}", s);
 }
 
 #[test]
@@ -1399,6 +1532,27 @@ fn impls_filter_by_self_type() {
 }
 
 #[test]
+fn an_unfiltered_impls_listing_names_the_commands_that_narrow_it() {
+    // The listing is a wall, and the escape people write is
+    // `impls | grep -A30 "impl Mask"` — which returns the rows that sort after
+    // `Mask`, not its members. Observed verbatim in a real session, followed by
+    // `outline src/mask.rs`, which is what actually answered.
+    let big = ur().args(["--root", FIXTURE, "impls"]).output().unwrap();
+    let err = String::from_utf8_lossy(&big.stderr);
+    assert!(err.contains("impls --of <Type>"), "no route offered:\n{}", err);
+    assert!(err.contains("outline <file>"), "{}", err);
+    // A caller who already narrowed does not need telling.
+    let narrowed = ur()
+        .args(["--root", FIXTURE, "impls", "--of", "Document"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&narrowed.stderr).contains("unfiltered"),
+        "nagged a caller who had already filtered"
+    );
+}
+
+#[test]
 fn impls_header_carries_the_traits_generic_arguments() {
     // The header used to render the trait path without its arguments, so
     // `impl Tag<u32> for Boxx` and `impl Tag<String> for Boxx` both came out as
@@ -2075,11 +2229,13 @@ fn top_caps_every_command_and_announces_it() {
         let out = ur().args(&full).output().unwrap();
         let rows = rows_of(&out.stdout).len();
         assert!(rows <= 1, "{args:?} listed {rows} rows under --top 1");
-        let err = String::from_utf8_lossy(&out.stderr);
-        if rows == 1 && err.contains("showing") {
+        // The cut announces itself beside the rows it cut — on stdout, so a
+        // `2>/dev/null` caller still learns the listing is partial.
+        let said = String::from_utf8_lossy(&out.stdout);
+        if rows == 1 && said.contains("showing") {
             assert!(
-                err.contains("raise or drop --top"),
-                "{args:?} truncated without saying so: {err}"
+                said.contains("raise or drop --top"),
+                "{args:?} truncated without saying so: {said}"
             );
         }
     }
@@ -3728,6 +3884,228 @@ fn changed_since_head_runs() {
         .success();
 }
 
+/// A committed two-file tree, each file carrying one waiver that hits, with
+/// only `touched.rs` dirty. The shape both `--changed-since` waiver bugs need:
+/// one waiver inside the diff and one outside it, and both genuinely live.
+fn scoped_waiver_repo(name: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    let body = |fname: &str| {
+        format!(
+            "pub fn {fname}(p: &std::path::Path) {{\n    \
+             let _ = std::fs::remove_file(p); // unruster: ok(error-swallows/let-_) \
+             2026-01-01 — absence is fine\n}}\n"
+        )
+    };
+    std::fs::write(dir.join("src/kept.rs"), body("kept")).unwrap();
+    std::fs::write(dir.join("src/touched.rs"), body("touched")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub mod kept;\npub mod touched;\n").unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit", "-qm", "init",
+    ]);
+    // Dirty exactly one file, without disturbing its waiver.
+    std::fs::write(
+        dir.join("src/touched.rs"),
+        format!("{}\npub const EDIT: u8 = 1;\n", body("touched")),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn a_usage_question_says_when_the_default_scope_walked_past_the_tests() {
+    // `--scope production` is right for the checks and wrong for "who uses
+    // this", which is the question asked immediately before a signature
+    // changes. A real session widening a struct by one field found its
+    // construction sites with `grep -rn "Options {" src/ tests/`; eight of
+    // ~fourteen were in `tests/`. The AST answer would have been better in
+    // every way except that by default it would not have looked there — and
+    // would have said so nowhere.
+    let dir = scratch("scope-gap");
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub struct Cfg { pub a: u8 }\n").unwrap();
+    std::fs::write(
+        dir.join("tests/it.rs"),
+        "#[test]\nfn t() { let _ = demo::Cfg { a: 1 }; }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let err = |args: &[&str]| -> String {
+        let mut full = vec!["--root", root];
+        full.extend(args);
+        String::from_utf8_lossy(&ur().args(&full).output().unwrap().stderr).into_owned()
+    };
+    let usage = err(&["type-refs", "Cfg"]);
+    assert!(
+        usage.contains("test file(s) were not scanned") && usage.contains("--scope all"),
+        "a usage question answered production-only in silence:\n{}",
+        usage
+    );
+    // Asking for the wider scope is not then told it is missing something.
+    assert!(
+        !err(&["type-refs", "Cfg", "--scope", "all"]).contains("were not scanned"),
+        "nagged a caller who had already widened"
+    );
+    // A catalogue is not a usage question: `--scope` narrowing the catalogue is
+    // the flag doing its job, and saying so on every listing is the noise that
+    // got the blind-spot line gated in the first place.
+    assert!(
+        !err(&["inventory"]).contains("were not scanned"),
+        "a catalogue does not need the warning"
+    );
+}
+
+#[test]
+fn changed_since_asks_the_root_s_repository_and_not_the_cwd_s() {
+    // The scope was computed by running git in the process CWD, so
+    // `unruster -r <another checkout> --changed-since HEAD` diffed *this* repo
+    // and matched nothing under `--root`: every check dropped every row and the
+    // run reported clean over a tree it had not looked at. Same shape as the
+    // empty-`files` guard in `main`, one layer down and without the error.
+    let dir = scoped_waiver_repo("changed-since-root");
+    let rows = rows_of(&ur_stdout_allow_findings(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "--changed-since",
+        "HEAD",
+        "--no-suppress",
+        "error-swallows",
+    ]));
+    assert!(
+        rows.iter().any(|r| r.contains("touched.rs")),
+        "the changed file's items went missing:\n{:?}",
+        rows
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("kept.rs")),
+        "the unchanged file was not scoped out:\n{:?}",
+        rows
+    );
+}
+
+#[test]
+fn conversion_pairs_honours_changed_since_like_every_other_gating_check() {
+    // It was the one check in the battery that never called `retain_changed`,
+    // and it gates — so `audit --changed-since HEAD` exited 1 over a pair in a
+    // file the caller had not touched, and the documented
+    // `until unruster --fail-on-findings audit` loop could not go green no
+    // matter what the caller fixed.
+    let dir = scratch("conv-pairs-scope");
+    std::fs::write(
+        dir.join("src/kept.rs"),
+        "pub struct A;\npub struct B;\n\
+         impl From<A> for B { fn from(_: A) -> B { B } }\n\
+         impl From<B> for A { fn from(_: B) -> A { A } }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/touched.rs"), "pub fn touched() {}\n").unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub mod kept;\npub mod touched;\n").unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    std::fs::write(dir.join("src/touched.rs"), "pub fn touched() {}\npub fn more() {}\n").unwrap();
+
+    let root = dir.to_str().unwrap();
+    let unscoped = rows_of(&ur_stdout_allow_findings(&["--root", root, "conversion-pairs"]));
+    assert_eq!(unscoped.len(), 1, "fixture should hold one pair:\n{:?}", unscoped);
+    let scoped = rows_of(&ur_stdout_allow_findings(&[
+        "--root",
+        root,
+        "--changed-since",
+        "HEAD",
+        "conversion-pairs",
+    ]));
+    assert!(
+        scoped.is_empty(),
+        "a pair in an untouched file leaked into a scoped run:\n{:?}",
+        scoped
+    );
+}
+
+#[test]
+fn a_scoped_audit_does_not_report_out_of_scope_waivers_as_dead() {
+    // Every check calls `retain_changed` *before* `retain_unsuppressed`, so
+    // under `--changed-since` a waiver in an unchanged file never sees a
+    // finding — its hit count is zero by construction, not by decay. Tallied
+    // whole-ledger, a scoped run on unruster's own tree said "25 waiver(s) …,
+    // 24 of them suppressing nothing" where the unscoped answer is 4: a line
+    // that reads as a demand to delete two dozen live waivers.
+    let dir = scoped_waiver_repo("scoped-waivers-audit");
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "--changed-since", "HEAD", "audit"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stderr);
+    let line = s
+        .lines()
+        .find(|l| l.starts_with("(audit:"))
+        .unwrap_or_else(|| panic!("no audit summary in:\n{}", s));
+    assert!(
+        !line.contains("suppressing nothing"),
+        "the waiver outside the diff was called dead:\n{}",
+        line
+    );
+    assert!(
+        line.contains("1 waiver(s) in the changed files"),
+        "the count should name its scope:\n{}",
+        line
+    );
+}
+
+#[test]
+fn waivers_honours_changed_since_on_its_rows_but_not_on_orphanhood() {
+    // `--changed-since` is global and its help promises it "applies to
+    // site-listing commands"; `waivers` used to fall through and list the whole
+    // ledger, so it disagreed with the scoped `audit` line that sent the reader
+    // over. Scoping the rows is the fix — scoping the *hit counts* would not be,
+    // since it would report every waiver outside the diff as orphaned, which is
+    // the bug this command exists to detect.
+    let dir = scoped_waiver_repo("scoped-waivers-list");
+    let root = dir.to_str().unwrap();
+    let out = ur()
+        .args([
+            "--root", root, "--changed-since", "HEAD", "waivers", "--scope", "all",
+        ])
+        .output()
+        .unwrap();
+    let (rows, err) = (rows_of(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(rows.len(), 1, "expected only the changed file's waiver:\n{:?}", rows);
+    assert!(rows[0].contains("touched.rs"), "{:?}", rows);
+    assert!(err.contains("held back 1 waiver(s)"), "the drop was silent:\n{}", err);
+    // Judged against the whole tree: the out-of-scope waiver is live, so
+    // nothing is reported orphaned.
+    assert!(
+        err.contains("2 waiver(s) shown") || err.contains("of 2 waiver(s) shown"),
+        "the ledger total should stay whole-tree:\n{}",
+        err
+    );
+    assert!(
+        err.contains("0 earning nothing in `audit`"),
+        "a live waiver outside the diff was scored as orphaned:\n{}",
+        err
+    );
+}
+
 #[test]
 fn context_flag_prints_snippets() {
     let out = ur_stdout(&["--root", FIXTURE, "--context", "1", "casts"]);
@@ -4955,7 +5333,28 @@ fn row_capped_checks_announce_what_they_dropped() {
     ur().args(["--root", FIXTURE, "stringly", "--top", "1"])
         .assert()
         .success()
-        .stderr(contains("note: showing 1 of"));
+        .stdout(contains("note: showing 1 of"));
+}
+
+#[test]
+fn the_truncation_note_survives_the_redirect_callers_actually_write() {
+    // Everything on stderr is commentary a caller can discard and still hold a
+    // correct answer — except this. One real session paired `2>/dev/null` with
+    // `| head -N` on five of seven invocations, so the line saying the answer
+    // was cut short was the first thing thrown away, and three rows of
+    // thirty-seven read as the whole tree. The cut goes where the rows go.
+    let out = ur()
+        .args(["--root", FIXTURE, "--top", "1", "inventory"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("raise or drop --top"),
+        "the cut did not survive `2>/dev/null`:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // And it stays out of the row stream a consumer parses.
+    assert_eq!(rows_of(&out.stdout).len(), 1);
+    assert_tsv_cols(&out.stdout, 5);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5344,4 +5743,89 @@ fn upgrade_of_a_reasonless_waiver_stamps_check_and_date_only() {
         "expected an upgraded, reasonless waiver:\n{after}"
     );
     assert!(!after.contains(" — \n"), "no dangling reason separator:\n{after}");
+}
+
+// ─── coverage: local bindings must not masquerade as item callers ──────────
+
+/// A tree where the item `grow` is shadowed at some call sites by local
+/// bindings — the false-attribution shape from a real analysis session.
+fn shadow_fixture() -> std::path::PathBuf {
+    let root = std::env::temp_dir().join("unruster_local_shadow");
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub fn grow(v: &[f64], m: f64) -> Vec<f64> { v.iter().map(|x| x * m).collect() }\n\
+         pub fn real_caller(h: &[f64]) -> Vec<f64> {\n\
+             grow(h, 1.1)\n\
+         }\n\
+         pub fn closure_shadow(w: f64) -> f64 {\n\
+             let grow = |lo: f64| lo + w;\n\
+             grow(1.0) + grow(2.0)\n\
+         }\n\
+         pub fn call_before_let(h: &[f64]) -> Vec<f64> {\n\
+             let out = grow(h, 2.0);\n\
+             let grow = |x: f64| x;\n\
+             let _ = grow(3.0);\n\
+             out\n\
+         }\n\
+         pub fn param_shadow(grow: impl Fn(f64) -> f64) -> f64 {\n\
+             grow(4.0)\n\
+         }\n\
+         pub fn recursive_init(h: &[f64]) -> Vec<f64> {\n\
+             let grow = |v: &[f64]| grow(v, 9.0);\n\
+             grow(h)\n\
+         }\n",
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn callers_demotes_calls_to_a_shadowing_local_binding() {
+    let root = shadow_fixture();
+    let out = ur().args(["--root", root.to_str().unwrap(), "callers", "grow"]).output().unwrap();
+    assert!(out.status.success());
+    let rows = rows_of(&out.stdout);
+    let confidence_of = |caller: &str| -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.starts_with(caller))
+            .map(|r| r.split('\t').nth(2).unwrap().to_string())
+            .collect()
+    };
+    // Calls through a local closure or fn param can never be the item.
+    for caller in ["closure_shadow", "param_shadow"] {
+        for c in confidence_of(caller) {
+            assert_eq!(c, "heuristic", "{caller} must be demoted:\n{rows:?}");
+        }
+    }
+    // A call *before* the shadowing `let` resolves to the item, and so does
+    // the call inside the closure's own initializer (`let grow = |v| grow(v)`).
+    for caller in ["real_caller", "call_before_let", "recursive_init"] {
+        assert!(
+            confidence_of(caller).contains(&"resolved".to_string()),
+            "{caller} must keep a resolved site:\n{rows:?}"
+        );
+    }
+    // The demotion announces itself rather than silently reshuffling a column.
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("local"), "expected the local-binding note, got: {err}");
+}
+
+#[test]
+fn min_confidence_resolved_drops_shadowed_sites() {
+    let root = shadow_fixture();
+    let out = ur_stdout(&[
+        "--root",
+        root.to_str().unwrap(),
+        "callers",
+        "grow",
+        "--min-confidence",
+        "resolved",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("closure_shadow"), "{s}");
+    assert!(!s.contains("param_shadow"), "{s}");
+    assert!(s.contains("real_caller"), "{s}");
 }

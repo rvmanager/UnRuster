@@ -19,12 +19,26 @@ struct CallSite {
     /// Target as resolved through the calling file's `use` map, if different
     /// from `target`. Used as a secondary key for `matches_target`. Approximate.
     target_resolved: Option<String>,
+    /// The callee is a bare name bound *locally* at the call site — a `let`
+    /// closure, a closure parameter, or a fn parameter — so it cannot be the
+    /// item that shares the name. `let grow = |lo, hi| …; grow(a)` calls the
+    /// closure, and attributing it to `hull::grow` misled a real session.
+    /// Best-effort: bindings introduced by `match` arms or `if let` patterns
+    /// are not tracked.
+    shadowed: bool,
 }
 
 struct CallVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
     sites: Vec<CallSite>,
+    /// Local-binding scopes, innermost last. Names land here when their
+    /// binding is visited, so a call *before* the `let` that shadows it still
+    /// reads as a call to the item — which is what the compiler resolves too.
+    locals: Vec<BTreeSet<String>>,
+    /// Parameter names from the most recent signature, claimed by the fn
+    /// body's block when it opens.
+    pending_params: BTreeSet<String>,
 }
 
 impl<'a> CallVisitor<'a> {
@@ -32,14 +46,41 @@ impl<'a> CallVisitor<'a> {
         self.scope.enclosing_with_toplevel()
     }
 
-    fn record(&mut self, target: String, line: usize) {
+    fn local_shadows(&self, name: &str) -> bool {
+        self.locals.iter().any(|frame| frame.contains(name))
+    }
+
+    fn record(&mut self, target: String, line: usize, shadowed: bool) {
         self.sites.push(CallSite {
             file: self.file.to_string(),
             line,
             caller: self.enclosing(),
             target,
             target_resolved: None,
+            shadowed,
         });
+    }
+}
+
+/// Every name a pattern binds, recursively. Used to learn which bare names a
+/// `let`, closure head, or fn signature shadows.
+fn pat_idents(p: &syn::Pat, out: &mut BTreeSet<String>) {
+    match p {
+        syn::Pat::Ident(i) => {
+            out.insert(i.ident.to_string());
+            if let Some((_, sub)) = &i.subpat {
+                pat_idents(sub, out);
+            }
+        }
+        syn::Pat::Type(t) => pat_idents(&t.pat, out),
+        syn::Pat::Reference(r) => pat_idents(&r.pat, out),
+        syn::Pat::Paren(p) => pat_idents(&p.pat, out),
+        syn::Pat::Tuple(t) => t.elems.iter().for_each(|e| pat_idents(e, out)),
+        syn::Pat::TupleStruct(t) => t.elems.iter().for_each(|e| pat_idents(e, out)),
+        syn::Pat::Struct(s) => s.fields.iter().for_each(|f| pat_idents(&f.pat, out)),
+        syn::Pat::Slice(s) => s.elems.iter().for_each(|e| pat_idents(e, out)),
+        syn::Pat::Or(o) => o.cases.iter().for_each(|c| pat_idents(c, out)),
+        _ => {}
     }
 }
 
@@ -53,25 +94,69 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*e.func {
             let target = path_to_string(&p.path);
-            self.record(target, line_of(&e.func));
+            // Only a bare single-segment name can be captured by a local
+            // binding; `hull::grow(…)` always names the item.
+            let shadowed =
+                p.path.segments.len() == 1 && self.local_shadows(&target);
+            self.record(target, line_of(&e.func), shadowed);
         }
         visit::visit_expr_call(self, e);
     }
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         let target = format!(".{}", e.method);
-        self.record(target, line_of(&e.method));
+        self.record(target, line_of(&e.method), false);
         visit::visit_expr_method_call(self, e);
     }
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         if let Some(last) = m.path.segments.last() {
             let target = format!("{}!", path_to_string(&m.path));
-            self.record(target, line_of(&last.ident));
+            self.record(target, line_of(&last.ident), false);
         }
         for expr in crate::macro_scan::macro_exprs(m) {
             self.visit_expr(&expr);
         }
+    }
+
+    fn visit_signature(&mut self, s: &'ast syn::Signature) {
+        // Overwrite, not extend: a body-less trait signature must not leak
+        // its params into the next body that happens to open.
+        self.pending_params = BTreeSet::new();
+        for input in &s.inputs {
+            if let syn::FnArg::Typed(t) = input {
+                pat_idents(&t.pat, &mut self.pending_params);
+            }
+        }
+        visit::visit_signature(self, s);
+    }
+
+    fn visit_block(&mut self, b: &'ast syn::Block) {
+        let frame = std::mem::take(&mut self.pending_params);
+        self.locals.push(frame);
+        visit::visit_block(self, b);
+        self.locals.pop();
+    }
+
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        // Initializer first: in `let grow = |x| grow(x)` the body's call
+        // still names the outer item, exactly as the compiler resolves it.
+        visit::visit_local(self, l);
+        let mut names = BTreeSet::new();
+        pat_idents(&l.pat, &mut names);
+        if let Some(frame) = self.locals.last_mut() {
+            frame.extend(names);
+        }
+    }
+
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        let mut frame = BTreeSet::new();
+        for p in &c.inputs {
+            pat_idents(p, &mut frame);
+        }
+        self.locals.push(frame);
+        visit::visit_expr_closure(self, c);
+        self.locals.pop();
     }
 }
 
@@ -87,6 +172,8 @@ fn collect_sites(
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()).with_spans(spans),
             sites: Vec::new(),
+            locals: Vec::new(),
+            pending_params: BTreeSet::new(),
         };
         v.visit_file(&f.ast);
         // Resolve each target's head through the file's use-map (approximate).
@@ -186,6 +273,11 @@ fn top_module(qpath: &str) -> &str {
 /// - bare-name query whose last segment has exactly one defn in the tree → `resolved`
 /// - plain last-segment match → `heuristic`
 fn site_confidence(s: &CallSite, query: &str, unique_name: bool) -> Confidence {
+    // A callee shadowed by a local binding cannot be the item the query
+    // names — no promotion applies, however unique or qualified the query.
+    if s.shadowed {
+        return Confidence::Heuristic;
+    }
     let via_resolved = s
         .target_resolved
         .as_deref()
@@ -251,6 +343,16 @@ pub fn run_callers(
     ctx.retain_changed(&mut direct, |s| &s.file);
     if direct.is_empty() {
         note_narrower_than_bare(ctx, &sites, query);
+    }
+    let local_hits = direct.iter().filter(|s| s.shadowed).count();
+    if local_hits > 0 {
+        ctx.out.note(&format!(
+            "(note: {} of these site(s) call a *local* binding named `{}` (a closure or \
+             `let`), not the item — kept at heuristic confidence; `--min-confidence \
+             resolved` drops them)",
+            local_hits,
+            crate::ast::last_segment(query)
+        ));
     }
 
     if !transitive {
@@ -420,41 +522,12 @@ fn emit_caller_rows(
     }
 }
 
-/// Last-segment glob match. `*` matches any (possibly empty) run of chars.
-/// No other metacharacters. `name` is the bare last segment of an item.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    // Fast path: no wildcard means exact match.
-    if !pattern.contains('*') {
-        return pattern == name;
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    // Anchored prefix (text before the first `*`).
-    let mut rest = name;
-    if let Some(first) = parts.first() {
-        if !rest.starts_with(first) {
-            return false;
-        }
-        rest = &rest[first.len()..];
-    }
-    // Anchored suffix (text after the last `*`).
-    if let Some(last) = parts.last() {
-        if !rest.ends_with(last) {
-            return false;
-        }
-        rest = &rest[..rest.len() - last.len()];
-    }
-    // Interior literals must appear in order.
-    for mid in &parts[1..parts.len().saturating_sub(1)] {
-        if mid.is_empty() {
-            continue;
-        }
-        match rest.find(mid) {
-            Some(i) => rest = &rest[i + mid.len()..],
-            None => return false,
-        }
-    }
-    true
-}
+/// Last-segment glob match, re-exported from [`crate::ast`].
+///
+/// Lived here first, because `--among` was the only glob in the tool. It moved
+/// the day `inventory --name` needed the same three lines: two copies of a
+/// matcher is how two commands end up disagreeing about what `*` means.
+use crate::ast::glob_match;
 
 /// The fns/methods in the tree whose last-segment name matches `pattern`.
 /// Returns (display_label, qpath, file, line), de-duplicated by qpath and

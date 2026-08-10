@@ -75,10 +75,30 @@ pub enum ItemSort {
     Source,
 }
 
+/// Does `--name <pat>` select this item?
+///
+/// A bare pattern matches the **last segment**, so `--name Options` is not
+/// defeated by every item's module prefix. A pattern containing `::` matches
+/// any whole-segment suffix of the qualified path — the same rule `show`
+/// resolves a name by, so `--name 'Document::*'` means here what
+/// `show Document::new` means there. Without the qualified form the only way to
+/// list one type's methods was `inventory --kind impl-fn | grep 'Document::'`,
+/// which this command's own playbook was recommending.
+fn name_matches(pat: &str, qpath: &str) -> bool {
+    use crate::ast::{glob_match, last_segment};
+    if !pat.contains("::") {
+        return glob_match(pat, last_segment(qpath));
+    }
+    std::iter::once(qpath)
+        .chain(qpath.match_indices("::").map(|(i, _)| &qpath[i + 2..]))
+        .any(|suffix| glob_match(pat, suffix))
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
     kind_filter: Option<ItemKind>,
     vis_filter: Option<VisFilter>,
+    name_filter: Option<&str>,
     tree: bool,
     sort: ItemSort,
     docs: bool,
@@ -91,6 +111,16 @@ pub fn run(
     }
     if let Some(v) = vis_filter {
         all.retain(|d| d.vis == v.as_str());
+    }
+    // The filter that was missing. `--kind`/`--vis` narrow by category, and a
+    // reader looking for one *name* had nothing — so the shape that showed up
+    // in practice was `unruster inventory | grep -iE "profile|span"`, which
+    // costs the row count and the `--top` cut along with the stderr it drops,
+    // and matches the file path and the doc summary as happily as the name.
+    // Matching on the last segment keeps `--name Options` from being defeated
+    // by every item's module prefix.
+    if let Some(pat) = name_filter {
+        all.retain(|d| name_matches(pat, &d.qpath));
     }
 
     if tree {
@@ -131,7 +161,28 @@ pub fn run(
             }
         }
     }
-    ctx.out.summary(&format!("({} items)", all.len()));
+    ctx.out.summary(&format!(
+        "({} items{})",
+        all.len(),
+        match name_filter {
+            Some(p) => format!("; --name {}", p),
+            None => String::new(),
+        }
+    ));
+    // A glob that matches nothing is a typo far more often than a fact about
+    // the tree, and an empty listing plus `(0 items)` says neither. `show`
+    // answers an unresolvable name with the near names; this is the same
+    // courtesy for the pattern that is one character off.
+    if all.is_empty() && name_filter.is_some() {
+        let pat = name_filter.unwrap_or_default();
+        ctx.out.note(&format!(
+            "note: no item's bare name matches `{}` — `*` is the only metacharacter, and \
+             the match is on the last `::` segment. `show {}` answers with the near names \
+             if it is a typo.",
+            pat,
+            pat.trim_matches('*')
+        ));
+    }
     Ok(all.len())
 }
 

@@ -572,6 +572,17 @@ struct InventoryArgs {
     #[arg(long, value_enum)]
     vis: Option<inventory::VisFilter>,
 
+    /// Keep only items whose bare name matches this last-segment glob
+    /// (`*` = any run of chars; the only metacharacter). `--name '*Options'`,
+    /// `--name profile`. Same pattern language as `callers --among`.
+    ///
+    /// Without it the listing had no way to narrow by name, so the shape people
+    /// wrote was `inventory | grep -iE 'profile|span'` — which throws away the
+    /// item count and the `--top` cut along with the stderr it redirects, and
+    /// matches the path and the doc column as readily as the name.
+    #[arg(long, value_name = "GLOB")]
+    name: Option<String>,
+
     /// Shorthand for `--vis pub`: the tree's external surface.
     // The same pair `outline` and `dead-code` offer. `--vis` was here and this
     // was not, so the three vis-filtering commands each took a different subset
@@ -610,9 +621,11 @@ struct ShowArgs {
     name: Vec<String>,
 
     /// How much of the item to print. `full` = docs + signature + body;
-    /// `sig` = docs + signature (a fn's, through the return type); `doc` = the
-    /// doc comment and attributes alone; `span` = no source, just the
-    /// `file:start-end` row for a reader that will seek there itself.
+    /// `sig` = docs + signature — a fn's through the return type, and for a
+    /// struct/enum/const the whole declaration, since its fields, variants or
+    /// value *are* the signature; `doc` = the doc comment and attributes alone;
+    /// `span` = no source, just the `file:start-end` row for a reader that will
+    /// seek there itself.
     #[arg(long, value_enum, default_value = "full")]
     part: show::Part,
 
@@ -1130,6 +1143,56 @@ fn analyses_code(command_name: &str) -> bool {
     !matches!(command_name, "show" | "outline")
 }
 
+/// Commands whose answer is *where a thing is used*, for which a
+/// production-only scan is confidently incomplete.
+///
+/// Kept next to `cmd_name` because the strings must match its output exactly.
+/// Deliberately not every command: `inventory` and `outline` catalogue what
+/// they were pointed at and a narrower scope narrows the catalogue, which is
+/// what the flag is for. These are the ones where the reader's next act is an
+/// edit made on the strength of a list being complete.
+const USAGE_COMMANDS: &[&str] = &[
+    "callers",
+    "callees",
+    "co-call",
+    "cohort-callees",
+    "field-uses",
+    "type-refs",
+    "takes-mut",
+    "variants",
+    "enum-coverage",
+    "parallel-matches",
+    "catch-all-arms",
+];
+
+/// Say that the default scope walked past the tests, on the commands where
+/// that changes the answer.
+///
+/// `--scope production` is the right default for the checks — a lint about test
+/// code is mostly noise — and the wrong one for "who uses this", which is the
+/// question asked immediately before a signature changes. A real session
+/// widening `trace::Options` by one field found its construction sites with
+/// `grep -rn "trace::Options {" src/ tests/`; eight of the roughly fourteen
+/// were in `tests/render.rs`. The AST answer would have been better in every
+/// way except the one that mattered, since by default it would not have looked
+/// there — and it would have said so nowhere. A wrong answer arriving from an
+/// AST tool is worse than one arriving from grep, because it is believed.
+fn report_scope_gap(out: &emit::Out, scope: Scope, command_name: &str) {
+    if scope != Scope::Production || !USAGE_COMMANDS.contains(&command_name) {
+        return;
+    }
+    let skipped = parse::scope_skipped();
+    if skipped == 0 {
+        return;
+    }
+    out.note(&format!(
+        "(scope: {} test file(s) were not scanned — this answer covers production code \
+         only. `--scope all` includes tests, which is usually what you want before \
+         changing a signature or a type's shape.)",
+        skipped
+    ));
+}
+
 /// Would a waiver change what this command prints?
 ///
 /// True for the checks that consult `// unruster: ok(…)` — plus `waivers`
@@ -1279,6 +1342,7 @@ fn dispatch(
             ctx,
             a.kind,
             a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
+            a.name.as_deref(),
             a.tree,
             a.sort,
             a.include_docs,
@@ -1586,7 +1650,7 @@ fn main() -> Result<()> {
         report_waiver_hygiene(&out, &suppressions, matches!(cmd, Cmd::Waivers(_)));
     }
     let changed = match changed_since.as_deref() {
-        Some(r) => match context::changed_set(r) {
+        Some(r) => match context::changed_set(r, &root) {
             Ok(set) => Some(set),
             Err(e) => {
                 eprintln!("error: {:#}", e);
@@ -1627,8 +1691,9 @@ fn main() -> Result<()> {
     out.set_row_budget(top);
     let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude, top);
     if let Some(note) = out.cap_note() {
-        out.note(&note);
+        out.row_note(&note);
     }
+    report_scope_gap(&out, scope, command_name);
     if analyses_code(command_name) {
         report_blind_spots(&out);
     }

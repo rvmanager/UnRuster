@@ -25,13 +25,13 @@ PRECISION (the `via` column says which tier fired; `explain precision` for the t
 
 GLOBAL FLAGS
   -r/--root <path>       scan root (default `.`); respects .gitignore
-  --scope prod|tests|all test-code inclusion (default production)
-  --changed-since <ref>  keep only rows in files changed vs a git ref
+  --scope prod|tests|all test-code inclusion (default prod; usage cmds say when it hid tests)
+  --changed-since <ref>  rows in files changed vs a git ref (read in --root's repo)
   --format tsv|json      output shape; --json is an alias for --format json
   --context N            print ±N source lines under each row
   --spans                fn labels `name@start-end`; item rows' `at` gains an end
   --summary              drop rows, keep the summary line
-  --all-stdout           summaries/notes to stdout instead of stderr
+  --all-stdout           summaries/notes to stdout too (a --top cut is always there)
   --exclude GLOB         drop matching files (repeatable)
   --cfg KEY[=VALUE]      strip items whose cfg is definitively false
   --fail-on-findings     exit 1 on any finding (0 = clean, 2 = error)
