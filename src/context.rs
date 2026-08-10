@@ -226,6 +226,24 @@ impl AnalysisCtx<'_> {
             ));
             return;
         }
+        // Before offering guesses: is it simply outside this run's `--scope`?
+        //
+        // The old order asked that only when there was nothing close, so the
+        // *better* the fuzzy match the more confidently wrong the answer got.
+        // `show rows_of` on this tree offered `Row`, `Out::row`, `Out::row_note`
+        // and `group_of` — four production near-misses — while `rows_of` sat in
+        // `tests/cli.rs`, unmentioned, because the run had not scanned it. A
+        // reader concludes their name is wrong when their scope is. Parsing the
+        // excluded files costs a handful of files on a path that was going to
+        // exit 2 regardless.
+        if let Some(d) = self.in_excluded_scope(name) {
+            self.out.answer(&format!(
+                "note: no {} `{}` in the scanned tree — but `{}` is there in the code \
+                 `--scope` excluded: {} {} at {}:{}. Re-run with `--scope all`.",
+                what, name, name, d.kind, d.qpath, d.file, d.line
+            ));
+            return;
+        }
         let near = self.idx.similar(name, 6);
         if near.is_empty() {
             self.out.answer(&format!(
@@ -241,6 +259,22 @@ impl AnalysisCtx<'_> {
             self.out
                 .answer(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));
         }
+    }
+
+    /// Does `name` resolve in the files `--scope` left out of this run?
+    ///
+    /// Parses them on the spot. That is affordable *here and nowhere else*:
+    /// every caller is already on its way to exit 2, and the set is whatever
+    /// the scope excluded rather than the whole tree. Returns the first match
+    /// in source order — one concrete location ends the search, where a list
+    /// would just be a second set of guesses.
+    fn in_excluded_scope(&self, name: &str) -> Option<crate::index::Defn> {
+        let files = crate::parse::parse_excluded();
+        if files.is_empty() {
+            return None;
+        }
+        let idx = crate::index::NameIndex::build(&files);
+        idx.lookup(name).first().map(|d| (*d).clone())
     }
 
     /// Is this file inside the run's `--changed-since` scope? Always true when

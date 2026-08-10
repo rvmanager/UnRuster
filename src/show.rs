@@ -338,6 +338,32 @@ fn show_one(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
         _ => {}
     }
     note_container_sig(ctx, d, opts);
+    note_field_route(ctx, d);
+}
+
+/// After printing a struct, name the two commands that answer the question a
+/// reader almost always asks next: is this field used, and where.
+///
+/// The observed miss, verbatim from one session:
+///
+/// ```text
+/// unruster show measure::Opened … ; echo "=== field uses ==="; \
+///   grep -rn "\.cost\b|cost:" src/ --include="*.rs" | head
+/// ```
+///
+/// The step was *labelled* "field uses" while a grep was written for it, and
+/// the grep's top hit was a doc comment rather than a field use. `fields` and
+/// `field-uses` were both there. Only for a struct, and only for a print that
+/// actually showed the fields, so it lands exactly where the next question is.
+fn note_field_route(ctx: &AnalysisCtx, d: &Defn) {
+    if d.kind != "struct" {
+        return;
+    }
+    ctx.out.note(&format!(
+        "note: `fields {}` lists these with read/write/init counts, and \
+         `field-uses {} <field>` gives the sites — both take this qualified name.",
+        d.qpath, d.qpath
+    ));
 }
 
 /// `--part sig` on an `impl`/`trait`/`mod` prints its header line and stops.

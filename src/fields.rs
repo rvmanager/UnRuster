@@ -42,6 +42,15 @@ impl<'ast, 'a> Visit<'ast> for FieldDefVisitor<'a> {
 }
 
 pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
+    // Targets resolve by last `::` segment throughout this tool — the playbook
+    // says so, `impls --of` and `callers` already do it, and `show` prints the
+    // *qualified* path in its header row. These three commands compared the raw
+    // string against a bare `ident`, so the qualified name a reader had just
+    // read off `show` silently matched nothing: `fields index::Defn` answered
+    // "(0 field(s))" plus a note contradicting itself ("not as a struct with
+    // named fields — it is: struct"). A command that says "none" for a copied
+    // name teaches the reader it does not work.
+    let ty = crate::ast::last_segment(ty);
     let files = ctx.files;
     let summary = ctx.summary;
     // 1. Collect field definitions for the target type from all files.

@@ -877,6 +877,66 @@ fn show_of_an_ordinary_item_is_not_cut() {
 }
 
 #[test]
+fn a_name_that_exists_only_in_the_excluded_scope_says_so_instead_of_guessing() {
+    // The old order asked "is it out of scope?" only when *nothing* was close,
+    // so the better the fuzzy match the more confidently wrong the answer got.
+    // `show rows_of` on this tree offered `Row`, `Out::row`, `Out::row_note`
+    // and `group_of` — four production near-misses — while `rows_of` sat in
+    // `tests/cli.rs`, unmentioned, because the run had not scanned it. A reader
+    // concludes their name is wrong when their scope is.
+    let dir = scratch("excluded-scope-name");
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    // A near-miss in production, so the suggester has something to offer.
+    std::fs::write(dir.join("src/lib.rs"), "pub fn row_of() {}\n").unwrap();
+    std::fs::write(dir.join("tests/it.rs"), "fn rows_of() {}\n#[test]\nfn t() { rows_of() }\n")
+        .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur_output_allow_2(&["--root", root, "show", "rows_of"]);
+    assert!(
+        out.contains("`--scope` excluded") && out.contains("tests/it.rs"),
+        "did not name where it actually is:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("Did you mean"),
+        "guessed instead of answering:\n{}",
+        out
+    );
+    // A real typo still gets the near names — the new branch must not eat them.
+    let typo = ur_output_allow_2(&["--root", root, "show", "roww_ofx"]);
+    assert!(typo.contains("Did you mean"), "lost the suggester:\n{}", typo);
+    // And under the wider scope it just resolves.
+    ur().args(["--root", root, "--scope", "all", "show", "rows_of"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn show_of_a_struct_names_the_commands_that_answer_the_next_question() {
+    // Observed: a session ran `show measure::Opened`, echoed "=== field uses
+    // ===", and then wrote `grep -rn "\.cost\b|cost:"` — whose top hit was a
+    // doc comment. It labelled the step with the command's own name and did
+    // not use it.
+    let out = ur()
+        .args(["--root", FIXTURE, "show", "Document", "--kind", "struct"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("fields "), "no route to the fields:\n{}", err);
+    assert!(err.contains("field-uses "), "{}", err);
+    // A fn has no fields to ask about.
+    let fun = ur()
+        .args(["--root", FIXTURE, "show", "Document::new"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&fun.stderr).contains("field-uses"),
+        "nagged about fields on a fn"
+    );
+}
+
+#[test]
 fn show_kind_disambiguates() {
     ur().args(["--root", FIXTURE, "show", "render", "--kind", "trait-fn"])
         .assert()
@@ -1541,6 +1601,39 @@ fn fields_lists_struct_fields_with_counts() {
         .success()
         .stdout(contains("transform"))
         .stdout(contains("name"));
+}
+
+#[test]
+fn the_type_commands_take_a_qualified_name_like_every_other_command() {
+    // `show` prints the *qualified* path in its header row, the playbook says
+    // targets resolve by last `::` segment, and `impls --of`/`callers` do — but
+    // these three compared the raw string against a bare `ident`, so the name a
+    // reader had just copied off `show` matched nothing. `fields index::Defn`
+    // answered "(0 field(s))" under a note contradicting itself ("not as a
+    // struct with named fields — it is: struct"). A command that says "none"
+    // for a copied name teaches the reader it does not work.
+    let rows = |args: &[&str]| -> usize {
+        let mut full = vec!["--root", FIXTURE];
+        full.extend(args);
+        rows_of(&ur_stdout_allow_findings(&full)).len()
+    };
+    assert_eq!(
+        rows(&["fields", "Document"]),
+        rows(&["fields", "main::Document"]),
+        "fields disagreed with itself over a qualified name"
+    );
+    assert_eq!(
+        rows(&["field-uses", "Document", "transform"]),
+        rows(&["field-uses", "main::Document", "transform"]),
+        "field-uses disagreed with itself over a qualified name"
+    );
+    assert_eq!(
+        rows(&["variants", "Token"]),
+        rows(&["variants", "main::Token"]),
+        "variants disagreed with itself over a qualified name"
+    );
+    // Non-zero, or the equality above is satisfied by two empty answers.
+    assert!(rows(&["fields", "main::Document"]) > 0);
 }
 
 #[test]
@@ -4418,6 +4511,27 @@ fn playbook_subcommand_prints_the_full_text() {
 }
 
 #[test]
+fn the_playbook_names_the_habits_that_cost_real_sessions() {
+    // Each of these is in the text because a measured session paid for not
+    // knowing it. They are cheap to delete in a reflow and expensive to
+    // rediscover, so they are pinned.
+    let s = String::from_utf8_lossy(&ur_stdout(&["playbook"])).into_owned();
+    for (needle, why) in [
+        // A `grep -A<N>` on a type is `+70` under another name — written three
+        // times in one session that used `show` correctly eight times.
+        ("-A45", "the grep -A<N> form `show` replaces"),
+        // Three full batteries: two to page the report, one for the exit code
+        // the pipes had thrown away.
+        ("--findings-only --top 10", "the bounded audit invocation"),
+        ("$?` is the *last* command's status", "the piped-exit-code trap"),
+        // A prose sweep stopped at a waiver, unsure what was load-bearing.
+        ("The reason is prose and nothing keys off it", "the waiver contract"),
+    ] {
+        assert!(s.contains(needle), "the playbook lost {}", why);
+    }
+}
+
+#[test]
 fn divergence_pairs_the_sibling_that_forgot_a_variant() {
     let out = ur_stdout(&["--root", DIV, "divergence"]);
     let s = String::from_utf8_lossy(&out);
@@ -4608,6 +4722,50 @@ fn waiver_comment_suppresses_exactly_its_own_site() {
         rows_of(&without).len(),
         rows_of(&with).len() + 1,
         "the single `// unruster: ok` waiver should hide exactly one row"
+    );
+}
+
+#[test]
+fn rewording_a_waivers_reason_does_not_stop_it_matching() {
+    // A session doing a prose sweep over its own comments hit an
+    // `// unruster: ok(...)` line and stopped, unsure: "there's a small risk
+    // that unruster might hash the entire line". It had to run an audit to
+    // find out. Nothing in the help, the grammar or the playbook said which
+    // parts of the comment are load-bearing — and the reason, the one part a
+    // human is meant to keep current, is the part nothing keys off.
+    let dir = scratch("waiver-reword");
+    let src = |reason: &str| {
+        format!(
+            "pub fn cleanup(p: &std::path::Path) {{\n    \
+             let _ = std::fs::remove_file(p); // unruster: ok(error-swallows/let-_) \
+             2026-01-01 — {}\n}}\n",
+            reason
+        )
+    };
+    let root = dir.to_str().unwrap();
+    let hidden = |reason: &str| -> usize {
+        std::fs::write(dir.join("src/lib.rs"), src(reason)).unwrap();
+        let with = rows_of(&ur_stdout_allow_findings(&["--root", root, "error-swallows"])).len();
+        let without = rows_of(&ur_stdout_allow_findings(&[
+            "--root",
+            root,
+            "--no-suppress",
+            "error-swallows",
+        ]))
+        .len();
+        without - with
+    };
+    assert_eq!(hidden("absence is fine"), 1, "the waiver never worked");
+    assert_eq!(
+        hidden("the file may already be gone, and that is the success case"),
+        1,
+        "rewording the reason stopped the waiver matching"
+    );
+    // Including across a wrap onto a second comment line.
+    assert_eq!(
+        hidden("the file may already be gone\n    // and that is the success case"),
+        1,
+        "a wrapped reason stopped the waiver matching"
     );
 }
 

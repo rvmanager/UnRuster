@@ -361,6 +361,8 @@ pub fn run(
     field: &str,
     opts: FieldUsesOpts,
 ) -> anyhow::Result<usize> {
+    // See the note in `fields::run`: targets resolve by last `::` segment.
+    let ty = crate::ast::last_segment(ty);
     let files = ctx.files;
     let fn_sigs = &ctx.sem.fn_sigs;
     let known = ctx.idx.knows_name(ty);

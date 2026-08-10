@@ -1,7 +1,7 @@
 Query a Rust codebase via syntactic (syn) analysis. Finds candidates; you judge them.
 
 AGENT QUICKSTART
-  unruster audit --findings-only     ranked battery, clean sections omitted; exit 1 on gating
+  unruster audit --findings-only --top 10  ranked battery, bounded; exit 1 on gating (never pipe it)
   unruster audit --changed-since HEAD~1    same, scoped to your last commit — highest yield
   unruster divergence                sibling paths that disagree — highest yield, start here
   unruster clones                    the same body written out more than once

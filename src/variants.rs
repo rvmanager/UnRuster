@@ -198,7 +198,8 @@ impl<'ast, 'a> Visit<'ast> for SiteVisitor<'a> {
 /// different contracts and only one of them made you read its help to run it.
 pub fn run(ctx: &AnalysisCtx, enum_name: Option<&str>, bare: bool) -> anyhow::Result<usize> {
     match enum_name {
-        Some(n) => run_one(ctx, n, bare, false),
+        // See the note in `fields::run`: targets resolve by last `::` segment.
+        Some(n) => run_one(ctx, crate::ast::last_segment(n), bare, false),
         None => run_all(ctx, bare),
     }
 }

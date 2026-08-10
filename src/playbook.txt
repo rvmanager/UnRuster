@@ -74,8 +74,16 @@ sections and exits 1 while gating findings remain —
   until unruster audit; do <fix the top finding>; done
 Do not pipe it: after a pipeline `$?` is the *last* command's status, so
 `unruster audit | tail -40; echo $?` reports tail's 0 no matter what the
-audit found. `--findings-only` drops the sections that found nothing (the
-closing line says how many), which is usually why the pipe was reached for.
+audit found. One session paid for three full batteries on an 856-fn tree —
+`| head -50`, then `| sed -n '50,140p'`, then a third run for the exit code
+the first two had thrown away. Bound it instead:
+
+  unruster audit --changed-since HEAD --findings-only --top 10
+
+`--findings-only` drops the sections that found nothing (the closing line
+says how many), `--top` caps each section's rows and every cut announces
+itself on stdout. On that same tree it is 70 lines against 156, complete,
+with the exit status stated in the closing line.
 `unruster explain <topic>` prints one repair recipe instead of this whole
 text.
 
@@ -114,6 +122,12 @@ In-source markers (no config file — the marker lives with the code):
                               alone). Always give the reason: it is what the
                               next reader has to evaluate. Reasons may wrap
                               onto following comment lines.
+                              **The reason is prose and nothing keys off it.**
+                              A waiver is matched by its file, the line range
+                              it covers, its check and its key — never by the
+                              text after the dash. Reword it freely; only
+                              changing the `ok(check/key)` head or moving the
+                              comment away from its site can stop it matching.
                               `--no-suppress` ignores all waivers; every
                               summary reports how many were used, and
                               `unruster waivers` lists them with their age and
@@ -146,6 +160,19 @@ It is wrong in three ways and silent about all three.
 The same three failures apply to `grep -n "^pub fn\|^pub struct"` used as
 a file outline: it misses private items and multi-line signatures, and it
 matches `pub` on struct *fields*, so declarations arrive mixed in.
+
+And to the shorter spelling of the same thing, which is the one that keeps
+getting written:
+
+  grep -n "struct Model" -A45 src/edit.rs | head -55
+
+`-A45` is `+70` under another name, `head -55` is a second guess stacked
+on the first, and `show edit::Model` is the whole command. Reach for it
+for *types* as readily as for fns — a struct's fields are its definition,
+and `show` prints them from the doc comment through the closing brace.
+Three of these were written in one session that used `show` correctly
+eight times: the tool gets chosen when you are reading and missed when
+you are already grepping.
 
 WHAT TO RUN INSTEAD
 

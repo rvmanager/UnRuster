@@ -36,17 +36,53 @@ fn build_walker(root: &Path, excludes: &[String]) -> anyhow::Result<ignore::Walk
     Ok(walker.build())
 }
 
-/// Files the last non-`All` scan walked past because of `--scope`.
+/// The files the last non-`All` scan walked past because of `--scope`, and the
+/// root they were found under.
 ///
 /// Recorded rather than returned so `parse_dir`'s signature stays what it is:
 /// three call sites, only one of which is the run's real scan. Written only
 /// when `scope != Scope::All`, so the `Scope::All` pass a few commands make for
 /// their call graph cannot zero it.
-static SCOPE_SKIPPED: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+///
+/// The paths, not just a count, because a failed lookup needs to answer "is the
+/// name in there?" — and that is a question worth parsing a handful of files to
+/// answer, on a path the run was going to exit 2 from anyway.
+static SCOPE_SKIPPED: std::sync::Mutex<Option<(PathBuf, Vec<PathBuf>)>> =
+    std::sync::Mutex::new(None);
 
 /// How many files the run's scope excluded. See [`SCOPE_SKIPPED`].
 pub fn scope_skipped() -> usize {
-    *SCOPE_SKIPPED.lock().unwrap_or_else(|e| e.into_inner())
+    SCOPE_SKIPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |(_, v)| v.len())
+}
+
+/// Parse the files `--scope` excluded, so a caller can ask what is in them.
+///
+/// Deliberately not part of the run's own `files`: the whole point of the flag
+/// is that they were not analysed. This exists for the one moment where their
+/// contents change an *answer* rather than a finding — a name that did not
+/// resolve, where "no such item" and "it is in the tests you did not scan" are
+/// different sentences and only one of them is true.
+pub fn parse_excluded() -> Vec<ParsedFile> {
+    let guard = SCOPE_SKIPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((root, paths)) = guard.as_ref() else {
+        return Vec::new();
+    };
+    paths
+        .iter()
+        .filter_map(|path| {
+            let source = std::fs::read_to_string(path).ok()?;
+            let ast = syn::parse_file(&source).ok()?;
+            Some(ParsedFile {
+                path: path.clone(),
+                ast,
+                module: module_path_for(root, path),
+            })
+        })
+        .collect()
 }
 
 /// Should `path` be skipped entirely under this scope? Exhaustive (no `_`)
@@ -71,7 +107,7 @@ pub fn parse_dir(
     let mut walk_errs = 0usize;
     let mut read_errs = 0usize;
     let mut parse_errs = 0usize;
-    let mut scope_skips = 0usize;
+    let mut scope_skips: Vec<PathBuf> = Vec::new();
     for entry in build_walker(root, excludes)? {
         let entry = match entry {
             Ok(e) => e,
@@ -89,7 +125,7 @@ pub fn parse_dir(
             continue;
         }
         if out_of_scope(path, scope) {
-            scope_skips += 1;
+            scope_skips.push(path.to_path_buf());
             continue;
         }
 
@@ -120,7 +156,8 @@ pub fn parse_dir(
         }
     }
     if scope != Scope::All {
-        *SCOPE_SKIPPED.lock().unwrap_or_else(|e| e.into_inner()) = scope_skips;
+        *SCOPE_SKIPPED.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((root.to_path_buf(), scope_skips));
     }
     let skipped = walk_errs + read_errs + parse_errs;
     if skipped > 0 {
