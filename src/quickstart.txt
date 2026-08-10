@@ -1,7 +1,7 @@
 Query a Rust codebase via syntactic (syn) analysis. Finds candidates; you judge them.
 
 AGENT QUICKSTART
-  unruster audit                     ranked battery, exit 1 while gating findings remain
+  unruster audit --findings-only     ranked battery, clean sections omitted; exit 1 on gating
   unruster audit --changed-since HEAD~1    same, scoped to your last commit — highest yield
   unruster divergence                sibling paths that disagree — highest yield, start here
   unruster clones                    the same body written out more than once
@@ -9,7 +9,7 @@ AGENT QUICKSTART
   unruster divergence --handling     one callee, different care (.expect vs .ok())
   unruster explain <topic>           one repair recipe (cheap); `playbook` for all
   unruster outline <file>            the file's items, each with file:start-end
-  unruster show <name>               one item's exact source (`explain reading-code`)
+  unruster show <name>               one item's exact source; bounds itself, never pipe to head
   --json                             every command; named keys (TSV has no header row)
 
 HIGHEST-SIGNAL FIRST

@@ -85,13 +85,13 @@ pub enum ItemSort {
 /// list one type's methods was `inventory --kind impl-fn | grep 'Document::'`,
 /// which this command's own playbook was recommending.
 fn name_matches(pat: &str, qpath: &str) -> bool {
-    use crate::ast::{glob_match, last_segment};
+    use crate::ast::{glob_match_smart, last_segment};
     if !pat.contains("::") {
-        return glob_match(pat, last_segment(qpath));
+        return glob_match_smart(pat, last_segment(qpath));
     }
     std::iter::once(qpath)
         .chain(qpath.match_indices("::").map(|(i, _)| &qpath[i + 2..]))
-        .any(|suffix| glob_match(pat, suffix))
+        .any(|suffix| glob_match_smart(pat, suffix))
 }
 
 pub fn run(
@@ -173,12 +173,24 @@ pub fn run(
     // the tree, and an empty listing plus `(0 items)` says neither. `show`
     // answers an unresolvable name with the near names; this is the same
     // courtesy for the pattern that is one character off.
-    if all.is_empty() && name_filter.is_some() {
-        let pat = name_filter.unwrap_or_default();
+    // The listing people reach for `| grep` on. Named here rather than only in
+    // `--help`, because the observed shape was `inventory | grep -i mask`
+    // written by a reader who never opened the help — and a grep matches the
+    // file path and the doc column as readily as the name, takes this count
+    // down with the stderr it redirects, and hides the `--top` cut.
+    if name_filter.is_none() && !tree && all.len() > 40 {
+        ctx.out.note(
+            "note: `--name <glob>` narrows by name — `*` the only metacharacter, smartcase, \
+             and `Type::*` for one type's members. Prefer it to `| grep`, which also matches \
+             the path and the doc column and discards the count above.",
+        );
+    }
+    if let Some(pat) = name_filter.filter(|_| all.is_empty()) {
         ctx.out.note(&format!(
-            "note: no item's bare name matches `{}` — `*` is the only metacharacter, and \
-             the match is on the last `::` segment. `show {}` answers with the near names \
-             if it is a typo.",
+            "note: nothing matches `{}` — `*` is the only metacharacter, the match is on the \
+             last `::` segment (a pattern with `::` matches any qualified suffix), and an \
+             all-lowercase pattern already matches case-insensitively. `show {}` answers \
+             with the near names if it is a typo.",
             pat,
             pat.trim_matches('*')
         ));

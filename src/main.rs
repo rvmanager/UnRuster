@@ -522,6 +522,18 @@ struct AuditArgs {
     /// loop converges on a healthy codebase.
     #[arg(long)]
     strict: bool,
+
+    /// Omit sections that found nothing. Every check still runs and still
+    /// counts — the closing line reports how many sections were hidden — this
+    /// only stops a mostly-clean battery from spending two thirds of its
+    /// output saying so.
+    ///
+    /// On a healthy tree that is eight of thirteen sections, three lines each,
+    /// which is what pushed one session's real findings past its own
+    /// `| head -60` and made it run the whole battery a second time with
+    /// `| tail -40` to read the rest.
+    #[arg(long)]
+    findings_only: bool,
 }
 
 #[derive(Args)]
@@ -572,14 +584,19 @@ struct InventoryArgs {
     #[arg(long, value_enum)]
     vis: Option<inventory::VisFilter>,
 
-    /// Keep only items whose bare name matches this last-segment glob
-    /// (`*` = any run of chars; the only metacharacter). `--name '*Options'`,
-    /// `--name profile`. Same pattern language as `callers --among`.
+    /// Keep only items whose name matches this glob (`*` = any run of chars,
+    /// the only metacharacter). A bare pattern matches the last `::` segment;
+    /// one containing `::` matches any qualified suffix, so
+    /// `--name 'Document::*'` lists one type's members.
+    ///
+    /// Smartcase: an all-lowercase pattern matches case-insensitively, so
+    /// `--name mask` finds `Mask`, `load_mask_for` and `MaskArgs` alike; any
+    /// uppercase makes it exact.
     ///
     /// Without it the listing had no way to narrow by name, so the shape people
-    /// wrote was `inventory | grep -iE 'profile|span'` — which throws away the
-    /// item count and the `--top` cut along with the stderr it redirects, and
-    /// matches the path and the doc column as readily as the name.
+    /// wrote was `inventory | grep -i mask` — which throws away the item count
+    /// and the `--top` cut along with the stderr it redirects, and matches the
+    /// file path and the doc column as readily as the name.
     #[arg(long, value_name = "GLOB")]
     name: Option<String>,
 
@@ -649,9 +666,16 @@ struct ShowArgs {
     #[arg(long, short = 'n')]
     number: bool,
 
-    /// Stop after N source lines and say how many were left. The bounded look
-    /// between `--part sig` and the whole body — and unlike `| head -N`, the
-    /// cut announces itself instead of ending mid-body in silence.
+    /// Stop after N source lines per item and say how many were left.
+    /// `--max-lines 0` prints all of it.
+    ///
+    /// Defaults to 240, so this command bounds its own output and there is no
+    /// reason to wrap it in `| head -N`. That matters because the two cuts are
+    /// not equivalent: this one names the lines it dropped and the flag that
+    /// lifts it, while a pipe ends mid-expression in silence. In one measured
+    /// session seventeen of twenty invocations were piped and five were cut
+    /// mid-item — twice sending the reader back to a raw `sed -n 'A,Bp'` for
+    /// the rest of a body this command had already located exactly.
     #[arg(long, value_name = "N")]
     max_lines: Option<usize>,
 }
@@ -1289,7 +1313,7 @@ fn dispatch(
             if comparing || a.write_baseline.is_some() {
                 ctx.out.start_recording();
             }
-            let gating = audit::run(ctx, call_source, top, a.strict)?;
+            let gating = audit::run(ctx, call_source, top, a.strict, a.findings_only)?;
             let current = ctx.out.take_recording();
 
             if let Some(p) = a.write_baseline.as_deref() {

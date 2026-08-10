@@ -406,6 +406,27 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     true
 }
 
+/// [`glob_match`] with smartcase: an all-lowercase pattern matches
+/// case-insensitively, a pattern carrying any uppercase matches exactly.
+///
+/// The ripgrep/vim convention, adopted because the case it serves is the one
+/// that actually showed up. A session hunting the mask machinery wrote
+/// `inventory | grep -i mask`, and neither `--name '*mask*'` (misses `Mask`,
+/// `MaskArgs`, `load_mask_for`'s type) nor `--name '*Mask*'` (misses the
+/// snake_case fns) covers it — `*` is the only metacharacter, so there is no
+/// character class to fall back on. `--name mask` now does what the `-i` did.
+///
+/// Deliberately *not* used by `callers --among`: a cohort is a naming
+/// convention, `wrap_in_*` is already lowercase, and quietly widening it to
+/// match `Wrap_In_*` would change which functions a divergence report compares
+/// without anyone asking.
+pub fn glob_match_smart(pattern: &str, name: &str) -> bool {
+    if pattern.chars().any(|c| c.is_ascii_uppercase()) {
+        return glob_match(pattern, name);
+    }
+    glob_match(pattern, &name.to_ascii_lowercase())
+}
+
 pub fn path_last(p: &syn::Path) -> String {
     p.segments
         .last()

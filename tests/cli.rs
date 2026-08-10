@@ -187,7 +187,33 @@ fn inventory_name_takes_a_glob_and_says_when_it_matches_nothing() {
     assert!(rows_of(&out.stdout).is_empty());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--name Documnet"), "the filter is unnamed:\n{}", err);
-    assert!(err.contains("no item's bare name matches"), "{}", err);
+    assert!(err.contains("nothing matches `Documnet`"), "{}", err);
+}
+
+#[test]
+fn inventory_name_is_smartcase() {
+    // The case the flag was reached for: `inventory | grep -i mask`. Neither
+    // `*mask*` (misses `Mask`) nor `*Mask*` (misses `load_mask_for`) covers it,
+    // and `*` is the only metacharacter, so there is no character class to fall
+    // back on. All-lowercase means case-insensitive; any uppercase means exact.
+    let names = |pat: &str| -> Vec<String> {
+        rows_of(&ur_stdout(&["--root", FIXTURE, "inventory", "--name", pat]))
+            .iter()
+            .map(|r| r.split('\t').nth(3).unwrap().to_string())
+            .collect()
+    };
+    let loose = names("document");
+    assert!(
+        loose.iter().any(|n| n.ends_with("Document")),
+        "an all-lowercase pattern should have reached `Document`:\n{:?}",
+        loose
+    );
+    // An uppercase anywhere pins it back to exact.
+    assert!(
+        names("Document").iter().all(|n| n.ends_with("Document")),
+        "a cased pattern must stay exact"
+    );
+    assert!(names("DOCUMENT").is_empty(), "`DOCUMENT` must not match");
 }
 
 #[test]
@@ -805,6 +831,49 @@ fn sig_of_a_fn_still_stops_at_the_return_type() {
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("pub fn new(name: String) -> Self"), "{}", s);
     assert!(!s.contains("transform: [0.0; 4]"), "body leaked in:\n{}", s);
+}
+
+#[test]
+fn show_bounds_its_own_output_and_names_the_flag_that_lifts_it() {
+    // The command's own pitch is that it knows where an item ends — but
+    // unbounded output is what makes a caller write `| head -N` to protect
+    // itself, and *that* cut lands mid-expression in silence. Across one
+    // measured session 17 of 20 invocations were piped and 5 were cut, twice
+    // sending the reader back to `sed -n 'A,Bp'` for the rest of a body this
+    // command had already located exactly. A bound the tool owns can say so.
+    let dir = scratch("show-budget");
+    let body: String = (0..400).map(|i| format!("    let _x{} = {};\n", i, i)).collect();
+    std::fs::write(dir.join("src/lib.rs"), format!("pub fn big() {{\n{}}}\n", body)).unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur_stdout(&["--root", root, "show", "big"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("more line(s) to"), "no cut announced:\n{}", s);
+    assert!(s.contains("--max-lines 0"), "the lift is unnamed:\n{}", s);
+    // And it is on stdout, so it survives the redirect that surrounds it.
+    assert!(
+        !String::from_utf8_lossy(&ur().args(["--root", root, "show", "big"]).output().unwrap().stderr)
+            .contains("more line(s)"),
+        "the cut belongs with the rows"
+    );
+
+    // `--max-lines 0` is the explicit "all of it".
+    let full = ur_stdout(&["--root", root, "show", "big", "--max-lines", "0"]);
+    let f = String::from_utf8_lossy(&full);
+    assert!(f.contains("let _x399"), "the lift did not lift:\n{}", &f[f.len() - 200..]);
+    assert!(!f.contains("more line(s) to"), "cut anyway");
+}
+
+#[test]
+fn show_of_an_ordinary_item_is_not_cut() {
+    // The bound is a backstop for god-functions, not a default that truncates
+    // normal reading. Every item in this tree's own `show` module is well
+    // inside it.
+    let out = ur_stdout(&["--root", FIXTURE, "show", "Document::new"]);
+    assert!(
+        !String::from_utf8_lossy(&out).contains("more line(s) to"),
+        "a short item was cut"
+    );
 }
 
 #[test]
@@ -4220,6 +4289,98 @@ fn audit_puts_each_sections_summary_in_the_section() {
         s.contains("partial site(s)"),
         "expected per-check summary lines on stdout:\n{}",
         s
+    );
+}
+
+#[test]
+fn audit_findings_only_drops_clean_sections_and_says_how_many() {
+    // Two thirds of a healthy battery is sections reporting that they found
+    // nothing, which is what pushed one session's real findings past its own
+    // `| head -60` and made it run the whole battery again with `| tail -40`.
+    // Hiding them must never hide a finding, so the count and the closing
+    // tallies have to be identical either way.
+    let full = ur_stdout_allow_findings(&["--root", FIXTURE, "audit"]);
+    let lean = ur_stdout_allow_findings(&["--root", FIXTURE, "audit", "--findings-only"]);
+    let headers = |o: &[u8]| -> Vec<String> {
+        rows_of(o).into_iter().filter(|l| l.starts_with("## ")).collect()
+    };
+    assert!(
+        headers(&lean).len() < headers(&full).len(),
+        "nothing was dropped: {} vs {}",
+        headers(&lean).len(),
+        headers(&full).len()
+    );
+    // Every surviving header is one that also appears in the full run — the
+    // flag omits, it does not rewrite.
+    for h in headers(&lean) {
+        assert!(headers(&full).contains(&h), "invented a section: {}", h);
+    }
+    let err = |args: &[&str]| -> String {
+        let mut full = vec!["--root", FIXTURE];
+        full.extend(args);
+        String::from_utf8_lossy(&ur().args(&full).output().unwrap().stderr).into_owned()
+    };
+    let line = err(&["audit", "--findings-only"]);
+    let summary = line.lines().find(|l| l.starts_with("(audit:")).unwrap();
+    assert!(summary.contains("hid"), "the omission is silent:\n{}", summary);
+    // The finding counts and check count are the run's, not the listing's.
+    let counts = |s: &str| s.split(';').next().unwrap().to_string();
+    let plain = err(&["audit"]);
+    assert_eq!(
+        counts(plain.lines().find(|l| l.starts_with("(audit:")).unwrap()),
+        counts(summary),
+        "--findings-only changed what was counted"
+    );
+}
+
+#[test]
+fn a_failing_audit_says_the_exit_code_is_the_process_s() {
+    // The documented loop is `until unruster audit; do …; done`, and the habit
+    // around it is a pipe: one session ran `audit … | tail -40; echo "EXIT=$?"`
+    // and read back `EXIT=0`, which was tail's. It happened to be clean.
+    let out = ur().args(["--root", FIXTURE, "audit"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "fixture should have gating findings");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("after a pipe `$?` is the pipe's"),
+        "the trap is unsaid:\n{}",
+        err
+    );
+}
+
+#[test]
+fn a_note_stays_under_the_rows_it_qualifies_when_the_streams_are_merged() {
+    // Under the `2>&1` a reader actually writes, the sibling note printed a
+    // line *above* the header row it was about — `show cmd::isolate 2>&1 |
+    // head -160` opened with "note: 1 other item(s) … also named `isolate`",
+    // reading as though the tool had answered before it was asked. Not a
+    // buffering race (Rust line-buffers stdout through a pipe too): it was
+    // emitted during name resolution, before anything had been printed.
+    //
+    // Goes through a shell and a pipe because the merge is the whole
+    // condition — the harness captures the two streams separately and would
+    // show any ordering as passing.
+    let bin = assert_cmd::cargo::cargo_bin("unruster");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{} --root {} show Document::render 2>&1 | cat",
+            bin.display(),
+            FIXTURE
+        ))
+        .output()
+        .unwrap();
+    let merged = String::from_utf8_lossy(&out.stdout);
+    let at = |pat: &str| -> usize {
+        merged
+            .lines()
+            .position(|l| l.contains(pat))
+            .unwrap_or_else(|| panic!("no {:?} in:\n{}", pat, merged))
+    };
+    assert!(
+        at("also named") > at("Document::render"),
+        "the note overtook the row it qualifies:\n{}",
+        merged
     );
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "unruster"
-version = "0.1.61"
+version = "0.1.62"
 edition = "2021"
 description = "CLI for querying Rust codebases: inventory, call graph, field uses."
 license = "MIT OR Apache-2.0"

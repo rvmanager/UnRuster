@@ -72,6 +72,10 @@ Top-level flags:
 Agent loop: `unruster audit` runs the whole battery as severity-ranked
 sections and exits 1 while gating findings remain —
   until unruster audit; do <fix the top finding>; done
+Do not pipe it: after a pipeline `$?` is the *last* command's status, so
+`unruster audit | tail -40; echo $?` reports tail's 0 no matter what the
+audit found. `--findings-only` drops the sections that found nothing (the
+closing line says how many), which is usually why the pipe was reached for.
 `unruster explain <topic>` prints one repair recipe instead of this whole
 text.
 
@@ -181,9 +185,14 @@ WHAT TO RUN INSTEAD
                                 span` for just the `file:start-end` row when
                                 your own reader will do the seeking, `-n` to
                                 number the lines you are about to edit against,
-                                `--max-lines N` for a bounded look at a long
-                                body (the cut says how many it dropped — a
-                                `| head -N` ends mid-body in silence).
+                                `--max-lines N` for a tighter look, `0` for
+                                all of it. Output is bounded at 240 lines per
+                                item by default and the cut names what it
+                                dropped, so **do not pipe this through
+                                `head`**: that cut is silent, lands
+                                mid-expression, and is what sent one session
+                                back to `sed -n 'A,Bp'` for the rest of a body
+                                this command had already located exactly.
 
   NAME SEVERAL AT ONCE
   `show a b c` resolves all three in one invocation. The tree is parsed once

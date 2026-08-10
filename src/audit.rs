@@ -258,10 +258,12 @@ pub fn run(
     dead_call_source: &[ParsedFile],
     top: Option<usize>,
     strict: bool,
+    findings_only: bool,
 ) -> anyhow::Result<usize> {
     let mut gating = 0usize;
     let mut advisory = 0usize;
     let mut checks = 0usize;
+    let mut skipped_clean = 0usize;
     // Each check's own summary line belongs with its rows, on one stream.
     // Splitting them cost a full round-trip of "re-run with 2> redirected"
     // every time someone read this output for the first time.
@@ -289,7 +291,16 @@ pub fn run(
         // The check name is part of every fingerprint: two checks reporting the
         // same line must not collapse into one identity.
         let prev = ctx.out.set_check(check);
+        // A check announces its own `(0 …)` line before anyone can know the
+        // section is empty, so `--findings-only` catches the line rather than
+        // predicting it. The header is deferred by `section` for the same
+        // reason. Nothing about the check's execution changes: the count, the
+        // waiver hits and the `--since` baseline are all recorded either way,
+        // so what this hides is a rendering and never a finding.
+        let held = ctx.out.hold_summary(findings_only);
         let n = count()?;
+        ctx.out.hold_summary(held);
+        let own_summary = ctx.out.take_held_summary();
         ctx.out.set_check(&prev);
         // `--strict` promotes every advisory row, so it wants the total, not
         // the tier: the flag means "nothing at all", not "nothing important".
@@ -305,6 +316,18 @@ pub fn run(
         gating += g;
         advisory += n.total - g;
         checks += 1;
+        // Clean and nobody asked to see it: drop the header too and move on.
+        // `drop_pending_section` reports false when the check printed something
+        // that already flushed it — a tree rendering, a matrix — and in that
+        // case the section is half on screen and has to be finished properly.
+        if findings_only && n.total == 0 && ctx.out.drop_pending_section() {
+            ctx.out.set_row_budget(None);
+            skipped_clean += 1;
+            return Ok(());
+        }
+        if let Some(s) = own_summary {
+            ctx.out.summary(&s);
+        }
         if let Some(note) = ctx.out.cap_note() {
             ctx.out.row_note(&note);
         }
@@ -485,14 +508,33 @@ pub fn run(
     let waivers = ledger.len();
     let hidden: usize = ledger.iter().map(|w| w.hits()).sum();
     ctx.out.summary(&format!(
-        "(audit: {} gating + {} advisory finding(s) across {} check(s); {}{}{})",
+        "(audit: {} gating + {} advisory finding(s) across {} check(s){}; {}{}{})",
         gating,
         advisory,
         checks,
+        // `--findings-only` hides sections, never findings — but a report with
+        // eight of thirteen headers missing has to say which eight are missing
+        // and why, or the next reader counts the headers and believes the
+        // battery shrank.
+        if skipped_clean > 0 {
+            format!(
+                "; --findings-only hid {} clean section(s), all counted above",
+                skipped_clean
+            )
+        } else {
+            String::new()
+        },
         // Printing "exit 1 while gating findings remain" next to "0 gating" read
         // as a contradiction on the one line that is supposed to say you are done.
+        //
+        // Naming the *process's* status matters because this line is what the
+        // documented `until unruster audit; do …; done` loop turns on, and the
+        // habit that surrounds it is a pipe: one session ran
+        // `unruster audit … | tail -40; echo "EXIT=$?"` and read back `EXIT=0`,
+        // which was `tail`'s. It happened to be clean that time.
         if gating > 0 {
-            "exit 1 while gating findings remain"
+            "exit 1 while gating findings remain (the process's status — after a \
+             pipe `$?` is the pipe's)"
         } else {
             "clean: no gating findings, exit 0"
         },

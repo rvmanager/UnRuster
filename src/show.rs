@@ -50,7 +50,8 @@ pub struct ShowOpts<'a> {
     pub no_doc: bool,
     /// Prefix each source line with its number.
     pub number: bool,
-    /// Stop after this many source lines, saying so.
+    /// Stop after this many source lines per item, saying so. `Some(0)` lifts
+    /// the bound entirely; `None` takes [`DEFAULT_MAX_LINES`].
     ///
     /// There was nothing between `--part sig` (the signature) and the whole
     /// body, so a reader wanting a bounded look at a 109-line fn reached for
@@ -59,6 +60,23 @@ pub struct ShowOpts<'a> {
     /// dropped, which a pipe cannot.
     pub max_lines: Option<usize>,
 }
+
+/// Lines of source printed per item before the cut announces itself.
+///
+/// This command's pitch is that it knows where an item ends, so a default
+/// bound looks like a contradiction. It is the opposite. Unbounded output is
+/// exactly what makes a caller wrap the command in `| head -N` to protect
+/// itself, and *that* cut is silent and lands mid-expression: across one real
+/// session, seventeen of twenty invocations were piped and five were cut —
+/// `show cmd::isolate` (a 177-line item, whose header row said so) truncated at
+/// `head -160` in the middle of an error message, and twice the next command
+/// was a raw `sed -n 'A,Bp'` into the same file to fetch the rest.
+///
+/// A bound the tool owns can say it happened, name the line it stopped at, and
+/// name the flag that lifts it. 240 is past the long tail: the overwhelming
+/// majority of items print whole, so in practice the cut fires on the
+/// god-functions where a reader wants the warning anyway.
+pub const DEFAULT_MAX_LINES: usize = 240;
 
 /// What `--part sig` can honestly print for one kind of item.
 ///
@@ -168,8 +186,16 @@ fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, opts: &
     }
     // `--max-lines` cuts here rather than in a pipe, so the cut can say where
     // it happened and what is left. A silent truncation of a body is the same
-    // class of wrong answer as a guessed line range.
-    let cut = opts.max_lines.map_or(hi, |n| (lo + n).min(hi));
+    // class of wrong answer as a guessed line range — and a caller who fears an
+    // unbounded dump writes that silent truncation themselves, which is why the
+    // bound has a default rather than waiting to be asked for.
+    let budget = match opts.max_lines {
+        // `--max-lines 0` is the explicit "all of it".
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(DEFAULT_MAX_LINES),
+    };
+    let cut = budget.map_or(hi, |n| (lo + n).min(hi));
     let dropped = hi - cut;
     if ctx.out.format == Format::Json {
         let body: Vec<String> = lines[lo..cut].iter().map(|l| (*l).to_string()).collect();
@@ -187,10 +213,14 @@ fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, opts: &
             ctx.out.line(l);
         }
     }
+    // Via `ctx.out.line`, so it lands on stdout with the rows: this is the one
+    // line that must survive whatever the caller wrapped the command in.
     if dropped > 0 {
         ctx.out.line(&format!(
-            "… {} more line(s) to {} — re-run without --max-lines for the rest",
-            dropped, hi
+            "… {} more line(s) to {} — `--max-lines {}` for more, `--max-lines 0` for all of it",
+            dropped,
+            hi,
+            (cut - lo).saturating_mul(2).max(DEFAULT_MAX_LINES * 2)
         ));
     }
 }
@@ -258,7 +288,6 @@ fn resolve<'a>(
     }
     hits.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
     hits.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.kind == b.kind);
-    note_siblings(ctx, query, &hits);
     Ok(hits)
 }
 
@@ -269,6 +298,12 @@ fn resolve<'a>(
 /// one copy and says nothing about the other seven. That reads as a complete
 /// answer, and the way out was to abandon the tool and `grep -rn "fn name"`.
 /// One line naming the count turns the narrow answer into a signposted one.
+///
+/// Called after the rows rather than during resolution. It was in `resolve`,
+/// which is where the fact is discovered — and under the `2>&1` a reader
+/// actually writes that put it a line *above* the header it qualifies, reading
+/// as though the tool had answered before it was asked. A note about a result
+/// goes under the result.
 fn note_siblings(ctx: &AnalysisCtx, query: &str, hits: &[&Defn]) {
     let bare = last_segment(query);
     // Only for a query that narrowed: a bare-name query already listed them.
@@ -349,6 +384,7 @@ fn emit_hits(ctx: &AnalysisCtx, query: &str, hits: &[&Defn], opts: &ShowOpts) ->
             // rather than a promise about the output.
             header(ctx, d, extent_of(d));
         }
+        note_siblings(ctx, query, hits);
         return hits.len();
     }
     for (i, d) in hits.iter().enumerate() {
@@ -358,6 +394,7 @@ fn emit_hits(ctx: &AnalysisCtx, query: &str, hits: &[&Defn], opts: &ShowOpts) ->
         }
         show_one(ctx, d, opts);
     }
+    note_siblings(ctx, query, hits);
     hits.len()
 }
 

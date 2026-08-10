@@ -13,6 +13,20 @@
 
 use std::cell::{Cell, RefCell};
 
+/// Write one line to stderr.
+///
+/// Deliberately *not* flushing stdout first. It looks like it should have to:
+/// under the `2>&1 | head -N` agents write, a note that arrives before the row
+/// it qualifies reads like a buffering race, and one was observed
+/// (`show cmd::isolate 2>&1 | head -160` printed its "also named `isolate`"
+/// note above the header row). It is not one — Rust backs `Stdout` with a
+/// `LineWriter` whether or not it is a terminal, unlike C's stdio, so the two
+/// streams already interleave in program order through a pipe. A note landing
+/// early means it was *emitted* early, and the fix belongs at the emit site.
+fn to_stderr(text: &str) {
+    eprintln!("{}", text);
+}
+
 /// How rows are rendered. `Tsv` writes as it goes; `Json` buffers the whole
 /// run and emits one document at the end (a valid document can't be streamed
 /// section-by-section).
@@ -241,6 +255,13 @@ pub struct Out {
     recorded: RefCell<Option<Vec<Finding>>>,
     /// `file -> lines`, so fingerprinting N rows in a file reads it once.
     line_cache: RefCell<std::collections::HashMap<String, Vec<String>>>,
+    /// A `## title` opened but not yet printed. See [`Out::section`].
+    pending_section: RefCell<Option<String>>,
+    /// While set, `summary` stores rather than prints — `audit --findings-only`
+    /// cannot know a section is empty until after the check that fills it has
+    /// already emitted its own `(0 …)` line.
+    hold_summary: Cell<bool>,
+    held_summary: RefCell<Option<String>>,
     state: RefCell<State>,
 }
 
@@ -272,6 +293,9 @@ impl Out {
             current_check: RefCell::new(String::new()),
             recorded: RefCell::new(None),
             line_cache: RefCell::new(std::collections::HashMap::new()),
+            pending_section: RefCell::new(None),
+            hold_summary: Cell::new(false),
+            held_summary: RefCell::new(None),
             state: RefCell::new(State::default()),
         }
     }
@@ -293,6 +317,9 @@ impl Out {
             current_check: RefCell::new(String::new()),
             recorded: RefCell::new(None),
             line_cache: RefCell::new(std::collections::HashMap::new()),
+            pending_section: RefCell::new(None),
+            hold_summary: Cell::new(false),
+            held_summary: RefCell::new(None),
             state: RefCell::new(State::default()),
         }
     }
@@ -398,6 +425,11 @@ impl Out {
         ))
     }
 
+    /// Open a section. In TSV the `## title` header is *deferred* until the
+    /// section emits something, so a caller that decides after the fact to drop
+    /// an empty section can do so without having already printed its heading.
+    /// Nothing about the ordering changes: every emitter flushes the pending
+    /// header before its own line, so the header still precedes its rows.
     pub fn section(&self, title: &str) {
         if self.silent {
             return;
@@ -411,8 +443,33 @@ impl Out {
             return;
         }
         if !self.summary_only {
-            println!("## {}", title);
+            *self.pending_section.borrow_mut() = Some(title.to_string());
         }
+    }
+
+    /// Print the deferred `## title`, if one is waiting.
+    fn flush_section(&self) {
+        if let Some(t) = self.pending_section.borrow_mut().take() {
+            println!("## {}", t);
+        }
+    }
+
+    /// Drop the deferred header. Returns false if it had already been printed,
+    /// in which case the caller is mid-section and must finish it normally.
+    pub fn drop_pending_section(&self) -> bool {
+        self.pending_section.borrow_mut().take().is_some()
+    }
+
+    /// While set, [`summary`](Self::summary) stores its line instead of
+    /// printing it, so a caller can decide whether the section it belongs to is
+    /// worth showing at all. Returns the previous setting.
+    pub fn hold_summary(&self, on: bool) -> bool {
+        self.hold_summary.replace(on)
+    }
+
+    /// Take the held summary line, if any.
+    pub fn take_held_summary(&self) -> Option<String> {
+        self.held_summary.borrow_mut().take()
     }
 
     /// Blank separator between TSV sections (no-op in JSON).
@@ -421,6 +478,7 @@ impl Out {
             return;
         }
         if !self.json() && !self.summary_only {
+            self.flush_section();
             println!();
         }
     }
@@ -472,6 +530,7 @@ impl Out {
                 line.push(f.fp.clone());
             }
         }
+        self.flush_section();
         println!("{}", line.join("\t"));
         for l in context {
             println!("{}", l);
@@ -491,6 +550,7 @@ impl Out {
             });
             return;
         }
+        self.flush_section();
         println!("{}", text);
     }
 
@@ -523,16 +583,25 @@ impl Out {
             st.current().summary = Some(text.to_string());
             return;
         }
+        // Held rather than printed: the caller will decide whether the section
+        // this line belongs to is worth showing. Deliberately does *not* flush
+        // the pending header, since holding it is the whole point.
+        if self.hold_summary.get() {
+            *self.held_summary.borrow_mut() = Some(text.to_string());
+            return;
+        }
         if self.summary_inline.get() {
             if !self.summary_only {
+                self.flush_section();
                 println!("{}", text);
             }
             return;
         }
         if self.all_stdout {
+            self.flush_section();
             println!("{}", text);
         } else {
-            eprintln!("{}", text);
+            to_stderr(text);
         }
     }
 
@@ -588,8 +657,9 @@ impl Out {
             return;
         }
         if self.summary_only {
-            eprintln!("{}", text);
+            to_stderr(text);
         } else {
+            self.flush_section();
             println!("{}", text);
         }
     }
@@ -617,7 +687,7 @@ impl Out {
         if self.all_stdout {
             println!("{}", text);
         } else {
-            eprintln!("{}", text);
+            to_stderr(text);
         }
     }
 
