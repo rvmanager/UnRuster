@@ -7012,3 +7012,200 @@ pub struct S {
     assert!(all.contains("Display"), "dyn bound elided: {all}");
     assert!(all.contains("Fn(u32) -> bool"), "Fn sugar elided: {all}");
 }
+
+// ── contract-drift: qualified names must name the item, not a spelling ─────
+
+/// A call site records the callee **as written**, so a qualified query used to
+/// match only the sites that spell the path out. On one real run `svg::n`
+/// reported 2 callers out of 164 and said nothing about it, and eight other
+/// qualified targets reported a confident zero — after which the session
+/// stopped using qualified names at all.
+fn qualified_fixture(name: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod svg {
+    pub fn n(v: f64) -> String { format!("{}", v) }
+    pub struct Svg;
+    impl Svg { pub fn leaf(&self, t: &str) -> usize { t.len() } }
+}
+pub mod a {
+    use crate::svg::n;
+    pub fn one() -> String { n(1.0) }
+    pub fn two() -> String { n(2.0) }
+    pub fn three() -> String { n(3.0) }
+}
+pub mod b {
+    pub fn qualified() -> String { crate::svg::n(4.0) }
+    pub fn m(s: &crate::svg::Svg) -> usize { s.leaf("x") }
+}
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+fn caller_count(root: &str, target: &str) -> usize {
+    let out = ur().args(["--root", root, "contract-drift", target, "--no-bodies"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    all.lines()
+        .find_map(|l| {
+            let n = l.strip_prefix('(')?;
+            let n = n.split(" caller(s)").next()?;
+            n.parse::<usize>().ok()
+        })
+        .unwrap_or_else(|| panic!("no caller count for {target}:\n{all}"))
+}
+
+#[test]
+fn a_qualified_target_finds_the_same_callers_as_its_bare_form() {
+    let dir = qualified_fixture("cd-qualified");
+    let root = dir.to_str().unwrap();
+    // Free fn: three bare `n(…)` calls plus one written `crate::svg::n(…)`.
+    // The qualified form used to see only the last of the four.
+    assert_eq!(caller_count(root, "svg::n"), 4);
+    assert_eq!(caller_count(root, "::n"), 4);
+    assert_eq!(caller_count(root, "n"), 4);
+    // Method: `Type::method` used to return a confident zero.
+    assert_eq!(caller_count(root, "Svg::leaf"), 1);
+    assert_eq!(caller_count(root, ".leaf"), 1);
+}
+
+#[test]
+fn widening_a_qualified_target_says_that_it_did() {
+    let dir = qualified_fixture("cd-widen-note");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "svg::n",
+        "--no-bodies",
+    ]))
+    .into_owned();
+    assert!(
+        out.contains("matched as an *item*, not as a literal path"),
+        "a widened match must be visible, on stdout:\n{out}"
+    );
+}
+
+/// The fixture the qualified form genuinely cannot resolve: two fns share a
+/// bare name, so widening would mix them. Then the answer must be a disclosed
+/// subset, never a quiet one.
+fn ambiguous_fixture(name: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod a { pub fn check(x: u32) -> bool { x > 0 } }
+pub mod b { pub fn check(x: u32) -> bool { x < 9 } }
+pub mod u {
+    pub fn q1() -> bool { crate::a::check(1) }
+    pub fn q2() -> bool { crate::a::check(2) }
+}
+pub mod v {
+    use crate::a::check;
+    pub fn w1() -> bool { check(3) }
+    pub fn w2() -> bool { check(4) }
+    pub fn w3() -> bool { check(5) }
+}
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn an_ambiguous_qualified_target_discloses_the_sites_it_could_not_attribute() {
+    let dir = ambiguous_fixture("cd-ambiguous");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "a::check",
+        "--no-bodies",
+    ]))
+    .into_owned();
+    // Two sites spell `a::check` out; three more call a bare `check`.
+    assert!(out.contains("3 further site(s)"), "{out}");
+    assert!(
+        out.contains("SUBSET"),
+        "a sampled caller set is the one failure this command cannot survive \
+         quietly — it must say so, and on stdout:\n{out}"
+    );
+}
+
+/// A bare zero reads as "nobody calls this" when it means "nothing spells the
+/// path out". One session took that zero at face value and went to `grep`.
+#[test]
+fn a_qualified_target_with_no_literal_call_sites_says_why_it_is_zero() {
+    let dir = ambiguous_fixture("cd-zero-why");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "b::check",
+        "--no-bodies",
+    ]))
+    .into_owned();
+    assert!(
+        out.contains("no call site spells out") && out.contains("5 site(s)"),
+        "the zero must explain itself:\n{out}"
+    );
+}
+
+/// Step 1's output has to be valid input to step 2. The `name` column is a
+/// qpath; feeding the top candidate straight back in is the first thing anyone
+/// does, and it used to return zero.
+#[test]
+fn candidate_names_round_trip_back_into_the_command() {
+    let dir = qualified_fixture("cd-roundtrip");
+    let root = dir.to_str().unwrap();
+    let listing = ur_stdout(&["--root", root, "contract-drift", "--candidates", "--min-callers", "1"]);
+    let names: Vec<String> = rows_of(&listing)
+        .iter()
+        .filter(|l| l.starts_with('0') || l.starts_with('1'))
+        .filter_map(|l| l.split('\t').nth(2).map(str::to_string))
+        .collect();
+    assert!(!names.is_empty(), "no candidates: {}", String::from_utf8_lossy(&listing));
+    for n in &names {
+        assert!(
+            caller_count(root, n) > 0,
+            "`--candidates` offered `{n}`, which the command then cannot find callers for"
+        );
+    }
+}
+
+/// `callers` warned only at *zero*, so a qualified query that matched 2 of 164
+/// sites looked like a complete answer. It now warns on any shortfall — but
+/// only when the bare name belongs to one fn, or the note would fire on every
+/// `new`, `len` and `push` in the tree and be read as wallpaper.
+#[test]
+fn callers_reports_a_partial_qualified_match_only_when_the_name_is_unambiguous() {
+    let dir = qualified_fixture("callers-partial");
+    let out = ur().args(["--root", dir.to_str().unwrap(), "callers", "svg::n"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("matched 1 site(s), but 4 site(s)"),
+        "a partial match on a unique name must say so:\n{s}"
+    );
+
+    // `new` is defined on several types in the sample fixture, so the sites the
+    // qualified form skipped belong to the others — the narrow answer is right.
+    let noisy = ur().args(["--root", FIXTURE, "callers", "Document::new"])
+        .output()
+        .unwrap();
+    let n = String::from_utf8_lossy(&noisy.stdout);
+    assert!(
+        !n.contains("call site records the callee as written"),
+        "a shared name must not produce a shortfall warning:\n{n}"
+    );
+}

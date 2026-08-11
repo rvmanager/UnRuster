@@ -749,13 +749,29 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
         return run_reveal(ctx, query, target, opts);
     }
 
-    let unique = crate::callers::query_unique(ctx.idx, query);
-    let mut sites = collect(ctx, query);
+    let key = search_key(ctx, query, target);
+    let unique = crate::callers::query_unique(ctx.idx, key.conf_query(query));
+
+    // Scanned on the bare name when the query is qualified, so the sites the
+    // qualified spelling would miss are *counted* even when they are then
+    // dropped. Without both numbers there is nothing to warn with.
+    let mut sites = collect(ctx, key.scan(query));
+    let mut unattributed = 0usize;
+    if key.narrow {
+        let before = sites.len();
+        sites.retain(|s| crate::callers::matches_target(&s.target, query));
+        unattributed = before - sites.len();
+    }
+
     sites.retain(|s| ctx.in_scope(&s.file));
     if let Some(min) = opts.min_confidence {
         sites.retain(|s| {
-            crate::callers::confidence_of(s.target_resolved.as_deref(), s.shadowed, query, unique)
-                >= min
+            crate::callers::confidence_of(
+                s.target_resolved.as_deref(),
+                s.shadowed,
+                key.conf_query(query),
+                unique,
+            ) >= min
         });
     }
     ctx.retain_changed(&mut sites, |s| &s.file);
@@ -777,6 +793,19 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     sites.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
 
     if sites.is_empty() {
+        // A bare zero here is the answer that sent one session to `grep`: it
+        // reads as "nobody calls this" when it means "nothing spells the path
+        // out". Say which one it is.
+        if unattributed > 0 {
+            ctx.out.answer(&format!(
+                "no call site spells out `{}`, but {} site(s) call something named `{}`. More \
+                 than one fn here has that name, so they cannot be attributed to this one — \
+                 `contract-drift {}` lists them all and marks them `heuristic`, and \
+                 `--min-confidence resolved` is the wrong tool here because the ambiguity is \
+                 in the name, not in the sites.",
+                query, unattributed, key.bare, key.bare
+            ));
+        }
         ctx.out.summary("(0 caller(s); nothing to infer a contract from)");
         if target.is_none() {
             return Err(TargetNotFound::err("fn, method, or macro matching", query));
@@ -792,7 +821,12 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     ctx.out.section("callers");
     for s in &shown {
         let conf =
-            crate::callers::confidence_of(s.target_resolved.as_deref(), s.shadowed, query, unique);
+            crate::callers::confidence_of(
+                s.target_resolved.as_deref(),
+                s.shadowed,
+                key.conf_query(query),
+                unique,
+            );
         let cells: Vec<(&'static str, Val)> = vec![
             ("via", Val::from(conf.as_str())),
             ("at", site(&s.file, s.line)),
@@ -838,8 +872,12 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     let low = shown
         .iter()
         .filter(|s| {
-            crate::callers::confidence_of(s.target_resolved.as_deref(), s.shadowed, query, unique)
-                < Confidence::Resolved
+            crate::callers::confidence_of(
+                s.target_resolved.as_deref(),
+                s.shadowed,
+                key.conf_query(query),
+                unique,
+            ) < Confidence::Resolved
         })
         .count();
     if low > 0 {
@@ -859,6 +897,36 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
             "(note: {} recursive call site(s) excluded — a fn calling itself is the \
              implementation, not evidence about it; `unruster callers {}` counts them)",
             recursive, query
+        ));
+    }
+    // Both of these go to stdout: a caller set that is quietly a sample is the
+    // failure this command cannot survive, and `note` is the channel a reader
+    // who redirected stderr never sees.
+    if key.widened {
+        ctx.out.row_note(&format!(
+            "(note: `{}` was matched as an *item*, not as a literal path — call sites record \
+             the callee as written, so matching `{}` textually would have found only the \
+             sites that spell the path out. `{}` names exactly one fn here, so every site \
+             calling it is this one)",
+            query, query, key.bare
+        ));
+    }
+    if unattributed > 0 {
+        ctx.out.row_note(&format!(
+            "(warning: {} further site(s) call something named `{}` and are NOT in the {} \
+             above — more than one fn here is called `{}`, so they cannot be attributed to \
+             this one. The contract you derive below is from a SUBSET of the callers. \
+             `contract-drift {}{}` includes them all, at heuristic confidence)",
+            unattributed,
+            key.bare,
+            sites.len(),
+            key.bare,
+            if query.contains("::") && target.map(|d| d.kind != "fn").unwrap_or(false) {
+                "."
+            } else {
+                ""
+            },
+            key.bare
         ));
     }
     note_hidden_tests(ctx, query);
@@ -885,6 +953,75 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     // on a dossier — there is no judgment here for a build to fail on, and the
     // count a reader wants is in the summary line above.
     Ok(0)
+}
+
+/// How a qualified query is turned into a call-site search.
+///
+/// A call site records the callee **as written** — `n(…)`, `.leaf(…)` — not as
+/// resolved, so `ends_with("svg::n")` matches only the sites that spell the
+/// path out. For `callers` that yields a short list; here it yields a *wrong
+/// contract*, because the whole premise is "everything that calls it". On one
+/// real run `svg::n` reported 2 callers out of 164 and said nothing, and eight
+/// other qualified queries reported a confident zero — after which the session
+/// stopped trusting qualified names at all and hand-translated every target to
+/// `.method` / `::name`.
+///
+/// So a qualified query is resolved to the *item* when that is unambiguous:
+/// one indexed fn, and a bare last segment no other fn shares. Matching on the
+/// bare segment is then `resolved` confidence under the rule `site_confidence`
+/// already encodes — the name cannot belong to anything else.
+///
+/// When the bare name is shared, widening would mix items, so the narrow match
+/// stands and the sites it could not attribute are reported. Silence is the one
+/// option that is not available: `callers::note_narrower_than_bare` was added
+/// for exactly this failure and fires only at zero, which is why the 2-of-164
+/// case slipped through.
+struct SearchKey<'a> {
+    bare: &'a str,
+    /// Qualified, but the bare name is shared — match narrowly and disclose.
+    narrow: bool,
+    /// Qualified and unambiguous — matched by item, on the bare name.
+    widened: bool,
+}
+
+impl<'a> SearchKey<'a> {
+    /// The query to scan call sites with.
+    fn scan(&self, query: &'a str) -> &'a str {
+        if self.widened || self.narrow {
+            self.bare
+        } else {
+            query
+        }
+    }
+    /// The query the confidence tiers are computed against — the bare name once
+    /// widened, since that is what actually matched.
+    fn conf_query(&self, query: &'a str) -> &'a str {
+        if self.widened {
+            self.bare
+        } else {
+            query
+        }
+    }
+}
+
+fn search_key<'a>(ctx: &AnalysisCtx, query: &'a str, target: Option<&Defn>) -> SearchKey<'a> {
+    let bare = last_segment(query);
+    // `::name` and `.method` already match by last segment; a bare name is the
+    // last segment. Only `a::b` needs resolving.
+    let qualified = query.contains("::") && !query.starts_with("::");
+    if !qualified {
+        return SearchKey {
+            bare,
+            narrow: false,
+            widened: false,
+        };
+    }
+    let unambiguous = target.is_some() && crate::callers::query_unique(ctx.idx, bare);
+    SearchKey {
+        bare,
+        narrow: !unambiguous,
+        widened: unambiguous,
+    }
 }
 
 /// Drop a `--spans` `@start-end` suffix from an enclosing-fn label, so a caller
@@ -1226,11 +1363,18 @@ fn run_candidates(ctx: &AnalysisCtx, opts: &ContractOpts) -> anyhow::Result<usiz
     // Said out loud rather than dropped: a reader who does not know these were
     // skipped reads the list as the whole field of candidates.
     if ambiguous > 0 {
+        // The old wording recommended `contract-drift <Type::method>`, which is
+        // the one thing that cannot work for *these* rows: they are here
+        // precisely because the bare name is shared, which is the same
+        // condition that stops a qualified query resolving to the item. A
+        // session followed the advice, got four confident zeros, and stopped
+        // trusting this column.
         ctx.out.note(&format!(
             "(note: {} fn(s) with enough callers were skipped because their bare name has \
              more than one definition here — call sites match by last segment, so the count \
-             cannot be attributed to one of them. `contract-drift <Type::method>` names one \
-             directly)",
+             cannot be attributed to one of them. Running one by name still works, but its \
+             caller set is a subset and the command says by how much; the listed rows above \
+             do not have this problem)",
             ambiguous
         ));
     }

@@ -366,9 +366,7 @@ pub fn run_callers(
         direct.retain(|s| site_confidence(s, query, unique_name) >= min);
     }
     ctx.retain_changed(&mut direct, |s| &s.file);
-    if direct.is_empty() {
-        note_narrower_than_bare(ctx, &sites, query);
-    }
+    note_narrower_than_bare(ctx, index, &sites, query, direct.len());
     let local_hits = direct.iter().filter(|s| s.shadowed).count();
     if local_hits > 0 {
         ctx.out.note(&format!(
@@ -419,7 +417,14 @@ pub fn run_callers(
     Ok(direct.len() + rows.len())
 }
 
-/// A qualified query found nothing, but its bare name would have. Say so.
+/// A qualified query matched fewer sites than its bare name would. Say so.
+///
+/// Fired only at *zero* until `contract-drift` hit the same wall with a
+/// non-zero count: `svg::n` matched the 2 sites that spell the path out and
+/// missed the other 162, and a short list is indistinguishable from a complete
+/// one. A partial answer that looks whole is the same defect as a zero that
+/// looks like an absence — so the threshold is "fewer than the bare name
+/// would", not "none at all".
 ///
 /// `Type::method` matches only where the receiver's type could be resolved,
 /// which is the APPROXIMATE tier: it misses a receiver reached through a field
@@ -432,24 +437,53 @@ pub fn run_callers(
 /// got a confident zero from each, and went to `grep` — which found seven real
 /// call sites for the first. The zero was defensible; presenting it as the
 /// whole answer was not.
-fn note_narrower_than_bare(ctx: &AnalysisCtx, sites: &[CallSite], query: &str) {
+fn note_narrower_than_bare(
+    ctx: &AnalysisCtx,
+    index: &NameIndex,
+    sites: &[CallSite],
+    query: &str,
+    matched: usize,
+) {
     let bare = crate::ast::last_segment(query);
-    if bare == query {
+    if bare == query || ctx.summary {
         return;
     }
     let n = sites
         .iter()
         .filter(|s| matches_target(&s.target, bare))
         .count();
-    if n == 0 {
+    if n <= matched {
         return;
     }
-    ctx.out.answer(&format!(
-        "note: no site resolves to `{}`, but {} site(s) call something named \
-         `{}` — receiver types are inferred, so a receiver reached through a \
-         field or a chain will not match the qualified form. Try `callers {}`.",
-        query, n, bare, bare
-    ));
+    // A *partial* match is only worth reporting when the bare name belongs to
+    // one fn: then the sites the qualified form missed are certainly this item,
+    // and losing them is losing real callers. When the name is shared —
+    // `Document::new` against six `new`s — the narrow match is the correct
+    // answer and the extra sites are other types', so the warning would be
+    // wallpaper on every `new`, `len` and `push` in the tree.
+    if matched > 0 && !query_unique(index, bare) {
+        return;
+    }
+    if matched == 0 {
+        ctx.out.answer(&format!(
+            "note: no site resolves to `{}`, but {} site(s) call something named \
+             `{}` — receiver types are inferred, so a receiver reached through a \
+             field or a chain will not match the qualified form. Try `callers {}`.",
+            query, n, bare, bare
+        ));
+    } else {
+        ctx.out.answer(&format!(
+            "note: `{}` matched {} site(s), but {} site(s) call something named `{}` — a \
+             call site records the callee as written, so the qualified form sees only the \
+             sites that spell the path out. `callers {}` shows all {}.",
+            query,
+            matched,
+            n,
+            bare,
+            bare,
+            n
+        ));
+    }
 }
 
 /// Breadth-first transitive callers of `query` through the last-segment call

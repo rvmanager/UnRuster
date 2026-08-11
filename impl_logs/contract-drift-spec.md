@@ -1,8 +1,9 @@
 # `contract-drift` — specification
 
-> **Status: implemented** in `src/contract_drift.rs` (v0.1.66, 37 subcommands).
+> **Status: implemented** in `src/contract_drift.rs` (v0.1.68, 37 subcommands).
 > §9 records where the build departed from this design and why. Everything
-> above §9 is the design as written; read §9 before treating it as a
+> above §9 is the design as written; §10 records the first field test against
+> another codebase. Read both before treating §1–§8 as a
 > description of the code.
 
 Compare a function's implementation against the contract its callers assume.
@@ -517,3 +518,83 @@ Reproduced: two impls on `[u8; 4]` and `[u8; 32]` get the *same* `qpath` from
 `unruster impls`, and two struct fields of those types are indistinguishable in
 `unruster fields`. Whether that matters is a judgment call — which is the
 posture the command was built for.
+
+---
+
+## 10. Field test — `impl_logs/math2svg01.log` (v0.1.67 → v0.1.68)
+
+First run against a codebase that is not this one. The exercise itself worked:
+the blindfold held, an expectation was written before the reveal, and it
+produced the finding it was designed for — `Cx::num_prop` returns `None` for
+both a *missing* and an *invalid* property, so the callers doing
+`.unwrap_or(default)` (visible as `ret:unwrap_or` in the usage table) silently
+apply a default over a typo. No other check in this tool would have found that.
+
+The target-naming grammar did not work at all. Ten of ten qualified queries
+gave a wrong answer, and the session responded by abandoning qualified names
+for the rest of its life.
+
+### 10.1 Qualified queries named a spelling, not an item
+
+A call site records the callee **as written** — `n(…)`, `.leaf(…)` — so
+`matches_target`'s `ends_with("svg::n")` matched only the sites that spell the
+path out. Eight queries returned a confident zero; two returned a silently
+truncated set:
+
+| Query | Reported | Actual |
+|:--|--:|--:|
+| `render::text`, `Theme::resolve`, `render::dash`, `render::arrowhead`, `Cx::{num,req_num,uint,req_uint}_prop` | 0 | 19, 17, 6, 7, 13, 18, 4, 4 |
+| `svg::n` | 2 | 164 |
+| `svg::esc` | 1 | 4 |
+
+**The zeros were loud; `svg::n` was the hazard.** It returned a plausible
+two-caller dossier drawn from 1.2% of the callers, with nothing in the output
+saying so. For `callers` a short list is a short list; here the premise is
+"everything that calls it", so a sampled caller set yields a confident *wrong
+contract*.
+
+**Fix.** A qualified query that resolves to one indexed fn whose bare last
+segment no other fn shares is matched on the bare segment — `resolved`
+confidence under the rule `site_confidence` already encodes. When the name is
+shared, widening would mix items, so the narrow match stands and the shortfall
+is reported. Zero now explains which kind of zero it is.
+
+### 10.2 The tool had already learned this, and the new command did not inherit it
+
+`callers::note_narrower_than_bare` exists for this exact failure; its doc
+comment records an earlier session that took a confident zero and went to
+`grep`. `contract-drift` never called it. A sibling divergence, in the tool
+built to find sibling divergences.
+
+That note also fired only at *zero*, so it would still have missed 2-of-164.
+It now warns on any shortfall — but only when the bare name belongs to one fn.
+The first version warned unconditionally and immediately produced
+`Document::new matched 3, but 6 call something named new`, which is noise: the
+other three are other types' `new`, and the narrow answer was correct. The
+gate is the same uniqueness test that makes widening safe.
+
+### 10.3 `--candidates` recommended the one form that cannot work
+
+The skipped-rows note said ``contract-drift <Type::method> names one
+directly``. Those rows are skipped *because* the bare name is shared — the
+same condition that stops a qualified query resolving. Reworded.
+
+### 10.4 Step 1's output was not valid input to step 2
+
+`--candidates` prints `name` as a qpath, which is right for `show` and was
+useless as a caller query. Fixed by §10.1: every listed candidate has a unique
+bare name, which is exactly the widening condition. There is now a test
+asserting the round-trip, because that property is what broke.
+
+### 10.5 Still open
+
+- **Batching defeats the design.** The session ran phase 1 across four targets,
+  then `--reveal` across six in one command. It wrote one combined expectation
+  and got away with it, but the exercise assumes one target at a time. Either
+  support batches explicitly or say not to.
+- **`--top 0`** means "all" here and "show nothing" everywhere else.
+- **The candidate score still over-rewards ubiquitous small helpers.**
+  `svg::n` — a five-line float formatter — scored 0.61 on 164 callers, the same
+  shape as `ast::line_of` scoring 0.69 on this repo. Two data points now. The
+  fix is a body-size floor and less weight on breadth, but tuning on two
+  codebases is still tuning on two codebases.
