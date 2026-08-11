@@ -388,6 +388,15 @@ pub fn last_segment(path: &str) -> &str {
     path.rsplit("::").next().unwrap_or(path)
 }
 
+/// Everything before the last `::`-segment — the module a qualified query
+/// names. Empty for a bare name, which has no qualifier to read.
+pub fn module_of_path(path: &str) -> &str {
+    match path.rfind("::") {
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
 /// Last-segment glob match. `*` matches any (possibly empty) run of chars.
 /// No other metacharacters. `name` is the bare last segment of an item.
 ///

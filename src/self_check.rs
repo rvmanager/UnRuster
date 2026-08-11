@@ -40,6 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::ast::{fn_span, scope_visits, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::emit::{site, Val};
 use crate::index::Defn;
@@ -120,6 +121,9 @@ pub fn run(ctx: &AnalysisCtx, root: &std::path::Path, exclude: &[String], opts: 
 
     ran.push(("dead-code-agrees-with-callers", probes.len()));
     check_dead_code(ctx, &sites, &oracle_files, &probes, &mut v);
+
+    let n_bind = check_shadowed_bindings(ctx, &sites, &mut v, &mut leads);
+    ran.push(("no-site-is-a-shadowed-binding", n_bind));
 
     let n_tests = check_tests_are_not_dead(ctx, &mut v);
     ran.push(("a-test-fn-is-never-dead", n_tests));
@@ -365,6 +369,159 @@ fn check_dead_code(
             });
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Cross-mechanism: the call-site walk against an independent binder scan
+// ---------------------------------------------------------------------------
+
+/// Every bare name a fn binds, flat and without scoping — the independent half
+/// of [`check_shadowed_bindings`].
+///
+/// Deliberately *not* `callers::LocalScopes`. That type is the thing under
+/// test: it tracks frames, ordering and pending sets, and re-deriving its
+/// answer here would produce a check that cannot fail — the theatre this
+/// module's header warns about. This walk knows nothing about scopes. It reads
+/// the signature for `params` and unions every pattern it meets for `any`,
+/// order-free, whole-fn. Two mechanisms, one question.
+///
+/// [`crate::callers::pat_idents`] is shared, because it extracts names from a
+/// pattern and has no opinion about scope; the disagreement being tested is
+/// about *where a name is in scope*, which is entirely on the other side.
+#[derive(Default)]
+struct BinderScan {
+    scope: ScopeTracker,
+    /// Parameters, by enclosing fn. In scope for the entire body with no
+    /// ordering question, which is what makes them a hard invariant.
+    params: BTreeMap<String, BTreeSet<String>>,
+    /// Every name bound by any pattern in the fn — `let`s, arms, closure
+    /// heads, `for` heads. Order-free and therefore over-approximate: a name
+    /// bound *after* a call is not in scope at it, so these are leads.
+    any: BTreeMap<String, BTreeSet<String>>,
+    /// Names declared as nested `fn` items inside a fn. A block-level item
+    /// shadows a parameter of the same name, so a bare call there names the
+    /// item after all and must not be reported.
+    nested_fns: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for BinderScan {
+    scope_visits!(item_mod, item_impl, impl_item_fn, trait_item_fn);
+
+    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+        // Recorded against the *enclosing* fn, before descending: this is the
+        // parent's shadowing item, not its own.
+        self.nested_fns
+            .entry(self.scope.enclosing_with_toplevel())
+            .or_default()
+            .insert(i.sig.ident.to_string());
+        self.scope
+            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
+        syn::visit::visit_item_fn(self, i);
+        self.scope.leave_fn();
+    }
+
+    fn visit_signature(&mut self, s: &'ast syn::Signature) {
+        let here = self.scope.enclosing_with_toplevel();
+        let names = crate::callers::params_of(s);
+        self.any.entry(here.clone()).or_default().extend(names.clone());
+        self.params.entry(here).or_default().extend(names);
+        syn::visit::visit_signature(self, s);
+    }
+
+    fn visit_pat(&mut self, p: &'ast syn::Pat) {
+        let mut names = BTreeSet::new();
+        crate::callers::pat_idents(p, &mut names);
+        self.any
+            .entry(self.scope.enclosing_with_toplevel())
+            .or_default()
+            .extend(names);
+        syn::visit::visit_pat(self, p);
+    }
+}
+
+/// A site the walk attributes to an item must not be naming a local binding.
+///
+/// The defect this exists for: a bare identifier in *argument position* is how
+/// a callback is written (`.map(parse)`) and how every variable is written, and
+/// the walk recorded the first reading unconditionally. `svggen`'s `out::path()`
+/// was reported with 30 callers across 7 modules, at `resolved`, every one of
+/// them a parameter or a `match` binding — and `--candidates` then ranked the
+/// fn 4th of 286 on the strength of it. No confidence tier separated the fake
+/// rows from the one real one, and every invariant here passed: the oracle is a
+/// token scan, so it sees `path` too and `callers-within-oracle` holds
+/// trivially. That is the gap this closes — over-reporting was bounded against
+/// a token scan, and never against *scope*.
+///
+/// Parameters are a violation and everything else is a lead, and the line is
+/// the ordering: a parameter is in scope for the whole body, while a name bound
+/// by a `let` further down is legitimately the item at a call above it.
+fn check_shadowed_bindings(
+    ctx: &AnalysisCtx,
+    sites: &[crate::callers::CallSite],
+    v: &mut Vec<Violation>,
+    leads: &mut Vec<Violation>,
+) -> usize {
+    let mut scan = BinderScan::default();
+    for f in ctx.files {
+        scan.scope = ScopeTracker::new(f.module.as_str());
+        syn::visit::Visit::visit_file(&mut scan, &f.ast);
+    }
+    let mut examined = 0;
+    for s in sites {
+        // Only a bare name can be captured. A qualified path, a method and a
+        // macro all name the item however many locals share the spelling —
+        // and `shadowed` sites are the ones the walk already caught, so
+        // counting them would be marking its own homework.
+        if s.shadowed
+            || s.target.contains("::")
+            || s.target.starts_with('.')
+            || s.target.ends_with('!')
+        {
+            continue;
+        }
+        examined += 1;
+        if scan
+            .nested_fns
+            .get(&s.caller)
+            .is_some_and(|n| n.contains(&s.target))
+        {
+            continue;
+        }
+        let param = scan
+            .params
+            .get(&s.caller)
+            .is_some_and(|n| n.contains(&s.target));
+        let bound = scan
+            .any
+            .get(&s.caller)
+            .is_some_and(|n| n.contains(&s.target));
+        if param {
+            v.push(Violation {
+                invariant: "no-site-is-a-shadowed-binding",
+                subject: s.target.clone(),
+                file: s.file.clone(),
+                line: s.line,
+                detail: format!(
+                    "recorded as a call to an item named `{}`, but `{}` is a parameter of the \
+                     enclosing `{}` — in scope for the whole body, so this names the binding",
+                    s.target, s.target, s.caller
+                ),
+            });
+        } else if bound {
+            leads.push(Violation {
+                invariant: "no-site-is-a-shadowed-binding",
+                subject: s.target.clone(),
+                file: s.file.clone(),
+                line: s.line,
+                detail: format!(
+                    "`{}` is also bound by a pattern somewhere in `{}`; a lead, not a verdict — \
+                     a binding below this line is not in scope at it",
+                    s.target, s.caller
+                ),
+            });
+        }
+    }
+    examined
 }
 
 /// A `#[test]` fn is called by the harness, which appears in no call site, so

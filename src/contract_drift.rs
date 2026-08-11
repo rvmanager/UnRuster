@@ -152,8 +152,7 @@ struct ContractVisitor<'a> {
     /// Call keys a preceding `if`/`assert!` in the same block guards, with the
     /// guard's rendered condition.
     guards: HashMap<(usize, usize), String>,
-    locals: Vec<BTreeSet<String>>,
-    pending_params: BTreeSet<String>,
+    scopes: crate::callers::LocalScopes,
     loop_depth: usize,
     cond_depth: usize,
 }
@@ -207,10 +206,6 @@ impl ContractVisitor<'_> {
         });
     }
 
-    fn local_shadows(&self, name: &str) -> bool {
-        self.locals.iter().any(|frame| frame.contains(name))
-    }
-
     /// The target handed to another call *as a value* rather than invoked:
     /// `.map(arg_shape)`. There is no call expression, so nothing recorded it
     /// and the command answered "0 caller(s)" for a fn with two real uses.
@@ -228,7 +223,8 @@ impl ContractVisitor<'_> {
             return;
         }
         let key = pos(a);
-        self.record(path, key, Vec::new(), false);
+        let shadowed = self.scopes.shadows_path(&path);
+        self.record(path, key, Vec::new(), shadowed);
         self.disp.entry(key).or_insert(Disp::with("fn-ref", consumer));
     }
 }
@@ -372,7 +368,7 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
         if let syn::Expr::Path(p) = &*e.func {
             let target = path_to_string(&p.path);
             if crate::callers::matches_target(&target, self.query) {
-                let shadowed = p.path.segments.len() == 1 && self.local_shadows(&target);
+                let shadowed = self.scopes.shadows_path(&target);
                 let args = e.args.iter().map(arg_shape).collect();
                 self.record(target, pos(&p.path), args, shadowed);
             }
@@ -435,13 +431,20 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
 
     fn visit_arm(&mut self, a: &'ast syn::Arm) {
         self.cond_depth += 1;
+        self.scopes.open_patterns(std::iter::once(&a.pat));
         visit::visit_arm(self, a);
+        self.scopes.close();
         self.cond_depth -= 1;
     }
 
     fn visit_expr_let(&mut self, e: &'ast syn::ExprLet) {
         self.claim(&e.expr, Disp::bare("if-let"));
+        // Pended *after* the scrutinee is walked, so a closure inside it
+        // cannot claim the binding, and picked up by the `then` block or loop
+        // body that opens next — which is where an `if let` binding is in
+        // scope.
         visit::visit_expr_let(self, e);
+        self.scopes.pend_pattern(&e.pat);
     }
 
     fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
@@ -454,8 +457,12 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
     }
 
     fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
+        // The iterated expression is outside the binding: `for path in
+        // paths()` calls the item, and only the body sees the local.
+        self.visit_expr(&e.expr);
+        self.scopes.pend_pattern(&e.pat);
         self.loop_depth += 1;
-        visit::visit_expr_for_loop(self, e);
+        self.visit_block(&e.body);
         self.loop_depth -= 1;
     }
 
@@ -510,7 +517,7 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
     }
 
     fn visit_signature(&mut self, s: &'ast syn::Signature) {
-        self.pending_params = crate::callers::params_of(s);
+        self.scopes.pend_signature(s);
         visit::visit_signature(self, s);
     }
 
@@ -528,16 +535,11 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
             self.claim(&init.expr, d);
         }
         visit::visit_local(self, l);
-        let mut names = BTreeSet::new();
-        pat_idents(&l.pat, &mut names);
-        if let Some(frame) = self.locals.last_mut() {
-            frame.extend(names);
-        }
+        self.scopes.bind(&l.pat);
     }
 
     fn visit_block(&mut self, b: &'ast syn::Block) {
-        let frame = std::mem::take(&mut self.pending_params);
-        self.locals.push(frame);
+        self.scopes.open_block();
 
         // A statement-position call whose value is dropped, and the block's
         // tail expression, are both dispositions no expression-level visit can
@@ -554,7 +556,7 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
         self.scan_guards(b);
 
         visit::visit_block(self, b);
-        self.locals.pop();
+        self.scopes.close();
     }
 
     fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
@@ -562,13 +564,9 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
         // position, so it beats `bare`. The method-call visit claims the
         // combinator case first, and `or_insert` keeps the more specific one.
         self.claim(&c.body, Disp::bare("closure-tail"));
-        let mut frame = BTreeSet::new();
-        for p in &c.inputs {
-            pat_idents(p, &mut frame);
-        }
-        self.locals.push(frame);
+        self.scopes.open_patterns(c.inputs.iter());
         visit::visit_expr_closure(self, c);
-        self.locals.pop();
+        self.scopes.close();
     }
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
@@ -693,8 +691,7 @@ fn collect(ctx: &AnalysisCtx, query: &str) -> Vec<Site> {
             sites: Vec::new(),
             disp: HashMap::new(),
             guards: HashMap::new(),
-            locals: Vec::new(),
-            pending_params: BTreeSet::new(),
+            scopes: crate::callers::LocalScopes::default(),
             loop_depth: 0,
             cond_depth: 0,
         };
@@ -928,6 +925,24 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
             tier(&key, s, query, unique, target) < Confidence::Resolved
         })
         .count();
+    // Named ahead of the generic tier warning, because it is the one reason a
+    // reader cannot infer from the rows. A bare name in argument position is
+    // how a callback is written (`.map(parse)`) *and* how every variable is
+    // written, and the caller column shows only the enclosing fn — so a set
+    // made entirely of locals reads exactly like a real one. `out::path()` in
+    // `svggen` had 30 such "callers" across 7 modules, every row a parameter or
+    // a `match` binding, and a whole contract-drift exercise was spent on them.
+    let shadowed = sites.iter().filter(|s| s.shadowed).count();
+    if shadowed > 0 {
+        ctx.out.row_note(&format!(
+            "(warning: {} of these site(s) name a *local* binding of `{}` — a parameter, `let`, \
+             closure head, `match` arm, `for` pattern or `if let` — and not this item. They are \
+             tiered `heuristic`; `--min-confidence resolved` drops them, and `--context 1` shows \
+             the call line so you can see which is which)",
+            shadowed,
+            key.bare
+        ));
+    }
     if low > 0 {
         ctx.out.note(&format!(
             "(note: {} of the listed caller(s) are below `resolved` — they may not be calling \
@@ -1043,7 +1058,10 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     ));
     ctx.out.summary(&format!(
         "({} caller(s) across {} module(s); body withheld — `--reveal` for the \
-         implementation; explain: contract-drift)",
+         implementation. The target's span above starts at its **signature**, not its doc \
+         comment: the doc is the stated contract and is withheld with the body, so `--spans` \
+         and a `sed` over that range cannot spend the exercise. `--reveal` and `show` print the \
+         doc-inclusive span, which is why the two disagree; explain: contract-drift)",
         sites.len(),
         modules.len()
     ));
@@ -1392,6 +1410,7 @@ fn emit_target_header(
             ("at", Val::from("—")),
             ("body", Val::from(if reveal { "shown" } else { "withheld" })),
             ("callers", Val::from(callers)),
+            ("lines", Val::from("—")),
         ]);
         ctx.out.note(&format!(
             "(note: `{}` does not resolve to exactly one indexed fn, so no signature is \
@@ -1407,6 +1426,12 @@ fn emit_target_header(
         ("at", span_site(&d.file, d.line, d.end)),
         ("body", Val::from(if reveal { "shown" } else { "withheld" })),
         ("callers", Val::from(callers)),
+        // Held as a column rather than reused: the sixth cell used to carry the
+        // caller count here and the body's line count under `--reveal`, so a
+        // TSV consumer reading position 6 got a different quantity depending on
+        // a flag it never saw. `--json` named them apart all along; the default
+        // format did not.
+        ("lines", Val::from("—")),
     ]);
     if !reveal {
         // The signature *is* contract, not implementation: types, `Result`,
@@ -1487,18 +1512,57 @@ fn emit_usage(ctx: &AnalysisCtx, sites: &[Site]) {
 /// the expectation lives in what the caller does *after* the call — the `?`,
 /// the `match`, the `let _`, the loop around it — and a fixed window is exactly
 /// as likely to cut that off as to include it.
+/// One body per *caller*, with every call site in it marked.
+///
+/// A caller that calls the target twice used to have its body printed twice,
+/// byte for byte, each copy differing only in which line carried the `>` — and
+/// under a `--max-lines` cut that lands above both, not even in that. It cost
+/// real budget: `render::render_full` has two sites in `cmd::tune`, so `--top
+/// 18` spent two of its eighteen caller slots on one 25-line body, and the
+/// duplicate carried no information the first copy did not.
 fn emit_bodies(ctx: &AnalysisCtx, shown: &[&Site], opts: &ContractOpts) {
     ctx.out.section("caller sources");
     let budget = opts.max_lines.or(Some(DEFAULT_MAX_LINES));
+    // Insertion-ordered, so the bodies keep the order the caller rows chose —
+    // spread across modules rather than by file.
+    let mut order: Vec<(&str, usize, usize)> = Vec::new();
+    let mut marks: HashMap<(&str, usize, usize), Vec<usize>> = HashMap::new();
     for s in shown {
         let Some((start, end)) = s.caller_span else {
             continue;
         };
-        ctx.out.row(vec![
-            ("in", Val::from(s.caller.clone())),
-            ("at", span_site(&s.file, start, end)),
-        ]);
-        crate::show::print_range(ctx, &s.file, start, end, budget, false, Some(s.line));
+        let key = (s.file.as_str(), start, end);
+        if !marks.contains_key(&key) {
+            order.push(key);
+        }
+        marks.entry(key).or_default().push(s.line);
+    }
+    for key in &order {
+        let (file, start, end) = *key;
+        let lines = &marks[key];
+        let caller = shown
+            .iter()
+            .find(|s| s.file == file && s.caller_span == Some((start, end)))
+            .map(|s| s.caller.clone())
+            .unwrap_or_default();
+        let mut cells = vec![("in", Val::from(caller)), ("at", span_site(file, start, end))];
+        // Said rather than implied: with more than one site the `>` markers are
+        // the only thing distinguishing them, and a `--max-lines` cut can drop
+        // every one.
+        if lines.len() > 1 {
+            cells.push((
+                "sites",
+                Val::from(
+                    lines
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            ));
+        }
+        ctx.out.row(cells);
+        crate::show::print_range_marked(ctx, file, start, end, budget, false, lines);
         blank(ctx);
     }
 }
@@ -1524,6 +1588,9 @@ fn run_reveal(
         ("name", Val::from(d.qpath.clone())),
         ("at", span_site(&d.file, d.doc_start, d.end)),
         ("body", Val::from("shown")),
+        // `—`: this mode prints the implementation and does not gather callers,
+        // and an empty cell says that where a `0` would claim there are none.
+        ("callers", Val::from("—")),
         ("lines", Val::from(d.end.saturating_sub(d.line) + 1)),
     ]);
     blank(ctx);
@@ -1573,12 +1640,42 @@ fn run_candidates(ctx: &AnalysisCtx, opts: &ContractOpts) -> anyhow::Result<usiz
     // mode, where `--top` counts callers instead of rows.)
     ctx.out.set_row_budget(opts.top.filter(|n| *n > 0));
     let sites = crate::callers::collect_sites(ctx.files, ctx.sem, ctx.idx, false);
-    let mut by_name: HashMap<&str, (usize, BTreeSet<&str>)> = HashMap::new();
+    /// Sites sharing one bare name, split by the form they are *written* in.
+    ///
+    /// The split is the whole point. A free `fn` is never called as `.name()`,
+    /// so counting method sites toward one credits it with evidence that
+    /// belongs to a type this tool never indexed: `svggen`'s private
+    /// `geom::boolean::collect` was ranked 7th of 286 with "475 callers across
+    /// 40 modules", which is `Iterator::collect` and nothing else. The
+    /// in-tree-homonym guard below could not catch it — `collect` really is
+    /// defined once *here*; the other definition is in `std`.
+    #[derive(Default)]
+    struct NameSites<'a> {
+        free: usize,
+        method: usize,
+        free_mods: BTreeSet<&'a str>,
+        all_mods: BTreeSet<&'a str>,
+        shadowed: usize,
+    }
+    let mut by_name: HashMap<&str, NameSites> = HashMap::new();
     for s in &sites {
         let name = last_segment(s.target.trim_start_matches('.').trim_end_matches('!'));
         let e = by_name.entry(name).or_default();
-        e.0 += 1;
-        e.1.insert(crate::config_drift::module_of(&s.caller));
+        let module = crate::config_drift::module_of(&s.caller);
+        // A local binding of the name is not a call to the item at all, and a
+        // fn whose whole caller set is locals is the worst possible target for
+        // this exercise: `out::path()` scored 0.73 on 30 of them.
+        if s.shadowed {
+            e.shadowed += 1;
+            continue;
+        }
+        e.all_mods.insert(module);
+        if s.target.starts_with('.') {
+            e.method += 1;
+        } else {
+            e.free += 1;
+            e.free_mods.insert(module);
+        }
     }
 
     struct Cand<'a> {
@@ -1605,15 +1702,35 @@ fn run_candidates(ctx: &AnalysisCtx, opts: &ContractOpts) -> anyhow::Result<usiz
 
     let mut cands: Vec<Cand> = Vec::new();
     let mut ambiguous = 0usize;
+    let mut method_only = 0usize;
+    let mut local_only = 0usize;
     for d in ctx.idx.iter() {
         if !matches!(d.kind, "fn" | "impl-fn") || !ctx.in_scope(&d.file) {
             continue;
         }
-        let Some((callers, mods)) = by_name.get(d.name.as_str()) else {
+        let Some(seen) = by_name.get(d.name.as_str()) else {
             continue;
         };
-        let callers = *callers;
+        // A free fn is evidenced only by free-call sites. A method can be
+        // reached either way (`v.push(x)`, `Vec::push(&mut v, x)`), so both
+        // count for one — and its row is already tiered `heuristic` below for
+        // exactly the reason that makes the count an upper bound.
+        let (callers, mods) = if d.kind == "fn" {
+            (seen.free, &seen.free_mods)
+        } else {
+            (seen.free + seen.method, &seen.all_mods)
+        };
         if callers < opts.min_callers {
+            // Counted only where the *reason* it fell short is a caller set
+            // this command would otherwise have ranked it on. Silence here is
+            // what let two fabricated targets into the top ten.
+            if d.kind == "fn" && seen.free + seen.method + seen.shadowed >= opts.min_callers {
+                if seen.shadowed > seen.method {
+                    local_only += 1;
+                } else {
+                    method_only += 1;
+                }
+            }
             continue;
         }
         if defns_named.get(d.name.as_str()).copied().unwrap_or(1) > 1 {
@@ -1633,11 +1750,12 @@ fn run_candidates(ctx: &AnalysisCtx, opts: &ContractOpts) -> anyhow::Result<usiz
         } else {
             "heuristic"
         };
-        let score = candidate_score(callers, mods.len(), loc, ret, doc, via == "resolved");
+        let mods = mods.len();
+        let score = candidate_score(callers, mods, loc, ret, doc, via == "resolved");
         cands.push(Cand {
             d,
             callers,
-            mods: mods.len(),
+            mods,
             loc,
             ret,
             doc,
@@ -1673,6 +1791,26 @@ fn run_candidates(ctx: &AnalysisCtx, opts: &ContractOpts) -> anyhow::Result<usiz
                 ("doc", Val::from(if c.doc { "yes" } else { "—" })),
             ]);
         }
+    }
+    // The two exclusions the in-tree-homonym guard cannot make, said out loud
+    // for the same reason it says its own: a rank the reader cannot reproduce
+    // is a rank they cannot check.
+    if method_only > 0 {
+        ctx.out.note(&format!(
+            "(note: {} free fn(s) reached the caller floor only on `.name()` sites and were \
+             dropped — a free fn is never called that way, so those belong to a same-named \
+             method on a type outside this tree. This is the guard the in-tree count below \
+             cannot make: the homonym is in `std`, not here)",
+            method_only
+        ));
+    }
+    if local_only > 0 {
+        ctx.out.note(&format!(
+            "(note: {} fn(s) reached the caller floor only on sites where the name is a local \
+             binding — a parameter, `let` or `match` arm — and were dropped. A contract derived \
+             from those describes nothing: they are not calls to the item)",
+            local_only
+        ));
     }
     // Said out loud rather than dropped: a reader who does not know these were
     // skipped reads the list as the whole field of candidates.

@@ -127,23 +127,77 @@ impl NameIndex {
     /// Ranked best-first by [`similarity`] on the last path segment. Returns at
     /// most one representative per distinct name, so a method defined in four
     /// impls does not crowd out the other candidates.
+    ///
+    /// Prefer [`similar_to_query`](Self::similar_to_query) when the query was
+    /// qualified: this one picks each name's representative in index order,
+    /// which throws away the only evidence available about *which* copy was
+    /// meant.
     pub fn similar(&self, query: &str, limit: usize) -> Vec<&Defn> {
+        self.similar_ranked(query, limit, false)
+    }
+
+    /// As [`similar`](Self::similar), but the representative for each name is
+    /// the one whose module path shares the most leading segments with the
+    /// query's own qualifier.
+    ///
+    /// One representative per name is right — four impls of `new` must not fill
+    /// the list — but choosing it by index order discards the question. With
+    /// `geom::dist` and `trace::dist` both defined, a query for
+    /// `geom::boolean::dist` was answered with `trace::dist` and nothing else:
+    /// the one candidate sharing the query's `geom` prefix, and the only one a
+    /// reader could have meant, was the copy that got dropped. Six suggestions,
+    /// none of them the answer.
+    pub fn similar_to_query(&self, query: &str, limit: usize) -> Vec<&Defn> {
+        self.similar_ranked(query, limit, true)
+    }
+
+    fn similar_ranked(&self, query: &str, limit: usize, use_prefix: bool) -> Vec<&Defn> {
         let want = crate::ast::last_segment(query).to_lowercase();
         // A one- or two-letter query is close to everything; suggesting from it
         // would be noise wearing the shape of an answer.
         if want.chars().count() < 3 {
             return Vec::new();
         }
+        let qualifier: Vec<&str> = if use_prefix && query.contains("::") {
+            crate::ast::module_of_path(query).split("::").collect()
+        } else {
+            Vec::new()
+        };
+        let shared = |d: &Defn| -> usize {
+            if qualifier.is_empty() {
+                return 0;
+            }
+            d.module
+                .split("::")
+                .zip(qualifier.iter())
+                .take_while(|(a, b)| a == *b)
+                .count()
+        };
         let mut scored: Vec<(f64, &str, &Defn)> = Vec::new();
         for (name, ids) in &self.by_last {
             let sim = similarity(&name.to_lowercase(), &want);
             if sim < SIMILAR_ENOUGH {
                 continue;
             }
-            let Some(&first) = ids.first() else { continue };
-            scored.push((sim, name.as_str(), &self.defns[first]));
+            // Index order only decides between copies the query cannot tell
+            // apart; a shared module prefix decides first when there is one.
+            let Some(&best) = ids
+                .iter()
+                .max_by_key(|&&i| (shared(&self.defns[i]), usize::MAX - i))
+            else {
+                continue;
+            };
+            scored.push((sim, name.as_str(), &self.defns[best]));
         }
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        // A candidate under the query's own qualifier outranks a closer spelling
+        // somewhere else: `geom::dist` before `trace::seg_dist`, whatever the
+        // edit distance says.
+        scored.sort_by(|a, b| {
+            shared(b.2)
+                .cmp(&shared(a.2))
+                .then_with(|| b.0.total_cmp(&a.0))
+                .then_with(|| a.1.cmp(b.1))
+        });
         scored.truncate(limit);
         scored.into_iter().map(|(_, _, d)| d).collect()
     }

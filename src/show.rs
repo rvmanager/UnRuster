@@ -193,6 +193,24 @@ pub(crate) fn print_range(
     number: bool,
     mark: Option<usize>,
 ) {
+    print_range_marked(ctx, file, start, end, max_lines, number, mark.as_slice());
+}
+
+/// As [`print_range`], marking *every* listed line with `>`.
+///
+/// One body can hold several sites of the same target, and printing it once per
+/// site is the same body twice with no way to tell the copies apart:
+/// `contract-drift render::render_full` printed `cmd::tune`'s 25 shown lines
+/// twice under `--top 18`, spending two of eighteen caller slots on one caller.
+pub(crate) fn print_range_marked(
+    ctx: &AnalysisCtx,
+    file: &str,
+    start: usize,
+    end: usize,
+    max_lines: Option<usize>,
+    number: bool,
+    marks: &[usize],
+) {
     let Ok(src) = std::fs::read_to_string(file) else {
         ctx.out.note(&format!("note: could not read {}", file));
         return;
@@ -227,10 +245,12 @@ pub(crate) fn print_range(
     }
     for (i, l) in lines[lo..cut].iter().enumerate() {
         let n = lo + i + 1;
-        let gutter = match mark {
-            Some(m) if m == n => "> ",
-            Some(_) => "  ",
-            None => "",
+        let gutter = if marks.is_empty() {
+            ""
+        } else if marks.contains(&n) {
+            "> "
+        } else {
+            "  "
         };
         if number {
             ctx.out.line(&format!("{}{:>5}| {}", gutter, n, l));
@@ -241,11 +261,18 @@ pub(crate) fn print_range(
     // Via `ctx.out.line`, so it lands on stdout with the rows: this is the one
     // line that must survive whatever the caller wrapped the command in.
     if dropped > 0 {
+        // The number that finishes the job, not a constant. This read
+        // `--max-lines 480` whether three lines were left or three hundred,
+        // because it was `max(shown × 2, 480)` and the floor always won — so
+        // the advice was wrong in both directions at once: far more than a
+        // reader needs for a short tail, and still short of the whole for a
+        // long one. Naming `hi - lo` means the suggested value always shows
+        // exactly the rest.
         ctx.out.line(&format!(
-            "… {} more line(s) to {} — `--max-lines {}` for more, `--max-lines 0` for all of it",
+            "… {} more line(s) to {} — `--max-lines {}` for the rest, `--max-lines 0` for all of it",
             dropped,
             hi,
-            (cut - lo).saturating_mul(2).max(DEFAULT_MAX_LINES * 2)
+            hi - lo
         ));
     }
 }

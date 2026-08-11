@@ -30,13 +30,29 @@ pub struct UseMap {
 }
 
 impl UseMap {
-    pub fn build(file: &syn::File) -> Self {
+    /// Build a file's use-map, given the file's own module path so that
+    /// `crate`, `self` and `super` prefixes become real module paths.
+    ///
+    /// Without this a glob is stored as written, and `use super::*;` — the
+    /// commonest glob in a `mod.rs`-shaped crate — was the literal string
+    /// `"super"`. Nothing was ever indexed under `super::…`, so the glob
+    /// resolved nothing and `geom::boolean::dist` (the name a reader writes
+    /// from a call site *inside* `boolean.rs`, where `dist` is glob-imported
+    /// from the parent) reported "no item named". The suggestion list then
+    /// offered six near-misses in other modules and not the answer.
+    pub fn build_in(file: &syn::File, module: &str) -> Self {
         let mut um = UseMap::default();
         for item in &file.items {
             if let syn::Item::Use(u) = item {
                 let mut prefix = Vec::new();
                 collect_uses(&u.tree, &mut prefix, &mut um);
             }
+        }
+        for g in &mut um.globs {
+            *g = normalize_prefix(g, module);
+        }
+        for q in um.aliases.values_mut() {
+            *q = normalize_prefix(q, module);
         }
         um
     }
@@ -54,6 +70,42 @@ impl UseMap {
         }
         None
     }
+}
+
+/// Rewrite a `crate` / `self` / `super` head into the module path it names,
+/// from the point of view of a file whose own module is `module`.
+///
+/// `crate` maps to the empty root because that is how this tool spells qpaths:
+/// `geom::dist`, never `crate::geom::dist`. A `super` that walks past the root
+/// is left alone rather than guessed at — a wrong path resolves to nothing and
+/// says nothing, where the unchanged one at least reads as what was written.
+fn normalize_prefix(path: &str, module: &str) -> String {
+    let mut segs: Vec<&str> = path.split("::").collect();
+    let mut here: Vec<&str> = if module.is_empty() {
+        Vec::new()
+    } else {
+        module.split("::").collect()
+    };
+    match segs.first() {
+        Some(&"crate") => {
+            segs.remove(0);
+            here.clear();
+        }
+        Some(&"self") => {
+            segs.remove(0);
+        }
+        Some(&"super") => {
+            while segs.first() == Some(&"super") {
+                segs.remove(0);
+                if here.pop().is_none() {
+                    return path.to_string();
+                }
+            }
+        }
+        _ => return path.to_string(),
+    }
+    here.extend(segs);
+    here.join("::")
 }
 
 fn collect_uses(tree: &syn::UseTree, prefix: &mut Vec<String>, um: &mut UseMap) {
@@ -616,7 +668,7 @@ impl Semantic {
     pub fn build(files: &[ParsedFile]) -> Self {
         let mut uses = BTreeMap::new();
         for f in files {
-            uses.insert(f.path.clone(), UseMap::build(&f.ast));
+            uses.insert(f.path.clone(), UseMap::build_in(&f.ast, &f.module));
         }
         Semantic {
             uses,
@@ -711,8 +763,9 @@ mod tests {
     fn a_glob_import_resolves_through_the_name_index() {
         let files = vec![pf("src/geom.rs", "geom", "pub struct Shape;")];
         let idx = NameIndex::build(&files);
-        let um = UseMap::build(
+        let um = UseMap::build_in(
             &syn::parse_str("use geom::*;\nuse std::fmt::{Display, Write as FmtWrite};").unwrap(),
+            "",
         );
         // The glob arm: `Shape` is not aliased, so it resolves only because
         // `geom::Shape` exists in the index.
@@ -721,6 +774,33 @@ mod tests {
         assert_eq!(um.resolve("Display", &idx).as_deref(), Some("std::fmt::Display"));
         assert_eq!(um.resolve("FmtWrite", &idx).as_deref(), Some("std::fmt::Write"));
         assert_eq!(um.resolve("Nope", &idx), None);
+    }
+
+    /// `crate`, `self` and `super` are not module names, and a glob stored as
+    /// written resolved nothing: `use super::*;` was the literal `"super"`, so
+    /// every name a `mod.rs`-shaped crate reaches through its parent was
+    /// invisible to resolution.
+    #[test]
+    fn a_relative_glob_becomes_the_module_path_it_names() {
+        let files = vec![pf("src/geom/mod.rs", "geom", "pub fn dist() {}")];
+        let idx = NameIndex::build(&files);
+        // As written from `geom::boolean`, one level down.
+        let um = UseMap::build_in(&syn::parse_str("use super::*;").unwrap(), "geom::boolean");
+        assert_eq!(um.globs, vec!["geom".to_string()]);
+        assert_eq!(um.resolve("dist", &idx).as_deref(), Some("geom::dist"));
+
+        // `crate` is the root, which this tool spells as no prefix at all.
+        let um = UseMap::build_in(&syn::parse_str("use crate::geom::*;").unwrap(), "deep::down");
+        assert_eq!(um.globs, vec!["geom".to_string()]);
+
+        // `self` is the module itself.
+        let um = UseMap::build_in(&syn::parse_str("use self::inner::*;").unwrap(), "geom");
+        assert_eq!(um.globs, vec!["geom::inner".to_string()]);
+
+        // A `super` that walks past the root is left as written rather than
+        // guessed at — a fabricated path resolves to nothing and says nothing.
+        let um = UseMap::build_in(&syn::parse_str("use super::super::*;").unwrap(), "geom");
+        assert_eq!(um.globs, vec!["super::super".to_string()]);
     }
 
     #[test]

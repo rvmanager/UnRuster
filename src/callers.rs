@@ -19,13 +19,13 @@ pub(crate) struct CallSite {
     /// Target as resolved through the calling file's `use` map, if different
     /// from `target`. Used as a secondary key for `matches_target`. Approximate.
     pub(crate) target_resolved: Option<String>,
-    /// The callee is a bare name bound *locally* at the call site — a `let`
-    /// closure, a closure parameter, or a fn parameter — so it cannot be the
-    /// item that shares the name. `let grow = |lo, hi| …; grow(a)` calls the
-    /// closure, and attributing it to `hull::grow` misled a real session.
-    /// Best-effort: bindings introduced by `match` arms or `if let` patterns
-    /// are not tracked.
-    shadowed: bool,
+    /// The callee is a bare name bound *locally* at the call site — a fn
+    /// parameter, a `let`, a closure head, a `match` arm, a `for` pattern or an
+    /// `if let` — so it cannot be the item that shares the name. `let grow =
+    /// |lo, hi| …; grow(a)` calls the closure, and attributing it to
+    /// `hull::grow` misled a real session. See [`LocalScopes`], which decides
+    /// this for both call walks.
+    pub(crate) shadowed: bool,
     /// The receiver was literally `self`. Enough to attribute `self.push(…)`
     /// inside `impl ArithVisitor` to `ArithVisitor::push` without inferring a
     /// type — and without mistaking `self.sites.push(…)`, whose receiver is a
@@ -37,22 +37,12 @@ struct CallVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
     sites: Vec<CallSite>,
-    /// Local-binding scopes, innermost last. Names land here when their
-    /// binding is visited, so a call *before* the `let` that shadows it still
-    /// reads as a call to the item — which is what the compiler resolves too.
-    locals: Vec<BTreeSet<String>>,
-    /// Parameter names from the most recent signature, claimed by the fn
-    /// body's block when it opens.
-    pending_params: BTreeSet<String>,
+    scopes: LocalScopes,
 }
 
 impl<'a> CallVisitor<'a> {
     fn enclosing(&self) -> String {
         self.scope.enclosing_with_toplevel()
-    }
-
-    fn local_shadows(&self, name: &str) -> bool {
-        self.locals.iter().any(|frame| frame.contains(name))
     }
 
     fn record(&mut self, target: String, line: usize, shadowed: bool) {
@@ -113,6 +103,97 @@ pub(crate) fn fn_ref_path(e: &syn::Expr) -> Option<String> {
     Some(path_to_string(&p.path))
 }
 
+/// The bare names bound *locally* at the point a visitor has reached — fn
+/// parameters, `let`s, closure heads, `match` arms, `for` patterns, and the
+/// patterns of `if let` / `while let`.
+///
+/// **One copy, because there were two and only one of them was complete.**
+/// `callers` and `contract_drift` each carried their own `locals` stack, their
+/// own `pending_params`, and their own `local_shadows`, and both applied the
+/// result at the direct-call site and *nowhere else* — so [`fn_ref_path`]
+/// arguments were recorded with `shadowed: false` hard-coded. A bare name in
+/// argument position is the shape a callback is written in (`.map(parse)`),
+/// and also the shape every ordinary variable is written in: `svggen`'s
+/// `raster::load(path: &str)` calling `image::open(path)` was reported as a
+/// `resolved` call to the unrelated `out::path()`, and all 30 "callers" of that
+/// fn across 7 modules were locals, parameters and match bindings. Nothing
+/// filtered it — `resolved` is the tier the docs say to trust — and
+/// `--candidates` ranked the fn 4th of 286 on the strength of the fake set.
+///
+/// Frames are ordered innermost last, and a name is only ever *added* once its
+/// binding has been visited: a call *before* the `let` that shadows it still
+/// reads as a call to the item, which is what the compiler resolves too.
+#[derive(Default)]
+pub(crate) struct LocalScopes {
+    frames: Vec<BTreeSet<String>>,
+    /// Names the next block to open should claim. A signature's parameters
+    /// belong to the body that follows it, and a `for`/`if let` pattern to the
+    /// block it guards; neither has a frame of its own to land in yet.
+    pending: BTreeSet<String>,
+}
+
+impl LocalScopes {
+    /// The parameters of a signature, replacing any pending set.
+    ///
+    /// Replaced rather than extended, for the reason [`params_of`] states: a
+    /// body-less trait signature must not leak its parameters into the next
+    /// body that happens to open.
+    pub(crate) fn pend_signature(&mut self, s: &syn::Signature) {
+        self.pending = params_of(s);
+    }
+
+    /// A pattern whose bindings scope over the block about to open — a `for`
+    /// head, or the `let` in an `if let` / `while let` condition. Extended, not
+    /// replaced, so a let-chain (`if let Some(a) = x && let Some(b) = y`)
+    /// contributes both.
+    pub(crate) fn pend_pattern(&mut self, p: &syn::Pat) {
+        pat_idents(p, &mut self.pending);
+    }
+
+    /// Open a block, which claims whatever is pending.
+    pub(crate) fn open_block(&mut self) {
+        let frame = std::mem::take(&mut self.pending);
+        self.frames.push(frame);
+    }
+
+    /// Open a scope for patterns that bind directly into it rather than into a
+    /// block — a `match` arm, a closure head.
+    pub(crate) fn open_patterns<'p>(&mut self, ps: impl Iterator<Item = &'p syn::Pat>) {
+        let mut frame = BTreeSet::new();
+        for p in ps {
+            pat_idents(p, &mut frame);
+        }
+        self.frames.push(frame);
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.frames.pop();
+    }
+
+    /// Add a `let`'s bindings to the innermost open frame, after its
+    /// initializer has been walked.
+    pub(crate) fn bind(&mut self, p: &syn::Pat) {
+        let mut names = BTreeSet::new();
+        pat_idents(p, &mut names);
+        if let Some(frame) = self.frames.last_mut() {
+            frame.extend(names);
+        }
+    }
+
+    /// Is this written-as-called path captured by a local binding?
+    ///
+    /// Only a bare single-segment name can be: `hull::grow(…)` and
+    /// `.grow(…)` always name the item however many locals are called `grow`.
+    /// This is the whole predicate, in one place, so a caller cannot apply it
+    /// to direct calls and forget it for fn-references.
+    pub(crate) fn shadows_path(&self, path: &str) -> bool {
+        if path.contains("::") || path.starts_with('.') || path.ends_with('!') {
+            return false;
+        }
+        self.frames.iter().any(|frame| frame.contains(path))
+    }
+}
+
 /// Every name a pattern binds, recursively. Used to learn which bare names a
 /// `let`, closure head, or fn signature shadows.
 pub(crate) fn pat_idents(p: &syn::Pat, out: &mut BTreeSet<String>) {
@@ -145,15 +226,13 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*e.func {
             let target = path_to_string(&p.path);
-            // Only a bare single-segment name can be captured by a local
-            // binding; `hull::grow(…)` always names the item.
-            let shadowed =
-                p.path.segments.len() == 1 && self.local_shadows(&target);
+            let shadowed = self.scopes.shadows_path(&target);
             self.record(target, line_of(&e.func), shadowed);
         }
         for a in &e.args {
             if let Some(t) = fn_ref_path(a) {
-                self.record(t, line_of(a), false);
+                let shadowed = self.scopes.shadows_path(&t);
+                self.record(t, line_of(a), shadowed);
             }
         }
         visit::visit_expr_call(self, e);
@@ -165,7 +244,8 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
         self.record_full(target, line_of(&e.method), false, on_self);
         for a in &e.args {
             if let Some(t) = fn_ref_path(a) {
-                self.record(t, line_of(a), false);
+                let shadowed = self.scopes.shadows_path(&t);
+                self.record(t, line_of(a), shadowed);
             }
         }
         visit::visit_expr_method_call(self, e);
@@ -182,36 +262,50 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     }
 
     fn visit_signature(&mut self, s: &'ast syn::Signature) {
-        self.pending_params = params_of(s);
+        self.scopes.pend_signature(s);
         visit::visit_signature(self, s);
     }
 
     fn visit_block(&mut self, b: &'ast syn::Block) {
-        let frame = std::mem::take(&mut self.pending_params);
-        self.locals.push(frame);
+        self.scopes.open_block();
         visit::visit_block(self, b);
-        self.locals.pop();
+        self.scopes.close();
     }
 
     fn visit_local(&mut self, l: &'ast syn::Local) {
         // Initializer first: in `let grow = |x| grow(x)` the body's call
         // still names the outer item, exactly as the compiler resolves it.
         visit::visit_local(self, l);
-        let mut names = BTreeSet::new();
-        pat_idents(&l.pat, &mut names);
-        if let Some(frame) = self.locals.last_mut() {
-            frame.extend(names);
-        }
+        self.scopes.bind(&l.pat);
     }
 
     fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
-        let mut frame = BTreeSet::new();
-        for p in &c.inputs {
-            pat_idents(p, &mut frame);
-        }
-        self.locals.push(frame);
+        self.scopes.open_patterns(c.inputs.iter());
         visit::visit_expr_closure(self, c);
-        self.locals.pop();
+        self.scopes.close();
+    }
+
+    fn visit_arm(&mut self, a: &'ast syn::Arm) {
+        self.scopes.open_patterns(std::iter::once(&a.pat));
+        visit::visit_arm(self, a);
+        self.scopes.close();
+    }
+
+    fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
+        // The iterated expression is outside the binding: `for path in
+        // paths()` calls the item, and only the body sees the local.
+        self.visit_expr(&e.expr);
+        self.scopes.pend_pattern(&e.pat);
+        self.visit_block(&e.body);
+    }
+
+    fn visit_expr_let(&mut self, e: &'ast syn::ExprLet) {
+        // Pended *after* the scrutinee is walked, so a closure inside it
+        // cannot claim the binding, and picked up by the `then` block or loop
+        // body that opens next — which is exactly where an `if let` binding is
+        // in scope.
+        visit::visit_expr_let(self, e);
+        self.scopes.pend_pattern(&e.pat);
     }
 }
 
@@ -227,8 +321,7 @@ pub(crate) fn collect_sites(
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()).with_spans(spans),
             sites: Vec::new(),
-            locals: Vec::new(),
-            pending_params: BTreeSet::new(),
+            scopes: LocalScopes::default(),
         };
         v.visit_file(&f.ast);
         // Resolve each target's head through the file's use-map (approximate).
@@ -525,10 +618,13 @@ pub fn run_callers(
     let index = ctx.idx;
     let sem = ctx.sem;
     let summary = ctx.summary;
+    // Deferred until the scan has run. The explanation used to be printed here,
+    // before anything had been looked for, on the reasoning that the scan can
+    // still find macros and unindexed names — and so `callers Paint::Raw`
+    // answered "no fn, method, or macro `Paint::Raw` ... and nothing close to
+    // it" and then listed the construction site it had just found. A note that
+    // contradicts the rows under it teaches the reader to skip the notes.
     let known = query_known(index, query);
-    if !known {
-        ctx.warn_unknown("fn, method, or macro", query);
-    }
 
     let sites = collect_sites(files, sem, index, ctx.spans);
 
@@ -570,13 +666,16 @@ pub fn run_callers(
         }
         ctx.retain_changed(&mut direct, |s| &s.file);
     }
+    if !known && direct.is_empty() {
+        ctx.warn_unknown("fn, method, or macro", query);
+    }
     note_narrower_than_bare(ctx, index, &sites, query, direct.len());
     let local_hits = direct.iter().filter(|s| s.shadowed).count();
     if local_hits > 0 {
         ctx.out.note(&format!(
-            "(note: {} of these site(s) call a *local* binding named `{}` (a closure or \
-             `let`), not the item — kept at heuristic confidence; `--min-confidence \
-             resolved` drops them)",
+            "(note: {} of these site(s) name a *local* binding of `{}` — a parameter, `let`, \
+             closure head, `match` arm, `for` pattern or `if let` — and not the item; kept at \
+             heuristic confidence, and `--min-confidence resolved` drops them)",
             local_hits,
             crate::ast::last_segment(query)
         ));

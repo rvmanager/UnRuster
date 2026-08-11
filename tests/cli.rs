@@ -7880,3 +7880,371 @@ fn leads_are_reported_without_failing_the_run() {
     let all = String::from_utf8_lossy(&out.stderr);
     assert!(all.contains("leads do not fail the run"), "{all}");
 }
+
+// ── shadowed bindings are not call sites ─────────────────────────────────
+
+/// A bare name in **argument position** is how a callback is written
+/// (`.map(parse)`) and how every ordinary variable is written. The walk applied
+/// its shadow check to direct calls and to nothing else, so `fn_ref` arguments
+/// were recorded with `shadowed: false` hard-coded: `svggen`'s `out::path()`
+/// came back with 30 callers across 7 modules at `resolved`, every row a
+/// parameter, a `let` or a `match` binding, and `--candidates` ranked the fn
+/// 4th of 286 on the strength of it. No confidence tier separated the fakes
+/// from the one real site.
+#[test]
+fn a_local_binding_in_argument_position_is_not_a_call_site() {
+    let out = ur()
+        .args(["--root", FIXTURE, "callers", "helpers::logfile"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    let notes = String::from_utf8_lossy(&out.stderr);
+
+    // Every binding form, and each must be demoted rather than dropped: the
+    // reader still learns the name occurs there.
+    for shape in [
+        "by_parameter",
+        "by_let",
+        "by_match_arm",
+        "by_for_pattern",
+        "by_if_let",
+        "by_closure_head",
+    ] {
+        let row = s
+            .lines()
+            .find(|l| l.contains(shape))
+            .unwrap_or_else(|| panic!("no row for {shape} in:\n{s}"));
+        assert!(
+            row.contains("heuristic"),
+            "`{shape}` binds the name locally, so its row must not be `resolved`:\n{row}"
+        );
+    }
+    assert!(
+        notes.contains("name a *local* binding of `logfile`") || s.contains("name a *local* binding of `logfile`"),
+        "the demotion must say why it happened:\n{notes}{s}"
+    );
+}
+
+/// The other direction, which matters just as much: the fn-reference feature
+/// exists because `.map(f)` is a real use, and narrowing the shadow check must
+/// not cost it. A qualified path can never be captured by a local, however many
+/// bindings share its last segment.
+#[test]
+fn a_genuine_fn_reference_survives_the_shadow_check() {
+    for (target, caller) in [
+        ("keep_it", "hands_over_a_fn"),
+        ("helpers::spell", "hands_over_a_qualified_fn"),
+        ("helpers::logfile", "calls_the_item"),
+        // The iterated expression sits outside the binding the loop opens.
+        ("helpers::logfile", "the_head_of_a_for_loop_is_not_shadowed"),
+    ] {
+        let out = ur()
+            .args(["--root", FIXTURE, "callers", target, "--min-confidence", "resolved"])
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains(caller),
+            "`{caller}` really does reference `{target}` and must survive at resolved:\n{s}"
+        );
+    }
+}
+
+/// `--min-confidence resolved` is the filter the docs point at, so it must be
+/// the one that separates the fakes from the real site.
+#[test]
+fn min_confidence_resolved_drops_the_shadowed_rows() {
+    let out = ur()
+        .args([
+            "--root", FIXTURE, "callers", "helpers::logfile",
+            "--min-confidence", "resolved",
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    for shape in ["by_parameter", "by_let", "by_match_arm", "by_for_pattern", "by_if_let"] {
+        assert!(!s.contains(shape), "`{shape}` must be filtered out:\n{s}");
+    }
+    assert!(s.contains("calls_the_item"), "the real caller must remain:\n{s}");
+}
+
+/// `contract-drift` is where a fake caller set does the most damage — the whole
+/// exercise is deriving a contract from the callers — so it must apply the same
+/// predicate and say so in words a reader cannot miss.
+#[test]
+fn contract_drift_applies_the_same_shadow_check_and_names_it() {
+    let out = ur()
+        .args(["--root", FIXTURE, "contract-drift", "helpers::logfile", "--no-bodies"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        all.contains("name a *local* binding of `logfile`"),
+        "contract-drift must name the reason its rows were demoted:\n{all}"
+    );
+    let rows: Vec<&str> = all.lines().filter(|l| l.contains("by_parameter\t")).collect();
+    assert!(
+        rows.iter().all(|r| r.starts_with("heuristic")),
+        "a shadowed caller row must not be `resolved`:\n{rows:?}"
+    );
+}
+
+/// The invariant must be able to *fail*, which means computing the binder set a
+/// different way from the walk it audits — a re-derivation would pass by
+/// construction. Here it only needs to hold on a tree that exercises every
+/// shape; `no-site-is-a-shadowed-binding` reporting `ok` over a non-empty probe
+/// set is the assertion.
+#[test]
+fn self_check_audits_the_walk_against_an_independent_binder_scan() {
+    let out = ur()
+        .args(["--root", FIXTURE, "self-check", "--probes", "0"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    let row = s
+        .lines()
+        .find(|l| l.contains("no-site-is-a-shadowed-binding"))
+        .unwrap_or_else(|| panic!("the invariant must appear in the report:\n{s}"));
+    let cols: Vec<&str> = row.split('\t').collect();
+    assert_eq!(cols[0], "ok", "the invariant must hold on the fixture:\n{row}");
+    assert_ne!(
+        cols[2], "0",
+        "an invariant that examined nothing has not passed:\n{row}"
+    );
+}
+
+// ── `--candidates` guards the axis that matters ──────────────────────────
+
+/// The ranker skipped names with more than one definition *in this tree*,
+/// which is the wrong axis: `svggen`'s private `geom::boolean::collect` has
+/// exactly one definition there and was ranked 7th of 286 on "475 callers
+/// across 40 modules" — every one of them an `Iterator::collect`. The evidence
+/// is in how the sites are written, and a free fn is never called `.name()`.
+#[test]
+fn candidates_do_not_credit_a_free_fn_with_method_calls() {
+    let out = ur()
+        .args(["--root", FIXTURE, "contract-drift", "--candidates", "--min-callers", "3"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !s.contains("homonyms::collect"),
+        "a free `collect` evidenced only by `.collect()` must not be ranked:\n{s}"
+    );
+    let all = format!("{}{}", s, String::from_utf8_lossy(&out.stderr));
+    assert!(
+        all.contains("only on `.name()` sites"),
+        "the drop must announce itself — a silent skip reads as 'no such candidate':\n{all}"
+    );
+}
+
+/// The other fabricated target from the same session: `out::path()` scored 0.73
+/// and ranked 4th of 286 on 30 "callers" that were all locals named `path`.
+#[test]
+fn candidates_do_not_credit_a_fn_with_its_own_shadowing_locals() {
+    let out = ur()
+        .args(["--root", FIXTURE, "contract-drift", "--candidates", "--min-callers", "3"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !s.contains("helpers::logfile"),
+        "a fn whose caller set is entirely local bindings must not be ranked:\n{s}"
+    );
+    let all = format!("{}{}", s, String::from_utf8_lossy(&out.stderr));
+    assert!(
+        all.contains("the name is a local binding"),
+        "the drop must announce itself:\n{all}"
+    );
+}
+
+/// Both guards are exclusions, so the cheapest way for them to be wrong is to
+/// exclude everything. A fn with real free-call sites must still rank.
+#[test]
+fn candidates_still_rank_a_genuine_target() {
+    let out = ur()
+        .args(["--root", FIXTURE, "contract-drift", "--candidates", "--min-callers", "3"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("shadowing::consume"),
+        "`consume` has seven ordinary call sites and must survive both guards:\n{s}"
+    );
+}
+
+// ── a qualified name reaches an item its module glob-imports ─────────────
+
+/// The name a reader writes from a call site. Inside `geom/boolean.rs`, `dist`
+/// is spelled bare because `use super::*` brought it in, so the honest guess is
+/// `geom::boolean::dist` — and the answer was "no item named", followed by six
+/// near-misses in other modules with the right one not among them. Two defects
+/// at once: globs were stored as the literal string `"super"`, and the
+/// suggestion list keeps one row per name and picked the wrong copy.
+#[test]
+fn a_qualified_name_resolves_through_a_glob_import() {
+    let s = ur_output_allow_2(&["--root", FIXTURE, "show", "glob_parent::globbed::reaches_the_parent"]);
+    assert!(
+        s.contains("glob_parent::reaches_the_parent"),
+        "the resolution must name the item, not guess near it:\n{s}"
+    );
+}
+
+/// One row per distinct name is right — four impls of `new` must not fill the
+/// list — but choosing the row by index order threw away the only evidence
+/// about which copy was meant, and said nothing about the ones it dropped.
+#[test]
+fn a_suggestion_prefers_the_candidate_under_the_querys_own_module() {
+    let s = ur_output_allow_2(&["--root", FIXTURE, "show", "glob_parent::nested::twinned"]);
+    let lines: Vec<&str> = s.lines().filter(|l| l.contains("twinned")).collect();
+    let first = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("fn "))
+        .unwrap_or_else(|| panic!("expected a suggestion row in:\n{s}"));
+    assert!(
+        first.contains("glob_parent::twinned"),
+        "the copy sharing the query's `glob_parent` prefix must lead:\n{s}"
+    );
+    assert!(
+        s.contains("share a name listed above and are not shown"),
+        "dropping the other copy must be said out loud:\n{s}"
+    );
+}
+
+// ── output-shape fixes ───────────────────────────────────────────────────
+
+/// The sixth TSV cell of the `## target` row carried the caller count when the
+/// body was withheld and the body's *line* count under `--reveal`, so a
+/// consumer reading position 6 got a different quantity depending on a flag it
+/// never saw. `--json` named them apart all along; the default format did not.
+#[test]
+fn the_target_row_keeps_one_column_set_in_both_modes() {
+    let withheld = String::from_utf8(ur_stdout(&["--root", FIXTURE, "contract-drift", "shadowing::consume", "--no-bodies"])).unwrap();
+    let revealed = String::from_utf8(ur_stdout(&[
+        "--root", FIXTURE, "contract-drift", "shadowing::consume", "--no-bodies", "--reveal",
+    ]))
+    .unwrap();
+    let row_of = |s: &str| -> Vec<String> {
+        s.lines()
+            .find(|l| l.contains("shadowing::consume") && l.starts_with("fn\t"))
+            .unwrap_or_else(|| panic!("no target row in:\n{s}"))
+            .split('\t')
+            .map(str::to_string)
+            .collect()
+    };
+    let (w, r) = (row_of(&withheld), row_of(&revealed));
+    assert_eq!(w.len(), r.len(), "the two modes must agree on the shape:\n{w:?}\n{r:?}");
+    // Whichever quantity this mode cannot answer is `—`, never a number in the
+    // other one's slot and never a `0` claiming there are none.
+    assert_eq!(w[6], "—", "withheld gathers no body line count:\n{w:?}");
+    assert_eq!(r[5], "—", "--reveal gathers no callers:\n{r:?}");
+    assert_ne!(w[5], "—", "withheld does report callers:\n{w:?}");
+    assert_ne!(r[6], "—", "--reveal does report body lines:\n{r:?}");
+}
+
+/// The withheld span starts at the signature and the revealed one at the doc
+/// comment, which is correct — the doc is the stated contract and is withheld
+/// with the body, so a `sed` over the printed range cannot spend the exercise.
+/// Correct and, until now, unsaid: the same item reported two locations with no
+/// hint that the difference was deliberate.
+#[test]
+fn the_withheld_span_says_why_it_differs_from_show() {
+    let out = ur()
+        .args(["--root", FIXTURE, "contract-drift", "shadowing::consume", "--no-bodies"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        all.contains("starts at its **signature**"),
+        "the span difference must be stated, not left to be discovered:\n{all}"
+    );
+}
+
+/// A caller with two call sites had its body printed twice, byte for byte,
+/// differing only in which line carried the `>` — and under a `--max-lines` cut
+/// above both, not even in that. It also spent two `--top` slots on one caller.
+#[test]
+fn a_caller_body_is_printed_once_however_many_sites_it_has() {
+    let s = String::from_utf8(ur_stdout(&["--root", FIXTURE, "contract-drift", "shadowing::consume"])).unwrap();
+    let bodies = s.matches("pub fn by_closure_head").count();
+    assert!(bodies <= 1, "expected one copy of each caller body, got {bodies}:\n{s}");
+    // `the_only_real_caller` is not a caller of `consume`; `by_*` all are, and
+    // each must appear exactly once in the header rows.
+    let headers = s.lines().filter(|l| l.starts_with("shadowing::by_parameter\t")).count();
+    assert_eq!(headers, 1, "one header row per caller:\n{s}");
+}
+
+/// The truncation hint read `--max-lines 480` whether three lines were left or
+/// three hundred: it was `max(shown × 2, 480)`, and the floor always won. The
+/// suggested value must be the one that shows the rest.
+#[test]
+fn the_truncation_hint_names_the_value_that_shows_the_rest() {
+    let s = String::from_utf8(ur_stdout(&["--root", FIXTURE, "show", "control_flow::loopy", "--max-lines", "3"])).unwrap();
+    let hint = s
+        .lines()
+        .find(|l| l.contains("more line(s) to"))
+        .unwrap_or_else(|| panic!("expected a truncation hint in:\n{s}"));
+    // "… N more line(s) to END — `--max-lines K` for the rest"
+    let end: usize = hint
+        .split(" to ")
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("could not read the end line from: {hint}"));
+    let dropped: usize = hint
+        .split_whitespace()
+        .nth(1)
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("could not read the dropped count from: {hint}"));
+    let suggested: usize = hint
+        .split("--max-lines ")
+        .nth(1)
+        .and_then(|t| t.split('`').next())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("could not read the suggestion from: {hint}"));
+    assert!(
+        suggested >= dropped + 3 && suggested <= end,
+        "the hint must name a value that shows the rest and no more \
+         (dropped {dropped}, ends at {end}, suggested {suggested}): {hint}"
+    );
+}
+
+/// The explanation was printed before anything had been looked for, so
+/// `callers Paint::Raw` said "no fn, method, or macro ... and nothing close to
+/// it" and then listed the construction site it had just found. A note that
+/// contradicts the rows under it teaches the reader to skip the notes.
+#[test]
+fn an_unknown_target_note_does_not_contradict_the_rows_below_it() {
+    // A tuple variant is not an indexed fn, so `query_known` is false — and
+    // the scan finds its construction site anyway. That is the exact shape
+    // (`Paint::Raw`) that produced "nothing close to it" above a listed hit.
+    let out = ur()
+        .args(["--root", FIXTURE, "callers", "Token::Word"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    let summary = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        s.contains("Token::Word") && !summary.contains("(0 call site(s)"),
+        "this target must have a hit for the test to mean anything:\n{s}{summary}"
+    );
+    assert!(
+        !s.contains("nothing close to it") && !s.contains("Did you mean"),
+        "sites were found, so the not-found explanation must not appear:\n{s}"
+    );
+
+    // The note must still fire where it is true.
+    let miss = ur_output_allow_2(&["--root", FIXTURE, "callers", "no_such_name_at_all"]);
+    assert!(
+        miss.contains("no fn, method, or macro"),
+        "a genuine miss must still be explained:\n{miss}"
+    );
+}

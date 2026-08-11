@@ -244,7 +244,28 @@ impl AnalysisCtx<'_> {
             ));
             return;
         }
-        let near = self.idx.similar(name, 6);
+        // `mod::name` where `mod` glob-imports the module that defines `name`.
+        // This is the name a reader writes from a call site: inside
+        // `geom/boolean.rs`, `dist(a, b)` is spelled bare and the enclosing
+        // module is `geom::boolean`, so `geom::boolean::dist` is the honest
+        // guess — and it was answered with six near-misses in other modules,
+        // the right item not among them. Asked before the fuzzy list, because
+        // an exact resolution beats every guess.
+        if let Some(d) = self.resolve_through_globs(name) {
+            self.out.answer(&format!(
+                "note: no {} `{}` — `{}` is defined as `{}` and reaches `{}` \
+                 through a glob import (`use …::*`), so the two name one item. \
+                 Use `{}`.",
+                what,
+                name,
+                crate::ast::last_segment(name),
+                d.qpath,
+                crate::ast::module_of_path(name),
+                d.qpath
+            ));
+            return;
+        }
+        let near = self.idx.similar_to_query(name, 6);
         if near.is_empty() {
             self.out.answer(&format!(
                 "note: no {} `{}` in the scanned tree, and nothing close to it \
@@ -258,6 +279,62 @@ impl AnalysisCtx<'_> {
         for d in &near {
             self.out
                 .answer(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));
+        }
+        // The list holds one entry per distinct name, so a method defined in
+        // four impls cannot crowd out the other candidates. That is right for
+        // four impls and wrong in silence: with `geom::dist` and `trace::dist`
+        // both in the tree, a query for `geom::boolean::dist` was answered with
+        // `trace::dist` alone and the reader had no way to know a second `dist`
+        // existed. Ranking now prefers the shared module prefix; this says when
+        // the choice was made at all.
+        let hidden: usize = near
+            .iter()
+            .map(|d| self.idx.lookup(&d.name).len().saturating_sub(1))
+            .sum();
+        if hidden > 0 {
+            self.out.answer(&format!(
+                "  (note: {} further item(s) share a name listed above and are not shown — \
+                 one row per distinct name. `show <name> --all` prints every copy)",
+                hidden
+            ));
+        }
+    }
+
+    /// The item `mod::name` names when `mod` reaches `name` through a glob.
+    ///
+    /// Only the unambiguous case answers: if two globs in that module both
+    /// supply the name, the query really is ambiguous and a confident answer
+    /// would be a guess wearing the shape of a resolution.
+    fn resolve_through_globs(&self, query: &str) -> Option<&crate::index::Defn> {
+        if !query.contains("::") {
+            return None;
+        }
+        let module = crate::ast::module_of_path(query);
+        let name = crate::ast::last_segment(query);
+        let mut found: Vec<&crate::index::Defn> = Vec::new();
+        for f in self.files {
+            if f.module != module {
+                continue;
+            }
+            let Some(uses) = self.sem.uses_for(&f.path) else {
+                continue;
+            };
+            for g in &uses.globs {
+                let candidate = if g.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}::{}", g, name)
+                };
+                for d in self.idx.lookup(&candidate) {
+                    if d.qpath == candidate && !found.iter().any(|x| x.qpath == d.qpath) {
+                        found.push(d);
+                    }
+                }
+            }
+        }
+        match found.as_slice() {
+            [one] => Some(one),
+            _ => None,
         }
     }
 
