@@ -210,7 +210,41 @@ fn parse_exprs(tokens: &TokenStream) -> Vec<syn::Expr> {
     if let Ok(expr) = syn::parse2::<syn::Expr>(tokens.clone()) {
         return vec![expr];
     }
-    Vec::new()
+    // Last resort: a body that is a *statement sequence* rather than an
+    // expression list. `tokio::select! { … }`, `bitflags! { … }` and any macro
+    // taking a block of code fail every attempt above — a `let` binding is not
+    // an expression and splitting on `;` leaves half-statements — so they were
+    // recorded as blind spots and analyzed by nothing. Parsing them as
+    // statements recovers every expression they contain.
+    exprs_of_stmts(tokens)
+}
+
+/// Parse `tokens` as a sequence of statements and return the expressions in
+/// them. Empty when the stream is not statement-shaped either.
+fn exprs_of_stmts(tokens: &TokenStream) -> Vec<syn::Expr> {
+    let Ok(stmts) = syn::Block::parse_within.parse2(tokens.clone()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for st in stmts {
+        match st {
+            syn::Stmt::Expr(e, _) => out.push(e),
+            // The initialiser is the part that can contain a call worth seeing;
+            // `let x;` contributes nothing and is not a failure to parse.
+            syn::Stmt::Local(l) => {
+                if let Some(init) = l.init {
+                    out.push(*init.expr);
+                    if let Some((_, diverge)) = init.diverge {
+                        out.push(*diverge);
+                    }
+                }
+            }
+            // A nested item or macro: its own body is visited by the AST walk
+            // that owns this file, so nothing is lost by not descending here.
+            syn::Stmt::Item(_) | syn::Stmt::Macro(_) => {}
+        }
+    }
+    out
 }
 
 fn parse_matches(m: &syn::Macro) -> Option<(syn::Expr, syn::Pat)> {

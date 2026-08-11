@@ -28,8 +28,8 @@ use crate::divergence;
 use crate::metrics::SortKey;
 use crate::parse::ParsedFile;
 use crate::{
-    casts, conversion_pairs, dead_code, error_swallows, metrics, parallel_matches, pass_through,
-    stringly,
+    arith_drift, casts, conversion_pairs, dead_code, error_swallows, metrics, panics,
+    parallel_matches, pass_through, stringly,
 };
 
 /// Cyclomatic-complexity threshold above which a fn counts as an audit
@@ -42,6 +42,15 @@ const CONTEXTED_TOP: usize = 20;
 
 /// Rows of the metrics ranking shown when `--top` is not given.
 const DEFAULT_METRICS_TOP: usize = 20;
+
+/// Rows shown for the two ranked, high-volume checks when `--top` is not given.
+///
+/// Matches `divergence`'s cap rather than the tighter 20 the low-volume
+/// sections use: these two rank their own rows, so the cut is at a score
+/// boundary and not an arbitrary one, and 40 still fits in a screenful of
+/// scrollback. `--top` overrides it; the count in the summary line, the waiver
+/// hits and the `--since` baseline are all taken before the cap applies.
+const ERROR_SWALLOWS_TOP: usize = 40;
 
 /// Source lines shown around each row of the low-volume checks. On the runs
 /// this battery was tuned against, `stringly` returned 4 rows and
@@ -87,6 +96,95 @@ enum Gate {
     Tiered,
 }
 
+/// Every check in the battery, in the order it runs. The names `--only` and
+/// `--skip` accept, and the names that appear as `"check"` in `--json`.
+pub const CHECKS: &[&str] = &[
+    "divergence",
+    "divergence-handling",
+    "enum-coverage",
+    "dead-code",
+    "conversion-pairs",
+    "error-swallows",
+    "panics",
+    "clones",
+    "config-drift",
+    "builder-drift",
+    "arith-drift",
+    "casts",
+    "stringly",
+    "metrics",
+    "pass-through",
+];
+
+/// Which checks this run should execute.
+///
+/// The battery had no selector at all, so the one recommendation to come out of
+/// a 200-defect evaluation — "read `audit` with `error-swallows` left out, and
+/// the checks that actually named defects fit on a screen" — could not be
+/// typed. `--top` already bounded rows per section; nothing bounded sections.
+#[derive(Clone, Default)]
+pub struct Selection {
+    /// `None` = every check. `Some` = exactly these.
+    only: Option<Vec<String>>,
+    skip: Vec<String>,
+}
+
+impl Selection {
+    /// Validate against [`CHECKS`] and build. An unknown name is an error
+    /// rather than a silent no-op: `--skip error_swallows` that quietly skips
+    /// nothing reads as a check that found nothing.
+    pub fn new(only: &[String], skip: &[String]) -> anyhow::Result<Self> {
+        let check = |names: &[String], flag: &str| -> anyhow::Result<()> {
+            for n in names {
+                if !CHECKS.contains(&n.as_str()) {
+                    anyhow::bail!(
+                        "unknown check `{}` for --{}. Known checks: {}",
+                        n,
+                        flag,
+                        CHECKS.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        };
+        check(only, "only")?;
+        check(skip, "skip")?;
+        let sel = Selection {
+            only: (!only.is_empty()).then(|| only.to_vec()),
+            skip: skip.to_vec(),
+        };
+        if CHECKS.iter().all(|c| !sel.wants(c)) {
+            anyhow::bail!("--only / --skip selected no checks at all; nothing would run");
+        }
+        Ok(sel)
+    }
+
+    pub fn wants(&self, check: &str) -> bool {
+        if self.skip.iter().any(|s| s == check) {
+            return false;
+        }
+        match &self.only {
+            Some(only) => only.iter().any(|o| o == check),
+            None => true,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.only.is_none() && self.skip.is_empty()
+    }
+
+    /// The checks this selection turns off, for the summary line. A report
+    /// missing five of fifteen sections has to say which five, or it reads as a
+    /// battery that shrank.
+    fn omitted(&self) -> Vec<&'static str> {
+        CHECKS
+            .iter()
+            .filter(|c| !self.wants(c))
+            .copied()
+            .collect()
+    }
+}
+
 /// The battery's per-check configuration, defined once.
 ///
 /// `waivers` must run the identical set to count waiver hits — if the two drift,
@@ -109,6 +207,10 @@ pub fn coverage_opts() -> parallel_matches::CoverageOpts {
     }
 }
 
+// unruster: ok(config-drift/SwallowOpts) 2026-08-11 — the two configurations
+// are the point. `BatteryConfig` exists precisely so the gating pass and the
+// permissive one sit side by side and can be diffed by eye; they differed
+// silently as two hand-written call sequences before that.
 pub fn swallow_opts() -> error_swallows::SwallowOpts {
     error_swallows::SwallowOpts {
         include_unwrap_or: false,
@@ -117,6 +219,21 @@ pub fn swallow_opts() -> error_swallows::SwallowOpts {
         // no defects.
         include_infallible: false,
         include_logged: false,
+        min_score: 0.0,
+    }
+}
+
+// unruster: ok(config-drift/PanicOpts) 2026-08-11 — same as its `SwallowOpts`
+// sibling above: `audit` reads for defects and hides the idiomatic families,
+// the permissive pass reports everything so `waivers` can tell "earns nothing
+// here" from "earns nothing anywhere".
+pub fn panic_opts() -> panics::PanicOpts {
+    panics::PanicOpts {
+        // `Mutex::lock().unwrap()` and friends: the panic is the documented
+        // response to a poisoned lock, and on the tree this was calibrated
+        // against they were the single largest family.
+        include_idiomatic: false,
+        min_score: 0.0,
     }
 }
 
@@ -145,6 +262,8 @@ pub struct BatteryConfig {
     pub handling_min_care_gap: u8,
     pub coverage: parallel_matches::CoverageOpts,
     pub swallows: error_swallows::SwallowOpts,
+    pub panics: panics::PanicOpts,
+    pub arith_min_score: f64,
     /// Empty = every class (the permissive pass).
     pub cast_classes: &'static [CastClass],
     pub include_unsafe_ptr: bool,
@@ -158,6 +277,8 @@ impl BatteryConfig {
             handling_min_care_gap: HANDLING_MIN_CARE_GAP,
             coverage: coverage_opts(),
             swallows: swallow_opts(),
+            panics: panic_opts(),
+            arith_min_score: ARITH_DRIFT_MIN_SCORE,
             cast_classes: CAST_CLASSES,
             include_unsafe_ptr: false,
         }
@@ -176,7 +297,13 @@ impl BatteryConfig {
                 include_unwrap_or: true,
                 include_infallible: true,
                 include_logged: true,
+                min_score: 0.0,
             },
+            panics: panics::PanicOpts {
+                include_idiomatic: true,
+                min_score: 0.0,
+            },
+            arith_min_score: 0.0,
             cast_classes: &[],
             include_unsafe_ptr: true,
         }
@@ -191,10 +318,19 @@ impl BatteryConfig {
 // unruster: ok(error-swallows/let-_) 2026-08-06 — the battery runs purely for
 // its effect on waiver hit counts; a check that fails contributes no hits,
 // which is the correct outcome, and there is no caller to report to.
-pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cfg: BatteryConfig) {
+pub fn run_silent_battery(
+    ctx: &AnalysisCtx,
+    dead_call_source: &[ParsedFile],
+    cfg: BatteryConfig,
+    sel: &Selection,
+) {
     // `--top` is enforced in the emitter, after fingerprint recording, so it
     // cannot affect hit counts or baselines however this battery is invoked.
-    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 13] = [
+    //
+    // `sel` is honoured here as well as in `run`. It has to be: this is the
+    // baseline half of `--since`, and a baseline that ran a check the current
+    // run skipped reports every one of that check's findings as `gone`.
+    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 15] = [
         ("divergence", &|| {
             divergence::run(ctx, None, cfg.divergence_min_score)
         }),
@@ -212,6 +348,7 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
             clones::run(ctx, clones::DEFAULT_MIN_TOKENS)
         }),
         ("error-swallows", &|| error_swallows::run(ctx, cfg.swallows)),
+        ("panics", &|| panics::run(ctx, cfg.panics)),
         ("casts", &|| {
             casts::run(ctx, cfg.cast_classes, None, false, cfg.include_unsafe_ptr)
         }),
@@ -220,6 +357,9 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
         }),
         ("builder-drift", &|| {
             builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE)
+        }),
+        ("arith-drift", &|| {
+            arith_drift::run(ctx, cfg.arith_min_score)
         }),
         // The advisory three too. They consult no waivers, so they add nothing
         // to hit counting — but a *baseline* comparison that omitted them would
@@ -233,6 +373,9 @@ pub fn run_silent_battery(ctx: &AnalysisCtx, dead_call_source: &[ParsedFile], cf
         ("pass-through", &|| pass_through::run(ctx, 1)),
     ];
     for (name, check) in checks {
+        if !sel.wants(name) {
+            continue;
+        }
         let prev = ctx.out.set_check(name);
         let _ = check();
         ctx.out.set_check(&prev);
@@ -253,12 +396,18 @@ pub const BUILDER_DRIFT_MIN_SCORE: f64 = 0.4;
 /// Minimum care distance for the `--handling` axis.
 pub const HANDLING_MIN_CARE_GAP: u8 = 2;
 
+/// Arithmetic-drift score below which rows are dropped from the audit section.
+/// One raw operator among three saturating siblings scores 0.75; an even split
+/// (one of two) scores 0.5 and is usually two different jobs in one scope.
+pub const ARITH_DRIFT_MIN_SCORE: f64 = 0.6;
+
 pub fn run(
     ctx: &AnalysisCtx,
     dead_call_source: &[ParsedFile],
     top: Option<usize>,
     strict: bool,
     findings_only: bool,
+    sel: &Selection,
 ) -> anyhow::Result<usize> {
     let mut gating = 0usize;
     let mut advisory = 0usize;
@@ -286,11 +435,20 @@ pub fn run(
                        cap: Option<usize>,
                        count: &mut dyn FnMut() -> anyhow::Result<Counts>|
      -> anyhow::Result<()> {
+        // `--only` / `--skip`: the check does not run at all, so it costs
+        // nothing and contributes nothing. The closing line names every check
+        // left out, so a shortened report cannot be misread as a clean one.
+        if !sel.wants(check) {
+            return Ok(());
+        }
+        // The check name is part of every fingerprint: two checks reporting the
+        // same line must not collapse into one identity. Set *before* the
+        // section opens so an empty section still carries its check in `--json`
+        // — otherwise a clean `metrics` and a clean `dead-code` are the same
+        // anonymous object.
+        let prev = ctx.out.set_check(check);
         ctx.out.section(title);
         ctx.out.set_row_budget(top.or(cap));
-        // The check name is part of every fingerprint: two checks reporting the
-        // same line must not collapse into one identity.
-        let prev = ctx.out.set_check(check);
         // A check announces its own `(0 …)` line before anyone can know the
         // section is empty, so `--findings-only` catches the line rather than
         // predicting it. The header is deferred by `section` for the same
@@ -402,8 +560,27 @@ pub fn run(
         // `DELETE FROM stripe_events` lived while this whole check sat in the
         // advisory pile and `audit` exited 0.
         Gate::Tiered,
-        None,
+        // Capped like every other section that can run long. It was the one
+        // that was not: on a twelve-crate workspace it emitted 665 of the
+        // battery's ~800 rows — 82% of the output — and the reader who gave up
+        // on it gave up on the battery. Rows are score-sorted, so the cap keeps
+        // the tier that gates and drops the tail, and `cap_note` says so.
+        Some(ERROR_SWALLOWS_TOP),
         &mut || error_swallows::run_counted(ctx, swallow_opts()),
+    )?;
+    section(
+        &format!(
+            "[high] panics — `.unwrap()` / `.expect()` / `panic!` on fallible work; \
+             gating at score >= {:.2} (explain: silent-fallbacks)",
+            panics::GATING_SCORE
+        ),
+        "panics",
+        // Tiered like its sibling: the rows that gate are the ones that panic
+        // on data the process did not produce — a parse of an argument, a
+        // response, a file — where a crash is the whole defect.
+        Gate::Tiered,
+        Some(ERROR_SWALLOWS_TOP),
+        &mut || panics::run_counted(ctx, panic_opts()),
     )?;
     section(
         &format!(
@@ -414,7 +591,7 @@ pub fn run(
         "clones",
         Gate::Tiered,
         Some(20),
-        &mut || clones::run_counted(ctx, clones::DEFAULT_MIN_TOKENS),
+        &mut || clones::run_counted(ctx, clones::DEFAULT_MIN_TOKENS, 0.0),
     )?;
     section(
         "[medium] config-drift — same struct, two configurations (explain: config-drift)",
@@ -438,6 +615,18 @@ pub fn run(
         Gate::Advisory,
         Some(10),
         &mut || Ok(Counts::flat(builder_drift::run(ctx, None, BUILDER_DRIFT_MIN_SCORE)?)),
+    )?;
+    section(
+        "[medium] arith-drift — one raw operator among saturating siblings (explain: divergence)",
+        "arith-drift",
+        // Advisory with its drift siblings: a scope that mixes `+` and
+        // `saturating_add` is often right, because the raw op is on a value the
+        // author knows cannot overflow. The rows are worth reading — this check
+        // exists because three of four adjacent RFC 9111 age terms saturated and
+        // the fourth did not.
+        Gate::Advisory,
+        Some(20),
+        &mut || Ok(Counts::flat(arith_drift::run(ctx, ARITH_DRIFT_MIN_SCORE)?)),
     )?;
     section(
         "[medium] casts — data-loss classes only (explain: casts)",
@@ -508,10 +697,23 @@ pub fn run(
     let waivers = ledger.len();
     let hidden: usize = ledger.iter().map(|w| w.hits()).sum();
     ctx.out.summary(&format!(
-        "(audit: {} gating + {} advisory finding(s) across {} check(s){}; {}{}{})",
+        "(audit: {} gating + {} advisory finding(s) across {} check(s){}{}; {}{}{})",
         gating,
         advisory,
         checks,
+        // A selected run reports what it did not look at. Without this the
+        // battery's own line is the same shape whether five checks were
+        // silenced or found nothing, and "0 gating findings" would be read as
+        // "clean" either way.
+        if sel.is_full() {
+            String::new()
+        } else {
+            format!(
+                " of {}; --only/--skip left out: {}",
+                CHECKS.len(),
+                sel.omitted().join(", ")
+            )
+        },
         // `--findings-only` hides sections, never findings — but a report with
         // eight of thirteen headers missing has to say which eight are missing
         // and why, or the next reader counts the headers and believes the

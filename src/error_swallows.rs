@@ -25,6 +25,9 @@ struct Hit {
     benign: Option<&'static str>,
     /// What the discarded `Result` was reporting on. See [`Effect`].
     effect: Effect,
+    /// The fallback puts a value from *somewhere else* in place of the one that
+    /// failed, rather than a type default. See [`fallback_substitutes`].
+    substitutes: bool,
 }
 
 impl Hit {
@@ -69,9 +72,35 @@ impl Hit {
         } else {
             self.effect.weight()
         };
-        (effect + kind).min(1.0)
+        // Third term: the fallback substituted a value from elsewhere.
+        //
+        // Added because the two swallows a 200-defect evaluation confirmed as
+        // real bugs both scored *below* the gate — 0.40 and 0.35 — so the
+        // ranking buried its own true positives. Both were the same shape:
+        // `.unwrap_or_else(|_| dist.install_path.clone())`, where the fallback
+        // is not a default but a *different value of the same type*. The
+        // failure vanishes and the program carries on holding data that looks
+        // valid, which is why the defect (an absolute path silently becoming a
+        // relative one) survived review.
+        //
+        // Effect alone could not see it: the receiver was a project-specific
+        // call, so it classified `Unknown` (0.20) and no combination of
+        // `Unknown` with a fallback kind reaches 0.55. Raising `Unknown`
+        // instead would have promoted every unrecognised chain in the tree.
+        let substitution = if self.substitutes && self.benign.is_none() {
+            SUBSTITUTION_WEIGHT
+        } else {
+            0.0
+        };
+        (effect + kind + substitution).min(1.0)
     }
 }
+
+/// Weight of the value-substitution term. Tuned to the boundary it exists to
+/// cross: `.unwrap_or_else` (0.15) on an `Unknown` effect (0.20) is 0.35, and
+/// 0.55 is the gate — so a substituting fallback on an unrecognised call gates,
+/// and a defaulting one still does not.
+const SUBSTITUTION_WEIGHT: f64 = 0.20;
 
 /// What the discarded `Result` was reporting on — the single feature that
 /// separated the real defects from the correct-by-design sites on the codebase
@@ -81,7 +110,7 @@ impl Hit {
 /// BEST-EFFORT signal: a project that wraps its database in `fn persist()`
 /// reads as `Unknown`, not `Mutation`. It ranks, it does not adjudicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Effect {
+pub enum Effect {
     /// External state was changed — a row written, a message sent, a file
     /// replaced. If this `Result` is dropped, the only record that the effect
     /// did or did not happen is gone with it. `let _ = sqlx::query("DELETE
@@ -109,7 +138,7 @@ impl Effect {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Effect::Mutation => "mutation",
             Effect::Io => "io",
@@ -203,7 +232,7 @@ fn verb_matches(name: &str, verbs: &[&str]) -> bool {
 /// in `sqlx::query(…).bind(id).execute(&mut *tx).await` sits three links down,
 /// and `query` alone would read as a plain read. Mutation wins over IO wins
 /// over decode, because a chain that both queries and executes did mutate.
-fn classify_effect(expr: &syn::Expr) -> Effect {
+pub fn classify_effect(expr: &syn::Expr) -> Effect {
     struct V {
         strong: bool,
         weak: bool,
@@ -450,19 +479,24 @@ impl<'a> SwallowVisitor<'a> {
     }
 
     fn record(&mut self, kind: &'static str, line: usize, swallowed: &syn::Expr) {
-        self.record_tagged(kind, line, None, swallowed);
+        self.record_tagged(kind, line, None, swallowed, false);
     }
 
     /// `swallowed` is the expression whose `Result` is being dropped — the
     /// method receiver, the `let` initialiser, the match scrutinee. It is the
     /// only thing that distinguishes a discarded DELETE from a discarded
     /// base64 decode, so every record path has to supply it.
+    ///
+    /// `substitutes` is the fallback's verdict from [`fallback_substitutes`];
+    /// only the two `.unwrap_or*` paths can answer it, and every other record
+    /// path passes false because it produces no replacement value.
     fn record_tagged(
         &mut self,
         kind: &'static str,
         line: usize,
         benign: Option<&'static str>,
         swallowed: &syn::Expr,
+        substitutes: bool,
     ) {
         let ctx = self.enclosing();
         self.hits.push(Hit {
@@ -472,6 +506,7 @@ impl<'a> SwallowVisitor<'a> {
             context: ctx,
             benign,
             effect: classify_effect(swallowed),
+            substitutes,
         });
     }
 }
@@ -487,6 +522,131 @@ fn pat_is_discarded(p: &syn::Pat) -> bool {
         }
         syn::Pat::Reference(r) => pat_is_discarded(&r.pat),
         syn::Pat::Paren(p) => pat_is_discarded(&p.pat),
+        _ => false,
+    }
+}
+
+/// Does this fallback substitute a value from elsewhere, rather than fall back
+/// to a default?
+///
+/// The distinction the [`Hit::score`] substitution term turns on:
+///
+/// ```ignore
+/// .unwrap_or_default()                                  // default — no
+/// .unwrap_or_else(|_| String::new())                     // default — no
+/// .unwrap_or(0)                                          // default — no
+/// .unwrap_or_else(|_| dist.install_path.clone())         // substitution — yes
+/// .unwrap_or_else(|_| self.fallback_index())             // substitution — yes
+/// ```
+///
+/// A default says "there was nothing"; a substitution says "there was
+/// *this* instead", and downstream code cannot tell the difference. Answers
+/// BEST-EFFORT: it reads the fallback's shape, not its meaning, so a `fn
+/// empty_path()` helper reads as a substitution.
+fn fallback_substitutes(kind: &str, e: &syn::ExprMethodCall) -> bool {
+    // `.unwrap_or_default()` is the default by construction; `.ok`/`.err`/
+    // `.map_err` produce no replacement value at all.
+    let expr = match kind {
+        ".unwrap_or" => e.args.first(),
+        ".unwrap_or_else" => match e.args.first() {
+            Some(syn::Expr::Closure(c)) => {
+                // A fallback built *out of the error* is not a substitution:
+                // it is the "inspects" tier of the `divergence --handling`
+                // care scale, one step more careful than a bare default.
+                // `.unwrap_or_else(|e| e.into_inner())` — the poisoned-lock
+                // recovery idiom — is this shape, and without the exemption
+                // the substitution term promoted every one of them.
+                if closure_uses_its_error(c) {
+                    return false;
+                }
+                Some(&*c.body)
+            }
+            other => other,
+        },
+        _ => None,
+    };
+    let Some(expr) = expr else { return false };
+    expr_is_substitute(expr)
+}
+
+/// Does this fallback closure read the error it was handed?
+///
+/// The parameter has to be a real binding (`|e|`, not `|_|` or `||`) and the
+/// body has to mention it. A closure that names its error and never uses it is
+/// discarding it just as completely as `|_|`.
+fn closure_uses_its_error(c: &syn::ExprClosure) -> bool {
+    let Some(syn::Pat::Ident(p)) = c.inputs.first() else {
+        return false;
+    };
+    let name = p.ident.to_string();
+    if name.starts_with('_') {
+        return false;
+    }
+    struct Uses<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Uses<'_> {
+        fn visit_ident(&mut self, i: &'ast syn::Ident) {
+            if i == self.name {
+                self.found = true;
+            }
+        }
+    }
+    let mut v = Uses {
+        name: &name,
+        found: false,
+    };
+    v.visit_expr(&c.body);
+    v.found
+}
+
+/// True when `e` names existing program state rather than an empty value.
+fn expr_is_substitute(e: &syn::Expr) -> bool {
+    match peel_grouping(e) {
+        // A block's answer is its tail expression; a block with no tail
+        // (`{ log!(…); }`) yields `()` and replaces nothing.
+        syn::Expr::Block(b) => match b.block.stmts.last() {
+            Some(syn::Stmt::Expr(tail, None)) => expr_is_substitute(tail),
+            _ => false,
+        },
+        // Literals, `None`, empty collections and `Default::default()` are the
+        // "there was nothing" family — and so is anything built entirely out of
+        // literals, however many calls it takes to spell: `"/tmp".to_string()`
+        // is a constant, not a value from elsewhere.
+        _ if crate::ast::is_literal_only(e) => false,
+        syn::Expr::Lit(_) => false,
+        syn::Expr::Array(a) => !a.elems.is_empty(),
+        syn::Expr::Tuple(t) => !t.elems.is_empty(),
+        syn::Expr::Unary(u) => expr_is_substitute(&u.expr),
+        syn::Expr::Reference(r) => expr_is_substitute(&r.expr),
+        syn::Expr::Path(p) => {
+            let last = p.path.segments.last().map(|s| s.ident.to_string());
+            !matches!(last.as_deref(), Some("None"))
+        }
+        syn::Expr::Call(c) => {
+            // `String::new()`, `Vec::new()`, `Default::default()`,
+            // `HashMap::with_capacity(0)` — constructors of the empty value.
+            // With arguments, a call is building something out of live data.
+            if !c.args.is_empty() {
+                return true;
+            }
+            let syn::Expr::Path(p) = peel_grouping(&c.func) else {
+                return true;
+            };
+            let last = p.path.segments.last().map(|s| s.ident.to_string());
+            !matches!(last.as_deref(), Some("new") | Some("default"))
+        }
+        // A method call, a field read, an index: all of them reach for a value
+        // the program already has.
+        syn::Expr::MethodCall(_)
+        | syn::Expr::Field(_)
+        | syn::Expr::Index(_)
+        | syn::Expr::Binary(_)
+        | syn::Expr::Try(_)
+        | syn::Expr::Await(_) => true,
+        // Anything unrecognised: no claim. The term only ever adds score, so
+        // the conservative answer is the one that adds none.
         _ => false,
     }
 }
@@ -563,7 +723,13 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
             // The receiver, not the whole call: the closure argument of
             // `.map_err(|_| …)` / `.unwrap_or_else(|| …)` is the handler that
             // runs on failure, not the thing that failed.
-            self.record_tagged(k, line_of(&e.method), benign, &e.receiver);
+            self.record_tagged(
+                k,
+                line_of(&e.method),
+                benign,
+                &e.receiver,
+                fallback_substitutes(k, e),
+            );
         }
         // A closure passed as an argument is not in *this* call's tail slot.
         self.closure_tail.push(false);
@@ -598,7 +764,7 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
                     } else {
                         None
                     };
-                    self.record_tagged("if-let-ok", line_of(&e.if_token), benign, &le.expr);
+                    self.record_tagged("if-let-ok", line_of(&e.if_token), benign, &le.expr, false);
                 }
             }
         }
@@ -637,7 +803,7 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
                 } else {
                     None
                 };
-                self.record_tagged("let-_", line_of(&l.let_token), benign, &init.expr);
+                self.record_tagged("let-_", line_of(&l.let_token), benign, &init.expr, false);
             }
         }
         visit::visit_local(self, l);
@@ -668,6 +834,13 @@ pub struct SwallowOpts {
     pub include_infallible: bool,
     /// `.unwrap_or_else(|| { log!(…); default })` — failure already observable.
     pub include_logged: bool,
+    /// Drop rows scoring below this. 0.0 keeps everything.
+    ///
+    /// This check ranks its own rows and gates on the top tier, and was the
+    /// only ranked check in the tool with no way to ask for that tier: the
+    /// sibling drift checks all take `--min-score`, and the answer here was
+    /// "read all 665 rows, or pipe them through `awk`".
+    pub min_score: f64,
 }
 
 impl Default for SwallowOpts {
@@ -679,6 +852,7 @@ impl Default for SwallowOpts {
             include_unwrap_or: false,
             include_infallible: true,
             include_logged: true,
+            min_score: 0.0,
         }
     }
 }
@@ -725,6 +899,16 @@ pub fn run_counted(
         _ => true,
     });
     let benign_hidden = before - all.len();
+    // Before the counts are taken: `--min-score` is a different question from
+    // `--top`. A cap says "show me fewer of these"; a floor says "these are
+    // not findings", so the summary must not go on counting them.
+    let below_floor = if opts.min_score > 0.0 {
+        let n = all.len();
+        all.retain(|h| h.score() >= opts.min_score);
+        n - all.len()
+    } else {
+        0
+    };
     let benign_shown = all.iter().filter(|h| h.benign.is_some()).count();
     // Ranked, not alphabetical. This list runs to ~90 rows on a mid-size
     // workspace and converts at a few percent; sorted by kind, the one row that
@@ -769,8 +953,9 @@ pub fn run_counted(
             ctx.suggest("error-swallows", Some(h.kind), today);
         }
     }
+    let substituting = all.iter().filter(|h| h.substitutes && h.benign.is_none()).count();
     ctx.out.summary(&format!(
-        "({} swallow site(s){}; {}; include_unwrap_or={}{}{}; explain: silent-fallbacks)",
+        "({} swallow site(s){}{}{}; {}; include_unwrap_or={}{}{}; explain: silent-fallbacks)",
         total,
         if top_tier > 0 {
             format!(
@@ -778,6 +963,22 @@ pub fn run_counted(
                  `audit` gates on)",
                 top_tier, GATING_SCORE
             )
+        } else {
+            String::new()
+        },
+        // Named because it is the term that moved a row above the gate, and a
+        // reader comparing two `unknown`-effect rows has no other way to see
+        // why one outranks the other.
+        if substituting > 0 {
+            format!(
+                ", {} whose fallback substitutes another value rather than a default",
+                substituting
+            )
+        } else {
+            String::new()
+        },
+        if below_floor > 0 {
+            format!("; {} below --min-score {:.2}", below_floor, opts.min_score)
         } else {
             String::new()
         },
@@ -968,7 +1169,93 @@ mod tests {
             context: "f".into(),
             benign: None,
             effect,
+            substitutes: false,
         }
+    }
+
+    /// A fallback that hands downstream code a *different value* rather than a
+    /// default. Both swallows a 200-defect evaluation confirmed as real bugs
+    /// were this shape and both scored below the gate.
+    fn substituting_hit(kind: &'static str, effect: Effect) -> Hit {
+        Hit {
+            substitutes: true,
+            ..hit(kind, effect)
+        }
+    }
+
+    fn call(src: &str) -> syn::ExprMethodCall {
+        match syn::parse_str::<syn::Expr>(src).expect("parse") {
+            syn::Expr::MethodCall(c) => c,
+            other => panic!("not a method call: {:?}", other),
+        }
+    }
+
+    /// The regression the substitution term exists for: uv PR #18176 replaced
+    /// `.unwrap_or_else(|_| dist.install_path.clone())`, which quietly turned an
+    /// absolute lockfile path into a relative one. It scored 0.35 — below the
+    /// gate — so `audit` ranked its own true positive into the tail.
+    #[test]
+    fn a_substituting_fallback_on_an_unknown_call_gates() {
+        let defect = substituting_hit(".unwrap_or_else", Effect::Unknown);
+        assert!(
+            defect.score() >= GATING_SCORE,
+            "score {:.2} must gate",
+            defect.score()
+        );
+        // …and the same site falling back to a default still must not, or the
+        // term has promoted the whole family rather than one shape.
+        assert!(hit(".unwrap_or_else", Effect::Unknown).score() < GATING_SCORE);
+    }
+
+    #[test]
+    fn defaults_are_not_substitutions() {
+        for src in [
+            "x.unwrap_or_else(|_| String::new())",
+            "x.unwrap_or_else(|_| Vec::new())",
+            "x.unwrap_or_else(|_| Default::default())",
+            "x.unwrap_or(0)",
+            r#"x.unwrap_or("")"#,
+            "x.unwrap_or_else(|_| None)",
+            // A block whose tail is not an expression yields `()`.
+            "x.unwrap_or_else(|_| { log(); })",
+            // Built out of the error: the `divergence --handling` scale calls
+            // this "inspects", one step more careful than a default. The
+            // poisoned-lock recovery idiom is this shape.
+            "x.unwrap_or_else(|e| e.into_inner())",
+            "x.unwrap_or_else(|e| Recovered::from(e))",
+        ] {
+            assert!(
+                !fallback_substitutes(".unwrap_or_else", &call(src))
+                    && !fallback_substitutes(".unwrap_or", &call(src)),
+                "{} is a default, not a substitution",
+                src
+            );
+        }
+    }
+
+    #[test]
+    fn values_from_elsewhere_are_substitutions() {
+        for src in [
+            "x.unwrap_or_else(|_| dist.install_path.clone())",
+            "x.unwrap_or_else(|_| self.fallback_index())",
+            "x.unwrap_or_else(|_| other[0])",
+            "x.unwrap_or_else(|_| { warn(); previous.clone() })",
+            // A closure that names its error and ignores it anyway.
+            "x.unwrap_or_else(|e| cached.clone())",
+        ] {
+            assert!(
+                fallback_substitutes(".unwrap_or_else", &call(src)),
+                "{} substitutes a value",
+                src
+            );
+        }
+        assert!(fallback_substitutes(".unwrap_or", &call("x.unwrap_or(cached)")));
+        // The kinds that produce no replacement value cannot substitute.
+        assert!(!fallback_substitutes(".ok", &call("x.ok()")));
+        assert!(!fallback_substitutes(
+            ".unwrap_or_default",
+            &call("x.unwrap_or_default()")
+        ));
     }
 
     /// The row that was losing money must outrank the rows that were correct

@@ -174,6 +174,33 @@ struct Section {
     rows: Vec<Row>,
     /// Raw text lines that aren't tabular (tree renderings, matrix headers).
     summary: Option<String>,
+    /// The check that produced these rows, recorded when the first one lands.
+    ///
+    /// The title is prose (`"[medium] metrics — fns with cyclo >= 15 (explain:
+    /// god-function)"`) and a consumer had to regex it to find out which check
+    /// it was reading. That is how a `metrics` row — a whole 1200-line function
+    /// — ends up scored as if it pointed at a line.
+    check: Option<String>,
+}
+
+/// What a row's location *means*, so a consumer can tell a pointer from an
+/// extent without knowing the battery by heart.
+///
+/// Emitted per section alongside [`Section::check`]. The distinction is the one
+/// that made a proximity-scored evaluation of this tool report matches it had
+/// not made: an `item` row names a whole function, so every defect inside that
+/// function lands "on" it.
+pub fn kind_of_check(check: &str) -> &'static str {
+    match check {
+        // Two locations, and the finding is the disagreement between them.
+        "divergence" | "divergence-handling" | "conversion-pairs" | "config-drift"
+        | "builder-drift" | "clones" | "arith-drift" | "co-call" => "pair",
+        // A whole item: the row's line is where it starts, not where a defect is.
+        "metrics" | "dead-code" | "pass-through" | "inventory" | "impls" | "tests" | "outline"
+        | "show" => "item",
+        // Everything else points at the line the reader should open.
+        _ => "site",
+    }
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +217,7 @@ impl State {
                 title: None,
                 rows: Vec::new(),
                 summary: None,
+                check: None,
             });
         }
         self.sections.last_mut().expect("just ensured non-empty")
@@ -435,10 +463,17 @@ impl Out {
             return;
         }
         if self.json() {
+            // Stamped at creation, not at the first row: a section that found
+            // nothing still has to say which check found nothing, or a
+            // consumer cannot tell an empty `metrics` from an empty
+            // `dead-code`. Callers set the check before opening the section;
+            // `row` fills it in for the ones that cannot.
+            let check = self.current_check.borrow().clone();
             self.state.borrow_mut().sections.push(Section {
                 title: Some(title.to_string()),
                 rows: Vec::new(),
                 summary: None,
+                check: (!check.is_empty()).then_some(check),
             });
             return;
         }
@@ -517,11 +552,13 @@ impl Out {
             if let Some(f) = &finding {
                 cells.push(("fp", Val::Str(f.fp.clone())));
             }
-            self.state
-                .borrow_mut()
-                .current()
-                .rows
-                .push(Row { cells, context });
+            let check = self.current_check.borrow().clone();
+            let mut st = self.state.borrow_mut();
+            let sec = st.current();
+            if sec.check.is_none() && !check.is_empty() {
+                sec.check = Some(check);
+            }
+            sec.rows.push(Row { cells, context });
             return;
         }
         let mut line: Vec<String> = cells.iter().map(|(_, v)| v.tsv()).collect();
@@ -752,6 +789,17 @@ impl Out {
                 push_str(&mut s, t);
                 s.push(',');
             }
+            // The two fields that make a section machine-readable: which check
+            // wrote it, and whether its rows point at a line or span an item.
+            // Without them the title — prose, with a severity tag and an
+            // `explain:` topic in it — was the only handle a consumer had.
+            if let Some(c) = &sec.check {
+                s.push_str("\n      \"check\": ");
+                push_str(&mut s, c);
+                s.push_str(",\n      \"kind\": ");
+                push_str(&mut s, kind_of_check(c));
+                s.push(',');
+            }
             s.push_str("\n      \"rows\": ");
             if sec.rows.is_empty() {
                 // `[]`, not `[\n]` — an empty result is the common case and
@@ -817,9 +865,28 @@ fn snippet(file: &str, line: usize, n: usize) -> Vec<String> {
         .collect()
 }
 
+/// JSON field prefix for the *second* and later site cells in one row.
+///
+/// The first site keeps the bare `file` / `line` names every consumer is
+/// written against. Subsequent ones are namespaced by their own cell key, which
+/// is what the emitter used to throw away: `push_row` hardcoded `file`/`line`
+/// for every [`Val::Site`], so a row naming two locations — every row the five
+/// comparison checks emit — produced the same key twice. `json.loads` keeps the
+/// last, so the *primary* (lean) location was silently replaced by the `vs` one
+/// and findings were attributed to the wrong file and line.
+///
+/// The trailing `_at` of a column name is dropped because those keys read as
+/// locations already (`vs_at` → `vs_file`, `vs_line`); anything else keeps its
+/// name whole (`vs_richest` → `vs_richest_file`).
+fn site_prefix(key: &str) -> &str {
+    key.strip_suffix("_at").unwrap_or(key)
+}
+
 fn push_row(s: &mut String, r: &Row) {
     s.push('{');
     let mut first = true;
+    // Whether the bare `file`/`line` pair has been spent on this row.
+    let mut primary_site_emitted = false;
     let sep = |s: &mut String, first: &mut bool| {
         if *first {
             *first = false;
@@ -827,24 +894,44 @@ fn push_row(s: &mut String, r: &Row) {
             s.push_str(", ");
         }
     };
+    // `"file"` for the first site cell, `"vs_file"` for the ones after it.
+    let key_of = |primary: bool, cell_key: &str, field: &str| -> String {
+        if primary {
+            format!("\"{}\"", field)
+        } else {
+            format!("\"{}_{}\"", site_prefix(cell_key), field)
+        }
+    };
     for (k, v) in &r.cells {
         match v {
             Val::Site { file, line } => {
                 sep(s, &mut first);
-                s.push_str("\"file\": ");
+                let primary = !primary_site_emitted;
+                primary_site_emitted = true;
+                s.push_str(&key_of(primary, k, "file"));
+                s.push_str(": ");
                 push_str(s, file);
-                s.push_str(", \"line\": ");
+                s.push_str(", ");
+                s.push_str(&key_of(primary, k, "line"));
+                s.push_str(": ");
                 s.push_str(&line.to_string());
             }
             // `line` stays the start, so a consumer written against `Site`
             // keeps working and only gains `end_line`.
             Val::Span { file, start, end } => {
                 sep(s, &mut first);
-                s.push_str("\"file\": ");
+                let primary = !primary_site_emitted;
+                primary_site_emitted = true;
+                s.push_str(&key_of(primary, k, "file"));
+                s.push_str(": ");
                 push_str(s, file);
-                s.push_str(", \"line\": ");
+                s.push_str(", ");
+                s.push_str(&key_of(primary, k, "line"));
+                s.push_str(": ");
                 s.push_str(&start.to_string());
-                s.push_str(", \"end_line\": ");
+                s.push_str(", ");
+                s.push_str(&key_of(primary, k, "end_line"));
+                s.push_str(": ");
                 s.push_str(&end.to_string());
             }
             other => {
@@ -857,7 +944,13 @@ fn push_row(s: &mut String, r: &Row) {
     }
     if !r.context.is_empty() {
         sep(s, &mut first);
-        s.push_str("\"context\": [");
+        // `context_lines`, not `context`: nine checks emit a column *called*
+        // `context` (the enclosing item), and under `--context N` — which
+        // `audit` turns on by itself for two of its sections — both landed in
+        // one object under one key. Worse than the site collision above,
+        // because the two values are different types: a consumer that reads
+        // the column as a string got an array of source lines instead.
+        s.push_str("\"context_lines\": [");
         for (i, l) in r.context.iter().enumerate() {
             if i > 0 {
                 s.push_str(", ");

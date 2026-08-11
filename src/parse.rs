@@ -59,6 +59,21 @@ pub fn scope_skipped() -> usize {
         .map_or(0, |(_, v)| v.len())
 }
 
+/// How many of those were skipped for being in a test-support *crate* rather
+/// than for living in `tests/` or being named `tests.rs`.
+///
+/// Reported separately because it is the surprising one: nothing about
+/// `crates/foo-test/src/lib.rs` looks like test code from the inside, so a
+/// reader who finds it missing from a production scan deserves to be told which
+/// rule removed it.
+pub fn scope_skipped_test_crates() -> usize {
+    SCOPE_SKIPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |(_, v)| v.iter().filter(|p| in_test_support_crate(p)).count())
+}
+
 /// Parse the files `--scope` excluded, so a caller can ask what is in them.
 ///
 /// Deliberately not part of the run's own `files`: the whole point of the flag
@@ -88,7 +103,8 @@ pub fn parse_excluded() -> Vec<ParsedFile> {
 /// Should `path` be skipped entirely under this scope? Exhaustive (no `_`)
 /// so a new Scope variant forces a decision here.
 fn out_of_scope(path: &Path, scope: Scope) -> bool {
-    let is_test_file = is_under_test_dir(path) || looks_like_test_named(path);
+    let is_test_file =
+        is_under_test_dir(path) || looks_like_test_named(path) || in_test_support_crate(path);
     match scope {
         Scope::Production => is_test_file,
         Scope::Tests => !is_test_file,
@@ -251,6 +267,101 @@ fn looks_like_test_named(p: &Path) -> bool {
         .and_then(|s| s.to_str())
         .map(|s| s == "tests" || s.ends_with("_test") || s.ends_with("_tests"))
         .unwrap_or(false)
+}
+
+/// Is this file inside a workspace member whose whole job is supporting tests?
+///
+/// The third shape of test code, and the one the other two heuristics cannot
+/// see: `crates/foo-test/src/lib.rs` is ordinary library code by every
+/// syntactic measure — not under a `tests/` directory, not named `tests.rs`,
+/// not behind `#[cfg(test)]`, because a crate depended on from
+/// `[dev-dependencies]` is compiled normally. So `--scope production` scanned
+/// it, and a battery run over a twelve-crate workspace reported swallowed
+/// `env::var`s in test scaffolding as production defects, twice landing them
+/// next to a real fix and reading as a near miss.
+///
+/// Decided from the crate's own name in the nearest ancestor `Cargo.toml`.
+/// BEST-EFFORT by construction — it is a naming convention, not a fact — so it
+/// is deliberately narrow: `test`, `tests`, `test-*`, `*-test`, `*-tests`,
+/// `*-test-utils`, `*-test-support`, `*-testing`. A crate that supports tests
+/// under some other name is missed, and `--exclude` remains the precise answer.
+fn in_test_support_crate(p: &Path) -> bool {
+    let Some(name) = crate_name_of(p) else {
+        return false;
+    };
+    // Compare on `-`; Cargo lets either spelling name the same package.
+    let n = name.replace('_', "-");
+    n == "test"
+        || n == "tests"
+        || n.starts_with("test-")
+        || n.ends_with("-test")
+        || n.ends_with("-tests")
+        || n.ends_with("-testing")
+        || n.ends_with("-test-utils")
+        || n.ends_with("-test-support")
+}
+
+/// `[package] name` of the nearest ancestor `Cargo.toml`, cached per directory.
+///
+/// Hand-scanned rather than parsed: the tool has no TOML dependency, and the
+/// one field it needs is unambiguous — the first `name = "…"` after the
+/// `[package]` header and before the next section.
+fn crate_name_of(p: &Path) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<PathBuf, Option<String>>>> = Mutex::new(None);
+
+    let dir = p.parent()?;
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(hit) = cache.get(dir) {
+        return hit.clone();
+    }
+    let mut found = None;
+    for anc in dir.ancestors() {
+        let manifest = anc.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&manifest) else {
+            break;
+        };
+        // A workspace-only root manifest has no `[package]`; keep walking up in
+        // case this is a nested directory of a member.
+        if let Some(name) = package_name(&src) {
+            found = Some(name);
+            break;
+        }
+    }
+    cache.insert(dir.to_path_buf(), found.clone());
+    found
+}
+
+/// The `name` of the `[package]` table in a manifest's text, if it has one.
+fn package_name(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("name") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let v = rest.trim().trim_matches(['"', '\''].as_slice());
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 /// Strip items whose cfg attributes evaluate to definitively False, OR which carry

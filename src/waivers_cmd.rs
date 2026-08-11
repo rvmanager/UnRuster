@@ -101,7 +101,7 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
         (HitMode::BelowAudit, crate::audit::BatteryConfig::permissive()),
     ] {
         ctx.suppressions.set_hit_mode(mode);
-        crate::audit::run_silent_battery(&probe, call_source, cfg);
+        crate::audit::run_silent_battery(&probe, call_source, cfg, &crate::audit::Selection::default());
     }
     ctx.suppressions.set_hit_mode(HitMode::Gating);
 }

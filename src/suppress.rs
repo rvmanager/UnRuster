@@ -418,7 +418,7 @@ const CHECK_GROUPS: &[(&str, &[&str])] = &[
     ("partial-enumeration", &["divergence", "enum-coverage"]),
     (
         "silent-fallbacks",
-        &["error-swallows", "divergence-handling"],
+        &["error-swallows", "divergence-handling", "panics"],
     ),
     ("replication", &["conversion-pairs", "pass-through", "clones"]),
 ];
@@ -458,6 +458,7 @@ pub fn group_of(check: &str) -> Option<&'static str> {
 /// Adding is always safe. Reordering is cosmetic. Renaming is a breaking change
 /// to files this tool does not control, so the answer is no.
 pub const WAIVABLE_CHECKS: &[&str] = &[
+    "arith-drift",
     "builder-drift",
     "casts",
     "clones",
@@ -468,6 +469,7 @@ pub const WAIVABLE_CHECKS: &[&str] = &[
     "divergence-handling",
     "enum-coverage",
     "error-swallows",
+    "panics",
     "pass-through",
     "stringly",
 ];

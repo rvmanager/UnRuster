@@ -322,13 +322,18 @@ pub const DEFAULT_MIN_TOKENS: usize = 24;
 pub const GATING_SCORE: f64 = 0.75;
 
 pub fn run(ctx: &AnalysisCtx, min_tokens: usize) -> anyhow::Result<usize> {
-    Ok(run_counted(ctx, min_tokens)?.total)
+    Ok(run_counted(ctx, min_tokens, 0.0)?.total)
 }
 
 /// As [`run`], but also reporting how many groups clear [`GATING_SCORE`].
+///
+/// `min_score` drops groups below a floor. This check ranks its rows and gates
+/// on the top tier, and — like `error-swallows`, and unlike the three drift
+/// checks it sits next to — used to offer no way to ask for that tier.
 pub fn run_counted(
     ctx: &AnalysisCtx,
     min_tokens: usize,
+    min_score: f64,
 ) -> anyhow::Result<Counts> {
     let mut bodies: Vec<Body> = Vec::new();
     for f in ctx.files {
@@ -391,6 +396,16 @@ pub fn run_counted(
         crate::suppress::Site::keyed(g.members[0].file.as_str(), g.members[0].line, &g.label)
     });
 
+    // Before the counts below, so a filtered row is not a finding rather than
+    // a hidden one.
+    let below_floor = if min_score > 0.0 {
+        let n = groups.len();
+        groups.retain(|g| g.score() >= min_score);
+        n - groups.len()
+    } else {
+        0
+    };
+
     groups.sort_by(|a, b| {
         b.score()
             .partial_cmp(&a.score())
@@ -430,7 +445,7 @@ pub fn run_counted(
     let copies: usize = groups.iter().map(|g| g.members.len()).sum();
     let gating = groups.iter().filter(|g| g.score() >= GATING_SCORE).count();
     ctx.out.summary(&format!(
-        "({} duplicated bod(ies) across {} group(s){}; {} fn(s) scanned; \
+        "({} duplicated bod(ies) across {} group(s){}{}; {} fn(s) scanned; \
          min_tokens={}{}; explain: replication)",
         copies,
         groups.len(),
@@ -439,6 +454,11 @@ pub fn run_counted(
                 ", {} at score >= {:.2} (the tier `audit` gates on)",
                 gating, GATING_SCORE
             )
+        } else {
+            String::new()
+        },
+        if below_floor > 0 {
+            format!("; {} below --min-score {:.2}", below_floor, min_score)
         } else {
             String::new()
         },

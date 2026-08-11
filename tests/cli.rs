@@ -6148,3 +6148,413 @@ fn min_confidence_resolved_drops_shadowed_sites() {
     assert!(!s.contains("param_shadow"), "{s}");
     assert!(s.contains("real_caller"), "{s}");
 }
+
+// ── JSON shape: one key, one meaning ──────────────────────────────────────
+//
+// Every row in this section exists because a 200-defect evaluation of this
+// tool parsed its `--json` with Python and silently got the wrong answer. Two
+// separate collisions produced duplicate keys in one object; `json.loads`
+// keeps the last, so findings were attributed to the wrong file and line.
+
+const ARITH_FIXTURE: &str = "fixtures/arith";
+const TEST_CRATE_FIXTURE: &str = "fixtures/testcrate";
+
+/// The keys of one JSON row object, in order, including repeats.
+///
+/// Hand-scanned rather than parsed: the point of the assertion is to catch a
+/// *duplicate* key, and every JSON library in the world would have already
+/// dropped one by the time a test could look. Rows are emitted one per line.
+fn json_row_keys(line: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut cur = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+                // A string at depth 1 followed by `:` is a key.
+                let mut rest = chars.clone();
+                let next = rest.find(|c: &char| !c.is_whitespace());
+                if depth == 1 && next == Some(':') {
+                    keys.push(std::mem::take(&mut cur));
+                } else {
+                    cur.clear();
+                }
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// Every row object in a `--json` document, as its key list.
+fn all_json_row_keys(out: &[u8]) -> Vec<Vec<String>> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('{'))
+        .map(json_row_keys)
+        .collect()
+}
+
+fn assert_no_duplicate_keys(out: &[u8], what: &str) {
+    for keys in all_json_row_keys(out) {
+        let mut seen = std::collections::HashSet::new();
+        for k in &keys {
+            assert!(
+                seen.insert(k.clone()),
+                "{what}: duplicate key `{k}` in one row object — a standard parser \
+                 keeps only the last: {keys:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_row_naming_two_sites_does_not_emit_file_twice() {
+    // `divergence`, `--handling`, `conversion-pairs`, `config-drift` and
+    // `builder-drift` all name two locations per row, and all five hardcoded
+    // `file`/`line` for both — so the *primary* (lean) site was the one a
+    // parser dropped. These are the checks the evaluation found real defects
+    // with, so the corruption landed exactly on the good rows.
+    let out = ur_stdout_allow_findings(&["--root", DIVGROUP, "--json", "audit"]);
+    assert_no_duplicate_keys(&out, "audit --json");
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("\"vs_file\": ") && s.contains("\"vs_line\": "),
+        "the second site must be namespaced by its own column:\n{s}"
+    );
+    assert!(
+        s.contains("\"file\": ") && s.contains("\"line\": "),
+        "the first site keeps the bare names every consumer is written against:\n{s}"
+    );
+}
+
+#[test]
+fn conversion_pairs_names_both_of_its_sites() {
+    // The worst of the five: both sites were anonymous, so even a consumer
+    // that kept duplicates could only tell them apart by position.
+    let out = ur_stdout(&["--root", FIXTURE, "--json", "conversion-pairs"]);
+    assert_no_duplicate_keys(&out, "conversion-pairs --json");
+    let s = String::from_utf8_lossy(&out);
+    assert!(
+        s.contains("\"reverse_file\": "),
+        "the reverse direction needs a name of its own:\n{s}"
+    );
+}
+
+#[test]
+fn a_context_column_does_not_collide_with_context_snippets() {
+    // Nine checks emit a column *called* `context` (the enclosing item) and
+    // `--context N` adds an array under the same key. Worse than the site
+    // collision: the two values are different types, so a consumer reading the
+    // column as a string got a list of source lines.
+    for cmd in ["error-swallows", "stringly", "casts", "catch-all-arms"] {
+        let out = ur_stdout(&["--root", FIXTURE, "--json", "--context", "1", cmd]);
+        assert_no_duplicate_keys(&out, cmd);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("\"context_lines\": ["),
+            "{cmd}: snippets need a key of their own:\n{s}"
+        );
+        assert!(
+            s.contains("\"context\": \""),
+            "{cmd}: the enclosing-item column must survive:\n{s}"
+        );
+    }
+}
+
+#[test]
+fn audit_json_defaults_have_no_duplicate_keys_anywhere() {
+    // `audit` raises `--context` for two of its sections by itself, so the
+    // collision fired on a plain `audit --json` with no flags at all.
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "--json", "audit"]);
+    assert_no_duplicate_keys(&out, "audit --json (defaults)");
+}
+
+#[test]
+fn json_sections_name_their_check_and_its_finding_kind() {
+    // The title is prose with a severity tag and an `explain:` topic in it. A
+    // consumer had to regex it — which is how a `metrics` row, a whole
+    // 1200-line function, gets scored as if it pointed at a line.
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "--json", "audit"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\"check\": \"metrics\""), "{s}");
+    assert!(s.contains("\"check\": \"error-swallows\""), "{s}");
+    // `item` says the row spans a whole function; `site` says it points at a
+    // line; `pair` says the finding is the disagreement between two places.
+    assert!(s.contains("\"kind\": \"item\""), "{s}");
+    assert!(s.contains("\"kind\": \"site\""), "{s}");
+    assert!(s.contains("\"kind\": \"pair\""), "{s}");
+}
+
+// ── audit: choosing what runs ─────────────────────────────────────────────
+
+#[test]
+fn audit_can_skip_a_check_and_says_which() {
+    let out = ur_stderr(&["--root", FIXTURE, "audit", "--skip", "error-swallows,dead-code"]);
+    assert!(
+        out.contains("--only/--skip left out: dead-code, error-swallows"),
+        "a shortened battery must name what it left out:\n{out}"
+    );
+    assert!(
+        out.contains("check(s) of "),
+        "and how many of the full battery ran:\n{out}"
+    );
+}
+
+#[test]
+fn audit_only_runs_exactly_what_was_named() {
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "audit", "--only", "stringly"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("## [medium] stringly"), "{s}");
+    assert!(!s.contains("## [high] divergence"), "{s}");
+    assert!(!s.contains("## [high] error-swallows"), "{s}");
+}
+
+#[test]
+fn an_unknown_check_name_is_an_error_not_a_silent_no_op() {
+    // `--skip error_swallows` that quietly skips nothing reads as a check that
+    // found nothing.
+    let out = ur()
+        .args(["--root", FIXTURE, "audit", "--skip", "error_swallows"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown check"), "{err}");
+    assert!(err.contains("Known checks:"), "{err}");
+}
+
+#[test]
+fn selecting_nothing_at_all_is_an_error() {
+    let out = ur()
+        .args([
+            "--root", FIXTURE, "audit", "--only", "stringly", "--skip", "stringly",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("selected no checks"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_highest_volume_check_is_capped_like_every_other_long_section() {
+    // It was the one section that could run long with no default cap: 665 of
+    // ~800 rows on a twelve-crate workspace, and the reader who gave up on it
+    // gave up on the battery.
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "audit", "--only", "error-swallows"]);
+    let s = String::from_utf8_lossy(&out);
+    let rows = s.lines().filter(|l| l.starts_with(".") || l.starts_with("let-_")).count();
+    assert!(rows <= 40, "expected the section capped at 40, got {rows} rows");
+}
+
+// ── the tier a ranked check gates on, askable ─────────────────────────────
+
+#[test]
+fn error_swallows_takes_a_min_score_like_its_ranked_siblings() {
+    let all = ur_stdout(&["--root", FIXTURE, "error-swallows"]);
+    let gating = ur_stdout(&["--root", FIXTURE, "error-swallows", "--min-score", "0.55"]);
+    assert!(
+        rows_of(&gating).len() < rows_of(&all).len(),
+        "a floor must actually drop rows"
+    );
+    for line in rows_of(&gating) {
+        let score: f64 = line.split('\t').nth(1).unwrap().parse().unwrap();
+        assert!(score >= 0.55, "row below the floor survived: {line}");
+    }
+}
+
+#[test]
+fn a_score_floor_is_reported_not_silently_applied() {
+    let err = ur_stderr(&["--root", FIXTURE, "error-swallows", "--min-score", "0.55"]);
+    assert!(err.contains("below --min-score 0.55"), "{err}");
+}
+
+#[test]
+fn clones_takes_a_min_score_too() {
+    let out = ur().args(["--root", FIXTURE, "clones", "--min-score", "0.99"]).output().unwrap();
+    assert!(out.status.success() || out.status.code() == Some(1));
+    for line in rows_of(&out.stdout) {
+        let score: f64 = line.split('\t').nth(1).unwrap().parse().unwrap();
+        assert!(score >= 0.99, "row below the floor survived: {line}");
+    }
+}
+
+// ── error-swallows: the substitution term ─────────────────────────────────
+
+#[test]
+fn a_fallback_that_substitutes_another_value_outranks_one_that_defaults() {
+    // uv PR #18176 replaced `.unwrap_or_else(|_| dist.install_path.clone())`,
+    // which quietly turned an absolute lockfile path into a relative one. It
+    // scored 0.35 — below the gate — so the ranking buried its own true
+    // positive. The fixture's `unwrap_or_else(|_| "/tmp".to_string())` is the
+    // control: a constant, however many calls it is spelled with.
+    let out = ur_stdout(&["--root", TEST_CRATE_FIXTURE, "--scope", "all", "error-swallows"]);
+    let s = String::from_utf8_lossy(&out);
+    let row = s
+        .lines()
+        .find(|l| l.starts_with(".unwrap_or_else"))
+        .expect("fixture has one");
+    let score: f64 = row.split('\t').nth(1).unwrap().parse().unwrap();
+    assert!(
+        score < 0.55,
+        "a constant fallback is a default, not a substitution: {row}"
+    );
+}
+
+// ── panics: the mirror of error-swallows ──────────────────────────────────
+
+#[test]
+fn unwrapping_a_parse_of_external_input_outranks_an_in_process_expect() {
+    let out = ur_stdout(&["--root", ARITH_FIXTURE, "panics"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("port_of"), "the parse unwrap must be reported:\n{s}");
+    let row = s.lines().find(|l| l.contains("port_of")).unwrap();
+    let score: f64 = row.split('\t').nth(1).unwrap().parse().unwrap();
+    assert!(score >= 0.55, "unwrapping a parse must gate: {row}");
+    assert!(row.contains("decode"), "and be classified by what it asserted: {row}");
+}
+
+#[test]
+fn a_shipped_todo_gates_on_its_own() {
+    let out = ur_stdout(&["--root", ARITH_FIXTURE, "panics"]);
+    let s = String::from_utf8_lossy(&out);
+    let row = s.lines().find(|l| l.starts_with("todo!")).expect("fixture has one");
+    let score: f64 = row.split('\t').nth(1).unwrap().parse().unwrap();
+    assert!(score >= 0.55, "a shipped todo! is a crash on a reachable path: {row}");
+}
+
+#[test]
+fn poisoned_lock_unwraps_are_idiomatic_and_hideable() {
+    let shown = ur_stdout(&["--root", ARITH_FIXTURE, "panics"]);
+    let hidden = ur_stdout(&["--root", ARITH_FIXTURE, "panics", "--hide-idiomatic"]);
+    assert!(rows_of(&hidden).len() < rows_of(&shown).len());
+    let err = ur_stderr(&["--root", ARITH_FIXTURE, "panics", "--hide-idiomatic"]);
+    assert!(err.contains("idiomatic site(s) hidden"), "{err}");
+}
+
+#[test]
+fn panics_rows_have_a_stable_column_shape() {
+    let out = ur_stdout(&["--root", ARITH_FIXTURE, "panics"]);
+    assert_tsv_cols(&out, 5);
+}
+
+// ── arith-drift: sibling expression divergence ────────────────────────────
+
+#[test]
+fn one_raw_operator_among_saturating_siblings_is_reported() {
+    // The shape no check in the tool could see: a fix changed `+` to
+    // `saturating_add` in a function whose neighbouring terms already
+    // saturated. Conceptually `divergence`'s thesis, but `divergence` pairs
+    // enum dispatch sites and nothing looked at expressions.
+    let out = ur_stdout(&["--root", ARITH_FIXTURE, "arith-drift"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("corrected_age"), "{s}");
+    assert!(s.starts_with("add\t0.75"), "three checked, one raw = 0.75:\n{s}");
+    assert!(s.contains("saturating_add"), "the row names the sibling to compare against:\n{s}");
+}
+
+#[test]
+fn a_lone_checked_call_is_not_a_convention() {
+    let out = ur_stdout(&["--root", ARITH_FIXTURE, "arith-drift", "--min-score", "0.0"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("lone_checked"), "one call is not a majority to differ from:\n{s}");
+}
+
+#[test]
+fn string_concatenation_is_not_arithmetic_drift() {
+    let out = ur_stdout(&["--root", ARITH_FIXTURE, "arith-drift", "--min-score", "0.0"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(!s.contains("\tlabel\t"), "`String + &str` has no checked sibling:\n{s}");
+}
+
+#[test]
+fn an_even_split_is_below_the_audit_floor() {
+    let loose = ur_stdout(&["--root", ARITH_FIXTURE, "arith-drift", "--min-score", "0.0"]);
+    assert!(String::from_utf8_lossy(&loose).contains("split"));
+    let tight = ur_stdout(&["--root", ARITH_FIXTURE, "arith-drift", "--min-score", "0.6"]);
+    assert!(
+        !String::from_utf8_lossy(&tight).contains("\tsplit\t"),
+        "two different jobs in one scope must not reach the battery"
+    );
+}
+
+// ── scope: test-support crates ────────────────────────────────────────────
+
+#[test]
+fn a_test_support_crate_is_not_production_code() {
+    // `crates/foo-test/src/lib.rs` is ordinary library code by every syntactic
+    // measure — not under `tests/`, not named `tests.rs`, not `#[cfg(test)]`,
+    // because a crate pulled in from `[dev-dependencies]` compiles normally.
+    // A battery run over a real workspace reported its swallowed `env::var`s
+    // as production defects.
+    let out = ur()
+        .args(["--root", TEST_CRATE_FIXTURE, "error-swallows"])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("Harness::new"),
+        "test-support crate scanned as production:\n{combined}"
+    );
+    // …and it is still there under `--scope all`, which is the whole point of
+    // classifying it rather than ignoring it.
+    let all = ur_stdout(&["--root", TEST_CRATE_FIXTURE, "--scope", "all", "error-swallows"]);
+    assert!(String::from_utf8_lossy(&all).contains("Harness::new"));
+}
+
+#[test]
+fn the_scope_note_says_which_rule_removed_a_test_support_crate() {
+    // "it was a test file" is not an explanation a reader can check by opening
+    // `crates/foo-test/src/lib.rs`, so the note names the rule.
+    let err = ur_stderr(&["--root", TEST_CRATE_FIXTURE, "callers", "Harness::new"]);
+    assert!(
+        err.contains("test-support crates"),
+        "expected the scope note to name the rule:\n{err}"
+    );
+}
+
+// ── macro bodies: fewer blind spots ───────────────────────────────────────
+
+#[test]
+fn a_statement_shaped_macro_body_is_no_longer_a_blind_spot() {
+    // `tokio::select! { … }` and friends fail every expression parse — a `let`
+    // is not an expression, and splitting on `;` leaves half-statements — so
+    // they were recorded as bodies no check could read.
+    let dir = scratch("macro-block-body");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn f(v: &Vec<u8>) {\n    \
+         some_macro! {\n        let n = v.len();\n        drop(n);\n    }\n}\n",
+    )
+    .unwrap();
+    let err = ur_stderr(&["--root", dir.to_str().unwrap(), "blind-spots"]);
+    assert!(
+        err.contains("0 blind spot(s)") || !err.contains("blind spot(s) —"),
+        "a statement-shaped body should parse now:\n{err}"
+    );
+}

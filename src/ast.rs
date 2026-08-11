@@ -776,6 +776,36 @@ pub fn peel_grouping(e: &syn::Expr) -> &syn::Expr {
     }
 }
 
+/// Is every input to this expression written in the source?
+///
+/// `Regex::new("^v[0-9]+$")`, `"3".parse::<u8>()`, `"/tmp".to_string()` — the
+/// value cannot vary at runtime on any input the program did not already
+/// contain, so it is a constant however many calls it is spelled with.
+///
+/// Two checks need this and they need to agree: `panics` uses it to clear
+/// `Regex::new("…").unwrap()` as an assertion about the source file rather than
+/// about data, and `error-swallows` uses it to keep `.unwrap_or_else(|_|
+/// "/tmp".to_string())` classified as a *default* rather than as a substituted
+/// value. Two copies that learned about different shapes would make the two
+/// checks disagree about the same question.
+///
+/// BEST-EFFORT: it looks for literals and rejects anything that names a binding,
+/// so a `const PATTERN: &str` reads as variable and stays in the listing.
+pub fn is_literal_only(e: &syn::Expr) -> bool {
+    match peel_grouping(e) {
+        syn::Expr::Lit(_) => true,
+        syn::Expr::Reference(r) => is_literal_only(&r.expr),
+        syn::Expr::Unary(u) => is_literal_only(&u.expr),
+        syn::Expr::MethodCall(c) => {
+            is_literal_only(&c.receiver) && c.args.iter().all(is_literal_only)
+        }
+        // A no-argument call has nothing written in it to be constant *from*:
+        // `Instant::now()` and `Default::default()` are both spelled this way.
+        syn::Expr::Call(c) => !c.args.is_empty() && c.args.iter().all(is_literal_only),
+        _ => false,
+    }
+}
+
 /// Peel grouping *and* borrows and derefs, so `&node` / `*node` / `(node)` all
 /// compare structurally equal to the bare `node`. For comparing two expressions
 /// for identity; use [`peel_grouping`] when only the noise should go.

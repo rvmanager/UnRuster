@@ -345,6 +345,22 @@ levels, and all three have produced confirmed defects:
   a write path legitimately handle different variant sets. What the tool
   does is put the two sides on one line so the comparison is one read.
 
+  A THIRD AXIS: `unruster arith-drift` — the same thesis applied to
+  expressions rather than dispatch sites. Inside one fn, if most of the
+  additions are written `saturating_add` and one is written `+`, the odd
+  one out is worth a look; the score is how outnumbered it is, so
+  three-to-one is someone who missed a line and one-to-one is two
+  different jobs in one scope. This exists because a real fix changed
+  `corrected_initial_age + resident_age` to `saturating_add` in a
+  function whose neighbouring RFC 9111 terms already saturated — a
+  one-token inconsistency between siblings that neither of the two axes
+  above could see, because both of them pair *sites*, not expressions.
+  Syntactic, so it has no types: `String + &str` in a scope that also
+  saturates is filtered on the obvious spellings and otherwise reads as
+  drift. Grouping is per operator — a `saturating_sub` is not a sibling
+  of an addition.
+  unruster arith-drift [--min-score 0.5]
+
   ROUTINE (what a session looks like)
     1. unruster divergence --changed-since HEAD~1     # your own last commit
     2. unruster divergence --handling                 # then the whole tree
@@ -623,6 +639,25 @@ loss from casts and conversions.
   (the event id, the row key) and decide explicitly whether to retry,
   propagate, or continue. Repair for the bottom tier: usually nothing —
   waive it with the reason, which is what the reason field is for.
+
+  A THIRD AXIS: what the fallback puts in place of the value that failed.
+  `.unwrap_or_default()` says "there was nothing"; `.unwrap_or_else(|_|
+  other.path.clone())` says "there was *this* instead", and downstream
+  code cannot tell the difference. Measured against a 200-defect
+  changelog, both of this check's confirmed true positives were the
+  second shape and both scored below the gate before that term existed —
+  one of them silently turning an absolute lockfile path into a relative
+  one. A substituting fallback adds 0.20.
+
+  THE MIRROR: `unruster panics` — Results that were *asserted* rather
+  than discarded. Same two-term shape, one table inverted: for a swallow
+  a decode is the safest class (nothing outside the process moved), for
+  a panic it is the most dangerous (the input to a parse is by definition
+  data the program did not produce, so the crash is reachable by whoever
+  supplies it). `.unwrap()` on a parse gates; `.expect` on an in-process
+  call does not. `Mutex::lock().unwrap()` and assertions over source
+  literals are the idiomatic families, hidden in `audit`.
+  unruster panics [--hide-idiomatic] [--min-score 0.55]
 
 ◇ CAST CLASSES — what is and isn't reported by default
   `casts` reports data-loss classes. `usize-widen` (`u32 as usize`,

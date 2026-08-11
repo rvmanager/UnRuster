@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+mod arith_drift;
 mod ast;
 mod audit;
 mod builder_drift;
@@ -32,6 +33,7 @@ mod metrics;
 mod outline;
 mod parallel_matches;
 mod parse;
+mod panics;
 mod pass_through;
 mod semantic;
 mod show;
@@ -290,6 +292,19 @@ enum Cmd {
     /// Each row carries a `kind` label so you can grep by category. Some hits
     /// are intentional (e.g. `let _ =` of a Drop guard) — review per site.
     ErrorSwallows(ErrorSwallowsArgs),
+    /// Find sites that abort the process instead of reporting a failure:
+    /// `.unwrap()`, `.expect(…)`, `panic!`, `unreachable!`, `todo!`,
+    /// `unimplemented!`. The mirror of `error-swallows` — that check finds
+    /// Results that were discarded, this one finds Results that were asserted.
+    /// Ranked so `.unwrap()` on a parse of data from outside the process (a
+    /// CLI argument, a response, a file) sorts above an `.expect` on an
+    /// in-process call, because that is the crash someone else can trigger.
+    Panics(PanicsArgs),
+    /// Find raw arithmetic operators among checked siblings: a `+` in a fn
+    /// where the neighbouring terms use `saturating_add`. Ranked by how
+    /// outnumbered the raw one is — three-to-one is someone who missed a line,
+    /// one-to-one is two different jobs in one scope.
+    ArithDrift(ArithDriftArgs),
     /// Find pass-through wrappers: fns whose body is a single call/expression.
     PassThrough(PassThroughArgs),
     /// Print one design-audit playbook section (repair recipe) by topic,
@@ -436,6 +451,8 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::Playbook => "playbook",
         Cmd::CohortCallees(_) => "cohort-callees",
         Cmd::ErrorSwallows(_) => "error-swallows",
+        Cmd::Panics(_) => "panics",
+        Cmd::ArithDrift(_) => "arith-drift",
         Cmd::PassThrough(_) => "pass-through",
         Cmd::Explain(_) => "explain",
         Cmd::Casts(_) => "casts",
@@ -479,6 +496,8 @@ impl Cmd {
             | Cmd::Divergence(_)
             | Cmd::Playbook
             | Cmd::ErrorSwallows(_)
+            | Cmd::Panics(_)
+            | Cmd::ArithDrift(_)
             | Cmd::PassThrough(_)
             | Cmd::Explain(_)
             | Cmd::Casts(_)
@@ -534,6 +553,22 @@ struct AuditArgs {
     /// `| tail -40` to read the rest.
     #[arg(long)]
     findings_only: bool,
+
+    /// Run only these checks (repeatable, or comma-separated). Names are the
+    /// ones in each section's `"check"` field: `divergence`,
+    /// `divergence-handling`, `enum-coverage`, `dead-code`,
+    /// `conversion-pairs`, `error-swallows`, `panics`, `clones`,
+    /// `config-drift`, `builder-drift`, `arith-drift`, `casts`, `stringly`,
+    /// `metrics`, `pass-through`.
+    #[arg(long, value_name = "CHECK", value_delimiter = ',')]
+    only: Vec<String>,
+
+    /// Run every check except these (repeatable, or comma-separated). The
+    /// low-volume comparison checks are where this tool's signal is; on a large
+    /// tree `--skip error-swallows,dead-code` is what makes the rest readable
+    /// end to end. The closing line always names what was left out.
+    #[arg(long, value_name = "CHECK", value_delimiter = ',')]
+    skip: Vec<String>,
 }
 
 #[derive(Args)]
@@ -543,6 +578,11 @@ struct ClonesArgs {
     #[arg(long, default_value_t = clones::DEFAULT_MIN_TOKENS)]
     min_tokens: usize,
 
+    /// Drop groups below this score. `--min-score 0.75` is the tier `audit`
+    /// gates on. The sibling drift checks all took a `--min-score` and this
+    /// one, which also ranks its rows, did not.
+    #[arg(long, default_value_t = 0.0)]
+    min_score: f64,
 }
 
 #[derive(Args)]
@@ -1010,6 +1050,42 @@ struct ErrorSwallowsArgs {
     /// default here; `audit` hides them.
     #[arg(long, alias = "no-logged")]
     hide_logged: bool,
+    /// Drop rows below this score. `--min-score 0.55` is the tier `audit`
+    /// gates on: an external effect happened and the only report of whether it
+    /// worked was discarded.
+    ///
+    /// This check ranks its rows and gates on the top tier, and was the only
+    /// ranked check in the tool with no way to ask for that tier — on a large
+    /// workspace it emits several hundred rows and the answer was `awk`.
+    #[arg(long, default_value_t = 0.0)]
+    min_score: f64,
+}
+
+#[derive(Args)]
+struct PanicsArgs {
+    /// Hide the idiomatic families: `Mutex::lock().unwrap()`, where the panic
+    /// is the documented response to a poisoned lock, and assertions over
+    /// source literals (`Regex::new("^a$").unwrap()`), whose input cannot vary
+    /// at runtime. Shown by default here; `audit` hides them.
+    // Bare switch named for its direction, per the convention set by
+    // `--hide-infallible` on `error-swallows`: `--include-X` when X is off by
+    // default, `--hide-X` when it is on.
+    #[arg(long, alias = "no-idiomatic")]
+    hide_idiomatic: bool,
+    /// Drop rows below this score. `--min-score 0.55` is the tier `audit`
+    /// gates on: asserted on data the process did not produce.
+    #[arg(long, default_value_t = 0.0)]
+    min_score: f64,
+}
+
+#[derive(Args)]
+struct ArithDriftArgs {
+    /// Drop rows below this score, where the score is checked-siblings over
+    /// total. Default 0.5 keeps every scope where the checked spelling is at
+    /// least as common as the raw one; `audit` uses 0.6, which needs a real
+    /// majority.
+    #[arg(long, default_value_t = 0.5)]
+    min_score: f64,
 }
 
 #[derive(Args)]
@@ -1209,11 +1285,24 @@ fn report_scope_gap(out: &emit::Out, scope: Scope, command_name: &str) {
     if skipped == 0 {
         return;
     }
+    // Test-support crates are called out separately: they are ordinary library
+    // code from the inside, so "it was a test file" is not an explanation a
+    // reader can check by opening it.
+    let in_test_crates = parse::scope_skipped_test_crates();
     out.note(&format!(
-        "(scope: {} test file(s) were not scanned — this answer covers production code \
+        "(scope: {} test file(s) were not scanned{} — this answer covers production code \
          only. `--scope all` includes tests, which is usually what you want before \
          changing a signature or a type's shape.)",
-        skipped
+        skipped,
+        if in_test_crates > 0 {
+            format!(
+                ", {} of them in test-support crates (a member named `*-test`, \
+                 `test-*`, `*-test-utils`, …)",
+                in_test_crates
+            )
+        } else {
+            String::new()
+        }
     ));
 }
 
@@ -1309,11 +1398,12 @@ fn dispatch(
             // Like dead-code, the call-set must come from the FULL tree.
             let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
             let call_source = all_files.as_deref().unwrap_or(files);
+            let sel = audit::Selection::new(&a.only, &a.skip)?;
             let comparing = a.since.is_some() || a.baseline.is_some();
             if comparing || a.write_baseline.is_some() {
                 ctx.out.start_recording();
             }
-            let gating = audit::run(ctx, call_source, top, a.strict, a.findings_only)?;
+            let gating = audit::run(ctx, call_source, top, a.strict, a.findings_only, &sel)?;
             let current = ctx.out.take_recording();
 
             if let Some(p) = a.write_baseline.as_deref() {
@@ -1328,7 +1418,10 @@ fn dispatch(
             }
 
             let Some((label, base)) = (match (&a.since, &a.baseline) {
-                (Some(r), _) => Some((r.clone(), battery_at_ref(r, root, scope, cfg, exclude)?)),
+                (Some(r), _) => Some((
+                    r.clone(),
+                    battery_at_ref(r, root, scope, cfg, exclude, &sel)?,
+                )),
                 (_, Some(p)) => Some((p.display().to_string(), baseline::read(p)?)),
                 _ => None,
             }) else {
@@ -1344,7 +1437,7 @@ fn dispatch(
             Ok(gating)
         }
         Cmd::BuilderDrift(a) => builder_drift::run(ctx, a.ctor.as_deref(), a.min_score),
-        Cmd::Clones(a) => clones::run(ctx, a.min_tokens),
+        Cmd::Clones(a) => Ok(clones::run_counted(ctx, a.min_tokens, a.min_score)?.total),
         Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score),
         Cmd::BlindSpots => {
             let sites = macro_scan::blind_spot_sites();
@@ -1478,8 +1571,18 @@ fn dispatch(
                 // The flag says "hide"; the option says "include".
                 include_infallible: !a.hide_infallible,
                 include_logged: !a.hide_logged,
+                min_score: a.min_score,
             },
         ),
+        Cmd::Panics(a) => panics::run(
+            ctx,
+            panics::PanicOpts {
+                // The flag says "hide"; the option says "include".
+                include_idiomatic: !a.hide_idiomatic,
+                min_score: a.min_score,
+            },
+        ),
+        Cmd::ArithDrift(a) => arith_drift::run(ctx, a.min_score),
         Cmd::PassThrough(a) => pass_through::run(ctx, a.max_loc),
         Cmd::Explain(_) => unreachable!("handled before the tree scan"),
         Cmd::Casts(a) => casts::run(ctx, &a.class, a.by, a.hide_widen, a.include_unsafe_ptr),
@@ -1550,6 +1653,7 @@ fn battery_at_ref(
     scope: Scope,
     cfg: &[String],
     exclude: &[String],
+    sel: &audit::Selection,
 ) -> Result<Vec<emit::Finding>> {
     let snap = baseline::snapshot(git_ref, root)?;
     let files = parse::parse_dir(&snap.scan_root, scope, cfg, exclude)?;
@@ -1572,7 +1676,7 @@ fn battery_at_ref(
         suppressions: &sup,
         suggest_waivers: false,
     };
-    audit::run_silent_battery(&sctx, &files, audit::BatteryConfig::gating());
+    audit::run_silent_battery(&sctx, &files, audit::BatteryConfig::gating(), sel);
     // Rewrite the temp-dir paths back to how the caller spells them, so a
     // `gone` row names a file the reader can actually open.
     let prefix = snap.scan_root.to_string_lossy().into_owned();
