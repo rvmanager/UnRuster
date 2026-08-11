@@ -15,6 +15,7 @@ mod cfg_eval;
 mod clones;
 mod context;
 mod config_drift;
+mod contract_drift;
 mod conversion_pairs;
 mod conversions;
 mod dead_code;
@@ -278,6 +279,14 @@ enum Cmd {
     /// with different care (`.expect` vs `.ok()`) by sibling fns.
     /// Highest-yield check in the tool; start here.
     Divergence(DivergenceArgs),
+    /// One function's implementation against the contract its callers assume.
+    /// Every other check compares siblings to each other; this one is vertical,
+    /// and the reasoning is yours: it prints the callers with the target's
+    /// signature but *not* its body or doc comment, so the expectation you
+    /// write from them is evidence rather than a description of code you have
+    /// already read. `--reveal` then prints the implementation to compare
+    /// against. `--candidates` ranks the fns worth the exercise.
+    ContractDrift(ContractDriftArgs),
     /// Print the full design-audit playbook (themes, signals, repair recipes).
     /// `explain <topic>` prints one section instead.
     Playbook,
@@ -449,6 +458,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::ParallelMatches(_) => "parallel-matches",
         Cmd::EnumCoverage(_) => "enum-coverage",
         Cmd::Divergence(_) => "divergence",
+        Cmd::ContractDrift(_) => "contract-drift",
         Cmd::Playbook => "playbook",
         Cmd::CohortCallees(_) => "cohort-callees",
         Cmd::ErrorSwallows(_) => "error-swallows",
@@ -495,6 +505,9 @@ impl Cmd {
             | Cmd::EnumCoverage(_)
             | Cmd::CohortCallees(_)
             | Cmd::Divergence(_)
+            // Emits material, not findings: there is no judgment here to fail
+            // a build on. The reader supplies the verdict.
+            | Cmd::ContractDrift(_)
             | Cmd::Playbook
             | Cmd::ErrorSwallows(_)
             | Cmd::Panics(_)
@@ -1090,6 +1103,51 @@ struct ArithDriftArgs {
 }
 
 #[derive(Args)]
+struct ContractDriftArgs {
+    /// The function, method, or macro whose contract to reconstruct. Same
+    /// target forms as `callers`: bare name, `Type::method`, `.method`,
+    /// `::name`, `name!`. Omit it only with `--candidates`.
+    #[arg(required_unless_present = "candidates")]
+    name: Option<String>,
+
+    /// Phase 2: print the target's doc comment, body, and callees. Run it
+    /// *after* writing the expectation the callers imply — an expectation
+    /// written afterwards describes the code instead of testing it.
+    #[arg(long, conflicts_with = "candidates")]
+    reveal: bool,
+
+    /// Rank the fns worth this exercise (enough callers, spread across enough
+    /// modules, enough body, little enough written down) instead of running it
+    /// on one. Takes no target. Pairs with `--changed-since`.
+    #[arg(long)]
+    candidates: bool,
+
+    /// Emit the caller rows and the usage table without the caller bodies.
+    /// The bodies are on by default because the expectation lives in what the
+    /// caller does *after* the call, and fetching them one `show` at a time is
+    /// the round-trip this command exists to remove.
+    #[arg(long, conflicts_with = "candidates")]
+    no_bodies: bool,
+
+    /// Stop after N source lines per caller body and say how many were left.
+    /// `0` lifts the bound. Defaults to 80 — lower than `show`'s, because this
+    /// prints one body per caller rather than one per run.
+    #[arg(long, value_name = "N")]
+    max_lines: Option<usize>,
+
+    /// `--candidates` only: the caller floor. Below three callers there is no
+    /// consensus to derive a contract *from*, only one caller's opinion.
+    #[arg(long, default_value_t = 3, value_name = "N")]
+    min_callers: usize,
+
+    /// Keep only callers at or above this confidence tier. A caller below
+    /// `resolved` may not be calling this item at all, and one wrong caller
+    /// poisons the expectation derived from the set.
+    #[arg(long, value_enum)]
+    min_confidence: Option<context::Confidence>,
+}
+
+#[derive(Args)]
 struct ExplainArgs {
     /// Topic words matched against playbook headings (e.g. `stringly`,
     /// `partial-enumeration`, `god function`). Omit to list topics.
@@ -1576,6 +1634,19 @@ fn dispatch(
                 divergence::run(ctx, a.name.as_deref(), a.min_score)
             }
         }
+        Cmd::ContractDrift(a) => contract_drift::run(
+            ctx,
+            a.name.as_deref().unwrap_or(""),
+            &contract_drift::ContractOpts {
+                reveal: a.reveal,
+                candidates: a.candidates,
+                no_bodies: a.no_bodies,
+                max_lines: a.max_lines,
+                min_callers: a.min_callers,
+                min_confidence: a.min_confidence,
+                top,
+            },
+        ),
         Cmd::Playbook => unreachable!("handled before the tree scan"),
         Cmd::CohortCallees(a) => callers::run_cohort_callees(ctx, &a.pattern),
         Cmd::ErrorSwallows(a) => error_swallows::run(

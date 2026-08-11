@@ -11,11 +11,11 @@ use crate::semantic::{Semantic, UseMap};
 use crate::emit::{row, site};
 
 #[derive(Debug, Clone)]
-struct CallSite {
+pub(crate) struct CallSite {
     file: String,
-    line: usize,
-    caller: String,
-    target: String,
+    pub(crate) line: usize,
+    pub(crate) caller: String,
+    pub(crate) target: String,
     /// Target as resolved through the calling file's `use` map, if different
     /// from `target`. Used as a secondary key for `matches_target`. Approximate.
     target_resolved: Option<String>,
@@ -62,9 +62,25 @@ impl<'a> CallVisitor<'a> {
     }
 }
 
+/// The names a signature's parameters bind, for a visitor that must know which
+/// bare names the body about to open shadows.
+///
+/// Returned rather than extended into place: a body-less trait signature must
+/// not leak its params into the next body that happens to open, and an
+/// overwrite makes that the only possible behaviour.
+pub(crate) fn params_of(s: &syn::Signature) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for input in &s.inputs {
+        if let syn::FnArg::Typed(t) = input {
+            pat_idents(&t.pat, &mut out);
+        }
+    }
+    out
+}
+
 /// Every name a pattern binds, recursively. Used to learn which bare names a
 /// `let`, closure head, or fn signature shadows.
-fn pat_idents(p: &syn::Pat, out: &mut BTreeSet<String>) {
+pub(crate) fn pat_idents(p: &syn::Pat, out: &mut BTreeSet<String>) {
     match p {
         syn::Pat::Ident(i) => {
             out.insert(i.ident.to_string());
@@ -120,14 +136,7 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     }
 
     fn visit_signature(&mut self, s: &'ast syn::Signature) {
-        // Overwrite, not extend: a body-less trait signature must not leak
-        // its params into the next body that happens to open.
-        self.pending_params = BTreeSet::new();
-        for input in &s.inputs {
-            if let syn::FnArg::Typed(t) = input {
-                pat_idents(&t.pat, &mut self.pending_params);
-            }
-        }
+        self.pending_params = params_of(s);
         visit::visit_signature(self, s);
     }
 
@@ -160,7 +169,7 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
     }
 }
 
-fn collect_sites(
+pub(crate) fn collect_sites(
     files: &[ParsedFile],
     sem: &Semantic,
     index: &NameIndex,
@@ -187,7 +196,11 @@ fn collect_sites(
     all
 }
 
-fn resolve_target_via_uses(target: &str, uses: &UseMap, index: &NameIndex) -> Option<String> {
+pub(crate) fn resolve_target_via_uses(
+    target: &str,
+    uses: &UseMap,
+    index: &NameIndex,
+) -> Option<String> {
     if target.starts_with('.') || target.ends_with('!') {
         return None;
     }
@@ -207,7 +220,7 @@ fn resolve_target_via_uses(target: &str, uses: &UseMap, index: &NameIndex) -> Op
     }
 }
 
-fn matches_target(call_target: &str, query: &str) -> bool {
+pub(crate) fn matches_target(call_target: &str, query: &str) -> bool {
     if let Some(name) = query.strip_suffix('!') {
         let Some(target_macro) = call_target.strip_suffix('!') else {
             return false;
@@ -242,7 +255,7 @@ fn matches_target(call_target: &str, query: &str) -> bool {
 }
 
 /// True if the index knows of any defined fn/method/etc. that matches the query.
-fn query_known(index: &NameIndex, query: &str) -> bool {
+pub(crate) fn query_known(index: &NameIndex, query: &str) -> bool {
     if query.ends_with('!') {
         // Macros aren't in the NameIndex (we only index struct/enum/etc.).
         // Assume known to avoid false alarms.
@@ -273,14 +286,26 @@ fn top_module(qpath: &str) -> &str {
 /// - bare-name query whose last segment has exactly one defn in the tree → `resolved`
 /// - plain last-segment match → `heuristic`
 fn site_confidence(s: &CallSite, query: &str, unique_name: bool) -> Confidence {
+    confidence_of(s.target_resolved.as_deref(), s.shadowed, query, unique_name)
+}
+
+/// [`site_confidence`] over the three facts it actually reads, so a command
+/// that collects its own richer call sites gets the same tiers rather than a
+/// second opinion. One rule, two callers — a `contract-drift` that disagreed
+/// with `callers` about which sites are trustworthy would be worse than one
+/// that never reported confidence at all.
+pub(crate) fn confidence_of(
+    target_resolved: Option<&str>,
+    shadowed: bool,
+    query: &str,
+    unique_name: bool,
+) -> Confidence {
     // A callee shadowed by a local binding cannot be the item the query
     // names — no promotion applies, however unique or qualified the query.
-    if s.shadowed {
+    if shadowed {
         return Confidence::Heuristic;
     }
-    let via_resolved = s
-        .target_resolved
-        .as_deref()
+    let via_resolved = target_resolved
         .map(|t| matches_target(t, query))
         .unwrap_or(false);
     if via_resolved || query.contains("::") || unique_name {
@@ -292,7 +317,7 @@ fn site_confidence(s: &CallSite, query: &str, unique_name: bool) -> Confidence {
 
 /// True when the query's last segment names exactly one fn/method definition
 /// in the tree — a bare-name match then can't be a same-named impostor.
-fn query_unique(index: &NameIndex, query: &str) -> bool {
+pub(crate) fn query_unique(index: &NameIndex, query: &str) -> bool {
     let last = query
         .trim_start_matches('.')
         .trim_start_matches("::")

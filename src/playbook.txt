@@ -387,6 +387,76 @@ levels, and all three have produced confirmed defects:
 When concrete types should become traits, primitives become newtypes,
 structs should split, or duplicate concepts should merge.
 
+◇ CONTRACT-DRIFT (implementation vs. the contract its use sites assume)
+  unruster contract-drift --candidates              # which fns are worth it
+  unruster contract-drift --candidates --changed-since HEAD~1
+  unruster contract-drift <fn>                      # phase 1: callers only
+  unruster contract-drift <fn> --reveal             # phase 2: the body
+  Every other check here is HORIZONTAL: it compares siblings to each
+  other. This one is VERTICAL — one function's implementation against
+  the aggregate expectation of everything that calls it — and it is the
+  one command where the tool is not the analyst. It assembles material;
+  you supply the verdict.
+  THE ORDER IS THE POINT. Phase 1 prints the callers with the target's
+  signature but NOT its body and NOT its doc comment. You read the
+  callers, write down what they imply the function must accept, return
+  and guarantee, and only then run `--reveal`. An expectation written
+  after reading the body is a description of the code, not evidence
+  about it — and nothing in the output would show the difference, which
+  is why the withholding is enforced rather than advised.
+  The signature IS shown: types, `Result`, `&mut` and lifetimes are
+  promises the compiler already keeps, and hiding them would only invite
+  expectations that are ruled out on sight. The doc comment is withheld
+  and revealed with the body, so the comparison is three-way: what
+  callers assume, what the doc promises, what the code does. Doc-vs-
+  callers disagreement is a finding of its own, and usually the cheaper
+  fix.
+  WHAT THE `usage` TABLE IS FOR. Three closed vocabularies, one row per
+  distinct fact, so "seven of eight callers propagate with `?`, one
+  unwraps" needs no counting:
+    ret:   what the caller does with the value — `?`, `unwrap`,
+           `discarded`, `match:N`, `if-let`, `closure:and_then`,
+           `arm-value`, `arg:<callee>`, `field:<Type>.<name>`
+    argN:  the shape of each argument — `literal`, `const`, `default`,
+           `field`, `call`, `var`
+    env:   `loop`, `cond`, `guarded`, `repeated`
+  Read `ret:discarded` and `ret:unwrap` first: a caller that throws the
+  result away asserts the call cannot fail, and a caller that unwraps
+  asserts the same thing more loudly. Either is a claim the
+  implementation may not honour.
+  `env:guarded` is the highest-value single fact the scan produces. It
+  means a preceding `if`/`assert!`/`let … else` in the same block tests
+  one of the argument names — a precondition the caller believes it must
+  establish, written down in no signature and checked by no compiler. If
+  some callers guard and others don't, that is the finding.
+  A parameter that is `literal` or `default` at EVERY site is a
+  parameter the implementation treats as more variable than it is, and a
+  deletion candidate regardless of what the comparison concludes.
+  WHAT IS EXCLUDED, AND WHY IT SAYS SO. Recursive call sites are dropped
+  — a fn calling itself is the implementation, and phase 1 undertook not
+  to show it. Callers below `resolved` may not be calling this item at
+  all, and one wrong caller poisons the whole derived expectation
+  (`--min-confidence resolved` drops them). Test callers are hidden by
+  the default scope and that costs you: a test states the expectation
+  outright where a production caller only implies it, so prefer
+  `--scope all` here. Each of these is reported, never silent.
+  `--top` counts CALLERS here, not rows, and the selection is spread
+  across modules rather than taken in file order — a truncated caller
+  set produces a confidently wrong contract rather than a short one.
+  CANDIDATES are ranked on caller breadth, spread across modules, body
+  size, a `Result`/`Option` return, and a missing doc comment. A method
+  row is tagged `heuristic`: call sites match by last segment, so
+  `Foo::len`'s count includes every `.len()` in the tree. Nothing here
+  is a verdict — the list says which targets are worth the exercise.
+  ROUTINE
+    1. unruster contract-drift --candidates --changed-since HEAD~1
+    2. unruster contract-drift <fn> --scope all
+    3. write the expectation — prose or a mini-spec — from the callers
+    4. unruster contract-drift <fn> --reveal
+    5. compare; what the body does that no caller expects, and what
+       every caller expects that the body does not guarantee, are the
+       two lists worth keeping
+
 ◇ EXTRACT A TRAIT (concrete type → interface)
   unruster takes-mut <Type>                       # mutation surface
   unruster type-refs <Type>                       # modules naming it

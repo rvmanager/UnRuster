@@ -189,6 +189,15 @@ impl ScopeTracker {
         }
     }
 
+    /// Source extent of the innermost enclosing fn, regardless of `--spans`.
+    ///
+    /// [`span_suffix`](Self::span_suffix) renders the same pair into a label
+    /// only when the flag is set. A caller that needs to *read* the enclosing
+    /// body — rather than to label it — needs the numbers unconditionally.
+    pub fn fn_span(&self) -> Option<(usize, usize)> {
+        self.fn_span_stack.last().copied()
+    }
+
     /// Label for the fn enclosing the current site: `module::mods::Type::fn`,
     /// or the prefix alone / `<top-level>` when not inside a fn. With
     /// `--spans` the fn segment carries `@start-end` source lines.
@@ -315,16 +324,31 @@ pub fn path_to_string_with_args(p: &syn::Path) -> String {
                     .map(|arg| match arg {
                         syn::GenericArgument::Type(t) => type_to_string(t),
                         syn::GenericArgument::Lifetime(l) => format!("'{}", l.ident),
-                        syn::GenericArgument::Const(_) => "_".to_string(),
-                        _ => "_".to_string(),
+                        // Spelled, not elided: `Matrix<4>` and `Matrix<32>` are
+                        // different types, and this string is what `index` and
+                        // `fields` key on. See `type_to_string`.
+                        syn::GenericArgument::Const(c) => const_arg_to_string(c),
+                        syn::GenericArgument::AssocType(a) => {
+                            format!("{} = {}", a.ident, type_to_string(&a.ty))
+                        }
+                        _ => "?".to_string(),
                     })
                     .collect();
                 s.push('<');
                 s.push_str(&args.join(", "));
                 s.push('>');
             }
-            syn::PathArguments::Parenthesized(_) => {
-                s.push_str("(...)");
+            // `Fn(A) -> B`. The old `(...)` merged every `Fn`/`FnMut`/`FnOnce`
+            // bound onto one spelling, the same identity collision the const
+            // arm above had.
+            syn::PathArguments::Parenthesized(p) => {
+                let args: Vec<String> = p.inputs.iter().map(type_to_string).collect();
+                s.push('(');
+                s.push_str(&args.join(", "));
+                s.push(')');
+                if let syn::ReturnType::Type(_, t) = &p.output {
+                    s.push_str(&format!(" -> {}", type_to_string(t)));
+                }
             }
         }
     }
@@ -434,6 +458,27 @@ pub fn path_last(p: &syn::Path) -> String {
         .unwrap_or_default()
 }
 
+/// Render a type as text.
+///
+/// # This string is an identity, not a label
+///
+/// Callers key on it: `index` builds an impl block's `qpath` out of it,
+/// `fields` stores it as `FieldDef.ty`, `casts` compares a cast's source
+/// against its target. So two *different* types must not render alike, or
+/// those consumers conflate them silently — which is exactly what happened
+/// while `Array` rendered `[T; _]`: `impl T for [u8; 4]` and
+/// `impl T for [u8; 32]` produced one and the same `qpath`, and two struct
+/// fields of those types were indistinguishable in `fields`.
+///
+/// Elision is still fine where it loses nothing that distinguishes: a const
+/// generic length that is neither a literal nor a path is `_` because there is
+/// nothing shorter to say about it. What is not fine is a whole *class* —
+/// every `impl Trait`, every `dyn Trait`, every fn pointer — collapsing onto
+/// one spelling.
+///
+/// The catch-all renders `?`, not `_`: `Type::Infer` *is* `_` in the source,
+/// and a variant this function cannot render is a different fact from a type
+/// the author wrote as inferred.
 pub fn type_to_string(t: &syn::Type) -> String {
     match t {
         syn::Type::Path(p) => {
@@ -462,14 +507,81 @@ pub fn type_to_string(t: &syn::Type) -> String {
             format!("({})", inner.join(", "))
         }
         syn::Type::Slice(s) => format!("[{}]", type_to_string(&s.elem)),
-        syn::Type::Array(a) => format!("[{}; _]", type_to_string(&a.elem)),
-        syn::Type::ImplTrait(_) => "impl _".to_string(),
-        syn::Type::TraitObject(_) => "dyn _".to_string(),
-        syn::Type::BareFn(_) => "fn(_)".to_string(),
+        syn::Type::Array(a) => format!(
+            "[{}; {}]",
+            type_to_string(&a.elem),
+            const_arg_to_string(&a.len)
+        ),
+        syn::Type::ImplTrait(i) => format!("impl {}", bounds_to_string(&i.bounds)),
+        syn::Type::TraitObject(o) => format!("dyn {}", bounds_to_string(&o.bounds)),
+        syn::Type::BareFn(f) => bare_fn_to_string(f),
+        syn::Type::Macro(m) => format!("{}!", path_to_string(&m.mac.path)),
         syn::Type::Infer(_) => "_".to_string(),
         syn::Type::Never(_) => "!".to_string(),
         syn::Type::Paren(p) => type_to_string(&p.elem),
         syn::Type::Group(g) => type_to_string(&g.elem),
+        // Not `_`: see the note on this fn. A variant syn added since this
+        // match was written is not a type the author elided.
+        _ => "?".to_string(),
+    }
+}
+
+/// `Trait + Send + 'a` for an `impl`/`dyn` bound list. Empty renders `_`, which
+/// is unreachable in valid source but keeps `impl `/`dyn ` from ending bare.
+fn bounds_to_string(bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>) -> String {
+    let parts: Vec<String> = bounds
+        .iter()
+        .map(|b| match b {
+            syn::TypeParamBound::Trait(t) => {
+                let q = if matches!(t.modifier, syn::TraitBoundModifier::Maybe(_)) {
+                    "?"
+                } else {
+                    ""
+                };
+                format!("{}{}", q, path_to_string_with_args(&t.path))
+            }
+            syn::TypeParamBound::Lifetime(l) => format!("'{}", l.ident),
+            _ => "?".to_string(),
+        })
+        .collect();
+    if parts.is_empty() {
+        "_".to_string()
+    } else {
+        parts.join(" + ")
+    }
+}
+
+/// `fn(A, B) -> C`. The arity alone already separates fn pointers that the old
+/// single `fn(_)` spelling merged.
+fn bare_fn_to_string(f: &syn::TypeBareFn) -> String {
+    let args: Vec<String> = f.inputs.iter().map(|i| type_to_string(&i.ty)).collect();
+    let variadic = if f.variadic.is_some() { ", ..." } else { "" };
+    let ret = match &f.output {
+        syn::ReturnType::Default => String::new(),
+        syn::ReturnType::Type(_, t) => format!(" -> {}", type_to_string(t)),
+    };
+    format!("fn({}{}){}", args.join(", "), variadic, ret)
+}
+
+/// An array length or const generic argument. A literal and a named constant
+/// are both worth spelling — `[u8; 4]` and `[u8; MAX]` are different types, and
+/// so are `[u8; 4]` and `[u8; 32]`. Anything computed stays `_`: there is
+/// nothing shorter than the expression itself to say about it.
+pub fn const_arg_to_string(e: &syn::Expr) -> String {
+    match e {
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Int(i) => i.base10_digits().to_string(),
+            syn::Lit::Bool(b) => b.value.to_string(),
+            syn::Lit::Str(s) => format!("{:?}", s.value()),
+            syn::Lit::Char(c) => format!("{:?}", c.value()),
+            _ => "_".to_string(),
+        },
+        syn::Expr::Path(p) => path_to_string(&p.path),
+        syn::Expr::Group(g) => const_arg_to_string(&g.expr),
+        syn::Expr::Paren(p) => const_arg_to_string(&p.expr),
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => {
+            format!("-{}", const_arg_to_string(&u.expr))
+        }
         _ => "_".to_string(),
     }
 }

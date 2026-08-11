@@ -7,6 +7,7 @@ AGENT QUICKSTART
   unruster clones                    the same body written out more than once
   unruster config-drift              same struct built two ways (divergence, for values)
   unruster divergence --handling     one callee, different care (.expect vs .ok())
+  unruster contract-drift <fn>       its callers, body withheld; `--reveal` after you judge
   unruster explain <topic>           one repair recipe (cheap); `playbook` for all
   unruster outline <file>            the file's items, each with file:start-end
   unruster show <name>               one item's exact source; bounds itself, never pipe to head

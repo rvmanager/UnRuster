@@ -1761,9 +1761,10 @@ fn impls_filters_still_take_the_bare_trait_name() {
 
 #[test]
 fn nested_and_elided_generics_render_without_panicking() {
-    // `type_to_string` writes `_` for the shapes it does not spell out
-    // (`impl _`, `dyn _`, `fn(_)`, `[T; _]`). That is a deliberate elision and
-    // it must stay an elision — never a panic, and never silently empty.
+    // `type_to_string` elides only what cannot distinguish two types (a
+    // computed const generic, a variant syn added since). Whatever it writes,
+    // it must never panic and never render empty — an impl header is a
+    // `qpath`, and an empty one names nothing.
     let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "impl"]);
     for line in rows_of(&out) {
         let header = line.split('\t').nth(3).unwrap();
@@ -4488,6 +4489,9 @@ fn help_shows_the_command_list_within_the_first_screen() {
     // Raised 60 → 62 when `show` and `outline` were added: two new top-level
     // commands earn their two lines in a list of commands, and the rest of that
     // feature's documentation went to `explain reading-code` rather than here.
+    //
+    // Raised 62 → 63 for `contract-drift`, on the same terms: one quickstart
+    // line for the command, and the rest of it in `explain contract-drift`.
     let out = ur_stdout(&["--help"]);
     let s = String::from_utf8_lossy(&out);
     let idx = s
@@ -4495,8 +4499,8 @@ fn help_shows_the_command_list_within_the_first_screen() {
         .position(|l| l.starts_with("Commands:"))
         .expect("expected a Commands: section in --help");
     assert!(
-        idx < 62,
-        "Commands: must appear within the first 62 help lines, found at {}",
+        idx < 63,
+        "Commands: must appear within the first 63 help lines, found at {}",
         idx
     );
 }
@@ -6638,4 +6642,373 @@ fn a_statement_shaped_macro_body_is_no_longer_a_blind_spot() {
         err.contains("0 blind spot(s)") || !err.contains("blind spot(s) —"),
         "a statement-shaped body should parse now:\n{err}"
     );
+}
+
+// ── contract-drift: the implementation vs. what its callers assume ─────────
+
+/// The fixture the blindfold tests read: one target whose body carries a
+/// sentinel token that appears nowhere else, and callers that exercise the
+/// disposition vocabulary.
+fn contract_fixture(name: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod core {
+    /// Resolve a scope. DOC_SENTINEL_ZQX.
+    pub fn resolve_scope(root: &str, depth: usize) -> Result<Vec<String>, String> {
+        let marker = BODY_SENTINEL_ZQX;
+        if root.is_empty() {
+            return Err(marker.to_string());
+        }
+        Ok(vec![root.to_string(); depth])
+    }
+    pub const BODY_SENTINEL_ZQX: &str = "x";
+}
+
+pub mod alpha {
+    use crate::core::resolve_scope;
+    pub fn propagates(root: &str) -> Result<usize, String> {
+        let v = resolve_scope(root, 1)?;
+        Ok(v.len())
+    }
+    pub fn asserts(root: &str) -> usize {
+        resolve_scope(root, 1).unwrap().len()
+    }
+}
+
+pub mod beta {
+    use crate::core::resolve_scope;
+    pub fn discards(root: &str) {
+        let _ = resolve_scope(root, 0);
+    }
+    pub fn guarded(root: &str) -> usize {
+        if root.is_empty() {
+            return 0;
+        }
+        resolve_scope(root, 2).map(|v| v.len()).unwrap_or(0)
+    }
+    pub fn looped(roots: &[String]) {
+        for r in roots {
+            let _ = resolve_scope(r, 1);
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+/// The load-bearing test. Everything else in this command is convenience; if
+/// phase 1 can leak the body, the exercise it exists to support is worthless
+/// and nothing in the output would say so.
+#[test]
+fn contract_drift_phase_one_never_emits_the_body() {
+    let dir = contract_fixture("contract-blindfold");
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "contract-drift", "resolve_scope"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !all.contains("BODY_SENTINEL_ZQX"),
+        "phase 1 leaked the implementation:\n{all}"
+    );
+    assert!(
+        !all.contains("DOC_SENTINEL_ZQX"),
+        "phase 1 leaked the doc comment, which is the *stated* contract and \
+         must not contaminate the caller-derived one:\n{all}"
+    );
+    // The signature is contract, not implementation: withholding it would only
+    // make the reader invent expectations the compiler already rules out.
+    assert!(
+        all.contains("Result<Vec<String>, String>"),
+        "the signature must still be shown:\n{all}"
+    );
+}
+
+/// A blindfold instruction on stderr is a blindfold that `2>/dev/null` removes.
+#[test]
+fn contract_drift_withheld_note_survives_a_stderr_redirect() {
+    let dir = contract_fixture("contract-stdout-note");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "resolve_scope",
+        "--no-bodies",
+    ]))
+    .into_owned();
+    assert!(
+        out.contains("withheld on purpose") && out.contains("--reveal"),
+        "the instruction must be on stdout:\n{out}"
+    );
+}
+
+#[test]
+fn contract_drift_reveal_prints_body_and_doc_but_no_callers() {
+    let dir = contract_fixture("contract-reveal");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "resolve_scope",
+        "--reveal",
+    ]))
+    .into_owned();
+    assert!(out.contains("BODY_SENTINEL_ZQX"), "no body:\n{out}");
+    assert!(out.contains("DOC_SENTINEL_ZQX"), "no doc comment:\n{out}");
+    assert!(
+        !out.contains("## callers"),
+        "phase 2 must not reprint the caller material:\n{out}"
+    );
+}
+
+#[test]
+fn contract_drift_classifies_return_dispositions() {
+    let dir = contract_fixture("contract-ret");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "resolve_scope",
+        "--no-bodies",
+        "--top",
+        "20",
+    ]))
+    .into_owned();
+    for expected in ["ret:?", "ret:unwrap", "ret:discarded", "ret:chained:map"] {
+        assert!(out.contains(expected), "missing {expected}:\n{out}");
+    }
+}
+
+/// A precondition the caller believes it must establish, written down nowhere
+/// else — not in the signature, and not anywhere a compiler checks.
+#[test]
+fn contract_drift_detects_a_preceding_guard() {
+    let dir = contract_fixture("contract-guard");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "resolve_scope",
+        "--no-bodies",
+        "--top",
+        "20",
+    ]))
+    .into_owned();
+    assert!(out.contains("env:guarded"), "no guard detected:\n{out}");
+    assert!(out.contains("env:loop"), "no loop detected:\n{out}");
+}
+
+#[test]
+fn contract_drift_json_marks_the_body_withheld() {
+    let dir = contract_fixture("contract-json");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "resolve_scope",
+        "--no-bodies",
+        "--json",
+    ]))
+    .into_owned();
+    assert!(
+        out.contains("\"body\": \"withheld\""),
+        "a JSON consumer must be able to assert which phase this is:\n{out}"
+    );
+    assert!(!out.contains("BODY_SENTINEL_ZQX"), "JSON leaked the body:\n{out}");
+}
+
+/// The `--top` cut here is not the global one — these rows were chosen to be
+/// unalike. A reader who thinks they are "the first N" reads the sample as the
+/// population.
+#[test]
+fn contract_drift_top_cut_announces_itself_and_spreads_across_modules() {
+    let dir = contract_fixture("contract-top");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "contract-drift",
+        "resolve_scope",
+        "--no-bodies",
+        "--top",
+        "2",
+    ]))
+    .into_owned();
+    assert!(
+        out.contains("spread across modules rather than taken in file order"),
+        "the cut must say what kind of cut it is:\n{out}"
+    );
+    assert!(
+        out.contains("alpha::") && out.contains("beta::"),
+        "two rows should come from two modules:\n{out}"
+    );
+}
+
+/// A fn calling itself is the implementation, and phase 1 undertook not to show
+/// that. Left in, the target's own argument shapes appear as caller evidence.
+#[test]
+fn contract_drift_excludes_recursive_call_sites() {
+    let dir = scratch("contract-recursive");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn walk(n: usize) -> usize {
+    if n == 0 {
+        return RECUR_SENTINEL_ZQX;
+    }
+    walk(n - 1) + walk(n - 2)
+}
+pub const RECUR_SENTINEL_ZQX: usize = 1;
+pub fn a() -> usize { walk(3) }
+pub fn b() -> usize { walk(4) }
+pub fn c() -> usize { walk(5) }
+"#,
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "contract-drift", "walk", "--no-bodies"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        all.contains("recursive call site(s) excluded"),
+        "the exclusion must be disclosed, not silent:\n{all}"
+    );
+    assert!(
+        all.contains("3 caller(s)"),
+        "only the three real callers should count:\n{all}"
+    );
+}
+
+#[test]
+fn contract_drift_candidates_skips_names_it_cannot_attribute() {
+    let dir = scratch("contract-candidates");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod a { pub fn run() {} }
+pub mod b { pub fn run() {} }
+pub fn unique_target(x: usize) -> Option<usize> { Some(x) }
+pub fn c1() { a::run(); b::run(); unique_target(1); }
+pub fn c2() { a::run(); unique_target(2); }
+pub fn c3() { b::run(); unique_target(3); }
+"#,
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "contract-drift", "--candidates"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(all.contains("unique_target"), "the attributable fn should rank:\n{all}");
+    assert!(
+        all.contains("more than one definition here"),
+        "skipping same-named fns must be disclosed:\n{all}"
+    );
+}
+
+/// It emits material, not findings: there is no judgment here to fail a build
+/// on, and no per-site verdict to waive.
+#[test]
+fn contract_drift_is_not_a_gating_check() {
+    let dir = contract_fixture("contract-not-gating");
+    ur().args([
+        "--root",
+        dir.to_str().unwrap(),
+        "--fail-on-findings",
+        "contract-drift",
+        "resolve_scope",
+        "--no-bodies",
+    ])
+    .assert()
+    .success();
+    let audit = ur_output_allow_2(&["--root", dir.to_str().unwrap(), "audit", "--help"]);
+    assert!(
+        !audit.contains("contract-drift"),
+        "the battery must not run an unbounded material dump:\n{audit}"
+    );
+}
+
+/// The rendered type string is an IDENTITY — `index` builds an impl block's
+/// `qpath` from it and `fields` stores it as `FieldDef.ty` — so two different
+/// types must never render alike.
+///
+/// Found by `contract-drift type_to_string`: the callers imply an identity,
+/// the implementation collapsed whole classes onto one spelling. `[u8; 4]` and
+/// `[u8; 32]` both wrote `[u8; _]`, so two impls got the *same* qpath; every
+/// `impl Trait` wrote `impl _`, every `dyn Trait` wrote `dyn _`, every fn
+/// pointer wrote `fn(_)`, and `Matrix<4>`/`Matrix<32>` both wrote `Matrix<_>`.
+#[test]
+fn rendered_types_do_not_collide_across_distinct_types() {
+    let dir = scratch("type-identity");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub trait T { fn go(&self); }
+impl T for [u8; 4]  { fn go(&self) {} }
+impl T for [u8; 32] { fn go(&self) {} }
+pub struct Matrix<const N: usize>;
+impl T for Matrix<4>  { fn go(&self) {} }
+impl T for Matrix<32> { fn go(&self) {} }
+pub const MAX: usize = 8;
+pub struct S {
+    pub small: [u8; 4],
+    pub big: [u8; 32],
+    pub named: [u8; MAX],
+    pub shown: Box<dyn std::fmt::Display>,
+    pub other: Box<dyn std::fmt::Debug + Send>,
+    pub f1: fn(u8) -> u16,
+    pub f2: fn(u8, u8),
+    pub cb: Box<dyn Fn(u32) -> bool>,
+}
+"#,
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    // Impl headers: four impls, four distinct qpaths.
+    let impls = rows_of(&ur_stdout(&["--root", root, "impls"]));
+    let headers: std::collections::BTreeSet<&str> =
+        impls.iter().map(|l| l.split('\t').nth(2).unwrap()).collect();
+    assert_eq!(
+        headers.len(),
+        4,
+        "impl headers collided: {:?}",
+        headers
+    );
+
+    // Field types: eight fields, eight distinct renderings.
+    let fields = rows_of(&ur_stdout(&["--root", root, "fields", "S"]));
+    let tys: std::collections::BTreeSet<&str> =
+        fields.iter().map(|l| l.split('\t').nth(2).unwrap()).collect();
+    assert_eq!(tys.len(), 8, "field types collided: {:?}", tys);
+
+    // And the renderings are informative, not merely distinct.
+    let all = tys.iter().copied().collect::<Vec<_>>().join(" | ");
+    for expected in [
+        "[u8; 4]",
+        "[u8; 32]",
+        "[u8; MAX]",
+        "fn(u8) -> u16",
+        "fn(u8, u8)",
+    ] {
+        assert!(all.contains(expected), "missing {expected} in {all}");
+    }
+    assert!(all.contains("Display"), "dyn bound elided: {all}");
+    assert!(all.contains("Fn(u32) -> bool"), "Fn sugar elided: {all}");
 }

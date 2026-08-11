@@ -197,7 +197,7 @@ pub fn kind_of_check(check: &str) -> &'static str {
         | "builder-drift" | "clones" | "arith-drift" | "co-call" => "pair",
         // A whole item: the row's line is where it starts, not where a defect is.
         "metrics" | "dead-code" | "pass-through" | "inventory" | "impls" | "tests" | "outline"
-        | "show" => "item",
+        | "show" | "contract-drift" => "item",
         // Everything else points at the line the reader should open.
         _ => "site",
     }

@@ -174,6 +174,25 @@ fn at(d: &Defn, range: Option<(usize, usize)>) -> Val {
 /// from the AST on purpose: a `syn` round-trip would return the tokens, not the
 /// source — no comments, no formatting, no `#[rustfmt::skip]` block as written.
 fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, opts: &ShowOpts) {
+    print_range(ctx, file, start, end, opts.max_lines, opts.number, None);
+}
+
+/// [`print_source`] with the two extras a non-`show` caller needs: an explicit
+/// `max_lines` (rather than one read off a [`ShowOpts`] it has no reason to
+/// build) and an optional line to mark with `>`.
+///
+/// Shared rather than copied because the `--max-lines` cut is the part with a
+/// contract: it names the lines it dropped and the flag that lifts them. A
+/// second implementation would be a second chance to truncate in silence.
+pub(crate) fn print_range(
+    ctx: &AnalysisCtx,
+    file: &str,
+    start: usize,
+    end: usize,
+    max_lines: Option<usize>,
+    number: bool,
+    mark: Option<usize>,
+) {
     let Ok(src) = std::fs::read_to_string(file) else {
         ctx.out.note(&format!("note: could not read {}", file));
         return;
@@ -189,7 +208,7 @@ fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, opts: &
     // class of wrong answer as a guessed line range — and a caller who fears an
     // unbounded dump writes that silent truncation themselves, which is why the
     // bound has a default rather than waiting to be asked for.
-    let budget = match opts.max_lines {
+    let budget = match max_lines {
         // `--max-lines 0` is the explicit "all of it".
         Some(0) => None,
         Some(n) => Some(n),
@@ -207,10 +226,16 @@ fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, opts: &
         return;
     }
     for (i, l) in lines[lo..cut].iter().enumerate() {
-        if opts.number {
-            ctx.out.line(&format!("{:>5}| {}", lo + i + 1, l));
+        let n = lo + i + 1;
+        let gutter = match mark {
+            Some(m) if m == n => "> ",
+            Some(_) => "  ",
+            None => "",
+        };
+        if number {
+            ctx.out.line(&format!("{}{:>5}| {}", gutter, n, l));
         } else {
-            ctx.out.line(l);
+            ctx.out.line(&format!("{}{}", gutter, l));
         }
     }
     // Via `ctx.out.line`, so it lands on stdout with the rows: this is the one
