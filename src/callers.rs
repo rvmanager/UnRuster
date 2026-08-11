@@ -12,7 +12,7 @@ use crate::emit::{row, site};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CallSite {
-    file: String,
+    pub(crate) file: String,
     pub(crate) line: usize,
     pub(crate) caller: String,
     pub(crate) target: String,
@@ -26,6 +26,11 @@ pub(crate) struct CallSite {
     /// Best-effort: bindings introduced by `match` arms or `if let` patterns
     /// are not tracked.
     shadowed: bool,
+    /// The receiver was literally `self`. Enough to attribute `self.push(…)`
+    /// inside `impl ArithVisitor` to `ArithVisitor::push` without inferring a
+    /// type — and without mistaking `self.sites.push(…)`, whose receiver is a
+    /// field, for the same thing.
+    pub(crate) receiver_is_self: bool,
 }
 
 struct CallVisitor<'a> {
@@ -51,6 +56,10 @@ impl<'a> CallVisitor<'a> {
     }
 
     fn record(&mut self, target: String, line: usize, shadowed: bool) {
+        self.record_full(target, line, shadowed, false);
+    }
+
+    fn record_full(&mut self, target: String, line: usize, shadowed: bool, on_self: bool) {
         self.sites.push(CallSite {
             file: self.file.to_string(),
             line,
@@ -58,6 +67,7 @@ impl<'a> CallVisitor<'a> {
             target,
             target_resolved: None,
             shadowed,
+            receiver_is_self: on_self,
         });
     }
 }
@@ -151,7 +161,8 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         let target = format!(".{}", e.method);
-        self.record(target, line_of(&e.method), false);
+        let on_self = matches!(crate::ast::peel_grouping(&e.receiver), syn::Expr::Path(p) if p.path.is_ident("self"));
+        self.record_full(target, line_of(&e.method), false, on_self);
         for a in &e.args {
             if let Some(t) = fn_ref_path(a) {
                 self.record(t, line_of(a), false);
@@ -277,7 +288,11 @@ pub(crate) fn matches_target(call_target: &str, query: &str) -> bool {
     }
     if query.contains("::") {
         let trimmed = call_target.strip_suffix('!').unwrap_or(call_target);
-        return trimmed.ends_with(query);
+        // Whole `::` segments. A plain `ends_with` is a substring test, and
+        // `"std::fs::write"` ends with `"s::write"` — so a query for `s::write`
+        // claimed both `std::fs::write` calls in a fixture written to prove it
+        // did not. `show`'s help already promised this rule.
+        return crate::contract_drift::ends_on_segment(trimmed, query);
     }
     let target_last = if let Some(m) = call_target.strip_prefix('.') {
         m
@@ -316,17 +331,55 @@ impl<'a> QueryMatcher<'a> {
         self.key.is_widened() && self.key.form_str().starts_with('.')
     }
 
-    pub(crate) fn hits(&self, target: &str, resolved: Option<&str>, module: &str) -> bool {
+    /// The site is this item by construction, not by name coincidence: the
+    /// written path names it, or it is `self.name(…)`/`Self::name(…)` inside
+    /// the defining impl, or a bare call inside the defining module.
+    ///
+    /// Kept apart from the tier so a method-name match is not demoted when it
+    /// was actually *proved*. `self.push(1)` inside `impl V` is as resolved as
+    /// a call gets; only `x.push(1)` on some other receiver is a lead.
+    pub(crate) fn is_certain(&self, target: &str, module: &str, on_self: bool) -> bool {
+        let Some(d) = self.target else { return false };
+        crate::contract_drift::written_names_item(d, target)
+            || crate::contract_drift::resolves_on_self(d, target, module, on_self)
+            || crate::contract_drift::resolves_locally(d, target, module)
+    }
+
+    pub(crate) fn hits(
+        &self,
+        target: &str,
+        resolved: Option<&str>,
+        module: &str,
+        on_self: bool,
+    ) -> bool {
         let written = matches_target(target, self.query)
             || resolved.map(|t| matches_target(t, self.query)).unwrap_or(false);
         let Some(d) = self.target else { return written };
         if self.key.is_widened() {
+            // `Type::name(…)` alongside `.name(…)`: an associated fn is called
+            // by path, and widening to the method form alone dropped every
+            // constructor in the tree.
+            if crate::contract_drift::written_names_item(d, target)
+                && !crate::contract_drift::out_of_visibility(d, module)
+            {
+                return true;
+            }
+            // `self.name(…)` and `Self::name(…)` inside the defining impl.
+            // Consulted here as well as on the narrow path: a *unique* method
+            // name takes the widened branch and would otherwise never reach it,
+            // which is how three `Self::is_wildcard(…)` families stayed
+            // invisible while `dead-code` knew they were called.
+            if crate::contract_drift::resolves_on_self(d, target, module, on_self) {
+                return true;
+            }
             return matches_target(target, self.key.form_str())
                 && !crate::contract_drift::names_another_item(d, target, resolved)
                 && !crate::contract_drift::out_of_visibility(d, module);
         }
         if self.key.is_narrow() {
-            return written || crate::contract_drift::resolves_locally(d, target, module);
+            return written
+                || crate::contract_drift::resolves_locally(d, target, module)
+                || crate::contract_drift::resolves_on_self(d, target, module, on_self);
         }
         written
     }
@@ -397,7 +450,20 @@ fn widened_confidence(
     query: &str,
     unique_name: bool,
     method_widened: bool,
+    matcher: &QueryMatcher,
 ) -> Confidence {
+    // A name captured by a local `let` or closure parameter is not this item,
+    // however well the module and the spelling line up — the compiler resolves
+    // the binding. Certainty must not outrank shadowing.
+    if !s.shadowed
+        && matcher.is_certain(
+            &s.target,
+            crate::config_drift::module_of(&s.caller),
+            s.receiver_is_self,
+        )
+    {
+        return Confidence::Resolved;
+    }
     if method_widened && s.target.starts_with('.') {
         return Confidence::Heuristic;
     }
@@ -493,13 +559,14 @@ pub fn run_callers(
                 &s.target,
                 s.target_resolved.as_deref(),
                 crate::config_drift::module_of(&s.caller),
+                s.receiver_is_self,
             )
         })
         .collect();
     if widened.len() > direct.len() {
         direct = widened;
         if let Some(min) = min_confidence {
-            direct.retain(|s| widened_confidence(s, query, unique_name, method_widened) >= min);
+            direct.retain(|s| widened_confidence(s, query, unique_name, method_widened, &matcher) >= min);
         }
         ctx.retain_changed(&mut direct, |s| &s.file);
     }
@@ -516,7 +583,7 @@ pub fn run_callers(
     }
 
     if !transitive {
-        emit_caller_rows(ctx, &direct, by, query, unique_name, method_widened);
+        emit_caller_rows(ctx, &direct, by, query, unique_name, method_widened, &matcher);
         let unique = direct
             .iter()
             .map(|s| s.caller.as_str())
@@ -686,6 +753,7 @@ fn emit_caller_rows(
     query: &str,
     unique_name: bool,
     method_widened: bool,
+    matcher: &QueryMatcher,
 ) {
     if ctx.summary {
         return;
@@ -711,7 +779,7 @@ fn emit_caller_rows(
                     ctx.out,
                     "caller" => s.caller.clone(),
                     "target" => s.target.clone(),
-                    "confidence" => widened_confidence(s, query, unique_name, method_widened).as_str(),
+                    "confidence" => widened_confidence(s, query, unique_name, method_widened, matcher).as_str(),
                     "at" => site(&s.file, s.line),
                 );
             }
@@ -1042,6 +1110,7 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<usize>
             &s.target,
             s.target_resolved.as_deref(),
             crate::config_drift::module_of(&s.caller),
+            s.receiver_is_self,
         )
     };
 

@@ -7507,3 +7507,265 @@ fn contract_drift_reports_the_scope_gap() {
         "the scope gap must be reported here of all places:\n{err}"
     );
 }
+
+// ── self-consistency: the tool's own registries ───────────────────────────
+
+/// `WAIVER_AWARE_NAMES` only renders a message; `traits_of` decides behaviour.
+/// This ties them together through what a user can observe, so the list cannot
+/// drift from the match the way `USAGE_COMMANDS` drifted from reality — that
+/// drift is why `contract-drift` never reported a scope gap.
+#[test]
+fn the_waiver_aware_list_matches_what_the_commands_actually_do() {
+    let named = [
+        "audit", "builder-drift", "casts", "clones", "config-drift",
+        "conversion-pairs", "dead-code", "divergence", "enum-coverage",
+        "error-swallows", "stringly", "waivers",
+    ];
+    for cmd in named {
+        let out = ur()
+            .args(["--root", FIXTURE, "--suggest-waivers", cmd])
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !all.contains("does not support waivers"),
+            "`{cmd}` is listed as waiver-aware but disclaims it:\n{all}"
+        );
+    }
+    // And the other direction: a command off the list must say so rather than
+    // silently offering nothing.
+    let out = ur()
+        .args(["--root", FIXTURE, "--suggest-waivers", "inventory"])
+        .output()
+        .unwrap();
+    let all = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        all.contains("does not support waivers"),
+        "a non-waiver command must disclaim, not go quiet:\n{all}"
+    );
+}
+
+// ── ground truth: fixtures whose answer is known by construction ──────────
+//
+// The invariant suite and the token oracle both compare the tool to itself or
+// to an approximation. Neither can say what the *right* number is. These can:
+// each fixture is written so the caller count is a fact about the text, and the
+// assertion is that exact number.
+//
+// This is what stops the "fixed one half of a symmetry" pattern that produced
+// two of the ten defects — a corpus finds a shape only if it happens to contain
+// it, and a generated fixture contains it because it was asked to.
+
+/// One target, one fixture, one number that is true by construction.
+struct GroundTruth {
+    what: &'static str,
+    query: &'static str,
+    src: &'static str,
+    /// Call sites that genuinely belong to the queried item.
+    expect: usize,
+}
+
+const GROUND_TRUTH: &[GroundTruth] = &[
+    GroundTruth {
+        what: "a free fn reached every way there is",
+        query: "m::target",
+        // bare, use-imported bare, fully qualified, fn-reference, macro arm.
+        src: r#"
+macro_rules! kv { ($($k:literal => $v:expr),+) => { vec![$(format!("{}{}", $k, $v)),+] }; }
+pub mod m {
+    pub fn target(x: u32) -> u32 { x }
+    pub fn near() -> u32 { target(1) }
+}
+pub mod n {
+    use crate::m::target;
+    pub fn bare() -> u32 { target(2) }
+    pub fn qualified() -> u32 { crate::m::target(3) }
+    pub fn as_value(v: &[u32]) -> Vec<u32> { v.iter().copied().map(target).collect() }
+    pub fn in_macro() -> Vec<String> { kv!("a" => target(4)) }
+}
+"#,
+        expect: 5,
+    },
+    GroundTruth {
+        what: "a name four modules share resolves per module",
+        query: "a::score",
+        src: r#"
+pub mod a {
+    pub fn score(x: u32) -> u32 { x + 1 }
+    pub fn run() -> u32 { score(1) + score(2) }
+}
+pub mod b {
+    pub fn score(x: u32) -> u32 { x * 2 }
+    pub fn run() -> u32 { score(3) + score(4) + score(5) }
+}
+pub mod c { pub fn run() -> u32 { crate::a::score(6) } }
+"#,
+        expect: 3,
+    },
+    GroundTruth {
+        what: "a fn whose name std also defines",
+        query: "s::write",
+        src: r#"
+pub mod s {
+    pub fn write(x: u32) -> u32 { x }
+    pub fn near() -> u32 { write(1) }
+}
+pub mod t {
+    pub fn spill(p: &std::path::Path) { std::fs::write(p, b"x").unwrap(); }
+    pub fn more(p: &std::path::Path) { std::fs::write(p, b"y").unwrap(); }
+    pub fn ours() -> u32 { crate::s::write(2) }
+}
+"#,
+        expect: 2,
+    },
+    GroundTruth {
+        what: "a method reached by self, by Self, and by path",
+        query: "V::push",
+        src: r#"
+pub struct V { pub items: Vec<u32> }
+impl V {
+    pub fn push(&mut self, x: u32) { self.items.push(x); }
+    pub fn two(&mut self) { self.push(1); self.push(2); }
+    pub fn indirect(v: &mut V) { V::push(v, 3); }
+}
+pub fn outside(v: &mut V) { v.items.push(9); }
+"#,
+        // `self.push(1)`, `self.push(2)`, `V::push(v, 3)`. The three
+        // `self.items.push(…)` / `v.items.push(…)` are `Vec::push`.
+        expect: 3,
+    },
+    GroundTruth {
+        what: "a private fn cannot be called from another module",
+        query: "p::helper",
+        src: r#"
+pub mod p {
+    fn helper(x: u32) -> u32 { x + 1 }
+    pub fn a() -> u32 { helper(1) }
+    pub mod deeper { pub fn c() -> u32 { super::helper(3) } }
+}
+pub mod q {
+    pub fn helper(x: u32) -> u32 { x * 2 }
+    pub fn d() -> u32 { helper(9) }
+}
+"#,
+        expect: 2,
+    },
+    GroundTruth {
+        what: "recursion is the implementation, not a caller",
+        query: "r::walk",
+        src: r#"
+pub mod r {
+    pub fn walk(n: u32) -> u32 { if n == 0 { 0 } else { walk(n - 1) + walk(n - 2) } }
+}
+pub mod u {
+    pub fn a() -> u32 { crate::r::walk(3) }
+    pub fn b() -> u32 { crate::r::walk(4) }
+}
+"#,
+        // `callers` counts the two recursive sites; `contract-drift` excludes
+        // them, and says so. Both numbers are in the assertions below.
+        expect: 4,
+    },
+];
+
+fn ground_truth_root(idx: usize, g: &GroundTruth) -> std::path::PathBuf {
+    let dir = scratch(&format!("ground-{idx}"));
+    std::fs::write(dir.join("src/lib.rs"), g.src).unwrap();
+    dir
+}
+
+#[test]
+fn callers_matches_ground_truth_on_every_call_shape() {
+    for (i, g) in GROUND_TRUTH.iter().enumerate() {
+        let dir = ground_truth_root(i, g);
+        // At `resolved`, which is the tier the tool claims to be sure about.
+        // A method widened by name alone is explicitly a lead list — every
+        // `.push()` in the tree arrives looking like a caller — so ground truth
+        // is the set the tool asserts, not the set it offers for review.
+        let out = ur()
+            .args([
+                "--root", dir.to_str().unwrap(), "callers", g.query,
+                "--scope", "all", "--min-confidence", "resolved",
+            ])
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got: usize = all
+            .lines()
+            .find_map(|l| l.strip_prefix('(')?.split(" call site").next()?.parse().ok())
+            .unwrap_or_else(|| panic!("no count for {}:\n{all}", g.query));
+        assert_eq!(
+            got, g.expect,
+            "{} — `{}` should have {} caller(s), got {}:\n{all}",
+            g.what, g.query, g.expect, got
+        );
+    }
+}
+
+/// `contract-drift` must agree with `callers` up to the one exclusion it
+/// documents: a fn calling itself is the implementation, not evidence about it.
+#[test]
+fn contract_drift_matches_ground_truth_less_its_stated_exclusion() {
+    for (i, g) in GROUND_TRUTH.iter().enumerate() {
+        let dir = ground_truth_root(i, g);
+        let root = dir.to_str().unwrap();
+        let out = ur()
+            .args([
+                "--root", root, "contract-drift", g.query, "--no-bodies",
+                "--scope", "all", "--min-confidence", "resolved",
+            ])
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got: usize = all
+            .lines()
+            .find_map(|l| l.strip_prefix('(')?.split(" caller(s)").next()?.parse().ok())
+            .unwrap_or(0);
+        let recursive: usize = all
+            .split("recursive call site(s) excluded")
+            .next()
+            .and_then(|s| s.rsplit("(note: ").next().map(str::to_string))
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        assert_eq!(
+            got + recursive,
+            g.expect,
+            "{} — contract-drift saw {} + {} recursive, ground truth is {}:\n{all}",
+            g.what, got, recursive, g.expect
+        );
+    }
+}
+
+/// The suite must be able to fail. A fixture with a deliberately wrong
+/// expectation has to be caught, or the green ticks above mean nothing.
+#[test]
+fn the_ground_truth_harness_would_notice_a_wrong_answer() {
+    let g = &GROUND_TRUTH[0];
+    let dir = ground_truth_root(99, g);
+    let out = ur()
+        .args([
+            "--root", dir.to_str().unwrap(), "callers", g.query,
+            "--scope", "all", "--min-confidence", "resolved",
+        ])
+        .output()
+        .unwrap();
+    let all = String::from_utf8_lossy(&out.stderr);
+    let got: usize = all
+        .lines()
+        .find_map(|l| l.strip_prefix('(')?.split(" call site").next()?.parse().ok())
+        .unwrap();
+    assert_ne!(got, g.expect + 1, "the harness must read a real count, not a constant");
+    assert_eq!(got, g.expect);
+}

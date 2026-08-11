@@ -108,6 +108,9 @@ struct Site {
     target: String,
     target_resolved: Option<String>,
     shadowed: bool,
+    /// The receiver was literally `self` — enough to attribute `self.push(…)`
+    /// inside the defining impl without inferring a type.
+    receiver_is_self: bool,
     ret: Disp,
     args: Vec<Arg>,
     env: Vec<String>,
@@ -169,6 +172,17 @@ impl ContractVisitor<'_> {
     }
 
     fn record(&mut self, target: String, key: (usize, usize), args: Vec<Arg>, shadowed: bool) {
+        self.record_full(target, key, args, shadowed, false)
+    }
+
+    fn record_full(
+        &mut self,
+        target: String,
+        key: (usize, usize),
+        args: Vec<Arg>,
+        shadowed: bool,
+        on_self: bool,
+    ) {
         let mut env = Vec::new();
         if self.loop_depth > 0 {
             env.push("loop".to_string());
@@ -186,6 +200,7 @@ impl ContractVisitor<'_> {
             target,
             target_resolved: None,
             shadowed,
+            receiver_is_self: on_self,
             ret: Disp::bare("bare"),
             args,
             env,
@@ -378,7 +393,8 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
         let target = format!(".{}", e.method);
         if crate::callers::matches_target(&target, self.query) {
             let args = e.args.iter().map(arg_shape).collect();
-            self.record(target, pos(&e.method), args, false);
+            let on_self = matches!(crate::ast::peel_grouping(&e.receiver), syn::Expr::Path(p) if p.path.is_ident("self"));
+            self.record_full(target, pos(&e.method), args, false, on_self);
         }
         // `f(…).unwrap()` — the method applied to the target *is* the
         // disposition, and the one that says most about the expectation.
@@ -792,6 +808,14 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     let mut foreign = 0usize;
     if key.widened {
         if let Some(d) = target {
+            // The item's own call forms: `.name`/`::name` as the widening
+            // decided, plus a written path that names it, plus `self`/`Self`
+            // inside its own impl.
+            sites.retain(|s| {
+                crate::callers::matches_target(&s.target, key.form_str())
+                    || written_names_item(d, &s.target)
+                    || resolves_on_self(d, &s.target, &s.module, s.receiver_is_self)
+            });
             let before = sites.len();
             sites.retain(|s| !names_another_item(d, &s.target, s.target_resolved.as_deref()));
             foreign = before - sites.len();
@@ -802,7 +826,7 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     }
 
     if let Some(min) = opts.min_confidence {
-        sites.retain(|s| tier(&key, s, query, unique) >= min);
+        sites.retain(|s| tier(&key, s, query, unique, target) >= min);
     }
     ctx.retain_changed(&mut sites, |s| &s.file);
 
@@ -855,7 +879,7 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
 
     ctx.out.section("callers");
     for s in &shown {
-        let conf = tier(&key, s, query, unique);
+        let conf = tier(&key, s, query, unique, target);
         let cells: Vec<(&'static str, Val)> = vec![
             ("via", Val::from(conf.as_str())),
             ("at", site(&s.file, s.line)),
@@ -901,7 +925,7 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     let low = shown
         .iter()
         .filter(|s| {
-            tier(&key, s, query, unique) < Confidence::Resolved
+            tier(&key, s, query, unique, target) < Confidence::Resolved
         })
         .count();
     if low > 0 {
@@ -950,7 +974,7 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
              the sites that spell the path out. No other fn in this tree is called `{}`, but \
              a same-named method on a type defined outside it would not be visible here)",
             query,
-            key.scan(query),
+            key.form_str(),
             query,
             key.bare
         ));
@@ -1073,7 +1097,19 @@ pub(crate) struct SearchKey<'a> {
 /// `Suppressions::len` at full confidence. `--candidates` already tiers method
 /// rows `heuristic` for exactly this reason (§9.3); this is the same rule,
 /// applied on the other path.
-fn tier(key: &SearchKey, s: &Site, query: &str, unique: bool) -> Confidence {
+fn tier(key: &SearchKey, s: &Site, query: &str, unique: bool, d: Option<&Defn>) -> Confidence {
+    // Proved beats named. `self.push(1)` inside `impl V` is as resolved as a
+    // call gets, and demoting it made `--min-confidence resolved` return
+    // nothing for a method with three certain callers — while `callers`, whose
+    // copy of this rule had already been fixed, returned all three.
+    if let Some(d) = d.filter(|_| !s.shadowed) {
+        if written_names_item(d, &s.target)
+            || resolves_on_self(d, &s.target, &s.module, s.receiver_is_self)
+            || resolves_locally(d, &s.target, &s.module)
+        {
+            return Confidence::Resolved;
+        }
+    }
     if key.by_method_name && s.target.starts_with('.') {
         return Confidence::Heuristic;
     }
@@ -1097,9 +1133,14 @@ impl<'a> SearchKey<'a> {
     }
 
     /// The query to scan call sites with.
+    /// Scanned on the bare name whenever the query resolves to an item, so the
+    /// filters below choose from a superset rather than from whatever one call
+    /// form happens to catch. Scanning on `.push` alone meant an associated fn
+    /// invoked as `V::push(v, 3)` never entered the collection at all — while
+    /// `callers`, which collects everything and filters afterwards, saw it.
     fn scan(&self, query: &'a str) -> &str {
         if self.widened || self.narrow {
-            &self.form
+            self.bare
         } else {
             query
         }
@@ -1199,14 +1240,51 @@ fn relative_head(path: &str) -> &str {
     let mut p = path.trim_start_matches("::");
     p = p.strip_prefix("crate::").unwrap_or(p);
     p = p.strip_prefix("self::").unwrap_or(p);
+    // `Self::name(…)` inside the impl is this item as surely as `self.name(…)`
+    // is; the caller checks the enclosing scope.
+    p = p.strip_prefix("Self::").unwrap_or(p);
     while let Some(rest) = p.strip_prefix("super::") {
         p = rest;
     }
     p
 }
 
+/// The written call path names this item: `Disp::bare`, `crate::x::Disp::bare`,
+/// or a bare `bare`.
+///
+/// Widening an `impl-fn` to `.name` matches method calls and nothing else, so
+/// an associated fn invoked as `Disp::bare(…)` — which is how constructors are
+/// almost always written — matched neither the widened form nor the qualified
+/// query. `self-check` found ten of them here in one pass.
+pub(crate) fn written_names_item(d: &Defn, target: &str) -> bool {
+    if target.starts_with('.') || target.ends_with('!') {
+        return false;
+    }
+    let written = relative_head(target);
+    // Must be *qualified*. `path_agrees` accepts a bare last segment, which is
+    // right when resolving a free fn and catastrophic here: `qpath.ends_with("bare")`
+    // is true of every `bare(…)` in the tree, and the first draft of this
+    // matched 772 sites the token oracle could not see at all.
+    written.contains("::") && path_agrees(d, written)
+}
+
 fn path_agrees(d: &Defn, written: &str) -> bool {
-    written == d.name || written.ends_with(&d.qpath) || d.qpath.ends_with(written)
+    written == d.name || ends_on_segment(written, &d.qpath) || ends_on_segment(&d.qpath, written)
+}
+
+/// Suffix match on whole `::` segments.
+///
+/// A plain `str::ends_with` is a substring test, and `"std::fs::write"` ends
+/// with `"s::write"` — so `s::write` claimed both `std::fs::write` calls in a
+/// fixture written to prove it did not. `show`'s own help already states the
+/// rule this restores: "Matching is on whole `::` segments, so a suffix that
+/// isn't one won't silently resolve to something else."
+pub(crate) fn ends_on_segment(hay: &str, needle: &str) -> bool {
+    match hay.strip_suffix(needle) {
+        Some("") => true,
+        Some(prefix) => prefix.ends_with("::"),
+        None => false,
+    }
 }
 
 /// A bare call that Rust's own scoping resolves to this item.
@@ -1224,7 +1302,39 @@ fn path_agrees(d: &Defn, written: &str) -> bool {
 /// Free fns only. A bare `.method()` in the same module can still be on some
 /// other type, and no scoping rule says otherwise.
 pub(crate) fn resolves_locally(d: &Defn, target: &str, module: &str) -> bool {
-    d.kind == "fn" && target == d.name && in_module_subtree(d, module)
+    // `relative_head` first: `super::helper(…)` from a child module is the same
+    // item as a bare `helper(…)` beside it, and Rust resolves both by scope.
+    // Comparing the raw target missed every `super::`/`self::` call.
+    d.kind == "fn" && relative_head(target) == d.name && in_module_subtree(d, module)
+}
+
+/// `self.name(…)` written inside the impl that defines `name`.
+///
+/// The method analogue of [`resolves_locally`], and the same argument: an
+/// inherent method wins over anything else `self` could offer, so the compiler
+/// binds this and so can we. Found by `self-check`, which noticed that
+/// `dead-code` knew `ArithVisitor::push` was called while the call-site walk
+/// reported nobody — twenty-one methods in this tree were in that state.
+///
+/// Requires the receiver to be *literally* `self`: `self.sites.push(…)` inside
+/// `impl ArithVisitor` is a `Vec`, and attributing it here would trade a
+/// missing caller for a wrong one.
+pub(crate) fn resolves_on_self(d: &Defn, target: &str, module: &str, on_self: bool) -> bool {
+    if d.kind != "impl-fn" {
+        return false;
+    }
+    let by_self = on_self && target == format!(".{}", d.name);
+    let by_self_type = target == format!("Self::{}", d.name);
+    if !(by_self || by_self_type) {
+        return false;
+    }
+    let Some(owner) = &d.owner else { return false };
+    let home = if d.module.is_empty() {
+        owner.clone()
+    } else {
+        format!("{}::{}", d.module, owner)
+    };
+    module == home
 }
 
 /// `site_module` is the target's module or one nested inside it.

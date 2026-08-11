@@ -181,6 +181,24 @@ fn collect_idents(ts: &TokenStream, out: &mut BTreeSet<String>) {
 /// Candidate defns come from `ctx.idx` (built over the user-scoped files);
 /// `call_source` is the FULL tree so production items called only from tests
 /// aren't false-flagged as dead.
+/// Every name `dead-code` believes is called, by its own independent
+/// mechanism: raw identifier collection rather than call-site matching.
+///
+/// Exposed so `self-check` can hold it against the AST call-site path. That
+/// disagreement is not academic — it is what exposed a fn used only as
+/// `.map(f)` and a fn called only from inside a `row!(… => f(x))` arm, both of
+/// which the AST path reported as having zero callers while this set contained
+/// them all along.
+pub(crate) fn called_names(call_source: &[ParsedFile]) -> BTreeSet<String> {
+    let mut sink = CallSink {
+        called: BTreeSet::new(),
+    };
+    for f in call_source {
+        sink.visit_file(&f.ast);
+    }
+    sink.called
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
     call_source: &[ParsedFile],

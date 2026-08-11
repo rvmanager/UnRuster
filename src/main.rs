@@ -31,11 +31,13 @@ mod index;
 mod inventory;
 mod macro_scan;
 mod metrics;
+mod oracle;
 mod outline;
 mod parallel_matches;
 mod parse;
 mod panics;
 mod pass_through;
+mod self_check;
 mod semantic;
 mod show;
 mod stringly;
@@ -292,6 +294,14 @@ enum Cmd {
     /// already read. `--reveal` then prints the implementation to compare
     /// against. `--candidates` ranks the fns worth the exercise.
     ContractDrift(ContractDriftArgs),
+    /// Hold the tool's own answers against each other and against an
+    /// independent token-level oracle. Reports on *unruster*, not on your code:
+    /// a violation is a bug in a command, not a finding about the tree. Runs
+    /// cross-mechanism invariants (the AST call-site walk against `dead-code`'s
+    /// identifier sink against a raw token scan) and metamorphic ones (two
+    /// spellings of one item must select the same sites). Exits 1 on any
+    /// violation, so it gates a release.
+    SelfCheck(SelfCheckArgs),
     /// Print the full design-audit playbook (themes, signals, repair recipes).
     /// `explain <topic>` prints one section instead.
     Playbook,
@@ -421,23 +431,6 @@ struct WaiversArgs {
 /// because the strings must match its output exactly — `--suggest-waivers`
 /// warns when it is invoked on anything not in this list, and `audit` gates on
 /// four of these five.
-const WAIVER_AWARE_CHECKS: &[&str] = &[
-    "audit",
-    "divergence",
-    "enum-coverage",
-    "dead-code",
-    "conversion-pairs",
-    "config-drift",
-    "builder-drift",
-    "error-swallows",
-    "casts",
-    // Both consult waivers and both print suggestions; leaving them off this
-    // list made `--suggest-waivers` announce "does not support waivers" and
-    // then print one anyway, so a reader had no way to tell which to believe.
-    "clones",
-    "stringly",
-];
-
 fn cmd_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::Audit(_) => "audit",
@@ -464,6 +457,7 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::EnumCoverage(_) => "enum-coverage",
         Cmd::Divergence(_) => "divergence",
         Cmd::ContractDrift(_) => "contract-drift",
+        Cmd::SelfCheck(_) => "self-check",
         Cmd::Playbook => "playbook",
         Cmd::CohortCallees(_) => "cohort-callees",
         Cmd::ErrorSwallows(_) => "error-swallows",
@@ -487,6 +481,10 @@ impl Cmd {
     fn implies_fail_on_findings(&self) -> bool {
         match self {
             Cmd::Audit(_) => true,
+            // A violated invariant is a bug in this tool. Failing the run is
+            // the whole point: it is meant to gate a release the way `audit`
+            // gates a commit.
+            Cmd::SelfCheck(_) => true,
             Cmd::BuilderDrift(_)
             | Cmd::ConfigDrift(_)
             | Cmd::Clones(_)
@@ -1153,6 +1151,22 @@ struct ContractDriftArgs {
 }
 
 #[derive(Args)]
+struct SelfCheckArgs {
+    /// How many items to probe. The probe set is ordered by how likely a shape
+    /// is to break something — shared bare names first, then names that collide
+    /// with std methods, then methods, then private items — so a small budget
+    /// is not a small sample.
+    #[arg(long, default_value_t = 120, value_name = "N")]
+    probes: usize,
+
+    /// Also report token sightings the AST path dropped without a stated
+    /// reason. Off by default: the oracle over-approximates deliberately, so
+    /// this is a lead sheet rather than a defect list.
+    #[arg(long)]
+    leads: bool,
+}
+
+#[derive(Args)]
 struct ExplainArgs {
     /// Topic words matched against playbook headings (e.g. `stringly`,
     /// `partial-enumeration`, `god function`). Omit to list topics.
@@ -1303,38 +1317,123 @@ fn full_tree_if_needed(
 /// noise there — it answers a question the command never asked. Across one real
 /// session it printed 38 times, each an unwrapped three-line paragraph under a
 /// four-line function.
-fn analyses_code(command_name: &str) -> bool {
-    !matches!(command_name, "show" | "outline")
+/// Every per-command trait, declared in one exhaustive match.
+///
+/// These used to be three `&[&str]` lists keyed on `cmd_name`'s output. Nothing
+/// made a new command declare itself, so `contract-drift` — the command with
+/// the most to lose from a scope gap, since its premise is "everything that
+/// calls this" — was simply absent from `USAGE_COMMANDS` and the warning never
+/// fired for it. It then grew a private note of its own that could not work.
+///
+/// A string list cannot be checked by the compiler; an exhaustive match over
+/// `Cmd` can, and `implies_fail_on_findings` already argued exactly this:
+/// "Exhaustive (no `_`) so a new command must declare its agent-loop
+/// semantics". One match rather than four, so adding a command is one decision
+/// in one place rather than four that drift apart.
+#[derive(Clone, Copy)]
+struct CmdTraits {
+    /// Answers "where is this used", so a production-only scan is confidently
+    /// incomplete and the scope gap must be reported.
+    usage_query: bool,
+    /// Consults the waiver ledger, so waiver hygiene and `--suggest-waivers`
+    /// are meaningful here.
+    waiver_aware: bool,
+    /// Reads code rather than cataloguing it, so blind spots are worth naming.
+    analyses_code: bool,
 }
 
-/// Commands whose answer is *where a thing is used*, for which a
-/// production-only scan is confidently incomplete.
+impl CmdTraits {
+    const NONE: Self = Self {
+        usage_query: false,
+        waiver_aware: false,
+        analyses_code: true,
+    };
+    const fn usage(self) -> Self {
+        Self {
+            usage_query: true,
+            ..self
+        }
+    }
+    const fn waivers(self) -> Self {
+        Self {
+            waiver_aware: true,
+            ..self
+        }
+    }
+    /// Catalogues rather than analyses: it can have no blind spot of its own.
+    const fn catalogue(self) -> Self {
+        Self {
+            analyses_code: false,
+            ..self
+        }
+    }
+}
+
+fn traits_of(cmd: &Cmd) -> CmdTraits {
+    let t = CmdTraits::NONE;
+    match cmd {
+        Cmd::Audit(_) => t.waivers(),
+        Cmd::Divergence(_) | Cmd::DeadCode(_) | Cmd::ConversionPairs => t.waivers(),
+        Cmd::ConfigDrift(_) | Cmd::BuilderDrift(_) | Cmd::Clones(_) => t.waivers(),
+        Cmd::ErrorSwallows(_) | Cmd::Casts(_) | Cmd::Stringly(_) => t.waivers(),
+        Cmd::EnumCoverage(_) => t.waivers().usage(),
+
+        Cmd::Callers(_)
+        | Cmd::Callees(_)
+        | Cmd::CoCall(_)
+        | Cmd::CohortCallees(_)
+        | Cmd::ContractDrift(_)
+        | Cmd::FieldUses(_)
+        | Cmd::TypeRefs(_)
+        | Cmd::TakesMut(_)
+        | Cmd::Variants(_)
+        | Cmd::ParallelMatches(_)
+        | Cmd::CatchAllArms(_) => t.usage(),
+
+        // Catalogue and navigation: they report what is there, so an
+        // unreadable macro body is not an answer they were ever giving.
+        Cmd::Show(_) | Cmd::Outline(_) => t.catalogue(),
+
+        Cmd::Waivers(_) => t.waivers(),
+
+        // Reports on the tool. Neither a usage query nor a waiver consumer,
+        // and its own blind spots are the thing it is looking for.
+        Cmd::SelfCheck(_) => t,
+
+        Cmd::Inventory(_)
+        | Cmd::Impls(_)
+        | Cmd::Fields(_)
+        | Cmd::Metrics(_)
+        | Cmd::Tests(_)
+        | Cmd::Panics(_)
+        | Cmd::ArithDrift(_)
+        | Cmd::PassThrough(_)
+        | Cmd::Conversions(_)
+        | Cmd::BlindSpots
+        | Cmd::Playbook
+        | Cmd::Explain(_) => t,
+    }
+}
+
+/// The waiver-aware command names, for the one message that lists them.
 ///
-/// Kept next to `cmd_name` because the strings must match its output exactly.
-/// Deliberately not every command: `inventory` and `outline` catalogue what
-/// they were pointed at and a narrower scope narrows the catalogue, which is
-/// what the flag is for. These are the ones where the reader's next act is an
-/// edit made on the strength of a list being complete.
-const USAGE_COMMANDS: &[&str] = &[
-    "callers",
-    // The command with the most to lose from a scope gap: its premise is
-    // "everything that calls this", and a caller set that quietly omits the
-    // tests yields a contract derived from half the evidence. It was missing
-    // here, and grew a private note of its own that could never fire — the
-    // scope filter drops those files before the scan, so nothing downstream
-    // can count what was never read.
-    "contract-drift",
-    "callees",
-    "co-call",
-    "cohort-callees",
-    "field-uses",
-    "type-refs",
-    "takes-mut",
-    "variants",
+/// Behaviour comes from [`traits_of`]; this only renders. `waiver_names_match_traits`
+/// keeps the two from drifting.
+const WAIVER_AWARE_NAMES: &[&str] = &[
+    "audit",
+    "builder-drift",
+    "casts",
+    "clones",
+    "config-drift",
+    "conversion-pairs",
+    "dead-code",
+    "divergence",
     "enum-coverage",
-    "parallel-matches",
-    "catch-all-arms",
+    "error-swallows",
+    "stringly",
+    "waivers",
 ];
+
 
 /// Say that the default scope walked past the tests, on the commands where
 /// that changes the answer.
@@ -1348,8 +1447,8 @@ const USAGE_COMMANDS: &[&str] = &[
 /// way except the one that mattered, since by default it would not have looked
 /// there — and it would have said so nowhere. A wrong answer arriving from an
 /// AST tool is worse than one arriving from grep, because it is believed.
-fn report_scope_gap(out: &emit::Out, scope: Scope, command_name: &str) {
-    if scope != Scope::Production || !USAGE_COMMANDS.contains(&command_name) {
+fn report_scope_gap(out: &emit::Out, scope: Scope, traits: CmdTraits) {
+    if scope != Scope::Production || !traits.usage_query {
         return;
     }
     let skipped = parse::scope_skipped();
@@ -1396,10 +1495,6 @@ fn report_scope_gap(out: &emit::Out, scope: Scope, command_name: &str) {
 /// itself, which exists to audit them. Everything else (navigation, listings,
 /// `explain`) is unaffected by a waiver, so telling it about a malformed one is
 /// advice it cannot act on and did not ask for.
-fn waiver_relevant(command_name: &str) -> bool {
-    command_name == "waivers" || WAIVER_AWARE_CHECKS.contains(&command_name)
-}
-
 /// Report waivers that cannot do what they look like they do: ones with no
 /// reason, ones naming a check that does not exist, and ones predating the
 /// `ok(<check>)` grammar. Each is a comment that lies about the codebase, so
@@ -1659,6 +1754,15 @@ fn dispatch(
                 top,
             },
         ),
+        Cmd::SelfCheck(a) => self_check::run(
+            ctx,
+            root,
+            exclude,
+            &self_check::SelfCheckOpts {
+                probes: a.probes,
+                leads: a.leads,
+            },
+        ),
         Cmd::Playbook => unreachable!("handled before the tree scan"),
         Cmd::CohortCallees(a) => callers::run_cohort_callees(ctx, &a.pattern),
         Cmd::ErrorSwallows(a) => error_swallows::run(
@@ -1866,12 +1970,13 @@ fn main() -> Result<()> {
     } else {
         suppress::scan(&files)
     };
+    let traits = traits_of(&cmd);
     // Waiver hygiene is advice about waivers, so it goes to the commands that
     // read waivers. It used to print on every invocation of everything: on a
     // `show` whose answer is 49 bytes the preamble was 558 — eleven times the
     // output, on every call, about a subsystem the command does not touch. An
     // agent making fifteen navigation calls paid for it fifteen times.
-    if waiver_relevant(cmd_name(&cmd)) {
+    if traits.waiver_aware {
         report_waiver_hygiene(&out, &suppressions, matches!(cmd, Cmd::Waivers(_)));
     }
     let changed = match changed_since.as_deref() {
@@ -1900,12 +2005,12 @@ fn main() -> Result<()> {
     // no way to tell whether the check has no findings or no waiver support.
     // On a real codebase that dead end sent someone off to invent a parallel
     // `// NOTE (unruster … false positive)` convention this tool cannot read.
-    if suggest_waivers && !WAIVER_AWARE_CHECKS.contains(&cmd_name(&cmd)) {
+    if suggest_waivers && !traits.waiver_aware {
         out.note(&format!(
             "note: `{}` does not support waivers, so --suggest-waivers has nothing to \
              offer here. Checks that do: {}",
             cmd_name(&cmd),
-            WAIVER_AWARE_CHECKS.join(", ")
+            WAIVER_AWARE_NAMES.join(", ")
         ));
     }
     let fail_on_findings = fail_on_findings || cmd.implies_fail_on_findings();
@@ -1919,8 +2024,8 @@ fn main() -> Result<()> {
     if let Some(note) = out.cap_note() {
         out.row_note(&note);
     }
-    report_scope_gap(&out, scope, command_name);
-    if analyses_code(command_name) {
+    report_scope_gap(&out, scope, traits);
+    if traits.analyses_code {
         report_blind_spots(&out);
     }
     out.finish(command_name);
