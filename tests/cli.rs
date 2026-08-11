@@ -6501,40 +6501,121 @@ fn an_even_split_is_below_the_audit_floor() {
 
 // ── scope: test-support crates ────────────────────────────────────────────
 
+/// Every package in `fixtures/testcrate`, as `unruster inventory` sees it.
+///
+/// The fixture is a four-member workspace built to pin all four verdicts:
+///
+/// | member | package | edge in | verdict |
+/// |:--|:--|:--|:--|
+/// | `prod` | `sample-prod` | none (a root) | production |
+/// | `golden` | `sample-tests` | normal, from `prod` | production |
+/// | `harness` | `sample-test-utils` | dev, from `prod` | test support |
+/// | `fixtures` | `sample-fixtures` | normal, from `harness` | test support |
+fn testcrate_modules(extra: &[&str]) -> String {
+    let mut args = vec!["--root", TEST_CRATE_FIXTURE];
+    args.extend_from_slice(extra);
+    args.push("inventory");
+    String::from_utf8_lossy(&ur_stdout(&args)).into_owned()
+}
+
 #[test]
-fn a_test_support_crate_is_not_production_code() {
+fn a_dev_only_dependency_is_not_production_code() {
     // `crates/foo-test/src/lib.rs` is ordinary library code by every syntactic
     // measure — not under `tests/`, not named `tests.rs`, not `#[cfg(test)]`,
     // because a crate pulled in from `[dev-dependencies]` compiles normally.
     // A battery run over a real workspace reported its swallowed `env::var`s
     // as production defects.
-    let out = ur()
-        .args(["--root", TEST_CRATE_FIXTURE, "error-swallows"])
-        .output()
-        .unwrap();
+    let prod = testcrate_modules(&[]);
+    assert!(!prod.contains("Harness::new"), "{prod}");
+    // …and it is still there under `--scope all`, which is the whole point of
+    // classifying it rather than ignoring it.
+    assert!(testcrate_modules(&["--scope", "all"]).contains("Harness::new"));
+}
+
+#[test]
+fn test_support_is_transitive_through_normal_edges() {
+    // `sample-fixtures` is reached only by the harness, over an ordinary
+    // `[dependencies]` edge, and its name says nothing. No naming rule could
+    // ever have caught it; the graph gets it for free.
+    let prod = testcrate_modules(&[]);
+    assert!(!prod.contains("sample_json"), "{prod}");
+    assert!(testcrate_modules(&["--scope", "all"]).contains("sample_json"));
+}
+
+#[test]
+fn a_normal_dependency_stays_production_however_it_is_named() {
+    // `sample-tests` reads exactly like scaffolding and is listed under
+    // `[dependencies]` by production code. That is hard evidence, and it beats
+    // the name — this is the case the naming rule got wrong in the other
+    // direction, silently dropping real production code from the scan.
+    let prod = testcrate_modules(&[]);
+    assert!(
+        prod.contains("threshold"),
+        "a normal dependency of production code must stay in scope:\n{prod}"
+    );
+}
+
+#[test]
+fn the_scope_note_names_the_crates_it_removed_and_why() {
+    // "it was a test file" is not an explanation a reader can check by opening
+    // `crates/foo-test/src/lib.rs`. Naming the crates also makes the verdict
+    // falsifiable: a crate listed here that the reader knows is production is
+    // a bug report, where a bare count is not.
+    let err = ur_stderr(&["--root", TEST_CRATE_FIXTURE, "callers", "load"]);
+    assert!(err.contains("sample-test-utils"), "{err}");
+    assert!(err.contains("sample-fixtures"), "{err}");
+    assert!(err.contains("[dev-dependencies]"), "{err}");
+    // The one it kept must not be named as removed.
+    assert!(!err.contains("sample-tests"), "{err}");
+}
+
+#[test]
+fn a_lone_harness_crate_falls_back_to_its_name() {
+    // Rooted straight at the harness: one manifest, nothing in the tree can
+    // depend on it, so it is a root. A root is production only by *absence* of
+    // a dependent, which is not evidence — so the graph declines and the name
+    // rule is what removes it. Answering "production" here would silently
+    // un-classify a crate the same run catches from one directory up.
+    let root = format!("{TEST_CRATE_FIXTURE}/harness");
+    let out = ur().args(["--root", &root, "inventory"]).output().unwrap();
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        !combined.contains("Harness::new"),
-        "test-support crate scanned as production:\n{combined}"
-    );
-    // …and it is still there under `--scope all`, which is the whole point of
-    // classifying it rather than ignoring it.
-    let all = ur_stdout(&["--root", TEST_CRATE_FIXTURE, "--scope", "all", "error-swallows"]);
-    assert!(String::from_utf8_lossy(&all).contains("Harness::new"));
+    assert!(!combined.contains("Harness::new"), "{combined}");
 }
 
 #[test]
-fn the_scope_note_says_which_rule_removed_a_test_support_crate() {
-    // "it was a test file" is not an explanation a reader can check by opening
-    // `crates/foo-test/src/lib.rs`, so the note names the rule.
-    let err = ur_stderr(&["--root", TEST_CRATE_FIXTURE, "callers", "Harness::new"]);
+fn the_note_does_not_claim_a_dependency_edge_it_never_saw() {
+    // Two unrelated crates, no dependency between them, so both are roots and
+    // the graph has no evidence about either. The harness is removed by its
+    // *name*, and the note has to say that rather than describing a
+    // `[dev-dependencies]` edge that does not exist.
+    let dir = scratch("name-fallback-note");
+    for (name, sub) in [("app", "app"), ("app-test-utils", "harness")] {
+        std::fs::create_dir_all(dir.join(sub).join("src")).unwrap();
+        std::fs::write(
+            dir.join(sub).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(dir.join("app/src/lib.rs"), "pub fn ship() {}\n").unwrap();
+    std::fs::write(dir.join("harness/src/lib.rs"), "pub fn rig() {}\n").unwrap();
+
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "callers", "ship"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("test-support crates"),
-        "expected the scope note to name the rule:\n{err}"
+        err.contains("name says test support"),
+        "expected the name-rule wording:\n{err}"
+    );
+    assert!(
+        !err.contains("[dev-dependencies]"),
+        "the graph saw no edge; the note must not claim one:\n{err}"
     );
 }
 

@@ -54,6 +54,17 @@ Top-level flags:
 - --root/-r <path>: root directory (or file) to scan (default `.`);
   respects .gitignore.
 - --scope production (default) / tests / all: controls test-code inclusion.
+  Test code is three things, not one: a `tests/` or `benches/` directory, a
+  file named `tests.rs` / `*_test(s).rs`, and a whole *crate* that production
+  code reaches only through a `[dev-dependencies]` edge. The third is read
+  from the manifests, because a dev-dependency compiles like any other crate
+  and nothing inside `crates/foo-test/src/lib.rs` says what it is for. The
+  classification is transitive (a helper only the harness depends on is
+  scaffolding too) and it beats the crate's name in both directions: a
+  `foo-tests` that production depends on normally stays in scope. When no
+  manifest in the tree depends on a crate at all — `-r crates/foo-test` — the
+  graph has no evidence and the name decides. The scope note names the crates
+  it removed and which rule removed them.
 - --cfg KEY[=VALUE]: repeatable. Items whose cfg evaluates to definitively
   False under this env are stripped. Unknown keys leave items in.
 - --summary: skip per-row output, keep summary line.

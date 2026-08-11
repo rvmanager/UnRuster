@@ -3,5 +3,8 @@ name = "sample-prod"
 version = "0.0.0"
 edition = "2021"
 
+[dependencies]
+sample-tests = { path = "../golden" }
+
 [dev-dependencies]
 sample-test-utils = { path = "../harness" }

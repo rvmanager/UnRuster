@@ -21,7 +21,7 @@ pub enum Scope {
 }
 
 /// Directory walker honoring .gitignore plus the user's `--exclude` globs.
-fn build_walker(root: &Path, excludes: &[String]) -> anyhow::Result<ignore::Walk> {
+pub fn build_walker(root: &Path, excludes: &[String]) -> anyhow::Result<ignore::Walk> {
     let mut walker = ignore::WalkBuilder::new(root);
     walker.standard_filters(true);
     if !excludes.is_empty() {
@@ -47,8 +47,25 @@ fn build_walker(root: &Path, excludes: &[String]) -> anyhow::Result<ignore::Walk
 /// The paths, not just a count, because a failed lookup needs to answer "is the
 /// name in there?" — and that is a question worth parsing a handful of files to
 /// answer, on a path the run was going to exit 2 from anyway.
-static SCOPE_SKIPPED: std::sync::Mutex<Option<(PathBuf, Vec<PathBuf>)>> =
+/// One skipped file and *why* it was skipped: `Some(reason)` for a file left
+/// out of a production scan, `None` for production code left out of a test scan.
+type Skip = (PathBuf, Option<TestReason>);
+
+static SCOPE_SKIPPED: std::sync::Mutex<Option<(PathBuf, Vec<Skip>)>> =
     std::sync::Mutex::new(None);
+
+/// The test-support crates the last scan classified from the dependency graph,
+/// for the note that has to name them.
+static TEST_SUPPORT_CRATES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The crates the last scan left out of production because the only way in was
+/// a `[dev-dependencies]` edge. Sorted; empty when the graph had no opinion.
+pub fn test_support_crates() -> Vec<String> {
+    TEST_SUPPORT_CRATES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 /// How many files the run's scope excluded. See [`SCOPE_SKIPPED`].
 pub fn scope_skipped() -> usize {
@@ -71,7 +88,16 @@ pub fn scope_skipped_test_crates() -> usize {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map_or(0, |(_, v)| v.iter().filter(|p| in_test_support_crate(p)).count())
+        .map_or(0, |(_, v)| {
+            v.iter()
+                .filter(|(_, r)| {
+                    matches!(
+                        r,
+                        Some(TestReason::TestSupportCrate) | Some(TestReason::TestCrateName)
+                    )
+                })
+                .count()
+        })
 }
 
 /// Parse the files `--scope` excluded, so a caller can ask what is in them.
@@ -88,7 +114,7 @@ pub fn parse_excluded() -> Vec<ParsedFile> {
     };
     paths
         .iter()
-        .filter_map(|path| {
+        .filter_map(|(path, _)| {
             let source = std::fs::read_to_string(path).ok()?;
             let ast = syn::parse_file(&source).ok()?;
             Some(ParsedFile {
@@ -100,11 +126,53 @@ pub fn parse_excluded() -> Vec<ParsedFile> {
         .collect()
 }
 
-/// Should `path` be skipped entirely under this scope? Exhaustive (no `_`)
+/// Why a file counts as test code. Recorded per skipped file so the note can
+/// name the rule — "it was a test file" is not an explanation a reader can
+/// check by opening `crates/foo-test/src/lib.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// The `Test` prefix is the point — every variant answers "why is this test
+// code?" — and dropping it would leave a bare `Dir` / `Named` that says nothing
+// at a use site.
+#[allow(clippy::enum_variant_names)]
+pub enum TestReason {
+    /// Under a `tests/` or `benches/` directory.
+    TestDir,
+    /// `tests.rs`, `foo_test.rs`, `foo_tests.rs`.
+    TestNamed,
+    /// Production code reaches this crate only across a `[dev-dependencies]`
+    /// edge. Decided by [`crate::workspace`].
+    TestSupportCrate,
+    /// No manifest, or a graph that declined to answer — the crate's *name*
+    /// says test support and nothing contradicted it.
+    TestCrateName,
+}
+
+/// Why this file is test code, or `None` if it is production.
+///
+/// The graph is asked first and its answer is final when it has one: an
+/// explicit normal dependency from production code is hard evidence, and it
+/// outranks a crate merely being *called* `foo-test`. The name rule covers what
+/// the graph structurally cannot — a run rooted inside a single harness crate,
+/// where there is no manifest anywhere in the tree that dev-depends on it.
+fn test_reason(path: &Path, ws: &crate::workspace::Workspace) -> Option<TestReason> {
+    if is_under_test_dir(path) {
+        return Some(TestReason::TestDir);
+    }
+    if looks_like_test_named(path) {
+        return Some(TestReason::TestNamed);
+    }
+    match ws.verdict(path) {
+        crate::workspace::Verdict::TestSupport => Some(TestReason::TestSupportCrate),
+        crate::workspace::Verdict::Production => None,
+        crate::workspace::Verdict::Unknown => {
+            crate_name_of(path).filter(|n| name_says_test_support(n)).map(|_| TestReason::TestCrateName)
+        }
+    }
+}
+
+/// Should a file be skipped entirely under this scope? Exhaustive (no `_`)
 /// so a new Scope variant forces a decision here.
-fn out_of_scope(path: &Path, scope: Scope) -> bool {
-    let is_test_file =
-        is_under_test_dir(path) || looks_like_test_named(path) || in_test_support_crate(path);
+fn out_of_scope(is_test_file: bool, scope: Scope) -> bool {
     match scope {
         Scope::Production => is_test_file,
         Scope::Tests => !is_test_file,
@@ -123,7 +191,15 @@ pub fn parse_dir(
     let mut walk_errs = 0usize;
     let mut read_errs = 0usize;
     let mut parse_errs = 0usize;
-    let mut scope_skips: Vec<PathBuf> = Vec::new();
+    let mut scope_skips: Vec<Skip> = Vec::new();
+    // One manifest pass per scan, before the file walk: the classification is a
+    // property of the whole tree, so it cannot be decided a file at a time.
+    // `Scope::All` keeps nothing out, so there is nothing to classify for.
+    let ws = if scope == Scope::All {
+        crate::workspace::Workspace::unknown()
+    } else {
+        crate::workspace::Workspace::discover(root, excludes)
+    };
     for entry in build_walker(root, excludes)? {
         let entry = match entry {
             Ok(e) => e,
@@ -140,8 +216,14 @@ pub fn parse_dir(
         if path.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
-        if out_of_scope(path, scope) {
-            scope_skips.push(path.to_path_buf());
+        // Computed once and reused: it is the skip decision *and* the
+        // explanation, and the note that reports it must name the rule that
+        // actually fired. `None` under `--scope tests` means the opposite
+        // thing — production code, skipped for not being test code — which is
+        // why the reason is an `Option` rather than a defaulted enum.
+        let reason = test_reason(path, &ws);
+        if out_of_scope(reason.is_some(), scope) {
+            scope_skips.push((path.to_path_buf(), reason));
             continue;
         }
 
@@ -174,6 +256,8 @@ pub fn parse_dir(
     if scope != Scope::All {
         *SCOPE_SKIPPED.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((root.to_path_buf(), scope_skips));
+        *TEST_SUPPORT_CRATES.lock().unwrap_or_else(|e| e.into_inner()) =
+            ws.test_support_crates().iter().map(|s| s.to_string()).collect();
     }
     let skipped = walk_errs + read_errs + parse_errs;
     if skipped > 0 {
@@ -269,26 +353,19 @@ fn looks_like_test_named(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Is this file inside a workspace member whose whole job is supporting tests?
+/// Does this package *name* say it exists to support tests?
 ///
-/// The third shape of test code, and the one the other two heuristics cannot
-/// see: `crates/foo-test/src/lib.rs` is ordinary library code by every
-/// syntactic measure — not under a `tests/` directory, not named `tests.rs`,
-/// not behind `#[cfg(test)]`, because a crate depended on from
-/// `[dev-dependencies]` is compiled normally. So `--scope production` scanned
-/// it, and a battery run over a twelve-crate workspace reported swallowed
-/// `env::var`s in test scaffolding as production defects, twice landing them
-/// next to a real fix and reading as a near miss.
+/// The fallback for the case the dependency graph structurally cannot answer:
+/// a run rooted inside a harness crate, where no manifest in the tree
+/// dev-depends on it, so the graph correctly calls it its own root. See
+/// [`crate::workspace`] for the real classification.
 ///
-/// Decided from the crate's own name in the nearest ancestor `Cargo.toml`.
 /// BEST-EFFORT by construction — it is a naming convention, not a fact — so it
 /// is deliberately narrow: `test`, `tests`, `test-*`, `*-test`, `*-tests`,
 /// `*-test-utils`, `*-test-support`, `*-testing`. A crate that supports tests
-/// under some other name is missed, and `--exclude` remains the precise answer.
-fn in_test_support_crate(p: &Path) -> bool {
-    let Some(name) = crate_name_of(p) else {
-        return false;
-    };
+/// under some other name is missed *here* and caught by the graph whenever the
+/// scan root is wide enough to contain the dependent.
+fn name_says_test_support(name: &str) -> bool {
     // Compare on `-`; Cargo lets either spelling name the same package.
     let n = name.replace('_', "-");
     n == "test"
@@ -302,10 +379,6 @@ fn in_test_support_crate(p: &Path) -> bool {
 }
 
 /// `[package] name` of the nearest ancestor `Cargo.toml`, cached per directory.
-///
-/// Hand-scanned rather than parsed: the tool has no TOML dependency, and the
-/// one field it needs is unambiguous — the first `name = "…"` after the
-/// `[package]` header and before the next section.
 fn crate_name_of(p: &Path) -> Option<String> {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -338,30 +411,13 @@ fn crate_name_of(p: &Path) -> Option<String> {
 }
 
 /// The `name` of the `[package]` table in a manifest's text, if it has one.
+///
+/// Shares [`crate::workspace`]'s parser rather than scanning lines: the two
+/// answer the same question about the same file, and a second implementation
+/// that disagreed about, say, `name = "app" # [dependencies]` would put the
+/// name rule and the graph rule into conflict over one crate.
 fn package_name(manifest: &str) -> Option<String> {
-    let mut in_package = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("name") else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('=') else {
-            continue;
-        };
-        let v = rest.trim().trim_matches(['"', '\''].as_slice());
-        if !v.is_empty() {
-            return Some(v.to_string());
-        }
-    }
-    None
+    crate::workspace::package_name_of(manifest)
 }
 
 /// Strip items whose cfg attributes evaluate to definitively False, OR which carry

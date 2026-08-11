@@ -44,6 +44,7 @@ mod tests_cmd;
 mod type_refs;
 mod variants;
 mod waivers_cmd;
+mod workspace;
 
 use crate::emit::row;
 
@@ -1285,23 +1286,36 @@ fn report_scope_gap(out: &emit::Out, scope: Scope, command_name: &str) {
     if skipped == 0 {
         return;
     }
-    // Test-support crates are called out separately: they are ordinary library
-    // code from the inside, so "it was a test file" is not an explanation a
-    // reader can check by opening it.
+    // Test-support crates are called out separately, and by name: they are
+    // ordinary library code from the inside, so "it was a test file" is not an
+    // explanation a reader can check by opening one. Naming them also makes
+    // the classification falsifiable — a crate listed here that the reader
+    // knows is production is a bug report, where a bare count is not.
     let in_test_crates = parse::scope_skipped_test_crates();
+    let named = parse::test_support_crates();
     out.note(&format!(
         "(scope: {} test file(s) were not scanned{} — this answer covers production code \
          only. `--scope all` includes tests, which is usually what you want before \
          changing a signature or a type's shape.)",
         skipped,
-        if in_test_crates > 0 {
+        if in_test_crates == 0 {
+            String::new()
+        } else if named.is_empty() {
+            // The graph had no opinion and the crate's *name* is what removed
+            // it. Say so, because that rule is a convention and can be wrong.
             format!(
-                ", {} of them in test-support crates (a member named `*-test`, \
-                 `test-*`, `*-test-utils`, …)",
+                ", {} of them in crates whose name says test support (no manifest \
+                 dev-depends on them in this tree, so the dependency graph could \
+                 not confirm it)",
                 in_test_crates
             )
         } else {
-            String::new()
+            format!(
+                ", {} of them in test-support crates ({} — production code reaches \
+                 them only through a `[dev-dependencies]` edge)",
+                in_test_crates,
+                named.join(", ")
+            )
         }
     ));
 }

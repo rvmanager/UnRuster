@@ -1,6 +1,6 @@
 # unruster — validated defect list & fix priorities
 
-> **Status: all items resolved in v0.1.64.** Each section below carries a
+> **Status: all items resolved in v0.1.65.** Each section below carries a
 > `RESOLVED` line saying what changed and where. Item 9 needed no code change —
 > the tool already reported everything the finding asked for, and the finding
 > was a correction to the evaluation's reasoning rather than to the tool.
@@ -155,15 +155,38 @@ the summary. **Fix, precise:** walk `Cargo.toml`s and mark members reachable
 only through `[dev-dependencies]`. Today's workaround is
 `--exclude 'crates/uv-test/**'`.
 
-**RESOLVED** (cheap form) — [parse.rs](src/parse.rs): `in_test_support_crate`
-reads the `[package] name` of the nearest ancestor manifest and classifies
-`test`, `tests`, `test-*`, `*-test`, `*-tests`, `*-testing`, `*-test-utils`,
-`*-test-support` as test scope, cached per directory. The scope note names the
-rule separately from the other two, because "it was a test file" is not an
-explanation a reader can check by opening `crates/foo-test/src/lib.rs`. The
-dev-dependency graph form was not built: it is strictly more precise but needs a
-real TOML parser, and the naming rule covers the case that motivated this.
-Fixture: `fixtures/testcrate` (a two-member workspace).
+**RESOLVED, precise form** — [workspace.rs](src/workspace.rs) builds the real
+dependency graph. Nodes are every package under the scan root (not just a
+`[workspace] members` list, so several independent manifests each get
+classified); edges resolve by package name, which is what makes `uv-test =
+{ workspace = true }` resolve. Production is everything reachable from a root by
+*normal* and *build* edges; dev edges are never followed; test support is
+everything else, which makes it transitive — a `foo-test-helpers` that only
+`foo-test` depends on is scaffolding too, even though its own edge is normal and
+its name says nothing.
+
+`toml_edit` (no serde, no display) replaced the line scanner. The scanner got the
+motivating case right and would have got `[dependencies.foo]` sub-tables,
+`foo.workspace = true` dotted keys, multi-line inline tables and a `#` inside a
+literal string wrong — each silently, and each in the direction of dropping
+files from a production scan.
+
+Three verdicts, because the failure mode is silent: `Production` needs a real
+incoming normal edge, `TestSupport` needs unreachability, and everything else is
+`Unknown` and falls back to the name rule. A **root** answers `Unknown` on
+purpose — it is production only by *absence* of a dependent, and reporting that
+as evidence would break `-r crates/foo-test`, which scans one manifest that
+nothing can depend on. Two guards also force `Unknown` wholesale: a rootless
+graph (legal, via a dev-dependency cycle) and one that demoted every package.
+
+The name rule survives as the documented fallback for exactly those cases, and
+the scope note says which rule fired and names the crates — a listed crate the
+reader knows is production is a bug report, where a bare count is not.
+
+Fixture `fixtures/testcrate` is a four-member workspace pinning all four
+verdicts, including the two the name rule could never get right: `sample-fixtures`
+(innocuous name, reached only through the harness → demoted) and `sample-tests`
+(reads like scaffolding, a normal dependency of production → kept).
 
 ### 7. JSON has no machine-readable check name or finding kind · CONFIRMED
 
