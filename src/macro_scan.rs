@@ -192,6 +192,46 @@ pub fn macro_exprs(m: &syn::Macro) -> Vec<syn::Expr> {
 // unruster: ok(error-swallows/if-let-ok) 2026-08-06 — a chunk that will not
 // parse as an expression is skipped on purpose; the caller gets the pieces
 // that did parse and every unparsed macro body is reported as a blind spot.
+/// Both halves of a `key => value` arm, each parsed as an expression.
+///
+/// Returns empty when the chunk holds no `=>` or when neither half parses, so a
+/// caller can fall through to its other strategies unchanged.
+fn split_fat_arrow(chunk: &TokenStream) -> Vec<syn::Expr> {
+    let parts = split_at_top_level_fat_arrow(chunk);
+    if parts.len() < 2 {
+        return Vec::new();
+    }
+    parts
+        .into_iter()
+        .filter_map(|p| syn::parse2::<syn::Expr>(p).ok())
+        .collect()
+}
+
+/// Split on a top-level `=>`, i.e. one not nested inside a delimiter. Written
+/// separately from [`split_at_top_level`] because `=>` is two joint punctuation
+/// tokens rather than one character.
+fn split_at_top_level_fat_arrow(tokens: &TokenStream) -> Vec<TokenStream> {
+    let mut parts: Vec<TokenStream> = Vec::new();
+    let mut cur: Vec<TokenTree> = Vec::new();
+    let mut it = tokens.clone().into_iter().peekable();
+    while let Some(tt) = it.next() {
+        if let TokenTree::Punct(p) = &tt {
+            if p.as_char() == '=' && p.spacing() == proc_macro2::Spacing::Joint {
+                if let Some(TokenTree::Punct(n)) = it.peek() {
+                    if n.as_char() == '>' {
+                        it.next();
+                        parts.push(cur.drain(..).collect());
+                        continue;
+                    }
+                }
+            }
+        }
+        cur.push(tt);
+    }
+    parts.push(cur.into_iter().collect());
+    parts
+}
+
 fn parse_exprs(tokens: &TokenStream) -> Vec<syn::Expr> {
     if let Ok(list) =
         Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated.parse2(tokens.clone())
@@ -200,9 +240,17 @@ fn parse_exprs(tokens: &TokenStream) -> Vec<syn::Expr> {
     }
     let mut out = Vec::new();
     for chunk in split_at_top_level(tokens, &[',', ';']) {
-        if let Ok(expr) = syn::parse2::<syn::Expr>(chunk) {
+        if let Ok(expr) = syn::parse2::<syn::Expr>(chunk.clone()) {
             out.push(expr);
+            continue;
         }
+        // A `key => value` arm. `row!(out, "at" => at(d, range))` parsed to
+        // `out` alone and dropped the arm, so `show::at` was called on that
+        // very line and reported zero callers — and `row!` is how every
+        // command in this tool emits, so the hole was the width of the
+        // codebase. Neither side is an expression on its own *with* the `=>`
+        // between them; both are without it.
+        out.extend(split_fat_arrow(&chunk));
     }
     if !out.is_empty() {
         return out;

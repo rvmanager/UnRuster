@@ -242,6 +242,20 @@ pub fn render_row() -> Vec<String> {
     kv_row!("age" => age_label(), "n" => 1)
 }
 
+/// A macro body that is neither an expression list nor a statement sequence:
+/// no parse strategy reaches it, so it is a genuine blind spot and the note
+/// about it has something to report.
+///
+/// `kv_row!` above used to serve this purpose, until `=>` arms became
+/// parseable — at which point three blind-spot tests started asserting against
+/// a tree that no longer had one.
+pub fn transitions() {
+    state_machine! {
+        idle -> running on start;
+        running -> idle on stop;
+    }
+}
+
 mod inner {
     pub use crate::Document as Renamed;
 }

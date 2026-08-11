@@ -18,7 +18,7 @@ pub(crate) struct CallSite {
     pub(crate) target: String,
     /// Target as resolved through the calling file's `use` map, if different
     /// from `target`. Used as a secondary key for `matches_target`. Approximate.
-    target_resolved: Option<String>,
+    pub(crate) target_resolved: Option<String>,
     /// The callee is a bare name bound *locally* at the call site — a `let`
     /// closure, a closure parameter, or a fn parameter — so it cannot be the
     /// item that shares the name. `let grow = |lo, hi| …; grow(a)` calls the
@@ -78,6 +78,31 @@ pub(crate) fn params_of(s: &syn::Signature) -> BTreeSet<String> {
     out
 }
 
+/// A path handed to another call *as a value* — `.map(arg_shape)`,
+/// `sort_by_key(width_of)`, `filter(is_gating)`.
+///
+/// These are uses with no call expression anywhere, so nothing recorded them
+/// and every usage command reported a confident zero. `contract_drift`'s own
+/// `arg_shape` has two `.map(arg_shape)` uses and answered "0 caller(s);
+/// nothing to infer a contract from" — the same shape of wrong answer as a
+/// qualified query that matches no literal path. `dead-code` was never fooled,
+/// because it collects bare identifiers rather than call sites; that is the
+/// divergence this closes.
+///
+/// A leading-uppercase segment is a constructor, not a fn — `.map(Some)` and
+/// `.map(Ok)` are the common case and must not be recorded as uses of anything.
+pub(crate) fn fn_ref_path(e: &syn::Expr) -> Option<String> {
+    let syn::Expr::Path(p) = crate::ast::peel_grouping(e) else {
+        return None;
+    };
+    let last = p.path.segments.last()?;
+    let name = last.ident.to_string();
+    if !name.starts_with(|c: char| c.is_lowercase() || c == '_') {
+        return None;
+    }
+    Some(path_to_string(&p.path))
+}
+
 /// Every name a pattern binds, recursively. Used to learn which bare names a
 /// `let`, closure head, or fn signature shadows.
 pub(crate) fn pat_idents(p: &syn::Pat, out: &mut BTreeSet<String>) {
@@ -116,12 +141,22 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
                 p.path.segments.len() == 1 && self.local_shadows(&target);
             self.record(target, line_of(&e.func), shadowed);
         }
+        for a in &e.args {
+            if let Some(t) = fn_ref_path(a) {
+                self.record(t, line_of(a), false);
+            }
+        }
         visit::visit_expr_call(self, e);
     }
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
         let target = format!(".{}", e.method);
         self.record(target, line_of(&e.method), false);
+        for a in &e.args {
+            if let Some(t) = fn_ref_path(a) {
+                self.record(t, line_of(a), false);
+            }
+        }
         visit::visit_expr_method_call(self, e);
     }
 
@@ -254,6 +289,72 @@ pub(crate) fn matches_target(call_target: &str, query: &str) -> bool {
     target_last == query
 }
 
+/// Does this site call the item `query` names?
+///
+/// The one place that answers it, because three commands answered it three
+/// ways: `callers` and `contract-drift` disagreed on nearly every qualified
+/// target, and `co-call` — which never got the fix at all — reported 0/0/0 for
+/// a pair that the bare form scores 1 both + 11 A-only. A call site records the
+/// callee *as written*, so a qualified query sees only the sites that spell the
+/// path out unless something resolves it to the item first.
+pub(crate) struct QueryMatcher<'a> {
+    query: &'a str,
+    target: Option<&'a crate::index::Defn>,
+    key: crate::contract_drift::SearchKey<'a>,
+}
+
+impl<'a> QueryMatcher<'a> {
+    pub(crate) fn new(index: &'a NameIndex, query: &'a str) -> Self {
+        let target = single_indexed_fn(index, query);
+        let key = crate::contract_drift::search_key_for(index, query, target);
+        Self { query, target, key }
+    }
+
+    /// True when the match came from widening a method by name — a lead rather
+    /// than a resolution, since the index holds no `Vec::len`.
+    pub(crate) fn is_method_widened(&self) -> bool {
+        self.key.is_widened() && self.key.form_str().starts_with('.')
+    }
+
+    pub(crate) fn hits(&self, target: &str, resolved: Option<&str>, module: &str) -> bool {
+        let written = matches_target(target, self.query)
+            || resolved.map(|t| matches_target(t, self.query)).unwrap_or(false);
+        let Some(d) = self.target else { return written };
+        if self.key.is_widened() {
+            return matches_target(target, self.key.form_str())
+                && !crate::contract_drift::names_another_item(d, target, resolved)
+                && !crate::contract_drift::out_of_visibility(d, module);
+        }
+        if self.key.is_narrow() {
+            return written || crate::contract_drift::resolves_locally(d, target, module);
+        }
+        written
+    }
+}
+
+/// The one indexed fn a query names, when it names exactly one. `None` for an
+/// ambiguous name, a macro, or a bare method form — the cases where resolving
+/// to an item is not something this tool can do.
+fn single_indexed_fn<'a>(index: &'a NameIndex, query: &str) -> Option<&'a crate::index::Defn> {
+    let bare = crate::ast::last_segment(
+        query
+            .trim_start_matches('.')
+            .trim_start_matches("::")
+            .trim_end_matches('!'),
+    );
+    let mut hits = index
+        .iter()
+        .filter(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn") && d.name == bare);
+    let first = hits.next()?;
+    // Ambiguous by bare name is still resolvable when the query qualifies it.
+    if hits.next().is_some() {
+        return index
+            .iter()
+            .find(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn") && d.qpath.ends_with(query));
+    }
+    Some(first)
+}
+
 /// True if the index knows of any defined fn/method/etc. that matches the query.
 pub(crate) fn query_known(index: &NameIndex, query: &str) -> bool {
     if query.ends_with('!') {
@@ -287,6 +388,20 @@ fn top_module(qpath: &str) -> &str {
 /// - plain last-segment match → `heuristic`
 fn site_confidence(s: &CallSite, query: &str, unique_name: bool) -> Confidence {
     confidence_of(s.target_resolved.as_deref(), s.shadowed, query, unique_name)
+}
+
+/// [`site_confidence`], demoted when the match came from widening a method by
+/// name. See the note where `method_widened` is set.
+fn widened_confidence(
+    s: &CallSite,
+    query: &str,
+    unique_name: bool,
+    method_widened: bool,
+) -> Confidence {
+    if method_widened && s.target.starts_with('.') {
+        return Confidence::Heuristic;
+    }
+    site_confidence(s, query, unique_name)
 }
 
 /// [`site_confidence`] over the three facts it actually reads, so a command
@@ -366,6 +481,28 @@ pub fn run_callers(
         direct.retain(|s| site_confidence(s, query, unique_name) >= min);
     }
     ctx.retain_changed(&mut direct, |s| &s.file);
+
+    // Resolve the query to the *item* where that is unambiguous. Without this
+    // a qualified query sees only the sites that spell the path out.
+    let matcher = QueryMatcher::new(index, query);
+    let method_widened = matcher.is_method_widened();
+    let widened: Vec<&CallSite> = sites
+        .iter()
+        .filter(|s| {
+            matcher.hits(
+                &s.target,
+                s.target_resolved.as_deref(),
+                crate::config_drift::module_of(&s.caller),
+            )
+        })
+        .collect();
+    if widened.len() > direct.len() {
+        direct = widened;
+        if let Some(min) = min_confidence {
+            direct.retain(|s| widened_confidence(s, query, unique_name, method_widened) >= min);
+        }
+        ctx.retain_changed(&mut direct, |s| &s.file);
+    }
     note_narrower_than_bare(ctx, index, &sites, query, direct.len());
     let local_hits = direct.iter().filter(|s| s.shadowed).count();
     if local_hits > 0 {
@@ -379,7 +516,7 @@ pub fn run_callers(
     }
 
     if !transitive {
-        emit_caller_rows(ctx, &direct, by, query, unique_name);
+        emit_caller_rows(ctx, &direct, by, query, unique_name, method_widened);
         let unique = direct
             .iter()
             .map(|s| s.caller.as_str())
@@ -548,6 +685,7 @@ fn emit_caller_rows(
     by: Option<GroupBy>,
     query: &str,
     unique_name: bool,
+    method_widened: bool,
 ) {
     if ctx.summary {
         return;
@@ -573,7 +711,7 @@ fn emit_caller_rows(
                     ctx.out,
                     "caller" => s.caller.clone(),
                     "target" => s.target.clone(),
-                    "confidence" => site_confidence(s, query, unique_name).as_str(),
+                    "confidence" => widened_confidence(s, query, unique_name, method_widened).as_str(),
                     "at" => site(&s.file, s.line),
                 );
             }
@@ -894,18 +1032,23 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<usize>
     }
 
     let sites = collect_sites(files, sem, index, ctx.spans);
-    let hits = |s: &CallSite, query: &str| -> bool {
-        matches_target(&s.target, query)
-            || s.target_resolved
-                .as_deref()
-                .map(|t| matches_target(t, query))
-                .unwrap_or(false)
+    // Same resolution as `callers`. Before this, `co-call emit::push_str
+    // emit::push_val` answered 0/0/0 while the bare pair scored 1 both and 11
+    // A-only — a paired-action check that silently sees no pairs is worse than
+    // one that errors.
+    let (ma, mb) = (QueryMatcher::new(index, a), QueryMatcher::new(index, b));
+    let hits = |s: &CallSite, m: &QueryMatcher| -> bool {
+        m.hits(
+            &s.target,
+            s.target_resolved.as_deref(),
+            crate::config_drift::module_of(&s.caller),
+        )
     };
 
     let mut by_caller: BTreeMap<&str, Co> = BTreeMap::new();
     for s in &sites {
-        let is_a = hits(s, a);
-        let is_b = hits(s, b);
+        let is_a = hits(s, &ma);
+        let is_b = hits(s, &mb);
         if !is_a && !is_b {
             continue;
         }

@@ -219,6 +219,13 @@ pub fn run(
         if d.allow_dead {
             continue;
         }
+        // The harness calls a `#[test]` fn, and the harness is in no call site.
+        // Without this, `--scope all` — the scope every command's own note
+        // recommends — answered with 600 rows of which every single one was a
+        // test fn.
+        if d.is_test {
+            continue;
+        }
         if sink.called.contains(&d.name) {
             continue;
         }

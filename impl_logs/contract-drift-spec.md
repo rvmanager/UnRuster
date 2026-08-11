@@ -1,9 +1,9 @@
 # `contract-drift` — specification
 
-> **Status: implemented** in `src/contract_drift.rs` (v0.1.68, 37 subcommands).
+> **Status: implemented** in `src/contract_drift.rs` (v0.1.69, 37 subcommands).
 > §9 records where the build departed from this design and why. Everything
 > above §9 is the design as written; §10 records the first field test against
-> another codebase. Read both before treating §1–§8 as a
+> another codebase and §11 the second. Read all three before treating §1–§8 as a
 > description of the code.
 
 Compare a function's implementation against the contract its callers assume.
@@ -598,3 +598,74 @@ asserting the round-trip, because that property is what broke.
   shape as `ast::line_of` scoring 0.69 on this repo. Two data points now. The
   fix is a body-size floor and less weight on breadth, but tuning on two
   codebases is still tuning on two codebases.
+
+---
+
+## 11. Second field test — `impl_logs/svggen_contract_drift.log` (v0.1.68)
+
+A larger codebase, "focus on functions recently changed, find 5 defects". The
+command carried the session: `--candidates --changed-since HEAD~3` picked the
+targets, six exercises ran, and five defects were reported and accepted (three
+were then fixed). §10's naming fixes held — no query was retried, and
+`trace::round` resolved as typed where v0.1.67 would have returned zero.
+
+Two defects, one of them introduced by §10's own fix.
+
+### 11.1 Widening threw away the call form (regression from §10.1)
+
+`trace::round` is a private free fn. No other `round` is indexed — but
+`f64::round` is not indexed *either*, so the bare-name scan collected 65
+callers across 13 modules, nearly all of them `.round()` on a float, and marked
+every one `resolved`. The note asserted "every site calling it is this one".
+
+This is the `Suppressions::len`-credited-with-321-`.len()`-calls problem from
+§9.3, which `--candidates` was already guarded against with a `heuristic` tier.
+The reasoning was not carried into widening.
+
+It was caught immediately — a private fn cannot have callers in thirteen
+modules — which makes it the cheapest kind of wrong answer to produce and the
+most expensive kind to have produced. Had the target been `pub`, the 65-caller
+set would have looked entirely reasonable and the derived contract would have
+been about `f64`.
+
+**Fix.** Widening preserves the call form: `::name` for a free fn (free-fn
+paths only), `.name` for a method (method calls only). Neither collects the
+other's homonyms. Plus a visibility guard — a `priv`/`pub(self)` target cannot
+be called outside its own module subtree, so widened sites landing elsewhere
+are dropped and counted. And the note no longer promises what the index cannot
+know: a name unique *in this tree* can still be a method on a type defined
+outside it.
+
+### 11.2 The blindfold is advisory outside the command
+
+One exercise in six used `--reveal`. The other five read the body with
+`unruster show`, and one did it in a single shell command:
+
+```
+unruster contract-drift trace::round --no-bodies …; echo "=== REVEAL ==="; unruster show trace::round
+```
+
+Labelled "=== REVEAL ===" — so this was not evasion. The session believed it
+was performing phase 2, and there was no moment in which an expectation could
+exist.
+
+§2.4 argued against a `--both` flag because "the blindfold is not advisory".
+That is true only inside the command. `show`, `sed`, `cat` and an editor all
+reach the same bytes, and phase 1 never said so.
+
+**Fix (partial, and it is the honest kind of partial).** The withheld-body note
+now names the bypasses and says that using them in the same breath as phase 1
+leaves no moment for an expectation. That is guidance, not enforcement — the
+tool cannot observe what else a reader runs. §2.4's claim is amended: the
+withholding is enforced *within the command*, and the ordering across commands
+is a discipline the caller keeps. Which is why the instruction text in the
+project's collaboration notes asks for the expectation as **visible output**:
+that is the only artifact anything downstream can check.
+
+### 11.3 Minor
+
+- The session piped `contract-drift` through `grep -n`, which destroys the
+  section structure the usage table lives in. `audit`'s help says "never pipe
+  it"; this command has the same property and says nothing.
+- `--candidates --changed-since HEAD~3` was the entry point both times it was
+  offered. That prediction from §8 holds.

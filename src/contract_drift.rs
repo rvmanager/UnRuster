@@ -195,6 +195,27 @@ impl ContractVisitor<'_> {
     fn local_shadows(&self, name: &str) -> bool {
         self.locals.iter().any(|frame| frame.contains(name))
     }
+
+    /// The target handed to another call *as a value* rather than invoked:
+    /// `.map(arg_shape)`. There is no call expression, so nothing recorded it
+    /// and the command answered "0 caller(s)" for a fn with two real uses.
+    ///
+    /// It is a caller in the sense that matters here — the combinator names
+    /// exactly what it expects of the fn, which is contract evidence a plain
+    /// call site does not carry.
+    fn record_fn_ref(&mut self, a: &syn::Expr, consumer: &str) {
+        let Some(path) = crate::callers::fn_ref_path(a) else {
+            return;
+        };
+        if !crate::callers::matches_target(&path, self.query)
+            && !crate::callers::matches_target(&format!("::{}", path), self.query)
+        {
+            return;
+        }
+        let key = pos(a);
+        self.record(path, key, Vec::new(), false);
+        self.disp.entry(key).or_insert(Disp::with("fn-ref", consumer));
+    }
 }
 
 /// `(target, key)` for a call-shaped expression: a free call, a method call, or
@@ -345,6 +366,7 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
         // enough to hand it straight on, without inspecting it.
         let callee = call_of(&syn::Expr::Call(e.clone())).map(|(t, _)| t);
         for a in &e.args {
+            self.record_fn_ref(a, callee.as_deref().unwrap_or("?"));
             if let Some(name) = &callee {
                 self.claim(a, Disp::with("arg", name.clone()));
             }
@@ -373,6 +395,7 @@ impl<'ast> Visit<'ast> for ContractVisitor<'_> {
             if let syn::Expr::Closure(c) = peel(a) {
                 self.claim(&c.body, Disp::with("closure", e.method.to_string()));
             }
+            self.record_fn_ref(a, &name);
             self.claim(a, Disp::with("arg", name.clone()));
         }
         visit::visit_expr_method_call(self, e);
@@ -759,20 +782,27 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     let mut unattributed = 0usize;
     if key.narrow {
         let before = sites.len();
-        sites.retain(|s| crate::callers::matches_target(&s.target, query));
+        sites.retain(|s| {
+            crate::callers::matches_target(&s.target, query)
+                || target.map(|d| resolves_locally(d, &s.target, &s.module)).unwrap_or(false)
+        });
         unattributed = before - sites.len();
     }
+    let mut unreachable = 0usize;
+    let mut foreign = 0usize;
+    if key.widened {
+        if let Some(d) = target {
+            let before = sites.len();
+            sites.retain(|s| !names_another_item(d, &s.target, s.target_resolved.as_deref()));
+            foreign = before - sites.len();
+            let before = sites.len();
+            sites.retain(|s| !out_of_visibility(d, &s.module));
+            unreachable = before - sites.len();
+        }
+    }
 
-    sites.retain(|s| ctx.in_scope(&s.file));
     if let Some(min) = opts.min_confidence {
-        sites.retain(|s| {
-            crate::callers::confidence_of(
-                s.target_resolved.as_deref(),
-                s.shadowed,
-                key.conf_query(query),
-                unique,
-            ) >= min
-        });
+        sites.retain(|s| tier(&key, s, query, unique) >= min);
     }
     ctx.retain_changed(&mut sites, |s| &s.file);
 
@@ -815,18 +845,17 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
 
     emit_target_header(ctx, query, target, sites.len(), false);
 
-    let top = opts.top.unwrap_or(DEFAULT_TOP);
+    // `--top 0` lifts the cap, matching `--max-lines 0` and the global flag.
+    let top = match opts.top {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => DEFAULT_TOP,
+    };
     let shown = diverse_take(&sites, top);
 
     ctx.out.section("callers");
     for s in &shown {
-        let conf =
-            crate::callers::confidence_of(
-                s.target_resolved.as_deref(),
-                s.shadowed,
-                key.conf_query(query),
-                unique,
-            );
+        let conf = tier(&key, s, query, unique);
         let cells: Vec<(&'static str, Val)> = vec![
             ("via", Val::from(conf.as_str())),
             ("at", site(&s.file, s.line)),
@@ -872,12 +901,7 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     let low = shown
         .iter()
         .filter(|s| {
-            crate::callers::confidence_of(
-                s.target_resolved.as_deref(),
-                s.shadowed,
-                key.conf_query(query),
-                unique,
-            ) < Confidence::Resolved
+            tier(&key, s, query, unique) < Confidence::Resolved
         })
         .count();
     if low > 0 {
@@ -902,13 +926,52 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     // Both of these go to stdout: a caller set that is quietly a sample is the
     // failure this command cannot survive, and `note` is the channel a reader
     // who redirected stderr never sees.
-    if key.widened {
+    // A method widened by name alone is the case where "unique in the index"
+    // says least: the index holds no `Vec::len`, so every `.len()` in the tree
+    // arrives looking like a caller. Lead with that rather than bury it.
+    if key.by_method_name && key.widened {
         ctx.out.row_note(&format!(
-            "(note: `{}` was matched as an *item*, not as a literal path — call sites record \
-             the callee as written, so matching `{}` textually would have found only the \
-             sites that spell the path out. `{}` names exactly one fn here, so every site \
-             calling it is this one)",
-            query, query, key.bare
+            "(warning: `{}` was matched by METHOD NAME — every `.{}()` in the tree is here, \
+             whatever its receiver's type, and nothing syntactic separates them. Rows are \
+             tiered `heuristic` for that reason. Read this as a lead list, not a caller set; \
+             a contract derived from it is a contract for every `{}` in the language)",
+            query, key.bare, key.bare
+        ));
+    }
+    if key.widened && !key.by_method_name {
+        // The first wording of this note said "every site calling it is this
+        // one". It is not a guarantee this tool can make: the index holds only
+        // the fns in the scanned tree, so a name unique *here* can still be a
+        // method on a std or third-party type. Say what was matched and leave
+        // the reader able to check it.
+        ctx.out.row_note(&format!(
+            "(note: `{}` was matched as an item, in its own call form `{}` — call sites \
+             record the callee as written, so matching `{}` textually would have found only \
+             the sites that spell the path out. No other fn in this tree is called `{}`, but \
+             a same-named method on a type defined outside it would not be visible here)",
+            query,
+            key.scan(query),
+            query,
+            key.bare
+        ));
+    }
+    if foreign > 0 {
+        ctx.out.row_note(&format!(
+            "(note: {} widened site(s) dropped — their written path names a different \
+             `{}` (a std or third-party item this tree does not define), not `{}`)",
+            foreign,
+            key.bare,
+            target.map(|d| d.qpath.as_str()).unwrap_or(query)
+        ));
+    }
+    if unreachable > 0 {
+        ctx.out.row_note(&format!(
+            "(note: {} widened site(s) dropped as unreachable — `{}` is `{}` in `{}`, so a \
+             call from outside that module is a different item of the same name)",
+            unreachable,
+            key.bare,
+            target.map(|d| d.vis).unwrap_or("priv"),
+            target.map(|d| d.module.as_str()).unwrap_or("")
         ));
     }
     if unattributed > 0 {
@@ -929,19 +992,30 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
             key.bare
         ));
     }
-    note_hidden_tests(ctx, query);
 
     // Through `answer`, not `note`: this is the instruction the whole command
     // exists to deliver, and `note` goes to stderr, which agents routinely
     // discard. A blindfold that lands on a suppressed channel is not applied.
+    // Naming the bypasses, because withholding the body here does not make it
+    // unreadable anywhere else. One session ran `contract-drift <fn>` and
+    // `unruster show <fn>` as two halves of a single shell command, labelled
+    // the second "=== REVEAL ===", and so had no moment in which an
+    // expectation could exist. It was not cheating; it did not know that
+    // `show` was the thing being avoided.
     ctx.out.answer(&format!(
         "the implementation of `{}` was withheld on purpose. write the expectation these \
          {} caller(s) imply — what it must accept, return, and guarantee — and only then run \
-         `unruster contract-drift {} --reveal`. reading the body first makes the expectation \
-         a description of the code rather than evidence about it.",
+         `unruster contract-drift {} --reveal`. that is the only reading step that keeps \
+         this honest: `show {}`, `sed`, `cat`, or opening {} yourself reaches the same body \
+         and spends the exercise, and doing it in the same breath as this command leaves no \
+         moment in which an expectation could exist. an expectation written afterwards \
+         describes the code instead of testing it, and nothing downstream can tell the \
+         difference.",
         query,
         sites.len(),
-        query
+        query,
+        query,
+        target.map(|d| d.file.as_str()).unwrap_or("the file"),
     ));
     ctx.out.summary(&format!(
         "({} caller(s) across {} module(s); body withheld — `--reveal` for the \
@@ -976,35 +1050,82 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
 /// option that is not available: `callers::note_narrower_than_bare` was added
 /// for exactly this failure and fires only at zero, which is why the 2-of-164
 /// case slipped through.
-struct SearchKey<'a> {
+pub(crate) struct SearchKey<'a> {
     bare: &'a str,
+    /// What the widened scan actually searches for: `::name` for a free fn,
+    /// `.name` for a method. **Never the bare name** — see `search_key`.
+    form: String,
     /// Qualified, but the bare name is shared — match narrowly and disclose.
     narrow: bool,
-    /// Qualified and unambiguous — matched by item, on the bare name.
+    /// Qualified and unambiguous — matched by item, in its own call form.
     widened: bool,
+    /// The widened form is `.name`, which matches by method name alone. Nothing
+    /// syntactic separates `Suppressions::len` from `Vec::len`, so a site whose
+    /// receiver type is unknown is a *lead*, not a caller.
+    by_method_name: bool,
+}
+
+/// The tier one widened site earns.
+///
+/// `confidence_of` promotes a name unique in the index to `resolved`, which is
+/// right for a free fn and wrong for a method: the index holds no `Vec::len`,
+/// so `len` looks unique and 416 `.len()` calls were reported as callers of
+/// `Suppressions::len` at full confidence. `--candidates` already tiers method
+/// rows `heuristic` for exactly this reason (§9.3); this is the same rule,
+/// applied on the other path.
+fn tier(key: &SearchKey, s: &Site, query: &str, unique: bool) -> Confidence {
+    if key.by_method_name && s.target.starts_with('.') {
+        return Confidence::Heuristic;
+    }
+    crate::callers::confidence_of(
+        s.target_resolved.as_deref(),
+        s.shadowed,
+        key.conf_query(query),
+        unique,
+    )
 }
 
 impl<'a> SearchKey<'a> {
+    pub(crate) fn is_widened(&self) -> bool {
+        self.widened
+    }
+    pub(crate) fn is_narrow(&self) -> bool {
+        self.narrow
+    }
+    pub(crate) fn form_str(&self) -> &str {
+        &self.form
+    }
+
     /// The query to scan call sites with.
-    fn scan(&self, query: &'a str) -> &'a str {
+    fn scan(&self, query: &'a str) -> &str {
         if self.widened || self.narrow {
-            self.bare
+            &self.form
         } else {
             query
         }
     }
-    /// The query the confidence tiers are computed against — the bare name once
-    /// widened, since that is what actually matched.
-    fn conf_query(&self, query: &'a str) -> &'a str {
+    /// The query the confidence tiers are computed against — the widened form
+    /// once widened, since that is what actually matched.
+    fn conf_query(&self, query: &'a str) -> &str {
         if self.widened {
-            self.bare
+            &self.form
         } else {
             query
         }
     }
 }
 
-fn search_key<'a>(ctx: &AnalysisCtx, query: &'a str, target: Option<&Defn>) -> SearchKey<'a> {
+pub(crate) fn search_key<'a>(ctx: &AnalysisCtx, query: &'a str, target: Option<&Defn>) -> SearchKey<'a> {
+    search_key_for(ctx.idx, query, target)
+}
+
+/// [`search_key`] over the index alone, for `callers`, which resolves its query
+/// before an `AnalysisCtx` is convenient to hand around.
+pub(crate) fn search_key_for<'a>(
+    idx: &crate::index::NameIndex,
+    query: &'a str,
+    target: Option<&Defn>,
+) -> SearchKey<'a> {
     let bare = last_segment(query);
     // `::name` and `.method` already match by last segment; a bare name is the
     // last segment. Only `a::b` needs resolving.
@@ -1012,16 +1133,116 @@ fn search_key<'a>(ctx: &AnalysisCtx, query: &'a str, target: Option<&Defn>) -> S
     if !qualified {
         return SearchKey {
             bare,
+            form: bare.to_string(),
             narrow: false,
             widened: false,
+            by_method_name: false,
         };
     }
-    let unambiguous = target.is_some() && crate::callers::query_unique(ctx.idx, bare);
+    // Widening keeps the *call form*, and matching the bare name would throw
+    // it away. `trace::round` is one private free fn, and the tree's index
+    // holds no other `round` — but `f64::round` is not in the index either, so
+    // a bare-name scan claimed 65 callers across 13 modules, nearly all of
+    // them `.round()` on a float, and asserted `resolved` on every one. A
+    // private fn cannot have callers in thirteen modules; the answer was
+    // rejected on sight, which is the cheapest kind of wrong answer to
+    // produce and the most expensive kind to have produced.
+    //
+    // `::name` matches free-fn paths only and `.name` matches method calls
+    // only, so neither can collect the other's homonyms. Same-named methods on
+    // *other* types remain possible — nothing syntactic separates them — which
+    // is why the note below claims a resolution, not a guarantee.
+    let form = match target.map(|d| d.kind) {
+        Some("fn") => format!("::{}", bare),
+        Some("impl-fn") | Some("trait-fn") => format!(".{}", bare),
+        _ => bare.to_string(),
+    };
+    let unambiguous = target.is_some() && crate::callers::query_unique(idx, bare);
+    let by_method_name = form.starts_with('.');
     SearchKey {
         bare,
+        form,
         narrow: !unambiguous,
         widened: unambiguous,
+        by_method_name,
     }
+}
+
+/// A widened site whose *written* path names something else.
+///
+/// `::name` matches free-fn paths by last segment, which keeps `.round()` out
+/// but not `std::fs::write` — 53 of `baseline::write`'s 62 reported callers
+/// were `std::fs::write` in the test file. Restricting to the target's own
+/// call form fixed the method half of this problem and left the free-fn half
+/// standing, which is the same defect twice.
+///
+/// A written path that carries any qualification has to be *compatible* with
+/// the target's: `crate::baseline::write` and `baseline::write` are, `std::fs::write`
+/// is not. A bare name is kept unless the file's use-map says it resolves
+/// somewhere else — `use std::fs::write; write(…)` is a bare spelling of a
+/// foreign item.
+pub(crate) fn names_another_item(d: &Defn, target: &str, resolved: Option<&str>) -> bool {
+    let written = relative_head(target);
+    if written.contains("::") {
+        return !path_agrees(d, written);
+    }
+    match resolved {
+        Some(r) => !path_agrees(d, relative_head(r)),
+        None => false,
+    }
+}
+
+/// Strip the prefixes that make a path relative rather than foreign, so
+/// `super::write` and `self::write` compare as the bare name they resolve to
+/// inside their own tree.
+fn relative_head(path: &str) -> &str {
+    let mut p = path.trim_start_matches("::");
+    p = p.strip_prefix("crate::").unwrap_or(p);
+    p = p.strip_prefix("self::").unwrap_or(p);
+    while let Some(rest) = p.strip_prefix("super::") {
+        p = rest;
+    }
+    p
+}
+
+fn path_agrees(d: &Defn, written: &str) -> bool {
+    written == d.name || written.ends_with(&d.qpath) || d.qpath.ends_with(written)
+}
+
+/// A bare call that Rust's own scoping resolves to this item.
+///
+/// A shared bare name makes a qualified query go narrow, and narrow means "only
+/// the sites that spell the path out" — which inside the defining module is
+/// nobody. Four modules here define a `score`, so `arith_drift::score` reported
+/// zero callers while `arith_drift::run` called it four times as bare `score`.
+/// Twenty-five of this tree's 362 fns answered zero for that reason alone.
+///
+/// Inside the module that defines it, the bare name is not ambiguous: the
+/// compiler binds it to the local item, and so can this. Outside, it stays
+/// unattributable, which is what the shortfall warning is for.
+///
+/// Free fns only. A bare `.method()` in the same module can still be on some
+/// other type, and no scoping rule says otherwise.
+pub(crate) fn resolves_locally(d: &Defn, target: &str, module: &str) -> bool {
+    d.kind == "fn" && target == d.name && in_module_subtree(d, module)
+}
+
+/// `site_module` is the target's module or one nested inside it.
+pub(crate) fn in_module_subtree(d: &Defn, site_module: &str) -> bool {
+    site_module == d.module || site_module.starts_with(&format!("{}::", d.module))
+}
+
+/// Widened sites that the target's visibility makes impossible.
+///
+/// A `priv` or `pub(self)` item is reachable only from its own module and that
+/// module's descendants, so a widened match landing anywhere else is a homonym
+/// this tool cannot see the definition of. Cheap, sound, and it catches
+/// precisely the class that made `trace::round` report 65 callers.
+pub(crate) fn out_of_visibility(d: &Defn, site_module: &str) -> bool {
+    if d.vis != "priv" && d.vis != "pub(self)" {
+        return false;
+    }
+    !in_module_subtree(d, site_module)
 }
 
 /// Drop a `--spans` `@start-end` suffix from an enclosing-fn label, so a caller
@@ -1172,23 +1393,6 @@ fn emit_bodies(ctx: &AnalysisCtx, shown: &[&Site], opts: &ContractOpts) {
     }
 }
 
-/// Tests state expectations outright where production callers only imply them,
-/// so a hidden test caller is hidden evidence — the one scope default in this
-/// tool that costs the reader something.
-fn note_hidden_tests(ctx: &AnalysisCtx, query: &str) {
-    let hidden = collect(ctx, query)
-        .into_iter()
-        .filter(|s| !ctx.in_scope(&s.file))
-        .count();
-    if hidden > 0 {
-        ctx.out.note(&format!(
-            "(note: {} caller(s) in test code were hidden by `--scope`; a test states the \
-             expectation outright where a production caller only implies it — `--scope all` \
-             includes them)",
-            hidden
-        ));
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Phase 2 — the implementation
@@ -1257,7 +1461,7 @@ fn run_candidates(ctx: &AnalysisCtx, opts: &ContractOpts) -> anyhow::Result<usiz
     // A plain ranked listing, so `--top` keeps its usual meaning here and the
     // usual note announces the cut. (`run` clears the budget for the two-phase
     // mode, where `--top` counts callers instead of rows.)
-    ctx.out.set_row_budget(opts.top);
+    ctx.out.set_row_budget(opts.top.filter(|n| *n > 0));
     let sites = crate::callers::collect_sites(ctx.files, ctx.sem, ctx.idx, false);
     let mut by_name: HashMap<&str, (usize, BTreeSet<&str>)> = HashMap::new();
     for s in &sites {

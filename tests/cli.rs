@@ -545,12 +545,15 @@ fn a_name_that_is_only_a_closure_is_named_as_one() {
 }
 
 #[test]
-fn a_qualified_callers_query_that_finds_nothing_names_the_broader_form() {
-    // `Type::method` resolves through inferred receiver types, so a receiver
-    // reached through a field misses. Reporting `(0 call site(s))` made that
-    // indistinguishable from a method nobody calls — and the qualified form is
-    // exactly what `show`/`outline` hand you to paste back in. Two sessions
-    // took the zero at face value and went to `grep`.
+fn a_qualified_callers_query_resolves_to_the_item_or_says_why_not() {
+    // `Type::method` used to match only the sites that spell the path out, so
+    // `self.inner.ping()` missed and the command reported `(0 call site(s))` —
+    // indistinguishable from a method nobody calls. Two sessions took the zero
+    // at face value and went to `grep`.
+    //
+    // It now resolves to the item when the bare name belongs to one fn, which
+    // is the better answer than any note could be. The note still has a job:
+    // when the name is shared, resolution is impossible and the zero is real.
     let root = std::env::temp_dir().join("unruster_qualified_callers");
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -566,13 +569,29 @@ fn a_qualified_callers_query_that_finds_nothing_names_the_broader_form() {
 
     let qualified = ur_output_allow_2(&["--root", r, "callers", "Inner::ping"]);
     assert!(
-        qualified.contains("Try `callers ping`"),
-        "no pointer to the broader form:\n{}",
+        qualified.contains("Outer::go"),
+        "the receiver reached through a field must resolve now:\n{}",
         qualified
     );
-    // The broader form does find it.
-    let bare = ur_stdout(&["--root", r, "callers", "ping"]);
-    assert!(!rows_of(&bare).is_empty(), "{}", String::from_utf8_lossy(&bare));
+
+    // Two `ping`s: nothing can attribute a bare `.ping()` to either, so the
+    // pointer to the broader form is still the only useful answer.
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub struct Inner;\n\
+         impl Inner { pub fn ping(&self) -> u8 { 1 } }\n\
+         pub struct Other;\n\
+         impl Other { pub fn ping(&self) -> u8 { 2 } }\n\
+         pub struct Outer { pub inner: Inner }\n\
+         impl Outer { pub fn go(&self) -> u8 { self.inner.ping() } }\n",
+    )
+    .unwrap();
+    let ambiguous = ur_output_allow_2(&["--root", r, "callers", "Inner::ping"]);
+    assert!(
+        ambiguous.contains("Try `callers ping`"),
+        "a genuinely unresolvable name still needs the broader form:\n{}",
+        ambiguous
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -6937,9 +6956,13 @@ fn contract_drift_is_not_a_gating_check() {
     ])
     .assert()
     .success();
-    let audit = ur_output_allow_2(&["--root", dir.to_str().unwrap(), "audit", "--help"]);
+    // The battery must not *run* it — checked against the sections it emits,
+    // not against `--help`, whose global-flag prose legitimately names the
+    // command.
+    let raw = ur_stdout_allow_findings(&["--root", dir.to_str().unwrap(), "audit"]);
+    let audit = String::from_utf8_lossy(&raw);
     assert!(
-        !audit.contains("contract-drift"),
+        !audit.contains("## contract-drift"),
         "the battery must not run an unbounded material dump:\n{audit}"
     );
 }
@@ -7090,8 +7113,9 @@ fn widening_a_qualified_target_says_that_it_did() {
     ]))
     .into_owned();
     assert!(
-        out.contains("matched as an *item*, not as a literal path"),
-        "a widened match must be visible, on stdout:\n{out}"
+        out.contains("was matched as an item, in its own call form `::n`"),
+        "a widened match must be visible, on stdout, and must name the form it \
+         actually searched for:\n{out}"
     );
 }
 
@@ -7189,13 +7213,16 @@ fn candidate_names_round_trip_back_into_the_command() {
 #[test]
 fn callers_reports_a_partial_qualified_match_only_when_the_name_is_unambiguous() {
     let dir = qualified_fixture("callers-partial");
+    // `svg::n` now resolves to the item, so all four sites are found and there
+    // is no shortfall left to warn about — parity with `contract-drift` is the
+    // point, and a warning here would mean the resolution had failed.
     let out = ur().args(["--root", dir.to_str().unwrap(), "callers", "svg::n"])
         .output()
         .unwrap();
-    let s = String::from_utf8_lossy(&out.stdout);
+    let s = String::from_utf8_lossy(&out.stderr);
     assert!(
-        s.contains("matched 1 site(s), but 4 site(s)"),
-        "a partial match on a unique name must say so:\n{s}"
+        s.contains("4 call site(s)"),
+        "the qualified form must find every call to the item:\n{s}"
     );
 
     // `new` is defined on several types in the sample fixture, so the sites the
@@ -7207,5 +7234,276 @@ fn callers_reports_a_partial_qualified_match_only_when_the_name_is_unambiguous()
     assert!(
         !n.contains("call site records the callee as written"),
         "a shared name must not produce a shortfall warning:\n{n}"
+    );
+}
+
+/// Widening a qualified target must keep its **call form**. Matching the bare
+/// name threw it away: `trace::round` is one private free fn and no other
+/// `round` is indexed — but `f64::round` is not indexed either, so a bare scan
+/// claimed 65 callers across 13 modules, nearly all `.round()` on a float, and
+/// marked every one `resolved`.
+#[test]
+fn widening_does_not_collect_same_named_methods() {
+    let dir = scratch("cd-round");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod trace {
+    fn round(v: f64) -> String { format!("{:.1}", v) }
+    pub fn emit(a: f64, b: f64) -> String { format!("{} {}", round(a), round(b)) }
+}
+pub mod colour {
+    pub fn straight(x: f64) -> f64 { x.round() }
+    pub fn mean(v: &[f64]) -> f64 { (v[0] + v[1]).round() }
+}
+pub mod raster {
+    pub fn overlay(x: f64) -> f64 { (x * 2.0).round() }
+}
+"#,
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    // Two real call sites, both in `trace::emit`. The three `.round()` calls
+    // are a method on `f64` and must not appear.
+    assert_eq!(caller_count(root, "trace::round"), 2);
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root", root, "contract-drift", "trace::round", "--no-bodies",
+    ]))
+    .into_owned();
+    assert!(
+        !out.contains("colour::") && !out.contains("raster::"),
+        "a `.round()` method call was collected as a caller:\n{out}"
+    );
+    // And the note must not promise more than the index can know.
+    assert!(
+        out.contains("would not be visible here"),
+        "the widening note must not claim every same-named site is this item:\n{out}"
+    );
+}
+
+/// A private fn cannot be called from another module, so a widened match that
+/// lands outside its subtree is a homonym — dropped, and said out loud.
+#[test]
+fn widening_drops_sites_a_private_target_cannot_reach() {
+    let dir = scratch("cd-vis");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod inner {
+    fn helper(x: u32) -> u32 { x + 1 }
+    pub fn a() -> u32 { helper(1) }
+    pub fn b() -> u32 { helper(2) }
+    pub mod deeper { pub fn c() -> u32 { super::helper(3) } }
+}
+pub mod other {
+    pub fn helper(x: u32) -> u32 { x * 2 }
+    pub fn d() -> u32 { helper(9) }
+}
+"#,
+    )
+    .unwrap();
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root", dir.to_str().unwrap(), "contract-drift", "inner::helper", "--no-bodies",
+    ]))
+    .into_owned();
+    assert!(
+        !out.contains("other::d"),
+        "a call in a module the private target cannot reach was kept:\n{out}"
+    );
+}
+
+/// Withholding the body here does not make it unreadable elsewhere. A session
+/// ran phase 1 and `unruster show` as two halves of one shell command, labelled
+/// the second "=== REVEAL ===", and never had a moment in which an expectation
+/// could exist. The instruction has to name the bypass.
+#[test]
+fn the_withheld_note_names_the_ways_around_it() {
+    let dir = contract_fixture("cd-bypass");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root", dir.to_str().unwrap(), "contract-drift", "resolve_scope", "--no-bodies",
+    ]))
+    .into_owned();
+    for bypass in ["show", "sed", "cat"] {
+        assert!(out.contains(bypass), "the note must name `{bypass}`:\n{out}");
+    }
+}
+
+/// `row!(out, "at" => at(d, range))` parsed to `out` alone and dropped the arm,
+/// so a fn called only from inside a `=>` arm was invisible to every usage
+/// command — and `row!` is how every command in this tool emits. `dead-code`
+/// documented the hole rather than closing it, because over-collecting is safe
+/// there; `callers` had no such escape.
+#[test]
+fn a_call_inside_a_fat_arrow_macro_arm_is_a_call() {
+    let raw = ur_stdout(&["--root", FIXTURE, "callers", "age_label"]);
+    let out = String::from_utf8_lossy(&raw);
+    assert!(
+        out.contains("render_row"),
+        "the `kv_row!(\"age\" => age_label())` site must be found:\n{out}"
+    );
+}
+
+/// A bare call inside the module that defines the fn is unambiguous by Rust's
+/// own scoping. Four modules here define a `score`, so `arith_drift::score`
+/// reported zero callers while its own module called it four times — twenty-five
+/// of this tree's fns answered zero for that reason alone.
+#[test]
+fn a_bare_call_in_the_defining_module_resolves_to_that_module() {
+    let dir = scratch("cd-local-scope");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod a {
+    fn score(x: u32) -> u32 { x + 1 }
+    pub fn run() -> u32 { score(1) + score(2) }
+}
+pub mod b {
+    fn score(x: u32) -> u32 { x * 2 }
+    pub fn run() -> u32 { score(3) }
+}
+"#,
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    // Two bare calls in `a`, and `b`'s single call must not be attributed here.
+    assert_eq!(caller_count(root, "a::score"), 2);
+    assert_eq!(caller_count(root, "b::score"), 1);
+}
+
+/// `arg_shape` has two `.map(arg_shape)` uses and no call expression anywhere,
+/// so every usage command reported a confident zero.
+#[test]
+fn a_fn_passed_as_a_value_is_a_use() {
+    let dir = scratch("cd-fn-ref");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn widen(x: &u32) -> u64 { *x as u64 }
+pub fn go(v: &[u32]) -> Vec<u64> { v.iter().map(widen).collect() }
+pub fn wrapped(v: &[u32]) -> Vec<Option<u64>> {
+    v.iter().map(widen).map(Some).collect()
+}
+"#,
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    assert_eq!(caller_count(root, "widen"), 2, "both `.map(widen)` uses");
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root", root, "contract-drift", "widen", "--no-bodies",
+    ]))
+    .into_owned();
+    assert!(
+        out.contains("fn-ref:.map"),
+        "the consumer names what it expects of the fn:\n{out}"
+    );
+    // `.map(Some)` is a constructor, not a use of anything this tree defines.
+    // (The "no such fn" note is itself stdout, so assert on the count.)
+    let some = ur().args(["--root", root, "callers", "Some"]).output().unwrap();
+    // The count is the summary line, which lives on stderr.
+    let s = String::from_utf8_lossy(&some.stderr);
+    assert!(
+        s.contains("0 call site(s)"),
+        "constructors must not be recorded as fn references:\n{s}"
+    );
+}
+
+/// `co-call` never got the item resolution `callers` and `contract-drift` have.
+/// A paired-action check that silently sees no pairs is worse than one that
+/// errors: `co-call emit::push_str emit::push_val` answered 0/0/0 while the
+/// bare pair scored 1 both and 11 A-only.
+#[test]
+fn co_call_resolves_qualified_names_to_their_items() {
+    let dir = scratch("cc-qualified");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod g {
+    pub fn lock() {}
+    pub fn unlock() {}
+}
+pub mod u {
+    use crate::g::{lock, unlock};
+    pub fn both() { lock(); unlock(); }
+    pub fn only_a() { lock(); }
+}
+"#,
+    )
+    .unwrap();
+    let out = ur().args([
+        "--root", dir.to_str().unwrap(), "co-call", "g::lock", "g::unlock",
+    ])
+    .output()
+    .unwrap();
+    let s = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.contains("1 call both"), "the qualified pair must resolve:\n{s}");
+    assert!(s.contains("1 call A-not-B"), "the asymmetry must be found:\n{s}");
+}
+
+/// `--top 0` capped at zero here and meant "all of it" in `contract-drift`, so
+/// one flag emptied one command's output and filled another's. `--max-lines 0`
+/// has always meant "all"; nothing ever wanted the literal reading, because
+/// `--summary` is how you ask for no rows.
+#[test]
+fn top_zero_lifts_the_cap_rather_than_emptying_the_output() {
+    let uncapped = rows_of(&ur_stdout(&["--root", FIXTURE, "inventory"])).len();
+    let zero = rows_of(&ur_stdout(&["--root", FIXTURE, "inventory", "--top", "0"])).len();
+    assert!(uncapped > 5, "fixture should have plenty of items");
+    assert_eq!(zero, uncapped, "`--top 0` must lift the cap, not apply it");
+}
+
+/// The harness calls a `#[test]` fn, and the harness is in no call site. Under
+/// `--scope all` — the scope every command's own note recommends — `dead-code`
+/// answered with 600 rows of which every single one was a test fn.
+#[test]
+fn dead_code_does_not_call_the_test_suite_dead() {
+    let dir = scratch("dc-tests");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn used() -> u32 { 1 }
+pub fn go() -> u32 { used() }
+fn genuinely_dead() -> u32 { 9 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_test() { assert_eq!(super::go(), 1); }
+    #[test]
+    fn another_test() { assert_eq!(super::go(), 1); }
+}
+"#,
+    )
+    .unwrap();
+    let out = String::from_utf8_lossy(&ur_stdout(&[
+        "--root", dir.to_str().unwrap(), "dead-code", "--scope", "all",
+    ]))
+    .into_owned();
+    assert!(out.contains("genuinely_dead"), "real dead code must survive:\n{out}");
+    assert!(!out.contains("a_test"), "a #[test] fn is called by the harness:\n{out}");
+    assert!(!out.contains("another_test"), "{out}");
+}
+
+/// The command whose premise is "everything that calls this" was the one usage
+/// command not registered for the scope-gap warning, and had grown a private
+/// note of its own that could never fire — `--scope` drops those files before
+/// the scan, so nothing downstream can count what was never read.
+#[test]
+fn contract_drift_reports_the_scope_gap() {
+    let dir = scratch("cd-scope-gap");
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn target(x: u32) -> u32 { x }\npub fn a() -> u32 { target(1) }\npub fn b() -> u32 { target(2) }\n").unwrap();
+    std::fs::write(dir.join("tests/it.rs"), "#[test]\nfn t() { assert_eq!(demo::target(3), 3); }\n").unwrap();
+    let out = ur().args([
+        "--root", dir.to_str().unwrap(), "contract-drift", "target", "--no-bodies",
+    ])
+    .output()
+    .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("test file(s) were not scanned"),
+        "the scope gap must be reported here of all places:\n{err}"
     );
 }

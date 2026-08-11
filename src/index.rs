@@ -47,6 +47,14 @@ pub struct Defn {
     /// True if the item (or its enclosing impl block) carries `#[allow(dead_code)]`.
     /// `dead-code` skips these to respect the author's explicit opt-out.
     pub allow_dead: bool,
+    /// The item carries `#[test]`, `#[bench]`, `#[tokio::test]` or similar.
+    ///
+    /// Its caller is the test harness, which appears in no call site, so
+    /// `dead-code` reported all 600 of this crate's test fns as dead under
+    /// `--scope all` — a 100% false-positive rate on the scope its own note
+    /// recommends. The predicate already existed as `ast::has_test_attr`; only
+    /// the index did not carry the answer.
+    pub is_test: bool,
 }
 
 pub struct NameIndex {
@@ -169,6 +177,7 @@ struct Spot {
     sig_end: usize,
     doc: Option<String>,
     allow_dead: bool,
+    is_test: bool,
 }
 
 impl Spot {
@@ -182,6 +191,7 @@ impl Spot {
             sig_end: ext.decl,
             doc: None,
             allow_dead: false,
+            is_test: false,
         }
     }
 
@@ -192,6 +202,11 @@ impl Spot {
 
     fn sig(mut self, sig: &syn::Signature) -> Spot {
         self.sig_end = sig_end(sig, self.ext.decl);
+        self
+    }
+
+    fn test_attr(mut self, on: bool) -> Spot {
+        self.is_test = on;
         self
     }
 
@@ -361,6 +376,7 @@ impl<'a> IndexVisitor<'a> {
             trait_name: None,
             in_trait_impl: false,
             allow_dead: s.allow_dead,
+            is_test: s.is_test,
         }
     }
 
@@ -401,7 +417,8 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                 let spot = Spot::item("trait-fn", f.sig.ident.to_string(), "pub", ext)
                     .doc(&f.attrs)
                     .sig(&f.sig)
-                    .allow_dead(has_allow_dead_code(&f.attrs));
+                    .allow_dead(has_allow_dead_code(&f.attrs))
+                    .test_attr(crate::ast::has_test_attr(&f.attrs));
                 let mut d = self.defn(spot);
                 d.owner = self.scope.trait_stack.last().cloned();
                 self.out.push(d);
@@ -416,7 +433,8 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
             Spot::item("fn", i.sig.ident.to_string(), vis_str(&i.vis), ext)
                 .doc(&i.attrs)
                 .sig(&i.sig)
-                .allow_dead(has_allow_dead_code(&i.attrs)),
+                .allow_dead(has_allow_dead_code(&i.attrs))
+                .test_attr(crate::ast::has_test_attr(&i.attrs)),
         );
     }
 
@@ -484,7 +502,8 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                 let spot = Spot::item("impl-fn", f.sig.ident.to_string(), vis_str(&f.vis), ext)
                     .doc(&f.attrs)
                     .sig(&f.sig)
-                    .allow_dead(impl_block_allow || has_allow_dead_code(&f.attrs));
+                    .allow_dead(impl_block_allow || has_allow_dead_code(&f.attrs))
+                    .test_attr(crate::ast::has_test_attr(&f.attrs));
                 let mut d = self.defn(spot);
                 d.owner = self.scope.impl_stack.last().cloned();
                 d.in_trait_impl = is_trait_impl;

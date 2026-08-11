@@ -78,6 +78,11 @@ struct Cli {
     /// finding, and the cap announces itself — a silent truncation reads as
     /// "that is all there is".
     ///
+    /// `--top 0` lifts the cap, the same way `--max-lines 0` does. It used to
+    /// mean "cap at zero" here and "all of it" in `contract-drift`, so the same
+    /// flag emptied one command's output and filled another's. Nothing wanted
+    /// the literal reading — `--summary` is how you ask for no rows.
+    ///
     /// Global because it was 23 per-command copies that had drifted into three
     /// behaviours: uncapped, capped-at-20 (`metrics`), and absent from
     /// `error-swallows`, the highest-volume check in the tool.
@@ -1312,6 +1317,13 @@ fn analyses_code(command_name: &str) -> bool {
 /// edit made on the strength of a list being complete.
 const USAGE_COMMANDS: &[&str] = &[
     "callers",
+    // The command with the most to lose from a scope gap: its premise is
+    // "everything that calls this", and a caller set that quietly omits the
+    // tests yields a contract derived from half the evidence. It was missing
+    // here, and grew a private note of its own that could never fire — the
+    // scope filter drops those files before the scan, so nothing downstream
+    // can count what was never read.
+    "contract-drift",
     "callees",
     "co-call",
     "cohort-callees",
@@ -1901,7 +1913,8 @@ fn main() -> Result<()> {
     out.set_check(command_name);
     // Single-command runs never open a section, so the budget set here covers
     // the whole run. `audit` re-sets it per section from its own defaults.
-    out.set_row_budget(top);
+    // `Some(0)` is "no cap", not "cap at zero" — see the flag's own help.
+    out.set_row_budget(top.filter(|n| *n > 0));
     let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude, top);
     if let Some(note) = out.cap_note() {
         out.row_note(&note);
