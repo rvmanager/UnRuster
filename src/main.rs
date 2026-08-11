@@ -1155,7 +1155,7 @@ struct SelfCheckArgs {
     /// How many items to probe. The probe set is ordered by how likely a shape
     /// is to break something — shared bare names first, then names that collide
     /// with std methods, then methods, then private items — so a small budget
-    /// is not a small sample.
+    /// is not a small sample. `0` lifts the cap, matching `--top 0`.
     #[arg(long, default_value_t = 120, value_name = "N")]
     probes: usize,
 

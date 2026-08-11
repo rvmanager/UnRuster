@@ -61,6 +61,15 @@ pub struct Sighting {
     pub qualifier: String,
     /// The token before the name was `.`, so this is a method call.
     pub method: bool,
+    /// Followed by `(` — a definite call, as opposed to the name being handed
+    /// over as a value.
+    ///
+    /// The distinction decides what a disagreement is worth. `f(` is a call and
+    /// nothing else; a bare `f)` or `f,` is a fn-reference *or* an ordinary
+    /// variable, and no token scan can tell those apart. Treating the second as
+    /// evidence made a local `let far = score(…)` in one file look like proof
+    /// that a `far()` in another was being called.
+    pub call: bool,
 }
 
 /// Every place `name` is used as a callee or handed over as a value, found by
@@ -96,6 +105,7 @@ pub fn sightings(files: &[SourceFile], name: &str) -> Vec<Sighting> {
                     line: i + 1,
                     qualifier,
                     method,
+                    call: after.starts_with('('),
                 });
             }
         }
@@ -258,11 +268,20 @@ mod tests {
     /// The two shapes the AST path was blind to, and the reason this exists.
     #[test]
     fn a_fn_reference_and_a_macro_arm_are_both_sightings() {
-        assert_eq!(sightings(&f("fn go() { xs.map(widen) }"), "widen").len(), 1);
-        assert_eq!(
-            sightings(&f(r#"fn go() { row!(out, "at" => at(d, r)) }"#), "at").len(),
-            1
-        );
+        let r = sightings(&f("fn go() { xs.map(widen) }"), "widen");
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].call, "a fn handed over is not a call");
+        let m = sightings(&f(r#"fn go() { row!(out, "at" => at(d, r)) }"#), "at");
+        assert_eq!(m.len(), 1);
+        assert!(m[0].call);
+    }
+
+    /// The shape that cannot be told from a fn-reference, and must never be
+    /// treated as proof that anything was called.
+    #[test]
+    fn a_variable_in_argument_position_is_not_a_call() {
+        let s = sightings(&f("fn go() { let far = 1; assert!(near > far, \"x\"); }"), "far");
+        assert!(s.iter().all(|x| !x.call), "{:?}", s);
     }
 
     #[test]

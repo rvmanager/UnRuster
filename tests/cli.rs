@@ -7769,3 +7769,114 @@ fn the_ground_truth_harness_would_notice_a_wrong_answer() {
     assert_ne!(got, g.expect + 1, "the harness must read a real count, not a constant");
     assert_eq!(got, g.expect);
 }
+
+// ── self-check: the checker has to be checkable ───────────────────────────
+
+/// `--probes 0` capped the probe set at zero and the run printed five green
+/// ticks over nothing — the exact result this command exists to make
+/// impossible, produced by the command. `0` lifts the cap, as it does for
+/// `--top` and `--max-lines`.
+#[test]
+fn self_check_probes_zero_widens_rather_than_empties() {
+    let capped = ur_stdout(&["--root", FIXTURE, "self-check", "--probes", "2"]);
+    let all = ur_stdout(&["--root", FIXTURE, "self-check", "--probes", "0"]);
+    let count = |o: &[u8]| -> usize {
+        rows_of(o)
+            .iter()
+            .filter_map(|l| l.split('\t').nth(2)?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0)
+    };
+    assert!(
+        count(&all) > count(&capped),
+        "`--probes 0` must widen: capped={} all={}",
+        count(&capped),
+        count(&all)
+    );
+}
+
+/// An invariant that examined nothing has not passed. `ok` over an empty probe
+/// set is the most expensive output here, because it is indistinguishable from
+/// a real result.
+#[test]
+fn an_invariant_with_no_probes_reports_none_not_ok() {
+    let dir = scratch("sc-empty");
+    // No fns at all, so every probe-driven invariant has nothing to look at.
+    std::fs::write(dir.join("src/lib.rs"), "pub struct Empty;\n").unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "self-check"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(all.contains("none"), "an empty probe set must not read `ok`:\n{all}");
+    assert!(
+        all.contains("examined nothing"),
+        "and it must say so out loud:\n{all}"
+    );
+}
+
+/// A local `let far = …` in one file made a never-called `far()` in another
+/// look called: `dead-code`'s sink records every path expression, and the
+/// oracle counts `far,` as a use. Both over-approximate the same way, so their
+/// agreement is not evidence — the gating comparison needs a definite `name(`.
+#[test]
+fn a_variable_sharing_a_fns_name_is_not_evidence_it_was_called() {
+    let dir = scratch("sc-variable");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod a { pub fn far() -> u32 { 1 } }
+pub mod b {
+    pub fn go(near: u32) -> u32 {
+        let far = 2;
+        assert!(near > far, "{far}");
+        far
+    }
+}
+"#,
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "self-check", "--probes", "0"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !all.contains("dead-code-agrees-with-callers\ta::far"),
+        "a variable must not be read as a call:\n{all}"
+    );
+    assert!(all.contains("0 violation(s)"), "{all}");
+}
+
+/// A lead is the oracle's over-approximation asking a question; a violation is
+/// an invariant that does not hold. Counting the first as the second made
+/// `--leads` exit 1 with 162 "failures" — a flag nobody can put in CI, and a
+/// word ("FAIL") that stops meaning anything once it covers both.
+#[test]
+fn leads_are_reported_without_failing_the_run() {
+    let dir = scratch("sc-leads");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod a { pub fn solo() -> u32 { 1 } }\npub fn go() -> u32 { a::solo() }\n",
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", dir.to_str().unwrap(), "self-check", "--probes", "0", "--leads"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`--leads` must not gate: exit {:?}",
+        out.status.code()
+    );
+    let all = String::from_utf8_lossy(&out.stderr);
+    assert!(all.contains("leads do not fail the run"), "{all}");
+}

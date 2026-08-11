@@ -65,9 +65,24 @@ pub struct SelfCheckOpts {
 
 pub fn run(ctx: &AnalysisCtx, root: &std::path::Path, exclude: &[String], opts: &SelfCheckOpts) -> anyhow::Result<usize> {
     let mut v: Vec<Violation> = Vec::new();
+    // Kept apart from `v` and out of the exit code. A lead is the oracle's
+    // over-approximation asking a question; a violation is an invariant that
+    // does not hold. Counting the first as the second made `--leads` exit 1
+    // with 162 "failures", which is a flag nobody can use in CI and a word
+    // ("FAIL") that stops meaning anything.
+    let mut leads: Vec<Violation> = Vec::new();
     let mut ran: Vec<(&'static str, usize)> = Vec::new();
 
-    let probes = probe_set(ctx, opts.probes);
+    // `0` lifts the cap, the way `--top 0` and `--max-lines 0` do. It used to
+    // mean "probe nothing", and the run then printed five green ticks over an
+    // empty probe set — which is the exact result this command exists to make
+    // impossible, produced by this command.
+    let budget = if opts.probes == 0 {
+        usize::MAX
+    } else {
+        opts.probes
+    };
+    let probes = probe_set(ctx, budget);
     let sites = crate::callers::collect_sites(ctx.files, ctx.sem, ctx.idx, false);
     // Restricted to the files the AST path actually parsed. The oracle walks
     // the tree from disk and does not know about `--scope`, so without this it
@@ -100,28 +115,23 @@ pub fn run(ctx: &AnalysisCtx, root: &std::path::Path, exclude: &[String], opts: 
     ran.push(("callers-within-oracle", probes.len()));
     ran.push(("oracle-gap-explained", probes.len()));
     for d in &probes {
-        check_against_oracle(ctx, &sites, &oracle_files, d, opts.leads, &mut v);
+        check_against_oracle(ctx, &sites, &oracle_files, d, opts.leads, &mut v, &mut leads);
     }
 
     ran.push(("dead-code-agrees-with-callers", probes.len()));
-    check_dead_code(ctx, &sites, &probes, &mut v);
+    check_dead_code(ctx, &sites, &oracle_files, &probes, &mut v);
 
     let n_tests = check_tests_are_not_dead(ctx, &mut v);
     ran.push(("a-test-fn-is-never-dead", n_tests));
-    if n_tests == 0 {
-        ctx.out.note(
-            "(note: no test fns in scope, so `a-test-fn-is-never-dead` checked nothing — \
-             `--scope all` gives it something to do. A green tick over an empty probe set \
-             is the failure mode this whole command exists to avoid)",
-        );
-    }
+
 
     ran.push(("query-form-invariance", probes.len()));
     for d in &probes {
         check_query_forms(ctx, &sites, d, &mut v);
     }
 
-    emit(ctx, &ran, &v);
+    emit(ctx, &ran, &v, &leads);
+    // Leads deliberately excluded: they are questions, not verdicts.
     Ok(v.len())
 }
 
@@ -197,8 +207,9 @@ fn check_against_oracle(
     sites: &[crate::callers::CallSite],
     files: &[crate::oracle::SourceFile],
     d: &Defn,
-    leads: bool,
+    want_leads: bool,
     out: &mut Vec<Violation>,
+    leads: &mut Vec<Violation>,
 ) {
     let matcher = crate::callers::QueryMatcher::new(ctx.idx, &d.qpath);
     let ours: BTreeSet<(String, usize)> = sites
@@ -236,7 +247,7 @@ fn check_against_oracle(
         });
     }
 
-    if !leads {
+    if !want_leads {
         return;
     }
     // The gap the other way: a sighting the tool dropped. Only worth a row when
@@ -261,13 +272,18 @@ fn check_against_oracle(
         ));
     }
     for s in &seen {
-        if s.method || !(s.qualifier.is_empty() || d.qpath.ends_with(&s.qualifier)) {
+        // `s.call` here too. Without it the lane filled with local variables
+        // that happen to share a fn's name — 38 sightings of a `body` binding
+        // in the test file, reported against `clones::tests::body`. A lead has
+        // to be a definite `name(` the tool dropped without saying why, or it
+        // is not a question worth anyone's time.
+        if !s.call || s.method || !(s.qualifier.is_empty() || d.qpath.ends_with(&s.qualifier)) {
             continue;
         }
         if ours.contains(&(s.file.clone(), s.line)) {
             continue;
         }
-        out.push(Violation {
+        leads.push(Violation {
             invariant: "oracle-gap-explained",
             subject: d.qpath.clone(),
             file: s.file.clone(),
@@ -291,6 +307,7 @@ fn check_against_oracle(
 fn check_dead_code(
     ctx: &AnalysisCtx,
     sites: &[crate::callers::CallSite],
+    files: &[crate::oracle::SourceFile],
     probes: &[&Defn],
     out: &mut Vec<Violation>,
 ) {
@@ -306,6 +323,25 @@ fn check_dead_code(
         // attributable without receiver types. Comparing there is comparing a
         // precise answer against a vague one and calling the difference a bug.
         if !crate::callers::query_unique(ctx.idx, &d.name) {
+            continue;
+        }
+        // Unique *in the index* is not unique in the language. `split` is one
+        // free fn here and a `str` method everywhere, so the sink's "called"
+        // was about `.split(…)` and had nothing to say about this item.
+        //
+        // The oracle settles it, which is the reason it exists: if no sighting
+        // is written the way a call to *this* item would be — bare, or with a
+        // qualifier that agrees — then the two are discussing different things
+        // and comparing them is comparing nothing.
+        let plausible = crate::oracle::sightings(files, &d.name).into_iter().any(|s| {
+            // `s.call` required: a bare `name,` is a fn-reference *or* a
+            // variable, and the sink cannot tell either. Both mechanisms
+            // over-approximate the same way there, so their agreement carries
+            // no information — which is the whole test for whether a
+            // comparison belongs in a gating check.
+            s.call && !s.method && (s.qualifier.is_empty() || d.qpath.ends_with(&s.qualifier))
+        });
+        if !plausible {
             continue;
         }
         let matcher = crate::callers::QueryMatcher::new(ctx.idx, &d.qpath);
@@ -441,7 +477,12 @@ fn check_query_forms(
 
 // ---------------------------------------------------------------------------
 
-fn emit(ctx: &AnalysisCtx, ran: &[(&'static str, usize)], v: &[Violation]) {
+fn emit(
+    ctx: &AnalysisCtx,
+    ran: &[(&'static str, usize)],
+    v: &[Violation],
+    leads: &[Violation],
+) {
     if !ctx.summary {
         ctx.out.section("invariants");
         let mut by_inv: BTreeMap<&str, usize> = BTreeMap::new();
@@ -450,12 +491,38 @@ fn emit(ctx: &AnalysisCtx, ran: &[(&'static str, usize)], v: &[Violation]) {
         }
         for (name, probes) in ran {
             let bad = by_inv.get(name).copied().unwrap_or(0);
+            // An invariant that examined nothing has not passed. `ok` over zero
+            // probes is the most expensive output this command could produce,
+            // because it is indistinguishable from a real result.
+            let hinted = leads.iter().filter(|x| x.invariant == *name).count();
+            let status = match (probes, bad, hinted) {
+                (0, _, _) => "none",
+                (_, 0, 0) => "ok",
+                (_, 0, _) => "ok+leads",
+                _ => "FAIL",
+            };
             ctx.out.row(vec![
-                ("status", Val::from(if bad == 0 { "ok" } else { "FAIL" })),
+                ("status", Val::from(status)),
                 ("invariant", Val::from(*name)),
                 ("probes", Val::from(*probes)),
                 ("violations", Val::from(bad)),
+                ("leads", Val::from(hinted)),
             ]);
+        }
+        if !leads.is_empty() {
+            ctx.out.section("leads");
+            for x in leads.iter().take(40) {
+                ctx.out.row(vec![
+                    ("invariant", Val::from(x.invariant)),
+                    ("subject", Val::from(x.subject.clone())),
+                    ("at", site(&x.file, x.line)),
+                    ("detail", Val::from(x.detail.clone())),
+                ]);
+            }
+            if leads.len() > 40 {
+                ctx.out
+                    .row_note(&format!("(note: showing 40 of {} lead(s))", leads.len()));
+            }
         }
         if !v.is_empty() {
             ctx.out.section("violations");
@@ -469,10 +536,26 @@ fn emit(ctx: &AnalysisCtx, ran: &[(&'static str, usize)], v: &[Violation]) {
             }
         }
     }
+    let empty: Vec<&str> = ran
+        .iter()
+        .filter(|(_, n)| *n == 0)
+        .map(|(name, _)| *name)
+        .collect();
+    if !empty.is_empty() {
+        ctx.out.row_note(&format!(
+            "(warning: {} invariant(s) examined nothing and are reported `none`, not `ok`: {}. \
+             `--scope all` and `--probes 0` widen the probe set)",
+            empty.len(),
+            empty.join(", ")
+        ));
+    }
     ctx.out.summary(&format!(
-        "({} invariant(s) checked, {} violation(s); agreement is evidence only between \
-         independent paths — see the module header for what is deliberately not checked)",
+        "({} invariant(s), {} with a non-empty probe set, {} violation(s), {} lead(s) \
+         (leads do not fail the run); agreement is evidence only between independent \
+         paths — see the module header for what is deliberately not checked)",
         ran.len(),
-        v.len()
+        ran.len() - empty.len(),
+        v.len(),
+        leads.len()
     ));
 }
