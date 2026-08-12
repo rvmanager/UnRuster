@@ -199,7 +199,8 @@ pub fn kind_of_check(check: &str) -> &'static str {
         // `concepts` and `gate` name declarations, so their line is where an
         // item begins rather than where anything is wrong on it.
         "metrics" | "dead-code" | "pass-through" | "inventory" | "impls" | "tests" | "outline"
-        | "show" | "contract-drift" | "concepts" | "gate" => "item",
+        | "show" | "contract-drift" | "concepts" | "gate" | "vocabulary" | "doc-drift"
+        | "validation-drift" => "item",
         // Everything else points at the line the reader should open.
         _ => "site",
     }

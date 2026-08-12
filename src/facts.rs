@@ -178,6 +178,14 @@ pub struct ItemFact {
     /// so a local item is kept (its body is still a real near-clone candidate)
     /// and excluded from every question about what is *declared*.
     pub local: bool,
+    /// The concept this item declares itself the canonical home of:
+    /// `/// unruster: concept(user.id)`.
+    ///
+    /// `Some("")` records the malformed form — `concept()` with nothing in it —
+    /// rather than discarding it. A declaration the tool silently ignores is
+    /// the worst outcome available here: the author believes a name is claimed,
+    /// the uniqueness check never fires, and the marker reads as working.
+    pub concept: Option<String>,
 }
 
 impl ItemFact {
@@ -301,6 +309,7 @@ impl FactVisitor<'_> {
             shape,
             in_trait_impl: self.trait_impl_depth > 0,
             local: self.fn_depth > 0,
+            concept: crate::ast::doc_marker(attrs, "concept").map(|a| a.unwrap_or_default()),
         });
     }
 
@@ -627,7 +636,8 @@ fn render(
 ///
 /// v2: items carry `in_trait_impl`.
 /// v3: …and `local`.
-pub const SCHEME: u32 = 3;
+/// v4: …and `concept`.
+pub const SCHEME: u32 = 4;
 
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
@@ -668,7 +678,7 @@ pub fn encode(f: &FileFacts) -> String {
     for i in &f.items {
         let (tag, payload) = i.shape.encode();
         s.push_str(&format!(
-            "I\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "I\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             esc(&i.kind),
             esc(&i.name),
             esc(&i.qpath),
@@ -679,6 +689,13 @@ pub fn encode(f: &FileFacts) -> String {
             esc(&i.vis),
             u8::from(i.in_trait_impl),
             u8::from(i.local),
+            // A declared-but-empty concept and no concept at all are different
+            // states, so the marker's presence is its own column rather than an
+            // empty string that would collapse the two.
+            match &i.concept {
+                Some(c) => format!("1{}", esc(c)),
+                None => "0".to_string(),
+            },
             esc(i.doc.as_deref().unwrap_or("")),
             tag,
             esc(&payload),
@@ -711,8 +728,8 @@ pub fn decode(text: &str) -> Option<FileFacts> {
         }
         let c: Vec<&str> = line.split('\t').collect();
         match c.first() {
-            Some(&"I") if c.len() == 14 => {
-                let doc = unesc(c[11]);
+            Some(&"I") if c.len() == 15 => {
+                let doc = unesc(c[12]);
                 out.items.push(ItemFact {
                     kind: unesc(c[1]),
                     name: unesc(c[2]),
@@ -724,8 +741,11 @@ pub fn decode(text: &str) -> Option<FileFacts> {
                     vis: unesc(c[8]),
                     in_trait_impl: c[9] == "1",
                     local: c[10] == "1",
+                    concept: c[11]
+                        .strip_prefix('1')
+                        .map(unesc),
                     doc: (!doc.is_empty()).then_some(doc),
-                    shape: Shape::decode(c[12].chars().next()?, &unesc(c[13])),
+                    shape: Shape::decode(c[13].chars().next()?, &unesc(c[14])),
                 });
             }
             Some(&"B") if c.len() == 9 => {

@@ -23,6 +23,7 @@ mod conversions;
 mod corpus;
 mod dead_code;
 mod divergence;
+mod doc_drift;
 mod emit;
 mod error_swallows;
 mod explain;
@@ -52,7 +53,9 @@ mod suppress;
 mod takes_mut;
 mod tests_cmd;
 mod type_refs;
+mod validation;
 mod variants;
+mod vocabulary;
 mod waivers_cmd;
 mod workspace;
 
@@ -242,6 +245,38 @@ enum Cmd {
     /// `gate --hook` reads a Claude Code `PreToolUse` event on stdin and
     /// answers on the tool's own protocol — see `explain pre-write-gate`.
     Gate(GateArgs),
+    /// The documentation and the code disagreeing. Four classes: a `# Panics`
+    /// section over a body that cannot panic, a documented `pub` fn that panics
+    /// without one, an `# Errors` section over a fn returning no `Result`, and
+    /// a doc that names an identifier which is neither in the signature nor an
+    /// item anywhere in the tree — what a rename leaves behind. Doc comments
+    /// were indexed by this tool from the start and checked by nothing.
+    /// (explain: doc-drift)
+    DocDrift(DocDriftArgs),
+    /// Every place this codebase states a condition it requires: assertion
+    /// macros, `ensure!`, and `if <cond> { return Err(…) }` guards. `?`,
+    /// `.ok_or` and `.expect` are deliberately excluded — they propagate a
+    /// failure someone else detected rather than deciding what to accept.
+    /// `--by fn|file|module` to group. (explain: validation-drift)
+    Asserts(AssertsArgs),
+    /// Sibling functions where most check their inputs and one does not.
+    /// `arith-drift`'s thesis pointed at validation: a cohort is one impl or
+    /// module plus one shared word of the members' names, and a lone unchecked
+    /// sibling among three checked ones outranks an even split — the first is
+    /// someone who missed a line, the second is two different jobs.
+    /// (explain: validation-drift)
+    ValidationDrift(ValidationDriftArgs),
+    /// The concepts this codebase has *declared*, and where they leak.
+    /// `/// unruster: concept(user.id)` on an item names it the canonical home
+    /// of that concept; this reports the three ways that claim can be wrong —
+    /// two items claiming one concept (`duplicate`), an item that `concepts`
+    /// groups with a declared one while claiming nothing (`undeclared`), and
+    /// `concept()` with no name in it (`malformed`). `--all` also lists the
+    /// healthy claims, so it doubles as the ledger; `--coverage` reports
+    /// look-alike clusters no declaration covers. The positive counterpart of
+    /// `waivers`: a marker nothing can contradict is worse than no marker.
+    /// (explain: vocabulary)
+    Vocabulary(VocabularyArgs),
     /// Inspect or clear `~/.unruster_cache` — per-file derived facts, keyed by
     /// content hash so an entry is never stale, only absent. Written by every
     /// run, read by `gate`.
@@ -487,6 +522,10 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::Concepts(_) => "concepts",
         Cmd::NearClones(_) => "near-clones",
         Cmd::Gate(_) => "gate",
+        Cmd::DocDrift(_) => "doc-drift",
+        Cmd::Asserts(_) => "asserts",
+        Cmd::ValidationDrift(_) => "validation-drift",
+        Cmd::Vocabulary(_) => "vocabulary",
         Cmd::Cache(_) => "cache",
         Cmd::BlindSpots => "blind-spots",
         Cmd::Inventory(_) => "inventory",
@@ -541,6 +580,10 @@ impl Cmd {
             | Cmd::Clones(_)
             | Cmd::Concepts(_)
             | Cmd::NearClones(_)
+            | Cmd::Vocabulary(_)
+            | Cmd::DocDrift(_)
+            | Cmd::Asserts(_)
+            | Cmd::ValidationDrift(_)
             // The gate is a *question*, and a question with an answer is not a
             // failure. Its exit code stays 0 so a shell wrapper can read the
             // rows without `|| true`; the hook path (`--hook`) has its own
@@ -721,6 +764,49 @@ struct GateArgs {
     /// already in the tree — and drop the `warn` tier.
     #[arg(long)]
     collisions_only: bool,
+}
+
+#[derive(Args)]
+struct DocDriftArgs {
+    /// Also run the `stale-name` class: docs naming an identifier that is
+    /// neither a parameter nor an item in the tree. Off by default, and not in
+    /// `audit` — it reads prose rather than structure, and prose backticks
+    /// everything. `explain doc-drift` has the measurement.
+    #[arg(long)]
+    names: bool,
+
+    /// Drop rows below this score. `--min-score 0.70` is the tier `audit`
+    /// gates on.
+    #[arg(long, default_value_t = 0.0)]
+    min_score: f64,
+}
+
+#[derive(Args)]
+struct AssertsArgs {
+    /// Group counts by enclosing fn, file, or top-level module.
+    #[arg(long, value_enum)]
+    by: Option<context::GroupBy>,
+}
+
+#[derive(Args)]
+struct ValidationDriftArgs {
+    /// Drop rows below this score. `--min-score 0.70` is the tier `audit`
+    /// gates on.
+    #[arg(long, default_value_t = 0.0)]
+    min_score: f64,
+}
+
+#[derive(Args)]
+struct VocabularyArgs {
+    /// Also list healthy, sole-claimant declarations.
+    #[arg(long)]
+    all: bool,
+
+    /// Report look-alike clusters that no `concept(…)` covers. Advisory: a
+    /// codebase that has not adopted the vocabulary must not fail its own gate
+    /// on the first run.
+    #[arg(long)]
+    coverage: bool,
 }
 
 #[derive(Args)]
@@ -1520,6 +1606,9 @@ fn traits_of(cmd: &Cmd) -> CmdTraits {
         Cmd::Divergence(_) | Cmd::DeadCode(_) | Cmd::ConversionPairs => t.waivers(),
         Cmd::ConfigDrift(_) | Cmd::BuilderDrift(_) | Cmd::Clones(_) => t.waivers(),
         Cmd::Concepts(_) | Cmd::NearClones(_) => t.waivers().corpus(),
+        Cmd::Vocabulary(_) => t.waivers().corpus(),
+        Cmd::DocDrift(_) | Cmd::ValidationDrift(_) => t.waivers(),
+        Cmd::Asserts(_) => t,
         Cmd::ErrorSwallows(_) | Cmd::Casts(_) | Cmd::Stringly(_) => t.waivers(),
         Cmd::EnumCoverage(_) => t.waivers().usage(),
 
@@ -1583,8 +1672,11 @@ const WAIVER_AWARE_NAMES: &[&str] = &[
     "divergence",
     "enum-coverage",
     "error-swallows",
+    "doc-drift",
     "near-clones",
     "stringly",
+    "validation-drift",
+    "vocabulary",
     "waivers",
 ];
 
@@ -1777,6 +1869,23 @@ fn dispatch(
             &concepts::Opts {
                 kind: a.kind,
                 min_score: a.min_score,
+            },
+        ),
+        Cmd::DocDrift(a) => doc_drift::run(
+            ctx,
+            &doc_drift::Opts {
+                names: a.names,
+                min_score: a.min_score,
+            },
+        ),
+        Cmd::Asserts(a) => validation::run_asserts(ctx, a.by),
+        Cmd::ValidationDrift(a) => validation::run_drift(ctx, a.min_score),
+        Cmd::Vocabulary(a) => vocabulary::run(
+            ctx,
+            ctx.corpus,
+            &vocabulary::Opts {
+                all: a.all,
+                coverage: a.coverage,
             },
         ),
         Cmd::NearClones(a) => near_clones::run(

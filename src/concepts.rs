@@ -146,6 +146,16 @@ pub fn cognate_words(a: &str, b: &str, drop_generic: bool) -> Vec<String> {
         .collect()
 }
 
+/// Is this word Rust API vocabulary rather than a domain concept?
+///
+/// Shared with [`crate::validation`], which forms sibling cohorts the same way
+/// and hit the same wall: a `run`/`run_handling` cohort is not two functions
+/// that should agree about validating their inputs, it is one entry point and
+/// one variant of it.
+pub fn is_generic_api_word(w: &str) -> bool {
+    GENERIC_API_WORDS.contains(&w)
+}
+
 /// Words shared by every name in `names`, best-first by length — the longest
 /// shared word is the most specific thing the group has in common.
 fn shared_words(names: &[&str]) -> Vec<String> {
@@ -691,25 +701,44 @@ pub fn run(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::Result<us
     Ok(run_counted(ctx, corpus, opts)?.total)
 }
 
-pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::Result<Counts> {
-    let want = |k: &'static str| opts.kind.is_none_or(|w| w.as_str() == k);
-
-    let mut clusters: Vec<Cluster> = Vec::new();
+/// Every cluster the requested views form, unfiltered and unranked.
+fn collect<'a>(corpus: &'a Corpus, kind: Option<Kind>) -> Vec<Cluster<'a>> {
+    let want = |k: &'static str| kind.is_none_or(|w| w.as_str() == k);
+    let mut out: Vec<Cluster> = Vec::new();
     if want("newtype") {
-        clusters.extend(newtype_clusters(corpus));
+        out.extend(newtype_clusters(corpus));
     }
     if want("struct-shape") {
-        clusters.extend(struct_shape_clusters(corpus));
+        out.extend(struct_shape_clusters(corpus));
     }
     if want("enum-shape") {
-        clusters.extend(enum_shape_clusters(corpus));
+        out.extend(enum_shape_clusters(corpus));
     }
     if want("signature") {
-        clusters.extend(signature_clusters(corpus));
+        out.extend(signature_clusters(corpus));
     }
     if want("doc") {
-        clusters.extend(doc_clusters(corpus));
+        out.extend(doc_clusters(corpus));
     }
+    out
+}
+
+/// The member lists of every cluster scoring at or above [`DEFAULT_MIN_SCORE`].
+///
+/// Exposed for [`crate::vocabulary`], which runs the same clustering to ask a
+/// different question — "does this group of look-alikes have a declared home?"
+/// Two implementations of "what counts as one concept here" would drift apart,
+/// and the two commands would then disagree about the same three types.
+pub fn clusters(corpus: &Corpus, kind: Option<Kind>) -> Vec<Vec<&ItemFact>> {
+    collect(corpus, kind)
+        .into_iter()
+        .filter(|c| c.score() >= DEFAULT_MIN_SCORE)
+        .map(|c| c.members)
+        .collect()
+}
+
+pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::Result<Counts> {
+    let mut clusters: Vec<Cluster> = collect(corpus, opts.kind);
 
     // `--changed-since` keeps a cluster when *any* member is in the changed
     // set: the finding is the duplication, and it can be acted on from either

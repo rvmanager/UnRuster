@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{doc_text, enum_variant_of_path, line_of, peel_expr, scope_visits, ScopeTracker};
+use crate::ast::{enum_variant_of_path, line_of, peel_expr, scope_visits, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::emit::{row, site as site_cell};
 use crate::macro_scan::{macro_body, Body};
@@ -770,12 +770,10 @@ pub(crate) fn enum_sealed(files: &[ParsedFile], enum_name: &str) -> bool {
     }
     impl<'ast, 'a> Visit<'ast> for V<'a> {
         fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
-            if e.ident == self.target
-                && e.attrs
-                    .iter()
-                    .filter_map(doc_text)
-                    .any(|d| d.contains("unruster: sealed"))
-            {
+            // Shares one marker parser with `concept(…)` — see
+            // [`crate::ast::doc_marker`]. The inline `contains` this replaced
+            // also accepted `/// unruster: sealedish`.
+            if e.ident == self.target && crate::ast::doc_marker(&e.attrs, "sealed").is_some() {
                 self.sealed = true;
             }
         }

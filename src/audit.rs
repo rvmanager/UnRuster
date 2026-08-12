@@ -28,8 +28,8 @@ use crate::divergence;
 use crate::metrics::SortKey;
 use crate::parse::ParsedFile;
 use crate::{
-    arith_drift, casts, concepts, conversion_pairs, dead_code, error_swallows, metrics,
-    near_clones, panics, parallel_matches, pass_through, stringly,
+    arith_drift, casts, concepts, conversion_pairs, dead_code, doc_drift, error_swallows, metrics,
+    near_clones, panics, parallel_matches, pass_through, stringly, validation, vocabulary,
 };
 
 /// Cyclomatic-complexity threshold above which a fn counts as an audit
@@ -107,6 +107,11 @@ pub const CHECKS: &[&str] = &[
     "error-swallows",
     "panics",
     "clones",
+    "near-clones",
+    "concepts",
+    "vocabulary",
+    "doc-drift",
+    "validation-drift",
     "config-drift",
     "builder-drift",
     "arith-drift",
@@ -330,7 +335,7 @@ pub fn run_silent_battery(
     // `sel` is honoured here as well as in `run`. It has to be: this is the
     // baseline half of `--since`, and a baseline that ran a check the current
     // run skipped reports every one of that check's findings as `gone`.
-    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 17] = [
+    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 20] = [
         ("divergence", &|| {
             divergence::run(ctx, None, cfg.divergence_min_score)
         }),
@@ -367,6 +372,28 @@ pub fn run_silent_battery(
                     min_score: concepts::DEFAULT_MIN_SCORE,
                 },
             )
+        }),
+        ("vocabulary", &|| {
+            vocabulary::run(
+                ctx,
+                ctx.corpus,
+                &vocabulary::Opts {
+                    all: false,
+                    coverage: false,
+                },
+            )
+        }),
+        ("doc-drift", &|| {
+            doc_drift::run(
+                ctx,
+                &doc_drift::Opts {
+                    names: false,
+                    min_score: 0.0,
+                },
+            )
+        }),
+        ("validation-drift", &|| {
+            validation::run_drift(ctx, VALIDATION_DRIFT_MIN_SCORE)
         }),
         ("error-swallows", &|| error_swallows::run(ctx, cfg.swallows)),
         ("panics", &|| panics::run(ctx, cfg.panics)),
@@ -413,6 +440,11 @@ pub const CONFIG_DRIFT_MIN_SCORE: f64 = 0.12;
 /// (`context` vs `with_context`) land near 0.28, which is the noise this cut
 /// is placed to exclude.
 pub const BUILDER_DRIFT_MIN_SCORE: f64 = 0.4;
+
+/// Validation-drift score below which rows are dropped from the audit section.
+/// One unchecked sibling among two checked ones scores 0.62; a one-to-one split
+/// lands at 0.47, which is the noise this cut excludes.
+pub const VALIDATION_DRIFT_MIN_SCORE: f64 = 0.55;
 
 /// Minimum care distance for the `--handling` axis.
 pub const HANDLING_MIN_CARE_GAP: u8 = 2;
@@ -662,6 +694,62 @@ pub fn run(
                 },
             )
         },
+    )?;
+    section(
+        "[high] vocabulary — a declared concept claimed twice, or drifted away from; \
+         gating on duplicate/malformed/undeclared (explain: vocabulary)",
+        "vocabulary",
+        // Tiered: `unclaimed` is advisory and off by default here, so a
+        // codebase that has not adopted `concept(…)` reports nothing rather
+        // than failing its own gate on the first run.
+        Gate::Tiered,
+        Some(20),
+        &mut || {
+            vocabulary::run_counted(
+                ctx,
+                ctx.corpus,
+                &vocabulary::Opts {
+                    all: false,
+                    coverage: false,
+                },
+            )
+        },
+    )?;
+    section(
+        &format!(
+            "[medium] doc-drift — the docs and the code disagreeing; gating at score \
+             >= {:.2} (explain: doc-drift)",
+            doc_drift::GATING_SCORE
+        ),
+        "doc-drift",
+        // Tiered: an unbacked `# Panics`/`# Errors` heading is a contradiction
+        // and gates; a missing heading or a suspicious name in prose is a lead.
+        Gate::Tiered,
+        Some(20),
+        &mut || {
+            doc_drift::run_counted(
+                ctx,
+                // `stale-name` is off here as well as by default: it could not
+                // survive a run over this codebase (205 rows, essentially all
+                // wrong), and a class that cannot do that has no business
+                // holding an agent loop open.
+                &doc_drift::Opts {
+                    names: false,
+                    min_score: 0.0,
+                },
+            )
+        },
+    )?;
+    section(
+        &format!(
+            "[medium] validation-drift — a sibling that checks nothing among siblings that \
+             do; gating at score >= {:.2} (explain: validation-drift)",
+            validation::GATING_SCORE
+        ),
+        "validation-drift",
+        Gate::Tiered,
+        Some(15),
+        &mut || validation::run_drift_counted(ctx, VALIDATION_DRIFT_MIN_SCORE),
     )?;
     section(
         "[medium] config-drift — same struct, two configurations (explain: config-drift)",

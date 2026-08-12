@@ -684,6 +684,64 @@ pub fn doc_text(attr: &syn::Attribute) -> Option<String> {
     }
 }
 
+/// Every `///` doc line of an item, in order.
+pub fn doc_lines(attrs: &[syn::Attribute]) -> Vec<String> {
+    attrs.iter().filter_map(doc_text).collect()
+}
+
+/// An in-source declaration in an item's doc comment: `/// unruster: <verb>`
+/// or `/// unruster: <verb>(<arg>)`.
+///
+/// Returns `Some(None)` for the bare form, `Some(Some(arg))` for the
+/// parenthesized one, and `None` when the verb is absent.
+///
+/// # Why doc comments, and why one parser
+///
+/// A *waiver* (`// unruster: ok(…)`) is a line comment and
+/// [`crate::suppress`] deliberately refuses to read `///`, because a waiver is
+/// a note about a finding rather than documentation of the code. A
+/// *declaration* is the opposite: `/// unruster: sealed` and `/// unruster:
+/// concept(user.id)` say something about the item that a reader of the item
+/// should see, so they belong in its documentation.
+///
+/// One parser for all of them. `enum_sealed` used to test `d.contains("unruster:
+/// sealed")` inline, which accepted `/// unruster: sealedish` and had no way to
+/// carry an argument; a second inline test for `concept(…)` would have been two
+/// implementations of one grammar, which is the defect this tool reports about
+/// other codebases.
+///
+/// Tolerant of the two things a human varies — leading whitespace and the
+/// spacing after the colon — and of nothing else. An `unruster:` inside prose
+/// (`the `unruster: ok` grammar`) does not match, because the marker must open
+/// the line.
+pub fn doc_marker(attrs: &[syn::Attribute], verb: &str) -> Option<Option<String>> {
+    for line in doc_lines(attrs) {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("unruster:") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(tail) = rest.strip_prefix(verb) else {
+            continue;
+        };
+        return match tail.chars().next() {
+            // Bare verb, ending the token.
+            None => Some(None),
+            Some(c) if c.is_whitespace() => Some(None),
+            Some('(') => {
+                let inner = &tail[1..];
+                // The first `)` closes it. A concept name has no parentheses in
+                // it, so there is nothing to nest.
+                let arg = inner.split(')').next().unwrap_or("").trim();
+                Some(Some(arg.to_string()))
+            }
+            // `sealedish` is not `sealed`.
+            Some(_) => continue,
+        };
+    }
+    None
+}
+
 /// Group `items` by `key`, sort by count desc, optionally truncate to top N,
 /// print one row per group as `<count>\t<key>` on stdout.
 ///

@@ -597,6 +597,85 @@ structs should split, or duplicate concepts should merge.
   gate that argues with a judgment call is one an agent routes around.
   The retry is the acknowledgment. Only a `collide` ever stops an edit.
 
+◇ VOCABULARY (declaring which declaration is the canonical one)
+  unruster vocabulary                              # duplicate / undeclared / malformed
+  unruster vocabulary --all                        # …plus the healthy claims: the ledger
+  unruster vocabulary --coverage                   # clusters nobody has claimed
+  The marker, in the item's own doc comment:
+      /// The canonical identifier for a user.
+      ///
+      /// unruster: concept(user.id)
+      pub struct UserId(u64);
+  Why a declaration at all, when everything else here is derived: `concepts`
+  can tell you `UserId`, `AccountId` and `OwnerId` look like one concept and
+  it can never tell you which of the three is supposed to be the one. That
+  is a decision, not a measurement.
+  Why this one is safe to add: an annotation nothing can contradict drifts
+  exactly as the code drifts, and silently, because a reader who finds a
+  marker believes it. So the rule is that a marker must have a falsifier.
+  This has three, and they are the three statuses:
+    duplicate   two items claim one concept — the compile-clean, review-clean
+                way to split a concept in half, now a finding
+    undeclared  something `concepts` groups with a declared item, claiming
+                nothing: the home exists and this grew up beside it
+    malformed   `concept()` with no name — recorded rather than skipped,
+                because a marker the tool ignores is one you think is working
+  `unclaimed` (only under `--coverage`) is advisory: a codebase that has not
+  adopted the vocabulary must not fail its own gate on the first run.
+  This is `waivers` discipline applied to a *positive* marker; `/// unruster:
+  sealed` established the form, and this gives it an argument and a check.
+  Repair: pick the canonical declaration, put the marker on it, convert or
+  delete the others. Waive with `ok(vocabulary/<concept>)`.
+
+◇ DOC-DRIFT (the documentation and the code disagreeing)
+  unruster doc-drift                               # all four classes, ranked
+  unruster doc-drift --min-score 0.70              # the tier `audit` gates on
+  unruster doc-drift --no-names                    # drop the prose-reading class
+  Doc comments have been indexed by this tool from the start and checked by
+  nothing. That matters more than it used to: prose is the part of a codebase
+  an agent trusts most and can verify least, and a `# Panics` section that
+  outlived the panic is a sentence that will be believed for years.
+    panics-doc-unbacked   a `# Panics` section over a body that cannot panic
+    errors-doc-unbacked   an `# Errors` section over a fn returning no Result
+    panics-undocumented   a documented `pub` fn that panics, with no `# Panics`
+    stale-name            the docs name an identifier that is neither in the
+                          signature nor an item anywhere in the tree
+  The first two gate: a heading with nothing behind it is a contradiction,
+  and the code is the evidence. The last two are advisory — a missing heading
+  is a gap rather than a disagreement, and `stale-name` reads prose.
+  `stale-name` is the one worth the trouble: it is what a rename leaves
+  behind. It fires only on a *backticked bare identifier* that is not in the
+  signature, not an item in the tree, not a primitive or keyword, and not a
+  word of the fn's own name — four filters, because the alternative is
+  flagging every sentence that mentions a variable. Identifiers inside a
+  ``` fence or an indented block are example code and are never flagged.
+  Repair: delete the heading, or add the panic back, or fix the name. Waive
+  with `ok(doc-drift/Panics)`, `ok(doc-drift/Errors)`, `ok(doc-drift/<name>)`.
+
+◇ VALIDATION-DRIFT (a sibling that checks nothing among siblings that do)
+  unruster asserts                                 # the inventory
+  unruster asserts --by fn                         # where checking is concentrated
+  unruster validation-drift                        # the divergence, ranked
+  `arith-drift`'s thesis pointed at validation. What counts as validation is
+  exact and deliberately narrow:
+    assert! / assert_eq! / assert_ne! / debug_assert*
+    ensure!
+    a guard — `if <cond> { return Err(…) }`, `if … { bail!(…) }`, and the
+              expression form `if … { Err(e) } else { Ok(v) }`
+  Not counted: `?`, `.ok_or(…)`, `.expect(…)`. Those propagate or assert a
+  failure someone *else* detected — they are not this function deciding what
+  it will accept — and counting them would make nearly every fn "validating",
+  leaving the divergence check with nothing to say.
+  A cohort is one enclosing scope (an impl block or a module) plus one shared
+  word of the members' names: `parse_header`/`parse_body` in one impl, not
+  `parse` on nine unrelated types. Sibling-ness has to be local or the
+  comparison means nothing.
+  Signals: one unchecked fn among three checked ones is someone who missed a
+  line (gates); an even split is two different jobs sharing a scope (does
+  not). A cohort where nobody validates is a design, and is not reported.
+  Repair: add the guard, or move the check to the one place that should hold
+  it. Waive with `ok(validation-drift/<fn>)`.
+
 ◇ REDUCE DATA REPLICATION / REPETITION / CONVERSION
   unruster impls --trait From / Into / TryFrom / AsRef
   unruster fields <A> ; unruster fields <B>       # shape overlap

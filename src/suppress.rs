@@ -477,12 +477,15 @@ pub const WAIVABLE_CHECKS: &[&str] = &[
     "dead-code",
     "divergence",
     "divergence-handling",
+    "doc-drift",
     "enum-coverage",
     "error-swallows",
     "near-clones",
     "panics",
     "pass-through",
     "stringly",
+    "validation-drift",
+    "vocabulary",
 ];
 
 /// Every check a waiver key may name, group aliases included — used to warn

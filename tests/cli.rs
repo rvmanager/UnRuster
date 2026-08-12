@@ -4518,6 +4518,13 @@ fn help_shows_the_command_list_within_the_first_screen() {
     // nobody discovers a PreToolUse hook from a command list. Everything else
     // about them went to `explain pre-write-gate` / `explain concept-drift`,
     // which is where the last three raises sent their features too.
+    //
+    // Raised 71 → 75 for `doc-drift`, `vocabulary`, `validation-drift` and
+    // `asserts`: two quickstart lines for the two a reader reaches for first,
+    // and two for the `concept(…)` marker, which is the one thing here nobody
+    // can discover from a command list because it is written in *their*
+    // source. The other two commands and every repair recipe went to
+    // `explain vocabulary` / `explain doc-drift` / `explain validation-drift`.
     let out = ur_stdout(&["--help"]);
     let s = String::from_utf8_lossy(&out);
     let idx = s
@@ -4525,8 +4532,8 @@ fn help_shows_the_command_list_within_the_first_screen() {
         .position(|l| l.starts_with("Commands:"))
         .expect("expected a Commands: section in --help");
     assert!(
-        idx < 71,
-        "Commands: must appear within the first 71 help lines, found at {}",
+        idx < 75,
+        "Commands: must appear within the first 75 help lines, found at {}",
         idx
     );
 }
@@ -8682,4 +8689,229 @@ pub mod c { pub struct OwnerId(u64); }
     assert!(text.contains("## [high] concepts"), "{text}");
     assert!(text.contains("## [high] near-clones"), "{text}");
     assert!(text.contains("UserId"), "the cluster must be reported: {text}");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// vocabulary / doc-drift / asserts / validation-drift
+
+/// The registry `--only` and `--skip` validate against must list every section
+/// the battery actually emits.
+///
+/// This caught a real defect: `near-clones` and `concepts` ran in the default
+/// battery while `audit --only near-clones` answered "unknown check", because
+/// `CHECKS` is hand-maintained and the two newest sections were never added.
+/// Derived from `--json`, so it cannot drift again — a new section that forgets
+/// the registry fails here rather than at a user's prompt.
+#[test]
+fn every_audit_section_is_a_name_only_and_skip_accept() {
+    let (dir, cache) = scratch_cached("audit-registry");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct A(u8);\n").unwrap();
+    let json = run_in(&dir, &cache, &["audit", "--json"]);
+    let emitted: Vec<String> = json
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("\"check\": "))
+        .map(|v| v.trim().trim_matches(|c| c == '"' || c == ',').to_string())
+        .collect();
+    assert!(emitted.len() > 10, "expected a full battery, got {emitted:?}");
+    for check in &emitted {
+        let out = ur()
+            .env("UNRUSTER_CACHE_DIR", &cache)
+            .args(["--root", dir.to_str().unwrap(), "audit", "--only", check])
+            .output()
+            .unwrap();
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "`audit --only {check}` is rejected, but `{check}` is a section the battery emits: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The falsifier the whole `concept(…)` design turns on: a second claimant is
+/// a compile-clean, test-clean, review-clean way to split a concept in half.
+#[test]
+fn vocabulary_reports_two_claimants_of_one_concept() {
+    let (dir, cache) = scratch_cached("vocab-dup");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod a {\n/// unruster: concept(user.id)\npub struct UserId(u64);\n}\n\
+         pub mod b {\n/// unruster: concept(user.id)\npub struct Principal(u64);\n}\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["vocabulary"]);
+    let dups: Vec<&str> = text.lines().filter(|l| l.starts_with("duplicate\t")).collect();
+    assert_eq!(dups.len(), 2, "both claimants are named:\n{text}");
+    assert!(text.contains("user.id"), "{text}");
+}
+
+/// The other half: `concepts` found the cluster, and the marker turns "these
+/// resemble each other" into "this one is the home and that one drifted".
+#[test]
+fn vocabulary_reports_a_look_alike_of_a_declared_home() {
+    let (dir, cache) = scratch_cached("vocab-undeclared");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod a {\n/// unruster: concept(user.id)\npub struct UserId(u64);\n}\n\
+         pub mod b {\npub struct OwnerId(u64);\n}\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["vocabulary"]);
+    assert!(text.contains("undeclared\tuser.id"), "{text}");
+    assert!(text.contains("OwnerId"), "{text}");
+}
+
+/// A marker the tool quietly skips is one the author believes is working.
+#[test]
+fn vocabulary_reports_a_nameless_marker() {
+    let (dir, cache) = scratch_cached("vocab-malformed");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "/// unruster: concept()\npub struct Mystery(u64);\n",
+    )
+    .unwrap();
+    assert!(run_in(&dir, &cache, &["vocabulary"]).contains("malformed"));
+}
+
+/// A codebase that has not adopted the vocabulary must report nothing, or the
+/// feature is a wall of findings on first run and nobody keeps it on.
+#[test]
+fn vocabulary_is_silent_on_a_codebase_with_no_markers() {
+    let (dir, cache) = scratch_cached("vocab-none");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct UserId(u64);\npub struct OrderId(u64);\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["vocabulary"]);
+    assert!(
+        !text.lines().any(|l| l.contains('\t')),
+        "expected no rows without --coverage:\n{text}"
+    );
+    // …and `--coverage` is how you ask the opposite question.
+    assert!(run_in(&dir, &cache, &["vocabulary", "--coverage"]).contains("unclaimed"));
+}
+
+/// The sentence that survives the refactor which removed the panic.
+#[test]
+fn doc_drift_reports_an_unbacked_panics_section() {
+    let (dir, cache) = scratch_cached("doc-panics");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "/// Adds one.\n///\n/// # Panics\n///\n/// On overflow.\n\
+         pub fn inc(x: u32) -> u32 { x.wrapping_add(1) }\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["doc-drift"]);
+    assert!(text.starts_with("panics-doc-unbacked\t"), "{text}");
+}
+
+#[test]
+fn doc_drift_reports_an_errors_section_on_an_infallible_fn() {
+    let (dir, cache) = scratch_cached("doc-errors");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "/// Adds one.\n///\n/// # Errors\n///\n/// Never.\npub fn inc(x: u32) -> u32 { x + 1 }\n",
+    )
+    .unwrap();
+    assert!(run_in(&dir, &cache, &["doc-drift"]).contains("errors-doc-unbacked"));
+}
+
+/// What a rename leaves behind.
+#[test]
+fn doc_drift_reports_a_doc_naming_a_vanished_parameter() {
+    let (dir, cache) = scratch_cached("doc-stale");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "/// Splits `text` on `sep`, keeping at most `limit` pieces.\n\
+         pub fn split(text: &str, sep: char) -> usize { 0 }\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["doc-drift", "--names"]);
+    assert!(text.contains("stale-name"), "{text}");
+    assert!(text.contains("`limit`"), "{text}");
+    // Off unless asked for: the class produced 205 rows on this repo before it
+    // was tightened, essentially all of them wrong, so it does not run by
+    // default and `audit` does not run it at all.
+    assert!(!run_in(&dir, &cache, &["doc-drift"]).contains("stale-name"));
+}
+
+#[test]
+fn doc_drift_row_shape_is_stable() {
+    let (dir, cache) = scratch_cached("doc-shape");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "/// Adds one.\n///\n/// # Errors\n///\n/// Never.\npub fn inc(x: u32) -> u32 { x + 1 }\n",
+    )
+    .unwrap();
+    for line in run_in(&dir, &cache, &["doc-drift"]).lines().filter(|l| l.contains('\t')) {
+        assert_eq!(line.split('\t').count(), 5, "doc-drift row shape: {line}");
+    }
+}
+
+/// Most Rust validates with a guard, not an assert, and nothing here could see
+/// one before.
+#[test]
+fn asserts_counts_guards_as_well_as_assertion_macros() {
+    let (dir, cache) = scratch_cached("asserts-inv");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn a(n: usize) { assert!(n > 0); }\n\
+         pub fn b(n: usize) -> Result<(), E> { if n == 0 { return Err(E); } Ok(()) }\n\
+         pub fn c(s: &str) -> Result<u8, E> { Ok(s.parse()?) }\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["asserts"]);
+    assert!(text.contains("assert\t"), "{text}");
+    assert!(text.contains("guard-return-err\t"), "{text}");
+    // Propagation is not validation.
+    assert!(!text.contains("::c"), "`?` must not count:\n{text}");
+}
+
+/// `arith-drift`'s shape, pointed at validation: one sibling that checks
+/// nothing among three that do.
+#[test]
+fn validation_drift_finds_the_sibling_that_checks_nothing() {
+    let (dir, cache) = scratch_cached("valid-drift");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct P;\n\
+         impl P {\n\
+           pub fn parse_head(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(1) }\n\
+           pub fn parse_body(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(2) }\n\
+           pub fn parse_tail(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(3) }\n\
+           pub fn parse_trailer(s: &str) -> Result<u8, E> { Ok(4) }\n\
+         }\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["validation-drift"]);
+    let row = text
+        .lines()
+        .find(|l| l.contains("parse_trailer"))
+        .unwrap_or_else(|| panic!("expected the unchecked sibling:\n{text}"));
+    assert!(row.contains("parse_head"), "the checked siblings: {row}");
+    assert!(
+        !text.contains("parse_head\t") || text.lines().filter(|l| l.contains('\t')).count() == 1,
+        "only the unchecked one is a finding:\n{text}"
+    );
+}
+
+/// A scope where nobody validates is a design, not a divergence.
+#[test]
+fn validation_drift_is_silent_when_no_sibling_validates() {
+    let (dir, cache) = scratch_cached("valid-none");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct P;\n\
+         impl P {\n\
+           pub fn parse_head(s: &str) -> u8 { 1 }\n\
+           pub fn parse_body(s: &str) -> u8 { 2 }\n\
+         }\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["validation-drift"]);
+    assert!(
+        !text.lines().any(|l| l.contains('\t')),
+        "expected no rows:\n{text}"
+    );
 }

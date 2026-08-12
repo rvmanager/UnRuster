@@ -356,6 +356,7 @@ fn facts_of_name(name: &str, kind: &str) -> FileFacts {
             shape: Shape::Opaque,
             in_trait_impl: false,
             local: false,
+            concept: None,
         }],
         bodies: Vec::new(),
     }

@@ -7,6 +7,8 @@ AGENT QUICKSTART
   unruster clones                    the same body written out more than once
   unruster near-clones               ...and the copies that have already drifted apart
   unruster concepts                  one concept declared more than once (the noun axis)
+  unruster doc-drift                 the docs and the code disagreeing
+  unruster vocabulary                `/// unruster: concept(x)` claimed twice, or drifted from
   unruster gate --snippet '<decl>'   BEFORE you write it: what already exists?
   unruster config-drift              same struct built two ways (divergence, for values)
   unruster divergence --handling     one callee, different care (.expect vs .ok())
@@ -61,6 +63,8 @@ WAIVERS — record a verified false positive (`unruster explain waivers`)
   covers all its variants; a group name (`partial-enumeration`) covers every
   check asking the same question. `unruster waivers [--orphaned]` audits them.
 
-IN-SOURCE MARKERS
+IN-SOURCE MARKERS (declarations live in `///`, waivers in `//`)
   /// unruster: sealed        on an enum: partial dispatch is tagged SEALED
+  /// unruster: concept(x)    this item is the canonical home of concept `x`
+                              (`unruster vocabulary` audits the claims)
   // unruster: ok(...) ...    waive a finding — see WAIVERS above
