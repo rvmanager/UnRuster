@@ -76,6 +76,7 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
         files: ctx.files,
         idx: ctx.idx,
         sem: ctx.sem,
+        corpus: ctx.corpus,
         summary: true,
         spans: false,
         // Deliberately unscoped even when the run carries `--changed-since`.

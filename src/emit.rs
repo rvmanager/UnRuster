@@ -194,10 +194,12 @@ pub fn kind_of_check(check: &str) -> &'static str {
     match check {
         // Two locations, and the finding is the disagreement between them.
         "divergence" | "divergence-handling" | "conversion-pairs" | "config-drift"
-        | "builder-drift" | "clones" | "arith-drift" | "co-call" => "pair",
+        | "builder-drift" | "clones" | "near-clones" | "arith-drift" | "co-call" => "pair",
         // A whole item: the row's line is where it starts, not where a defect is.
+        // `concepts` and `gate` name declarations, so their line is where an
+        // item begins rather than where anything is wrong on it.
         "metrics" | "dead-code" | "pass-through" | "inventory" | "impls" | "tests" | "outline"
-        | "show" | "contract-drift" => "item",
+        | "show" | "contract-drift" | "concepts" | "gate" => "item",
         // Everything else points at the line the reader should open.
         _ => "site",
     }

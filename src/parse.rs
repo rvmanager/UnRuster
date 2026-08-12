@@ -273,6 +273,34 @@ pub fn parse_dir(
     Ok(files)
 }
 
+/// Every `.rs` file under `root`, honouring `.gitignore` and `--exclude`.
+///
+/// No `--scope` filter and no cfg stripping, deliberately. This backs the
+/// question "does this already exist in the tree?", where a name defined only
+/// in a test module still exists, and where an item behind a `#[cfg]` this run
+/// happens not to enable is still a name the author would collide with. Every
+/// *analysis* path keeps going through [`parse_dir`], which does apply both.
+pub fn walk_rs_files(root: &Path, excludes: &[String]) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in build_walker(root, excludes)? {
+        let Ok(e) = entry else { continue };
+        if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if e.path().extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(e.path().to_path_buf());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The implicit module path a file sits at, relative to `root`. Exposed for
+/// the paths that parse a single file outside [`parse_dir`].
+pub fn module_of(root: &Path, file: &Path) -> String {
+    module_path_for(root, file)
+}
+
 pub fn display_path(p: &Path) -> String {
     let s = p.to_string_lossy();
     // Strip the `./` the walker inherits from `--root .`. Without this the same

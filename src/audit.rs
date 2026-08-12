@@ -28,8 +28,8 @@ use crate::divergence;
 use crate::metrics::SortKey;
 use crate::parse::ParsedFile;
 use crate::{
-    arith_drift, casts, conversion_pairs, dead_code, error_swallows, metrics, panics,
-    parallel_matches, pass_through, stringly,
+    arith_drift, casts, concepts, conversion_pairs, dead_code, error_swallows, metrics,
+    near_clones, panics, parallel_matches, pass_through, stringly,
 };
 
 /// Cyclomatic-complexity threshold above which a fn counts as an audit
@@ -330,7 +330,7 @@ pub fn run_silent_battery(
     // `sel` is honoured here as well as in `run`. It has to be: this is the
     // baseline half of `--since`, and a baseline that ran a check the current
     // run skipped reports every one of that check's findings as `gone`.
-    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 15] = [
+    let checks: [(&str, &dyn Fn() -> anyhow::Result<usize>); 17] = [
         ("divergence", &|| {
             divergence::run(ctx, None, cfg.divergence_min_score)
         }),
@@ -346,6 +346,27 @@ pub fn run_silent_battery(
         ("conversion-pairs", &|| conversion_pairs::run(ctx)),
         ("clones", &|| {
             clones::run(ctx, clones::DEFAULT_MIN_TOKENS)
+        }),
+        ("near-clones", &|| {
+            near_clones::run(
+                ctx,
+                ctx.corpus,
+                &near_clones::Opts {
+                    min_tokens: near_clones::DEFAULT_MIN_TOKENS,
+                    max_diff: near_clones::DEFAULT_MAX_DIFF,
+                    min_score: 0.0,
+                },
+            )
+        }),
+        ("concepts", &|| {
+            concepts::run(
+                ctx,
+                ctx.corpus,
+                &concepts::Opts {
+                    kind: None,
+                    min_score: concepts::DEFAULT_MIN_SCORE,
+                },
+            )
         }),
         ("error-swallows", &|| error_swallows::run(ctx, cfg.swallows)),
         ("panics", &|| panics::run(ctx, cfg.panics)),
@@ -592,6 +613,55 @@ pub fn run(
         Gate::Tiered,
         Some(20),
         &mut || clones::run_counted(ctx, clones::DEFAULT_MIN_TOKENS, 0.0),
+    )?;
+    section(
+        &format!(
+            "[high] near-clones — one body, edited on one side only; gating at score \
+             >= {:.2} (explain: replication)",
+            near_clones::GATING_SCORE
+        ),
+        "near-clones",
+        // Tiered beside `clones`, and ranked above it in severity for the same
+        // reason the check exists: two identical copies are a maintenance
+        // smell, whereas two copies that differ in one leaf are a fix that
+        // landed once. The row names the leaf, so the top of this section is
+        // the shortest path from "run the battery" to "open one file".
+        Gate::Tiered,
+        Some(20),
+        &mut || {
+            near_clones::run_counted(
+                ctx,
+                ctx.corpus,
+                &near_clones::Opts {
+                    min_tokens: near_clones::DEFAULT_MIN_TOKENS,
+                    max_diff: near_clones::DEFAULT_MAX_DIFF,
+                    min_score: 0.0,
+                },
+            )
+        },
+    )?;
+    section(
+        &format!(
+            "[high] concepts — one concept declared more than once; gating at score \
+             >= {:.2} (explain: concept-drift)",
+            concepts::GATING_SCORE
+        ),
+        "concepts",
+        // Tiered: a cognate pair inside one module is a lead, three cognate
+        // declarations spread across modules is a concept somebody duplicated.
+        // The score already draws that line, so the gate follows it.
+        Gate::Tiered,
+        Some(20),
+        &mut || {
+            concepts::run_counted(
+                ctx,
+                ctx.corpus,
+                &concepts::Opts {
+                    kind: None,
+                    min_score: concepts::DEFAULT_MIN_SCORE,
+                },
+            )
+        },
     )?;
     section(
         "[medium] config-drift — same struct, two configurations (explain: config-drift)",

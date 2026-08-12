@@ -8,29 +8,36 @@ mod ast;
 mod audit;
 mod builder_drift;
 mod baseline;
+mod cache;
 mod callers;
 mod casts;
 mod catch_all;
 mod cfg_eval;
 mod clones;
+mod concepts;
 mod context;
 mod config_drift;
 mod contract_drift;
 mod conversion_pairs;
 mod conversions;
+mod corpus;
 mod dead_code;
 mod divergence;
 mod emit;
 mod error_swallows;
 mod explain;
+mod facts;
 mod field_uses;
 mod fingerprint;
 mod fields;
+mod gate;
+mod hook;
 mod impls;
 mod index;
 mod inventory;
 mod macro_scan;
 mod metrics;
+mod near_clones;
 mod oracle;
 mod outline;
 mod parallel_matches;
@@ -165,6 +172,16 @@ struct Cli {
     #[arg(long, global = true)]
     fail_on_findings: bool,
 
+    /// Do not read or write `~/.unruster_cache`.
+    ///
+    /// The cache holds per-file derived facts keyed by the *content hash* of
+    /// the file, so a hit is by construction the same bytes that produced it
+    /// and can change no answer — it exists so `gate` can run in front of an
+    /// edit without re-parsing the tree. This flag is for proving that: a run
+    /// with it and a run without it must agree, and `self-check` says so.
+    #[arg(long, global = true)]
+    no_cache: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -199,6 +216,36 @@ enum Cmd {
     /// and literals are compared verbatim, so a group is functions that do the
     /// same thing to the same APIs, not merely functions of the same shape.
     Clones(ClonesArgs),
+    /// One concept, declared more than once — the noun axis of duplication.
+    /// Every other check here compares what code *does*; this one compares what
+    /// data *is*: newtypes over one primitive, structs with one field-type
+    /// multiset, enums whose variants coincide, cognate fns with one signature,
+    /// items documented with one sentence. A cluster only forms when the
+    /// declarations also share a *word* of their names — `UserId`/`OrderId`
+    /// share `Id` and cluster, `Meters`/`Celsius` share nothing and do not —
+    /// which is what separates a duplicated concept from a fact about Rust.
+    /// `--kind` runs one view. (explain: concept-drift)
+    Concepts(ConceptsArgs),
+    /// Two bodies that were one body until somebody edited one. `clones` is
+    /// EXACT and so goes quiet exactly when copies start to diverge — which is
+    /// when they become a defect. This groups bodies by their *skeleton*
+    /// (structure with idents and literals elided) and reports the pairs whose
+    /// remaining leaves differ in at most `--max-diff` positions, ranked so the
+    /// closest pair sorts first. The `delta` column names the difference
+    /// (`users→orders`), so a row is checkable without opening either file.
+    NearClones(NearClonesArgs),
+    /// What already exists that a proposed item might be — asked *before* the
+    /// code is written, which is the one thing every other check cannot do.
+    /// Reduces a proposal to the same facts an on-disk file produces, then
+    /// looks it up five ways: name taken, near-spelling, same shape, same
+    /// signature under a cognate name, same doc sentence, same body.
+    /// `gate --hook` reads a Claude Code `PreToolUse` event on stdin and
+    /// answers on the tool's own protocol — see `explain pre-write-gate`.
+    Gate(GateArgs),
+    /// Inspect or clear `~/.unruster_cache` — per-file derived facts, keyed by
+    /// content hash so an entry is never stale, only absent. Written by every
+    /// run, read by `gate`.
+    Cache(CacheArgs),
     /// The macro bodies no check could read — where this tool is blind.
     ///
     /// Every run already reports the *count*; this says where. A bare "45 macro
@@ -437,6 +484,10 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::BuilderDrift(_) => "builder-drift",
         Cmd::ConfigDrift(_) => "config-drift",
         Cmd::Clones(_) => "clones",
+        Cmd::Concepts(_) => "concepts",
+        Cmd::NearClones(_) => "near-clones",
+        Cmd::Gate(_) => "gate",
+        Cmd::Cache(_) => "cache",
         Cmd::BlindSpots => "blind-spots",
         Cmd::Inventory(_) => "inventory",
         Cmd::Show(_) => "show",
@@ -488,6 +539,14 @@ impl Cmd {
             Cmd::BuilderDrift(_)
             | Cmd::ConfigDrift(_)
             | Cmd::Clones(_)
+            | Cmd::Concepts(_)
+            | Cmd::NearClones(_)
+            // The gate is a *question*, and a question with an answer is not a
+            // failure. Its exit code stays 0 so a shell wrapper can read the
+            // rows without `|| true`; the hook path (`--hook`) has its own
+            // protocol and decides there.
+            | Cmd::Gate(_)
+            | Cmd::Cache(_)
             | Cmd::BlindSpots
             | Cmd::Inventory(_)
             | Cmd::Show(_)
@@ -600,6 +659,79 @@ struct ClonesArgs {
     /// one, which also ranks its rows, did not.
     #[arg(long, default_value_t = 0.0)]
     min_score: f64,
+}
+
+#[derive(Args)]
+struct ConceptsArgs {
+    /// Run one view instead of all five.
+    #[arg(long, value_enum)]
+    kind: Option<concepts::Kind>,
+
+    /// Drop clusters below this score. `--min-score 0.70` is the tier `audit`
+    /// gates on.
+    #[arg(long, default_value_t = concepts::DEFAULT_MIN_SCORE)]
+    min_score: f64,
+}
+
+#[derive(Args)]
+struct NearClonesArgs {
+    /// Ignore bodies smaller than this many canonical tokens.
+    #[arg(long, default_value_t = near_clones::DEFAULT_MIN_TOKENS)]
+    min_tokens: usize,
+
+    /// How many leaves (idents/literals) may differ before two bodies stop
+    /// being versions of one body. `--max-diff 1` is the strictest reading:
+    /// one edit apart.
+    #[arg(long, default_value_t = near_clones::DEFAULT_MAX_DIFF)]
+    max_diff: usize,
+
+    /// Drop pairs below this score. `--min-score 0.75` is the tier `audit`
+    /// gates on.
+    #[arg(long, default_value_t = 0.0)]
+    min_score: f64,
+}
+
+#[derive(Args)]
+struct GateArgs {
+    /// The name about to be introduced, when there is no declaration to hand:
+    /// `unruster gate UserId --kind struct`.
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+
+    /// Item kind for a bare NAME query.
+    #[arg(long, default_value = "struct")]
+    kind: String,
+
+    /// Rust source for the proposed item(s). A bodyless signature is accepted:
+    /// `--snippet 'pub fn parse_user_id(s: &str) -> Result<UserId>'`.
+    #[arg(long, conflicts_with = "name")]
+    snippet: Option<String>,
+
+    /// A file holding the proposed item(s).
+    #[arg(long, conflicts_with_all = ["name", "snippet"])]
+    file: Option<PathBuf>,
+
+    /// Read a Claude Code `PreToolUse` event from stdin and answer on its
+    /// protocol. Every failure path exits 0: a gate that blocks an edit
+    /// because it could not read its own input is worse than no gate.
+    #[arg(long, conflicts_with_all = ["name", "snippet", "file"])]
+    hook: bool,
+
+    /// Report only the answers nobody argues with — a taken name, a body
+    /// already in the tree — and drop the `warn` tier.
+    #[arg(long)]
+    collisions_only: bool,
+}
+
+#[derive(Args)]
+struct CacheArgs {
+    /// Delete this project's cache directory.
+    #[arg(long)]
+    clear: bool,
+
+    /// Print the directory path alone, for scripting.
+    #[arg(long)]
+    path: bool,
 }
 
 #[derive(Args)]
@@ -1340,6 +1472,11 @@ struct CmdTraits {
     waiver_aware: bool,
     /// Reads code rather than cataloguing it, so blind spots are worth naming.
     analyses_code: bool,
+    /// Works from [`corpus::Corpus`], so the run must derive one. Deriving it
+    /// is a pass over the whole tree plus a cache write per file, which is
+    /// wasted on the navigation commands — a `show` that paid for it would be
+    /// slower than the `grep` it replaces.
+    needs_corpus: bool,
 }
 
 impl CmdTraits {
@@ -1347,7 +1484,14 @@ impl CmdTraits {
         usage_query: false,
         waiver_aware: false,
         analyses_code: true,
+        needs_corpus: false,
     };
+    const fn corpus(self) -> Self {
+        Self {
+            needs_corpus: true,
+            ..self
+        }
+    }
     const fn usage(self) -> Self {
         Self {
             usage_query: true,
@@ -1372,9 +1516,10 @@ impl CmdTraits {
 fn traits_of(cmd: &Cmd) -> CmdTraits {
     let t = CmdTraits::NONE;
     match cmd {
-        Cmd::Audit(_) => t.waivers(),
+        Cmd::Audit(_) => t.waivers().corpus(),
         Cmd::Divergence(_) | Cmd::DeadCode(_) | Cmd::ConversionPairs => t.waivers(),
         Cmd::ConfigDrift(_) | Cmd::BuilderDrift(_) | Cmd::Clones(_) => t.waivers(),
+        Cmd::Concepts(_) | Cmd::NearClones(_) => t.waivers().corpus(),
         Cmd::ErrorSwallows(_) | Cmd::Casts(_) | Cmd::Stringly(_) => t.waivers(),
         Cmd::EnumCoverage(_) => t.waivers().usage(),
 
@@ -1392,7 +1537,14 @@ fn traits_of(cmd: &Cmd) -> CmdTraits {
 
         // Catalogue and navigation: they report what is there, so an
         // unreadable macro body is not an answer they were ever giving.
-        Cmd::Show(_) | Cmd::Outline(_) => t.catalogue(),
+        // `cache` reports on this tool's own state and reads no code at all.
+        Cmd::Show(_) | Cmd::Outline(_) | Cmd::Cache(_) => t.catalogue(),
+
+        // The gate answers "what already exists", which is a usage query
+        // pointed at declarations rather than call sites — and it deliberately
+        // scans the whole tree, tests included, so the scope note would be
+        // wrong here rather than merely redundant.
+        Cmd::Gate(_) => t.catalogue(),
 
         Cmd::Waivers(_) => t.waivers(),
 
@@ -1424,12 +1576,14 @@ const WAIVER_AWARE_NAMES: &[&str] = &[
     "builder-drift",
     "casts",
     "clones",
+    "concepts",
     "config-drift",
     "conversion-pairs",
     "dead-code",
     "divergence",
     "enum-coverage",
     "error-swallows",
+    "near-clones",
     "stringly",
     "waivers",
 ];
@@ -1617,6 +1771,32 @@ fn dispatch(
         }
         Cmd::BuilderDrift(a) => builder_drift::run(ctx, a.ctor.as_deref(), a.min_score),
         Cmd::Clones(a) => Ok(clones::run_counted(ctx, a.min_tokens, a.min_score)?.total),
+        Cmd::Concepts(a) => concepts::run(
+            ctx,
+            ctx.corpus,
+            &concepts::Opts {
+                kind: a.kind,
+                min_score: a.min_score,
+            },
+        ),
+        Cmd::NearClones(a) => near_clones::run(
+            ctx,
+            ctx.corpus,
+            &near_clones::Opts {
+                min_tokens: a.min_tokens,
+                max_diff: a.max_diff,
+                min_score: a.min_score,
+            },
+        ),
+        // Both run before the tree is parsed — see the early return in `main`.
+        // The arms exist so the match stays exhaustive and a future command
+        // cannot be added without deciding where it runs; reaching one means
+        // that early return was removed, which is a bug worth naming rather
+        // than a silent no-op.
+        Cmd::Gate(_) | Cmd::Cache(_) => anyhow::bail!(
+            "internal: `gate`/`cache` run before the tree scan and should have \
+             returned in main"
+        ),
         Cmd::ConfigDrift(a) => config_drift::run(ctx, a.ty.as_deref(), a.min_score),
         Cmd::BlindSpots => {
             let sites = macro_scan::blind_spot_sites();
@@ -1861,12 +2041,17 @@ fn battery_at_ref(
     let idx = index::NameIndex::build(&files);
     let sem = semantic::Semantic::build(&files);
     let sup = suppress::scan(&files);
+    // No cache for the snapshot: it lives in a temp directory that is deleted
+    // when `snap` drops, so caching its facts would fill the store with entries
+    // keyed to paths nobody will ask about again.
+    let corp = corpus::Corpus::from_files(&files, None);
     let out = emit::Out::silent();
     out.start_recording();
     let sctx = AnalysisCtx {
         files: &files,
         idx: &idx,
         sem: &sem,
+        corpus: &corp,
         // NOT `summary: true`: every check guards its row loop with
         // `if !summary`, so setting it would skip the very rows this run exists
         // to record. `Out::silent()` is what suppresses the printing.
@@ -1894,6 +2079,176 @@ fn battery_at_ref(
         .collect())
 }
 
+/// The project's fact cache, unless `--no-cache` or there is no home directory
+/// to put one in. Never an error: an unusable cache degrades to recomputing,
+/// which is what every version of this tool before it did.
+fn open_cache(no_cache: bool, root: &std::path::Path) -> Option<cache::Cache> {
+    if no_cache {
+        return None;
+    }
+    cache::Cache::open(root)
+}
+
+fn run_cache(out: &emit::Out, root: &std::path::Path, a: &CacheArgs) -> Result<()> {
+    let Some(c) = cache::Cache::open(root) else {
+        out.note("note: no cache directory (set $UNRUSTER_CACHE_DIR or $HOME)");
+        out.finish("cache");
+        return Ok(());
+    };
+    if a.path {
+        out.answer(&c.dir().display().to_string());
+        out.finish("cache");
+        return Ok(());
+    }
+    if a.clear {
+        let (n, _) = c.size();
+        c.clear()?;
+        out.answer(&format!("cleared {} entr(ies) from {}", n, c.dir().display()));
+        out.finish("cache");
+        return Ok(());
+    }
+    let (n, bytes) = c.size();
+    row!(
+        out,
+        "dir" => c.dir().display().to_string(),
+        "entries" => n.to_string(),
+        "kib" => (bytes / 1024).to_string(),
+        "scheme" => facts::SCHEME.to_string(),
+    );
+    out.summary(&format!(
+        "({} cached file(s), {} KiB; entries are keyed by content hash, so one is \
+         never stale — only absent. `cache --clear` to drop them.)",
+        n,
+        bytes / 1024
+    ));
+    out.finish("cache");
+    Ok(())
+}
+
+/// The display path `file` would have inside a scan rooted at `root`, or `None`
+/// when it is outside the tree. Used to line an incoming absolute path up with
+/// the relative ones the corpus stores.
+fn relative_display(root: &std::path::Path, file: &str) -> Option<String> {
+    let f = std::fs::canonicalize(file).ok()?;
+    let r = std::fs::canonicalize(root).ok()?;
+    let rel = f.strip_prefix(&r).ok()?;
+    Some(parse::display_path(&root.join(rel)))
+}
+
+fn run_gate(
+    out: &emit::Out,
+    root: &std::path::Path,
+    exclude: &[String],
+    cache: Option<&cache::Cache>,
+    a: &GateArgs,
+    summary: bool,
+) -> Result<()> {
+    if a.hook {
+        return run_gate_hook(root, exclude, cache, a);
+    }
+    let opts = gate::Opts {
+        snippet: a.snippet.clone(),
+        file: a.file.clone(),
+        name: a.name.clone(),
+        kind: a.kind.clone(),
+        warnings: !a.collisions_only,
+    };
+    let Some(proposal) = gate::proposal_of(&opts)? else {
+        // Not an error. An `Edit` replacement that is a fragment of a body
+        // declares nothing, so there is nothing for this command to look up,
+        // and saying so beats refusing over a parse it never needed.
+        out.answer("note: nothing declared in the input — no items to check");
+        out.finish("gate");
+        return Ok(());
+    };
+    let mut corpus = corpus::Corpus::load(root, exclude, cache)?;
+    if let Some(f) = &a.file {
+        if let Some(rel) = relative_display(root, &f.to_string_lossy()) {
+            corpus.excluding(&rel);
+        }
+    }
+    gate::run(out, &corpus, &proposal, &opts, summary);
+    out.finish("gate");
+    Ok(())
+}
+
+/// The `PreToolUse` path. Every early return is a clean exit: this runs in
+/// front of somebody else's edit, and a gate that fails closed on its own bugs
+/// is a gate that gets switched off.
+fn run_gate_hook(
+    root: &std::path::Path,
+    exclude: &[String],
+    cache: Option<&cache::Cache>,
+    _a: &GateArgs,
+) -> Result<()> {
+    let mode = hook::Mode::from_env();
+    if mode == hook::Mode::Off {
+        return Ok(());
+    }
+    let Some(ev) = hook::read_event() else {
+        return Ok(());
+    };
+    // Matched here as well as in the hook's `matcher`, because the matcher is
+    // user-editable configuration and this command must be correct under
+    // whatever it is set to. A `Bash` event carrying a `file_path` would
+    // otherwise be gated as if it were a declaration.
+    if !matches!(ev.tool_name.as_str(), "Write" | "Edit" | "MultiEdit") {
+        return Ok(());
+    }
+    if !ev.file_path.ends_with(".rs") || ev.text.trim().is_empty() {
+        return Ok(());
+    }
+    let Some(proposal) = gate::proposal_of(&gate::Opts {
+        snippet: Some(ev.text.clone()),
+        file: None,
+        name: None,
+        kind: String::new(),
+        warnings: true,
+    })
+    .ok()
+    .flatten() else {
+        return Ok(());
+    };
+    let Ok(mut corpus) = corpus::Corpus::load(root, exclude, cache) else {
+        return Ok(());
+    };
+    if let Some(rel) = relative_display(root, &ev.file_path) {
+        corpus.excluding(&rel);
+    }
+    let lines = gate::brief(&corpus, &proposal);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    // Only a *collision* — a name already taken, a body already in the tree —
+    // is allowed to stop an edit. Everything softer is said and stepped past,
+    // because a pre-hoc check has no waiver to offer and a gate that argues
+    // with judgment calls is one an agent learns to route around.
+    let colliding = lines.iter().any(|l| {
+        l.contains("[name]") || l.contains("this exact body already exists")
+    });
+    let body = format!(
+        "unruster gate: {} existing declaration(s) may already be what you are about to write \
+         in {}:\n{}\n(`unruster show <name>` to read one. If this really is a new concept, \
+         repeat the write and it will go through.)",
+        lines.len(),
+        ev.file_path,
+        lines.join("\n")
+    );
+    let blocking = match mode {
+        hook::Mode::Block => colliding,
+        hook::Mode::WarnOnce => colliding && !hook::seen_before(root, &lines.join("\n")),
+        hook::Mode::Warn | hook::Mode::Off => false,
+    };
+    if blocking {
+        // Exit 2 is the tool protocol's "block, and hand stderr to the model" —
+        // and the only channel that reaches the model at all on this event.
+        eprintln!("{}", body);
+        std::process::exit(2);
+    }
+    println!("{}", hook::advisory_json(&body));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = if cli.json { Format::Json } else { cli.format };
@@ -1916,6 +2271,19 @@ fn main() -> Result<()> {
         out.finish("playbook");
         return Ok(());
     }
+    // `gate` and `cache` run *before* the tree scan, and that placement is the
+    // feature rather than an optimisation. The gate's whole premise is that it
+    // sits in front of an edit — once per `Write`, on the agent's keystroke
+    // path — where `parse_dir` over a workspace is a cost nobody absorbs twice.
+    // It reads the same facts from `~/.unruster_cache`, keyed by content hash,
+    // and parses only the files whose exact bytes it has not seen.
+    if let Cmd::Cache(a) = &cli.cmd {
+        return run_cache(&out, &cli.root, a);
+    }
+    if let Cmd::Gate(a) = &cli.cmd {
+        let cache = open_cache(cli.no_cache, &cli.root);
+        return run_gate(&out, &cli.root, &cli.exclude, cache.as_ref(), a, cli.summary);
+    }
     let Cli {
         root,
         scope,
@@ -1927,6 +2295,7 @@ fn main() -> Result<()> {
         fail_on_findings,
         no_suppress,
         suggest_waivers,
+        no_cache,
         top,
         cmd,
         ..
@@ -1989,10 +2358,20 @@ fn main() -> Result<()> {
         },
         None => None,
     };
+    let cache = open_cache(no_cache, &root);
+    // Derived here even for the single-check commands, so that an ordinary
+    // `unruster audit` leaves the fact cache warm and the next `gate` — the one
+    // running in front of an edit — pays for nothing but a read and a hash.
+    let corp = if traits.needs_corpus {
+        corpus::Corpus::from_files(&files, cache.as_ref())
+    } else {
+        corpus::Corpus::default()
+    };
     let ctx = AnalysisCtx {
         files: &files,
         idx: &idx,
         sem: &sem,
+        corpus: &corp,
         summary,
         spans,
         changed,

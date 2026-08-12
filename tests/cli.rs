@@ -4511,6 +4511,13 @@ fn help_shows_the_command_list_within_the_first_screen() {
     //
     // Raised 62 → 63 for `contract-drift`, on the same terms: one quickstart
     // line for the command, and the rest of it in `explain contract-drift`.
+    //
+    // Raised 63 → 71 for `concepts`, `near-clones` and `gate`: three commands
+    // earn their three lines and `--no-cache` its one, and `gate` earns three
+    // more because it is a new *mode* of use rather than another check —
+    // nobody discovers a PreToolUse hook from a command list. Everything else
+    // about them went to `explain pre-write-gate` / `explain concept-drift`,
+    // which is where the last three raises sent their features too.
     let out = ur_stdout(&["--help"]);
     let s = String::from_utf8_lossy(&out);
     let idx = s
@@ -4518,8 +4525,8 @@ fn help_shows_the_command_list_within_the_first_screen() {
         .position(|l| l.starts_with("Commands:"))
         .expect("expected a Commands: section in --help");
     assert!(
-        idx < 63,
-        "Commands: must appear within the first 63 help lines, found at {}",
+        idx < 71,
+        "Commands: must appear within the first 71 help lines, found at {}",
         idx
     );
 }
@@ -8247,4 +8254,432 @@ fn an_unknown_target_note_does_not_contradict_the_rows_below_it() {
         miss.contains("no fn, method, or macro"),
         "a genuine miss must still be explained:\n{miss}"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// concepts / near-clones / gate / cache
+//
+// Every one of these sets `UNRUSTER_CACHE_DIR`. The cache is keyed by content
+// hash and so cannot change an answer, but a test suite that writes into the
+// developer's real `~/.unruster_cache` is rude, and one that shares a cache
+// directory across parallel tests is a flake waiting to be blamed on the
+// feature rather than on the test.
+
+/// A scratch tree plus a cache directory of its own.
+fn scratch_cached(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = scratch(name);
+    let cache = std::env::temp_dir().join(format!("unruster-cache-{name}"));
+    let _ = std::fs::remove_dir_all(&cache);
+    (dir, cache)
+}
+
+fn run_in(dir: &std::path::Path, cache: &std::path::Path, args: &[&str]) -> String {
+    let out = ur()
+        .env("UNRUSTER_CACHE_DIR", cache)
+        .args(["--root", dir.to_str().unwrap(), "--all-stdout"])
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// The finding the whole noun axis exists for: one concept, three names.
+#[test]
+fn concepts_clusters_cognate_newtypes_over_one_primitive() {
+    let (dir, cache) = scratch_cached("concepts-newtype");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod user { pub struct UserId(u64); }
+pub mod order { pub struct OrderId(u64); }
+pub mod owner { pub struct OwnerId(u64); }
+"#,
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["concepts", "--kind", "newtype"]);
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("newtype\t"))
+        .unwrap_or_else(|| panic!("expected a newtype cluster:\n{text}"));
+    let cols: Vec<&str> = row.split('\t').collect();
+    assert_eq!(cols[2], "3", "n column: {row}");
+    assert_eq!(cols[3], "id", "the shared concept word: {row}");
+    assert!(row.contains("(u64)"), "the shape cell: {row}");
+    assert!(row.contains("UserId") && row.contains("OwnerId"), "{row}");
+}
+
+/// The false positive the shared-word rule exists to prevent. Grouping by
+/// inner type alone reports every wrapper in the tree.
+#[test]
+fn concepts_does_not_cluster_unrelated_newtypes() {
+    let (dir, cache) = scratch_cached("concepts-unrelated");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct Meters(f64);\npub struct Celsius(f64);\npub struct Volts(f64);\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["concepts", "--kind", "newtype"]);
+    assert!(
+        !text.lines().any(|l| l.starts_with("newtype\t")),
+        "three unrelated wrappers are a fact about Rust, not a finding:\n{text}"
+    );
+}
+
+/// A method inside a trait impl did not choose its own signature, so two of
+/// them agreeing is evidence of nothing. This was the largest false-positive
+/// class the first cut produced.
+#[test]
+fn concepts_ignores_signatures_a_trait_dictated() {
+    let (dir, cache) = scratch_cached("concepts-traitimpl");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub trait Render { fn render_frame(&self, w: &mut W) -> Res; }
+pub struct A; pub struct B;
+impl Render for A { fn render_frame(&self, w: &mut W) -> Res { w.a() } }
+impl Render for B { fn render_frame(&self, w: &mut W) -> Res { w.b() } }
+"#,
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["concepts", "--kind", "signature"]);
+    assert!(
+        !text.contains("render_frame"),
+        "a trait's signature is not a duplicated decision:\n{text}"
+    );
+}
+
+#[test]
+fn concepts_row_shape_is_stable() {
+    let (dir, cache) = scratch_cached("concepts-shape");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod a { pub struct UserId(u64); }\npub mod b { pub struct OrderId(u64); }\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["concepts"]);
+    for line in text.lines().filter(|l| l.contains('\t')) {
+        assert_eq!(line.split('\t').count(), 8, "concepts row shape: {line}");
+    }
+}
+
+/// The gap `clones` leaves. Two copies, one of which got a fix — `clones`
+/// reports nothing, because they are no longer identical.
+#[test]
+fn near_clones_reports_the_pair_clones_goes_quiet_on() {
+    let (dir, cache) = scratch_cached("near-clone-fix");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod a {
+    pub fn purge(d: &D, n: usize) -> Result<usize, E> {
+        let rows = d.query("DELETE FROM users WHERE age > ?", n)?;
+        let logged = d.audit("purge", rows)?;
+        Ok(rows + logged)
+    }
+}
+pub mod b {
+    pub fn purge(d: &D, n: usize) -> Result<usize, E> {
+        let rows = d.query("DELETE FROM orders WHERE age > ?", n)?;
+        let logged = d.audit("purge", rows)?;
+        Ok(rows + logged)
+    }
+}
+"#,
+    )
+    .unwrap();
+    let clones = run_in(&dir, &cache, &["clones"]);
+    assert!(
+        !clones.contains("purge"),
+        "clones is EXACT and must stay quiet here — that is the point:\n{clones}"
+    );
+    let text = run_in(&dir, &cache, &["near-clones"]);
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("purge\t"))
+        .unwrap_or_else(|| panic!("expected the near-clone pair:\n{text}"));
+    let cols: Vec<&str> = row.split('\t').collect();
+    assert_eq!(cols[2], "1", "diffs column: {row}");
+    // The delta names the drift itself, so the row is checkable without
+    // opening either file.
+    assert!(row.contains("users") && row.contains("orders"), "delta: {row}");
+}
+
+/// Six siblings that differ in one literal are one family. All-pairs would be
+/// fifteen rows and would crowd every other check out of an `audit`.
+#[test]
+fn near_clones_collapses_a_family_into_a_chain() {
+    let (dir, cache) = scratch_cached("near-clone-family");
+    let mut src = String::new();
+    for k in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"] {
+        src.push_str(&format!(
+            r#"
+pub fn emit_{k}(o: &mut O, v: &V) -> usize {{
+    let head = o.begin("{k}");
+    let body = o.write(v.payload(), head);
+    o.end(head, body);
+    head + body
+}}
+"#
+        ));
+    }
+    std::fs::write(dir.join("src/lib.rs"), src).unwrap();
+    let text = run_in(&dir, &cache, &["near-clones"]);
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains("emit_")).collect();
+    assert_eq!(
+        rows.len(),
+        5,
+        "a family of six is five chained rows, not fifteen pairs:\n{text}"
+    );
+    for r in &rows {
+        let cols: Vec<&str> = r.split('\t').collect();
+        assert_eq!(cols[3], "6", "family column: {r}");
+    }
+}
+
+#[test]
+fn near_clones_row_shape_is_stable() {
+    let (dir, cache) = scratch_cached("near-clone-shape");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn a(d: &D) -> R { let x = d.q("one", 1); let y = d.p(x); d.fin(x, y) }
+pub fn b(d: &D) -> R { let x = d.q("two", 1); let y = d.p(x); d.fin(x, y) }
+"#,
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["near-clones", "--min-tokens", "8"]);
+    for line in text.lines().filter(|l| l.contains('\t')) {
+        assert_eq!(line.split('\t').count(), 10, "near-clones row shape: {line}");
+    }
+}
+
+/// The strongest answer the gate has, and the one an agent most often lacks:
+/// the name lives in a file it never opened.
+#[test]
+fn gate_reports_a_taken_name_as_a_collision() {
+    let (dir, cache) = scratch_cached("gate-name");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct UserId(u64);\n").unwrap();
+    let text = run_in(&dir, &cache, &["gate", "UserId", "--kind", "struct"]);
+    assert!(text.starts_with("collide\tname\t"), "{text}");
+    assert!(text.contains("src/lib.rs"), "must say where: {text}");
+}
+
+/// The failure the gate exists for: a second name for a concept that is
+/// already declared elsewhere.
+#[test]
+fn gate_finds_a_second_name_for_an_existing_concept() {
+    let (dir, cache) = scratch_cached("gate-concept");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct UserId(u64);\n").unwrap();
+    let text = run_in(
+        &dir,
+        &cache,
+        &["gate", "--snippet", "pub struct AccountId(u64);"],
+    );
+    assert!(text.contains("\tshape\t"), "expected a shape match:\n{text}");
+    assert!(text.contains("UserId"), "{text}");
+}
+
+/// A genuinely new item must come back clean, or the gate is a speed bump.
+#[test]
+fn gate_passes_a_genuinely_new_item() {
+    let (dir, cache) = scratch_cached("gate-clear");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct UserId(u64);\n").unwrap();
+    let out = ur()
+        .env("UNRUSTER_CACHE_DIR", &cache)
+        .args(["--root", dir.to_str().unwrap()])
+        .args([
+            "gate",
+            "--snippet",
+            "pub struct RetryPolicy { pub attempts: u8, pub backoff: u64 }",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "expected no rows: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(out.status.success(), "a clean gate exits 0");
+}
+
+/// A bodyless signature is what a person types when asking "does this exist
+/// yet?", and it is not a valid Rust file.
+#[test]
+fn gate_accepts_a_bare_signature() {
+    let (dir, cache) = scratch_cached("gate-sig");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn parse_user(s: &str) -> Result<u64, E> { s.parse().map_err(E::from) }\n",
+    )
+    .unwrap();
+    let text = run_in(
+        &dir,
+        &cache,
+        &["gate", "--snippet", "pub fn parse_owner(s: &str) -> Result<u64, E>"],
+    );
+    assert!(text.contains("\tsignature\t"), "{text}");
+}
+
+/// The pre-hoc escape hatch. There is nowhere to write a waiver for code that
+/// does not exist, so the retry is the acknowledgment.
+#[test]
+fn gate_hook_blocks_once_then_allows_the_retry() {
+    let (dir, cache) = scratch_cached("gate-hook");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct UserId(u64);\n").unwrap();
+    let event = format!(
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":"{}/src/new.rs",
+           "content":"pub struct UserId(u32);"}}}}"#,
+        dir.display()
+    );
+    let call = || {
+        ur()
+            .env("UNRUSTER_CACHE_DIR", &cache)
+            .args(["--root", dir.to_str().unwrap(), "gate", "--hook"])
+            .write_stdin(event.clone())
+            .output()
+            .unwrap()
+    };
+    let first = call();
+    assert_eq!(first.status.code(), Some(2), "the first collision blocks");
+    let err = String::from_utf8_lossy(&first.stderr);
+    assert!(err.contains("UserId"), "the model must be told what: {err}");
+
+    let second = call();
+    assert!(second.status.success(), "an identical retry goes through");
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("systemMessage"),
+        "…and still says why"
+    );
+}
+
+/// A `warn`-tier match must never stop an edit: a gate with no waiver to offer
+/// that argues with judgment calls is one an agent routes around.
+#[test]
+fn gate_hook_does_not_block_on_a_soft_match() {
+    let (dir, cache) = scratch_cached("gate-hook-soft");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct UserId(u64);\n").unwrap();
+    let event = format!(
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":"{}/src/new.rs",
+           "content":"pub struct AccountId(u64);"}}}}"#,
+        dir.display()
+    );
+    let out = ur()
+        .env("UNRUSTER_CACHE_DIR", &cache)
+        .args(["--root", dir.to_str().unwrap(), "gate", "--hook"])
+        .write_stdin(event)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "a shape match warns, it does not block");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("AccountId"));
+}
+
+/// An event this hook has no business gating must pass through untouched.
+#[test]
+fn gate_hook_ignores_events_it_is_not_for() {
+    let (dir, cache) = scratch_cached("gate-hook-other");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct UserId(u64);\n").unwrap();
+    for event in [
+        r#"{"tool_name":"Bash","tool_input":{"file_path":"x.rs","content":"pub struct UserId(u8);"}}"#,
+        r#"{"tool_name":"Write","tool_input":{"file_path":"notes.md","content":"pub struct UserId(u8);"}}"#,
+        "not json at all",
+        "",
+    ] {
+        let out = ur()
+            .env("UNRUSTER_CACHE_DIR", &cache)
+            .args(["--root", dir.to_str().unwrap(), "gate", "--hook"])
+            .write_stdin(event)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "must not block on: {event}");
+    }
+}
+
+/// The cache is keyed by content hash, so it cannot change an answer. That
+/// claim is worth a test rather than a paragraph.
+#[test]
+fn the_cache_changes_no_answer() {
+    let (dir, cache) = scratch_cached("cache-agrees");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod a { pub struct UserId(u64); }\npub mod b { pub struct OrderId(u64); }\n",
+    )
+    .unwrap();
+    // Rows only. The *summary* is allowed to differ, and must: it says how many
+    // files came from the cache, which is the one honest place for a run to
+    // admit where its facts came from.
+    let rows = |s: String| -> Vec<String> {
+        s.lines()
+            .filter(|l| l.contains('\t'))
+            .map(str::to_string)
+            .collect()
+    };
+    let cold = rows(run_in(&dir, &cache, &["gate", "--snippet", "pub struct OwnerId(u64);"]));
+    let warm = rows(run_in(&dir, &cache, &["gate", "--snippet", "pub struct OwnerId(u64);"]));
+    assert!(!cold.is_empty(), "the fixture must produce rows");
+    assert_eq!(cold, warm, "a warm cache must answer identically");
+
+    let uncached = ur()
+        .env("UNRUSTER_CACHE_DIR", &cache)
+        .args(["--root", dir.to_str().unwrap(), "--all-stdout", "--no-cache"])
+        .args(["gate", "--snippet", "pub struct OwnerId(u64);"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        rows(String::from_utf8_lossy(&uncached.stdout).to_string()),
+        cold,
+        "--no-cache must answer identically too"
+    );
+}
+
+/// An edit invalidates nothing — it simply has no entry. Worth asserting,
+/// because "keyed by content" is the reason there is no invalidation rule to
+/// get wrong.
+#[test]
+fn an_edited_file_is_not_answered_from_the_cache() {
+    let (dir, cache) = scratch_cached("cache-edit");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct UserId(u64);\n").unwrap();
+    let before = run_in(&dir, &cache, &["gate", "UserId", "--kind", "struct"]);
+    assert!(before.contains("collide"), "{before}");
+
+    std::fs::write(dir.join("src/lib.rs"), "pub struct Renamed(u64);\n").unwrap();
+    let after = run_in(&dir, &cache, &["gate", "UserId", "--kind", "struct"]);
+    assert!(
+        !after.contains("collide"),
+        "the cache must not answer for bytes that are gone:\n{after}"
+    );
+}
+
+#[test]
+fn cache_reports_its_contents_and_clears_them() {
+    let (dir, cache) = scratch_cached("cache-cmd");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct UserId(u64);\n").unwrap();
+    run_in(&dir, &cache, &["gate", "UserId", "--kind", "struct"]);
+    let listed = run_in(&dir, &cache, &["cache"]);
+    assert!(listed.contains('\t'), "expected a TSV row: {listed}");
+    assert!(
+        listed.split('\t').nth(1).unwrap_or("0").trim() != "0",
+        "expected a non-empty cache: {listed}"
+    );
+    let cleared = run_in(&dir, &cache, &["cache", "--clear"]);
+    assert!(cleared.contains("cleared"), "{cleared}");
+}
+
+/// Both new checks have to be in the battery, or `audit` is quietly narrower
+/// than its own summary line claims.
+#[test]
+fn audit_runs_the_noun_axis_checks() {
+    let (dir, cache) = scratch_cached("audit-noun");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod a { pub struct UserId(u64); }
+pub mod b { pub struct OrderId(u64); }
+pub mod c { pub struct OwnerId(u64); }
+"#,
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["audit"]);
+    assert!(text.contains("## [high] concepts"), "{text}");
+    assert!(text.contains("## [high] near-clones"), "{text}");
+    assert!(text.contains("UserId"), "the cluster must be reported: {text}");
 }

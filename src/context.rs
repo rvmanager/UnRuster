@@ -15,6 +15,11 @@ pub struct AnalysisCtx<'a> {
     pub files: &'a [ParsedFile],
     pub idx: &'a NameIndex,
     pub sem: &'a Semantic,
+    /// Flattened per-item and per-body facts — shapes, signatures, docs, body
+    /// skeletons. Empty for the commands that do not ask for it (see
+    /// `CmdTraits::needs_corpus` in `main`), because deriving it costs a pass
+    /// over the whole tree and `show` has no use for one.
+    pub corpus: &'a crate::corpus::Corpus,
     pub summary: bool,
     /// Render enclosing-fn labels as `name@start-end` (the `--spans` flag).
     pub spans: bool,

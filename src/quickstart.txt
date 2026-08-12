@@ -5,6 +5,9 @@ AGENT QUICKSTART
   unruster audit --changed-since HEAD~1    same, scoped to your last commit — highest yield
   unruster divergence                sibling paths that disagree — highest yield, start here
   unruster clones                    the same body written out more than once
+  unruster near-clones               ...and the copies that have already drifted apart
+  unruster concepts                  one concept declared more than once (the noun axis)
+  unruster gate --snippet '<decl>'   BEFORE you write it: what already exists?
   unruster config-drift              same struct built two ways (divergence, for values)
   unruster divergence --handling     one callee, different care (.expect vs .ok())
   unruster contract-drift <fn>       its callers, body withheld; `--reveal` after you judge
@@ -39,6 +42,11 @@ GLOBAL FLAGS
   --no-suppress          ignore waiver comments, report every site
   --suggest-waivers      print the exact waiver comment under each row
   --fingerprints         add the stable `fp` column to TSV (--json always has it)
+  --no-cache             skip ~/.unruster_cache (see BEFORE YOU WRITE below)
+
+BEFORE YOU WRITE (`unruster explain pre-write-gate`)
+  Everything else is post-hoc. `gate` runs in front of the edit — as a Claude Code
+  PreToolUse hook on `Write|Edit`: "command": "unruster gate --hook" (no `jq`).
 
 COMPARING RUNS (`unruster explain baseline`)
   Findings key on a line-number-free fingerprint, so an edit above one doesn't

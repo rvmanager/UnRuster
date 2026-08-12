@@ -508,6 +508,95 @@ structs should split, or duplicate concepts should merge.
   a default, a macro-shaped body, two crates deliberately kept
   independent. `ok(clones/<name>)` above the first listed site.
 
+◇ NEAR-CLONES (one body, edited on one side only)
+  unruster near-clones                            # ranked, closest pair first
+  unruster near-clones --max-diff 1               # one edit apart, nothing else
+  unruster near-clones --min-score 0.75           # the tier `audit` gates on
+  The check `clones` cannot run. `clones` is EXACT, so it goes quiet at
+  exactly the moment two copies start to diverge — which is when they stop
+  being a smell and become a defect: one copy has the fix, the other does
+  not, and nothing reports it.
+  How it works, and why it is not a similarity score: every body is
+  canonicalized into a *skeleton* (punctuation, delimiters, leaf slots)
+  and a list of *leaves* (idents and literals, bindings alpha-renamed).
+  Two bodies that differ only in leaves have a byte-equal skeleton, so
+  bucketing on the skeleton is the definition rather than an optimisation.
+  Within a bucket the leaves are compared by position, so a row states
+  something exact — the `delta` column names the difference itself
+  (`users→orders`, `false→true`) and you can judge it without opening
+  either file.
+  `diffs` = how many leaves disagree; `family` = how many bodies share
+  this shape. A family of N is reported as N-1 chained rows (a minimum
+  spanning forest over the closest pairs), not as N(N-1)/2 pairs — six
+  sibling visitors are one finding, not fifteen.
+  Signals: `diffs 1` on a large body under one name = a fix that landed
+  once; look at the `delta` and decide which side is right. A whole
+  `family` = extract the varying leaf as a parameter.
+  Repair: parameterize the difference, or accept the twins. Waive with
+  `ok(near-clones/<name>)` when the two really are different jobs that
+  share a shape (`min`/`max`, `left`/`right`).
+
+◇ CONCEPT-DRIFT (one concept, declared more than once)
+  unruster concepts                               # all five views, ranked
+  unruster concepts --kind newtype                # ids/keys over one primitive
+  unruster concepts --kind struct-shape           # one field-type multiset
+  unruster concepts --kind enum-shape             # coinciding variant sets
+  unruster concepts --kind signature              # cognate fns, one interface
+  unruster concepts --kind doc                    # one sentence, written twice
+  The noun axis. Every other check compares what code *does*; this one
+  compares what data *is*, which is where Rust's concept drift actually
+  lives: minting a new type is free and the compiler will never tell you
+  one already means the same thing. `UserId(u64)`, `AccountId(u64)` and
+  `OwnerId(u64)` are three spellings of one concept, three sets of
+  conversions and three chances to drift, and no other check sees them.
+  Why a shared *name word* is required: grouping newtypes by inner type
+  alone reports "31 newtypes over String", which is a fact about Rust.
+  Members must also share a word — `UserId`/`OrderId` share `Id` and
+  cluster, `Meters`/`Celsius` share nothing and do not. The same rule
+  carries `signature`, where `(&str) -> Result<T>` is every parser in the
+  tree and `parse_user` beside `parse_account` is two of them.
+  What is deliberately not reported: methods inside a trait impl (the
+  signature was the trait's decision), and `signature` clusters whose only
+  shared word is Rust API vocabulary (`as_str`, `run`, `build`).
+  Signals: `n` ≥ 3 across modules, all `pub` = one canonical declaration
+  is missing; a cognate pair in one module = a lead, not a gate.
+  Repair: pick one declaration, make it the canonical home, convert the
+  others to it or to aliases of it. Waive with `ok(concepts/<key>)` —
+  `--suggest-waivers` prints the exact key.
+
+◇ PRE-WRITE GATE (ask before the duplicate is written)
+  unruster gate UserId --kind struct               # is this name taken?
+  unruster gate --snippet 'pub fn parse_id(s: &str) -> Result<Id>'
+  unruster gate --file src/new_thing.rs            # a whole proposed file
+  unruster gate --hook                             # a PreToolUse event on stdin
+  The one command here that runs *before* the edit. Everything else is
+  post-hoc: the duplicate gets written and the next `audit` finds it.
+  That is the right shape for cleaning a tree and the wrong shape for how
+  concept drift is produced now — an agent writes `AccountId` because it
+  never opened the module holding `UserId`, since "what already means
+  this?" had no cheap way to be asked.
+  A proposal is reduced to the same facts an on-disk file produces, then
+  looked up six ways: name taken, near-spelling, same shape, same
+  signature under a cognate name, same doc sentence, same body. `collide`
+  = the same thing exists (a taken name, a body already in the tree);
+  `warn` = something similar does.
+  Speed comes from `~/.unruster_cache`: per-file facts keyed by the
+  *content hash*, so a hit is by construction the same bytes that produced
+  it and there is no invalidation rule to get wrong — an edited file
+  simply has no entry. Every ordinary run leaves the cache warm.
+  `unruster cache` inspects it, `--no-cache` proves it changes nothing.
+  Wiring it into Claude Code — one line, no `jq`:
+    { "hooks": { "PreToolUse": [ {
+        "matcher": "Write|Edit",
+        "hooks": [ { "type": "command", "command": "unruster gate --hook" } ]
+    } ] } }
+  Modes via $UNRUSTER_GATE: `warn-once` (default — stop the first
+  colliding proposal, allow the retry), `block`, `warn`, `off`. It is
+  warn-once because a pre-hoc check has no waiver to offer: the code does
+  not exist yet, so there is nowhere to write `// unruster: ok(…)`, and a
+  gate that argues with a judgment call is one an agent routes around.
+  The retry is the acknowledgment. Only a `collide` ever stops an edit.
+
 ◇ REDUCE DATA REPLICATION / REPETITION / CONVERSION
   unruster impls --trait From / Into / TryFrom / AsRef
   unruster fields <A> ; unruster fields <B>       # shape overlap

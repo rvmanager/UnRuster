@@ -420,7 +420,16 @@ const CHECK_GROUPS: &[(&str, &[&str])] = &[
         "silent-fallbacks",
         &["error-swallows", "divergence-handling", "panics"],
     ),
-    ("replication", &["conversion-pairs", "pass-through", "clones"]),
+    (
+        "replication",
+        &[
+            "conversion-pairs",
+            "pass-through",
+            "clones",
+            "near-clones",
+            "concepts",
+        ],
+    ),
 ];
 
 /// The group a check belongs to, if any. Lets `waivers` spot two waivers that
@@ -462,6 +471,7 @@ pub const WAIVABLE_CHECKS: &[&str] = &[
     "builder-drift",
     "casts",
     "clones",
+    "concepts",
     "config-drift",
     "conversion-pairs",
     "dead-code",
@@ -469,6 +479,7 @@ pub const WAIVABLE_CHECKS: &[&str] = &[
     "divergence-handling",
     "enum-coverage",
     "error-swallows",
+    "near-clones",
     "panics",
     "pass-through",
     "stringly",
