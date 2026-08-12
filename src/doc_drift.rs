@@ -14,7 +14,7 @@
 //! | kind | the disagreement | precision |
 //! |---|---|---|
 //! | `panics-doc-unbacked` | a `# Panics` section over a body that cannot panic | APPROXIMATE |
-//! | `panics-undocumented` | a documented `pub` fn that panics, with no `# Panics` | APPROXIMATE |
+//! | `panics-undocumented` | a documented `pub` fn that panics *explicitly*, with no `# Panics` | APPROXIMATE |
 //! | `errors-doc-unbacked` | an `# Errors` section over a fn returning no `Result` | EXACT |
 //! | `stale-name` | the docs name an identifier that no longer exists | APPROXIMATE |
 //!
@@ -45,18 +45,18 @@
 //!   run it. A class that cannot survive its own codebase does not get to hold
 //!   an agent loop open.
 //!
-//! # Why the panic predicate here is coarser than `panics`
+//! # Why the panic predicate here is not `panics`
 //!
 //! [`crate::panics`] ranks its sites and hides the idiomatic ones — a
 //! poisoned-lock `unwrap`, an assertion over a source literal — because those
 //! are not the crashes it hunts. That filtering is exactly wrong for a doc
-//! check: a `# Panics` section should document a lock unwrap too. So the
-//! predicate below is presence/absence over every panic form, deliberately
-//! simpler rather than a second copy of a ranking this check does not want.
+//! check: a `# Panics` section should document a lock unwrap too. So [`Panic`]
+//! below is its own predicate, tiered rather than ranked, and the tier each
+//! class requires is the asymmetry documented there.
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{doc_lines, line_of, scope_visits, ScopeTracker};
+use crate::ast::{doc_lines, fn_visits, line_of, scope_visits, ScopeTracker};
 use crate::context::{AnalysisCtx, Counts};
 use crate::emit::{row, site};
 use crate::parse::{display_path, ParsedFile};
@@ -99,17 +99,50 @@ struct Hit {
     score: f64,
 }
 
-/// Does this body contain any form that aborts the process?
+/// How a body can abort, if it can.
 ///
-/// Presence only — see the module header for why this is not
-/// [`crate::panics`]'s ranked predicate.
-fn panics(block: &syn::Block) -> bool {
-    struct V(bool);
+/// The distinction exists because the two panic classes need different
+/// evidence, and running both off one predicate produced fifteen wrong rows on
+/// this codebase. `glob_match` slices with a length it just computed;
+/// `Date::parse` slices a string it has already checked is ten ASCII bytes;
+/// `NameIndex::lookup` indexes by an index it stored itself. Demanding a
+/// `# Panics` section from each of those is a style opinion about indexing, not
+/// a disagreement between the docs and the code.
+///
+/// The same reasoning covers `Mutex::lock().unwrap()`, which is the universal
+/// Rust idiom and which [`crate::panics`] already declines to report;
+/// [`crate::panics::receiver_is_lock`] is shared rather than re-derived here.
+///
+/// So:
+/// * `panics-undocumented` requires [`Panic::Explicit`] — the author wrote
+///   `unwrap`, `expect`, `panic!` or an assertion on something that is not a
+///   lock, and did not mention it.
+/// * `panics-doc-unbacked` accepts either tier, because a `# Panics` section is
+///   very often *about* an index or a lock, and calling such a section unbacked
+///   would be the same mistake pointed the other way.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Panic {
+    /// Nothing in the body can abort.
+    None,
+    /// A real panic path that convention leaves undocumented: an index or slice
+    /// (usually provably in bounds at the site), a poisoned-lock unwrap.
+    Incidental,
+    /// `unwrap` / `expect` / `panic!` / `unreachable!` / `todo!` / `assert*!`
+    /// on anything else.
+    Explicit,
+}
+
+fn panics(block: &syn::Block) -> Panic {
+    struct V(Panic);
     impl<'ast> Visit<'ast> for V {
         fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
             let m = e.method.to_string();
             if m == "unwrap" || m == "expect" || m == "unwrap_err" || m == "expect_err" {
-                self.0 = true;
+                self.0 = self.0.max(if crate::panics::receiver_is_lock(&e.receiver) {
+                    Panic::Incidental
+                } else {
+                    Panic::Explicit
+                });
             }
             visit::visit_expr_method_call(self, e);
         }
@@ -120,20 +153,20 @@ fn panics(block: &syn::Block) -> bool {
                     "panic" | "unreachable" | "todo" | "unimplemented" | "assert" | "assert_eq"
                         | "assert_ne"
                 ) {
-                    self.0 = true;
+                    self.0 = Panic::Explicit;
                 }
             }
             visit::visit_macro(self, m);
         }
         // Indexing can panic, and a `# Panics` section is often written for
-        // exactly that. Without it a documented `fn nth(&self, i: usize)` reads
-        // as an unbacked promise.
+        // exactly that — so it is recorded, at the weaker tier. It never
+        // upgrades an `Explicit` finding back down.
         fn visit_expr_index(&mut self, e: &'ast syn::ExprIndex) {
-            self.0 = true;
+            self.0 = self.0.max(Panic::Incidental);
             visit::visit_expr_index(self, e);
         }
     }
-    let mut v = V(false);
+    let mut v = V(Panic::None);
     v.visit_block(block);
     v.0
 }
@@ -279,9 +312,9 @@ impl DocVisitor<'_> {
         let name = sig.ident.to_string();
         let item = self.scope.qualify(&name);
         let line = line_of(&sig.ident);
-        let can_panic = body.map(panics).unwrap_or(false);
+        let can_panic = body.map(panics).unwrap_or(Panic::None);
 
-        if has_section(&docs, "Panics") && body.is_some() && !can_panic {
+        if has_section(&docs, "Panics") && body.is_some() && can_panic == Panic::None {
             self.hits.push(Hit {
                 kind: "panics-doc-unbacked",
                 item: item.clone(),
@@ -294,7 +327,7 @@ impl DocVisitor<'_> {
                 score: 0.80,
             });
         }
-        if is_pub && can_panic && !has_section(&docs, "Panics") {
+        if is_pub && can_panic == Panic::Explicit && !has_section(&docs, "Panics") {
             self.hits.push(Hit {
                 kind: "panics-undocumented",
                 item: item.clone(),
@@ -369,19 +402,15 @@ impl DocVisitor<'_> {
 impl<'ast> Visit<'ast> for DocVisitor<'_> {
     scope_visits!(item_mod, item_impl, item_trait);
 
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.check(&i.attrs, &i.sig, Some(&i.block), matches!(i.vis, syn::Visibility::Public(_)));
-        visit::visit_item_fn(self, i);
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.check(&i.attrs, &i.sig, Some(&i.block), matches!(i.vis, syn::Visibility::Public(_)));
-        visit::visit_impl_item_fn(self, i);
-    }
+    fn_visits!(before check; item_fn, impl_item_fn);
+
+    /// Written out rather than generated, because the argument it passes is a
+    /// decision this check makes and the macro must not make for it: a trait
+    /// method's doc describes the *contract*, and its default body is one
+    /// implementation of that contract. So `# Panics` over a defaulted method
+    /// that does not itself panic is a statement about implementors, not a
+    /// contradiction — and the body is deliberately withheld (`None`).
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        // A trait method's doc describes the contract; its default body, if
-        // any, is one implementation of it. So `# Panics` over a defaulted
-        // method that does not itself panic is a statement about implementors
-        // and not a contradiction — only the name and `# Errors` checks apply.
         self.check(&i.attrs, &i.sig, None, true);
         visit::visit_trait_item_fn(self, i);
     }
@@ -491,19 +520,19 @@ pub fn run_counted(ctx: &AnalysisCtx, opts: &Opts) -> anyhow::Result<Counts> {
 /// "nothing was looked at".
 fn documented_fns(files: &[ParsedFile]) -> usize {
     struct V(usize);
+    impl V {
+        fn count(
+            &mut self,
+            attrs: &[syn::Attribute],
+            _sig: &syn::Signature,
+            _body: Option<&syn::Block>,
+            _is_pub: bool,
+        ) {
+            self.0 += usize::from(!doc_lines(attrs).is_empty());
+        }
+    }
     impl<'ast> Visit<'ast> for V {
-        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-            self.0 += usize::from(!doc_lines(&i.attrs).is_empty());
-            visit::visit_item_fn(self, i);
-        }
-        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-            self.0 += usize::from(!doc_lines(&i.attrs).is_empty());
-            visit::visit_impl_item_fn(self, i);
-        }
-        fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-            self.0 += usize::from(!doc_lines(&i.attrs).is_empty());
-            visit::visit_trait_item_fn(self, i);
-        }
+        fn_visits!(before count; item_fn, impl_item_fn, trait_item_fn);
     }
     let mut v = V(0);
     for f in files {
@@ -566,9 +595,45 @@ mod tests {
     #[test]
     fn a_documented_pub_fn_that_panics_without_saying_so_is_reported() {
         assert_eq!(
-            kinds("/// Reads it.\npub fn f(v: &[u32]) -> u32 { v[0] }", false),
+            kinds("/// Reads it.\npub fn f(v: &[u32]) -> u32 { *v.first().unwrap() }", false),
             ["panics-undocumented"]
         );
+    }
+
+    /// The asymmetry, measured: fifteen rows on this codebase were fns that
+    /// slice with a length they just computed. Demanding a `# Panics` section
+    /// from those is an opinion about indexing, not a doc/code disagreement.
+    #[test]
+    fn indexing_alone_does_not_demand_a_panics_section() {
+        assert!(kinds("/// Reads it.\npub fn f(v: &[u32]) -> u32 { v[0] }", false).is_empty());
+    }
+
+    /// And the two rows that survived it: the poisoned-lock idiom, which
+    /// `panics` also declines to report.
+    #[test]
+    fn a_poisoned_lock_unwrap_does_not_demand_a_panics_section() {
+        assert!(kinds(
+            "/// Reads it.\npub fn f() -> usize { *STATE.lock().unwrap() }",
+            false
+        )
+        .is_empty());
+        // …but an unwrap on anything else still does.
+        assert_eq!(
+            kinds("/// Reads it.\npub fn f(s: &str) -> u8 { s.parse().unwrap() }", false),
+            ["panics-undocumented"]
+        );
+    }
+
+    /// …but it still backs a `# Panics` section somebody wrote, or the same
+    /// mistake fires in the other direction.
+    #[test]
+    fn indexing_does_back_a_panics_section() {
+        assert!(kinds(
+            "/// Reads it.\n///\n/// # Panics\n///\n/// On empty input.\n\
+             pub fn f(v: &[u32]) -> u32 { v[0] }",
+            false
+        )
+        .is_empty());
     }
 
     /// An undocumented fn is undocumented, not drifted. There is no claim to

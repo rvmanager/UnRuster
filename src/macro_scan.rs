@@ -189,9 +189,11 @@ pub fn macro_exprs(m: &syn::Macro) -> Vec<syn::Expr> {
     }
 }
 
-// unruster: ok(error-swallows/if-let-ok) 2026-08-06 — a chunk that will not
-// parse as an expression is skipped on purpose; the caller gets the pieces
-// that did parse and every unparsed macro body is reported as a blind spot.
+// unruster: ok(error-swallows/.ok) 2026-08-12 — a chunk that will not parse as
+// an expression is skipped on purpose; the caller gets the pieces that did
+// parse and every unparsed macro body is reported as a blind spot. (Key was
+// `if-let-ok` until the body became a `filter_map`; the judgment did not
+// change, the spelling of the site did, and the waiver had been inert since.)
 /// Both halves of a `key => value` arm, each parsed as an expression.
 ///
 /// Returns empty when the chunk holds no `=>` or when neither half parses, so a

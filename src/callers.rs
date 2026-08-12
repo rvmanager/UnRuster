@@ -794,6 +794,10 @@ fn note_narrower_than_bare(
 /// depth on first visit, so each name is expanded exactly once — without the
 /// `seen_names` set a cyclic call graph (any recursion) re-enqueued forever
 /// and `--transitive` with unlimited depth never terminated.
+// unruster: ok(validation-drift/transitive_callers) 2026-08-12 — a private BFS
+// helper, reached only from `run_callers` and `run_callers_among`, which both
+// resolve and validate the query before calling it. Re-checking here would be
+// the second half of a check the entry points already own.
 fn transitive_callers(
     sites: &[CallSite],
     query: &str,

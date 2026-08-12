@@ -1,6 +1,8 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{fn_span, line_of, path_last, path_to_string, scope_visits, ScopeTracker};
+use crate::ast::{
+    fn_span, fn_visits, line_of, path_last, path_to_string, scope_visits, ScopeTracker,
+};
 use crate::context::{AnalysisCtx, Confidence, TargetNotFound};
 use crate::parse::{display_path, ParsedFile};
 use crate::semantic::{FnSigIndex, FnTypes};
@@ -42,6 +44,26 @@ struct FieldVisitor<'a> {
 impl<'a> FieldVisitor<'a> {
     fn enclosing(&self) -> String {
         self.scope.enclosing()
+    }
+
+    /// Open a fn and push the local-type inference the receiver resolution
+    /// reads. Shared by every fn-shaped visit method — see [`fn_visits`].
+    fn enter_fn(&mut self, sig: &syn::Signature, block: Option<&syn::Block>) {
+        let Some(block) = block else { return };
+        self.scope.enter_fn(sig.ident.to_string(), fn_span(sig, block));
+        self.fn_types_stack.push(FnTypes::build(
+            sig,
+            block,
+            self.fn_sigs,
+            self.scope.impl_stack.last().map(String::as_str),
+        ));
+    }
+
+    fn leave_fn(&mut self, _sig: &syn::Signature, block: Option<&syn::Block>) {
+        if block.is_some() {
+            self.fn_types_stack.pop();
+            self.scope.leave_fn();
+        }
     }
 
     fn in_target_impl(&self) -> bool {
@@ -109,36 +131,10 @@ fn recv_display(base: &syn::Expr) -> String {
 impl<'ast, 'a> Visit<'ast> for FieldVisitor<'a> {
     scope_visits!(item_mod, item_impl, item_trait, trait_item_fn_typed);
 
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        self.fn_types_stack
-            .push(FnTypes::build(
-                &i.sig,
-                &i.block,
-                self.fn_sigs,
-                self.scope.impl_stack.last().map(String::as_str),
-            ));
-        visit::visit_item_fn(self, i);
-        self.fn_types_stack.pop();
-        self.scope.leave_fn();
-    }
+    fn_visits!(around enter_fn, leave_fn; item_fn, impl_item_fn);
 
 
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        self.fn_types_stack
-            .push(FnTypes::build(
-                &i.sig,
-                &i.block,
-                self.fn_sigs,
-                self.scope.impl_stack.last().map(String::as_str),
-            ));
-        visit::visit_impl_item_fn(self, i);
-        self.fn_types_stack.pop();
-        self.scope.leave_fn();
-    }
+
 
 
 

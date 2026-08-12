@@ -18,6 +18,15 @@
 //! order of first appearance. Everything else is compared verbatim, including
 //! called method and path names, literals, and control flow.
 //!
+//! That canonicalization lives in [`crate::facts`], and this check consumes it
+//! rather than repeating it. It used to have its own copy, and `clones`
+//! reported the two — `Renamer::bind`, `Renamer::bind_pat`,
+//! `BindingCollector::visit_expr_closure`, three groups in its own output. The
+//! duplication was also a correctness risk with a name: an "exact clone" and a
+//! "near clone with zero differing leaves" are supposed to be the same
+//! statement, and they can only be guaranteed to be while one canonicalizer
+//! produces both.
+//!
 //! That cut is deliberate. Renaming *called* names would group any two
 //! functions with the same shape (`fn a() { x.foo() }` and `fn b() { y.bar() }`),
 //! which is a similarity metric, not a defect report. Keeping them means a
@@ -38,34 +47,15 @@
 
 use std::collections::HashMap;
 
-use quote::ToTokens;
-use syn::visit::{self, Visit};
-
-use crate::ast::{line_of, scope_visits, ScopeTracker};
 use crate::context::{AnalysisCtx, Counts};
+use crate::corpus::Corpus;
 use crate::emit::{row, site};
-use crate::parse::display_path;
-
-/// One function body, canonicalized.
-#[derive(Debug)]
-struct Body {
-    /// Alpha-renamed token text — the grouping key.
-    canon: String,
-    /// Fully-qualified path as the scope tracker sees it.
-    qpath: String,
-    /// The declared name alone, for the "same name too" signal.
-    name: String,
-    file: String,
-    line: usize,
-    /// Tokens in the canonical body. Stands in for size; a copy-pasted
-    /// 40-token helper is a bigger deal than a copy-pasted 12-token one.
-    tokens: usize,
-}
+use crate::facts::BodyFact;
 
 /// A set of functions sharing one canonical body.
 #[derive(Debug)]
-struct Group {
-    members: Vec<Body>,
+struct Group<'a> {
+    members: Vec<&'a BodyFact>,
     tokens: usize,
     /// Every member declares the same identifier. The strongest form: the same
     /// helper, written out N times, under N different roofs.
@@ -79,7 +69,12 @@ struct Group {
     label: String,
 }
 
-impl Group {
+impl Group<'_> {
+    // unruster: ok(concepts/signature:score) 2026-08-12 — five ranked checks,
+    // five different formulas over five unrelated structs. What they share is
+    // an output *contract* — a 0..1 score, gated at the check's own
+    // `GATING_SCORE` — which each module already states in that constant's own
+    // doc. A trait would add a vtable and share no code.
     /// Rank: how much is duplicated, how many times, and how easy the fix is.
     ///
     /// Size and copy count multiply because they compound — four copies of a
@@ -105,7 +100,7 @@ impl Group {
     }
 
     /// The shortest description of what is duplicated.
-    fn make_label(members: &[Body], same_name: bool) -> String {
+    fn make_label(members: &[&BodyFact], same_name: bool) -> String {
         if same_name {
             members[0].name.clone()
         } else {
@@ -116,184 +111,6 @@ impl Group {
             names.dedup();
             names.join("/")
         }
-    }
-}
-
-/// Rewrites every binding the function introduces to `_0`, `_1`, … in order of
-/// first appearance, so two copies that differ only in local naming collapse to
-/// one key.
-///
-/// Collected from patterns rather than from every identifier: a pattern is
-/// exactly where Rust introduces a name, so this renames what the author chose
-/// and leaves what they called alone.
-struct Renamer {
-    map: HashMap<String, String>,
-}
-
-impl Renamer {
-    fn new() -> Self {
-        Renamer {
-            map: HashMap::new(),
-        }
-    }
-
-    fn bind(&mut self, ident: &syn::Ident) {
-        let k = ident.to_string();
-        if !self.map.contains_key(&k) {
-            let n = self.map.len();
-            self.map.insert(k, format!("_{n}"));
-        }
-    }
-
-    /// Walk a pattern and bind every identifier it introduces.
-    fn bind_pat(&mut self, p: &syn::Pat) {
-        struct V<'a>(&'a mut Renamer);
-        impl<'ast> Visit<'ast> for V<'_> {
-            fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
-                self.0.bind(&p.ident);
-                visit::visit_pat_ident(self, p);
-            }
-            // A struct pattern's *field* names are API, not bindings. The
-            // shorthand `Foo { bar }` does bind `bar`, and `visit_pat_ident`
-            // above catches it; the explicit `Foo { bar: x }` binds `x` only,
-            // which is also what the default walk reaches.
-        }
-        V(self).visit_pat(p);
-    }
-}
-
-/// Collects the bindings of one function, in source order.
-struct BindingCollector<'a> {
-    r: &'a mut Renamer,
-}
-
-impl<'ast> Visit<'ast> for BindingCollector<'_> {
-    fn visit_local(&mut self, l: &'ast syn::Local) {
-        self.r.bind_pat(&l.pat);
-        visit::visit_local(self, l);
-    }
-    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
-        for i in &c.inputs {
-            self.r.bind_pat(i);
-        }
-        visit::visit_expr_closure(self, c);
-    }
-    fn visit_arm(&mut self, a: &'ast syn::Arm) {
-        self.r.bind_pat(&a.pat);
-        visit::visit_arm(self, a);
-    }
-    fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
-        self.r.bind_pat(&e.pat);
-        visit::visit_expr_for_loop(self, e);
-    }
-    fn visit_expr_let(&mut self, e: &'ast syn::ExprLet) {
-        self.r.bind_pat(&e.pat);
-        visit::visit_expr_let(self, e);
-    }
-}
-
-/// Canonical token text of a body, with bindings alpha-renamed.
-///
-/// Renders through the token stream rather than the AST so the result is
-/// whitespace- and formatting-independent: two copies that `rustfmt` broke
-/// differently still hash the same.
-fn canonicalize(sig: &syn::Signature, body: &syn::Block) -> (String, usize) {
-    let mut r = Renamer::new();
-    // Parameters first, so the placeholder order matches the call shape and two
-    // copies with reordered `let`s still agree on their argument names.
-    for arg in &sig.inputs {
-        match arg {
-            syn::FnArg::Receiver(_) => {}
-            syn::FnArg::Typed(t) => r.bind_pat(&t.pat),
-        }
-    }
-    BindingCollector { r: &mut r }.visit_block(body);
-
-    let mut out = String::new();
-    let mut n = 0usize;
-    render(body.to_token_stream(), &r, &mut out, &mut n);
-    (out, n)
-}
-
-/// Flatten a token stream to a canonical string, substituting renamed
-/// bindings. Delimiters are emitted so `f(a)(b)` and `f(a, b)` never collide.
-fn render(
-    ts: proc_macro2::TokenStream,
-    r: &Renamer,
-    out: &mut String,
-    n: &mut usize,
-) {
-    use proc_macro2::TokenTree;
-    for tt in ts {
-        *n += 1;
-        match tt {
-            TokenTree::Ident(i) => {
-                let s = i.to_string();
-                out.push_str(r.map.get(&s).map_or(s.as_str(), |v| v.as_str()));
-                out.push(' ');
-            }
-            TokenTree::Literal(l) => {
-                out.push_str(&l.to_string());
-                out.push(' ');
-            }
-            TokenTree::Punct(p) => {
-                out.push(p.as_char());
-            }
-            TokenTree::Group(g) => {
-                let (open, close) = match g.delimiter() {
-                    proc_macro2::Delimiter::Parenthesis => ('(', ')'),
-                    proc_macro2::Delimiter::Brace => ('{', '}'),
-                    proc_macro2::Delimiter::Bracket => ('[', ']'),
-                    proc_macro2::Delimiter::None => ('\u{2039}', '\u{203a}'),
-                };
-                out.push(open);
-                render(g.stream(), r, out, n);
-                out.push(close);
-            }
-        }
-    }
-}
-
-struct CloneVisitor<'a> {
-    min_tokens: usize,
-    file: &'a str,
-    scope: ScopeTracker,
-    bodies: Vec<Body>,
-}
-
-impl CloneVisitor<'_> {
-    fn check(&mut self, sig: &syn::Signature, body: &syn::Block) {
-        let (canon, tokens) = canonicalize(sig, body);
-        if tokens < self.min_tokens {
-            return;
-        }
-        let name = sig.ident.to_string();
-        self.bodies.push(Body {
-            canon,
-            qpath: self.scope.qualify(&name),
-            name,
-            file: self.file.to_string(),
-            line: line_of(&sig.ident),
-            tokens,
-        });
-    }
-}
-
-impl<'ast> Visit<'ast> for CloneVisitor<'_> {
-    scope_visits!(item_mod, item_impl, item_trait);
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.check(&i.sig, &i.block);
-        visit::visit_item_fn(self, i);
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.check(&i.sig, &i.block);
-        visit::visit_impl_item_fn(self, i);
-    }
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        if let Some(body) = &i.default {
-            self.check(&i.sig, body);
-        }
-        visit::visit_trait_item_fn(self, i);
     }
 }
 
@@ -335,22 +152,17 @@ pub fn run_counted(
     min_tokens: usize,
     min_score: f64,
 ) -> anyhow::Result<Counts> {
-    let mut bodies: Vec<Body> = Vec::new();
-    for f in ctx.files {
-        let mut v = CloneVisitor {
-            min_tokens,
-            file: &display_path(&f.path),
-            scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
-            bodies: Vec::new(),
-        };
-        v.visit_file(&f.ast);
-        bodies.extend(v.bodies);
-    }
+    let corpus: &Corpus = ctx.corpus;
+    let bodies: Vec<&BodyFact> = corpus
+        .bodies
+        .iter()
+        .filter(|b| b.tokens >= min_tokens)
+        .collect();
     let scanned = bodies.len();
 
-    let mut by_canon: HashMap<String, Vec<Body>> = HashMap::new();
+    let mut by_canon: HashMap<String, Vec<&BodyFact>> = HashMap::new();
     for b in bodies {
-        by_canon.entry(b.canon.clone()).or_default().push(b);
+        by_canon.entry(b.canon()).or_default().push(b);
     }
 
     let mut groups: Vec<Group> = by_canon
@@ -376,17 +188,9 @@ pub fn run_counted(
     // `--changed-since` keeps a group when *any* copy is in the changed set:
     // the finding is the duplication, and you can act on it from either end.
     if ctx.changed.is_some() {
-        groups.retain(|g| {
-            let mut files: Vec<String> = g.members.iter().map(|m| m.file.clone()).collect();
-            ctx.retain_changed(&mut files, |f| f.as_str());
-            !files.is_empty()
-        });
+        groups.retain(|g| g.members.iter().any(|m| ctx.in_scope(&m.file)));
     }
 
-    // Keyed on the group label so a waiver above one copy names what it is
-    // retiring. Anchored at the *first* member: a group has several sites and
-    // the waiver has to attach to a specific one, so it attaches to the one the
-    // row leads with.
     // Keyed on the group label — the same key `--suggest-waivers` prints.
     // These two disagreed: the suggestion said `ok(clones/<label>)` while the
     // filter matched on an empty key, so the comment the tool told you to write
@@ -419,7 +223,7 @@ pub fn run_counted(
         let today = crate::suppress::Date::today();
         for g in &groups {
             let label = &g.label;
-            let first = &g.members[0];
+            let first = g.members[0];
             // `at` stays a real site so `--json` keeps file and line as fields
             // and `--context` can quote the source. The remaining copies ride in
             // one text column: a group has a variable number of members and the
@@ -476,76 +280,24 @@ pub fn run_counted(
 mod tests {
     use super::*;
 
-    fn canon_of(src: &str) -> String {
-        let f: syn::ItemFn = syn::parse_str(src).expect("parse");
-        canonicalize(&f.sig, &f.block).0
-    }
+    // The canonicalization tests live beside the canonicalizer, in `facts`.
+    // This module now tests only what it still owns: how a group is ranked.
 
-    /// The copy-paste this check exists for: same body, locals renamed.
-    #[test]
-    fn alpha_renaming_collapses_renamed_locals() {
-        let a = canon_of(
-            r#"fn parse_uuid(bytes: &[u8], field: &'static str) -> Result<Uuid, Status> {
-                   Uuid::from_slice(bytes).map_err(|_| Status::invalid_argument(field))
-               }"#,
-        );
-        let b = canon_of(
-            r#"fn parse_uuid(raw: &[u8], name: &'static str) -> Result<Uuid, Status> {
-                   Uuid::from_slice(raw).map_err(|_| Status::invalid_argument(name))
-               }"#,
-        );
-        assert_eq!(a, b);
-    }
-
-    /// Formatting is not identity. Two copies rustfmt broke differently are
-    /// still two copies.
-    #[test]
-    fn whitespace_and_line_breaks_do_not_matter() {
-        let a = canon_of("fn f(x: u32) -> u32 { let y = x + 1; y * 2 }");
-        let b = canon_of(
-            "fn f(x: u32) -> u32 {\n    let y = x + 1;\n\n    y * 2\n}",
-        );
-        assert_eq!(a, b);
-    }
-
-    /// Called names are API, not local naming. Renaming them too would turn
-    /// this into a shape-similarity metric and group everything.
-    #[test]
-    fn different_callees_are_not_clones() {
-        let a = canon_of("fn f(x: T) -> u32 { x.width() + x.height() }");
-        let b = canon_of("fn g(y: T) -> u32 { y.rows() + y.cols() }");
-        assert_ne!(a, b);
-    }
-
-    /// Literals carry meaning. Two functions that differ only in the table they
-    /// write to are not the same function.
-    #[test]
-    fn different_literals_are_not_clones() {
-        let a = canon_of(r#"fn f(d: &D) { d.exec("DELETE FROM users"); }"#);
-        let b = canon_of(r#"fn g(d: &D) { d.exec("DELETE FROM orders"); }"#);
-        assert_ne!(a, b);
-    }
-
-    /// Structure has to survive flattening: same tokens, different nesting.
-    #[test]
-    fn delimiters_are_part_of_the_key() {
-        let a = canon_of("fn f(x: T) { g(h(x)); }");
-        let b = canon_of("fn f(x: T) { g(h, x); }");
-        assert_ne!(a, b);
-    }
-
-    fn body(name: &str, file: &str, tokens: usize) -> Body {
-        Body {
-            canon: "c".into(),
-            qpath: format!("m::{name}"),
+    fn body(name: &str, file: &str, tokens: usize) -> BodyFact {
+        BodyFact {
             name: name.into(),
+            qpath: format!("m::{name}"),
             file: file.into(),
             line: 1,
+            end: 9,
             tokens,
+            skeleton: "·".into(),
+            leaves: vec!["c".into()],
         }
     }
 
-    fn group(members: Vec<Body>) -> Group {
+    fn group(members: &[BodyFact]) -> Group<'_> {
+        let members: Vec<&BodyFact> = members.iter().collect();
         let tokens = members[0].tokens;
         let same_name = members.iter().all(|m| m.name == members[0].name);
         let d = dir_of(&members[0].file);
@@ -564,11 +316,10 @@ mod tests {
     /// must gate. That is the finding the check was built to produce.
     #[test]
     fn the_same_helper_copied_across_one_directory_gates() {
-        let g = group(
-            (0..5)
-                .map(|i| body("parse_uuid", &format!("src/services/s{i}.rs"), 30))
-                .collect(),
-        );
+        let bodies: Vec<BodyFact> = (0..5)
+            .map(|i| body("parse_uuid", &format!("src/services/s{i}.rs"), 30))
+            .collect();
+        let g = group(&bodies);
         assert!(
             g.score() >= GATING_SCORE,
             "score {:.2} should gate",
@@ -580,10 +331,8 @@ mod tests {
     /// not a gate.
     #[test]
     fn an_incidental_pair_does_not_gate() {
-        let g = group(vec![
-            body("encode", "src/a/x.rs", 24),
-            body("write_tag", "src/b/y.rs", 24),
-        ]);
+        let bodies = [body("encode", "src/a/x.rs", 24), body("write_tag", "src/b/y.rs", 24)];
+        let g = group(&bodies);
         assert!(
             g.score() < GATING_SCORE,
             "score {:.2} should not gate",
@@ -597,10 +346,11 @@ mod tests {
     /// the gate.
     #[test]
     fn a_named_pair_reports_but_does_not_gate() {
-        let g = group(vec![
+        let bodies = [
             body("pat_is_ok", "src/divergence.rs", 81),
             body("pat_is_ok", "src/error_swallows.rs", 81),
-        ]);
+        ];
+        let g = group(&bodies);
         assert!(g.score() > 0.5, "a named pair is still worth reading");
         assert!(
             g.score() < GATING_SCORE,
@@ -613,28 +363,20 @@ mod tests {
     /// the biggest lever.
     #[test]
     fn score_rises_with_bulk_and_copies() {
-        let small = group(vec![body("f", "src/a.rs", 24), body("f", "src/b.rs", 24)]);
-        let bigger = group(vec![body("f", "src/a.rs", 80), body("f", "src/b.rs", 80)]);
-        let more = group(
-            (0..4)
-                .map(|i| body("f", &format!("src/{i}.rs"), 80))
-                .collect(),
-        );
-        assert!(bigger.score() > small.score());
-        assert!(more.score() > bigger.score());
+        let small = [body("f", "src/a.rs", 24), body("f", "src/b.rs", 24)];
+        let bigger = [body("f", "src/a.rs", 80), body("f", "src/b.rs", 80)];
+        let more: Vec<BodyFact> = (0..4)
+            .map(|i| body("f", &format!("src/{i}.rs"), 80))
+            .collect();
+        assert!(group(&bigger).score() > group(&small).score());
+        assert!(group(&more).score() > group(&bigger).score());
     }
 
     #[test]
     fn label_names_the_helper_when_every_copy_agrees() {
-        let g = group(vec![
-            body("parse_uuid", "src/a.rs", 30),
-            body("parse_uuid", "src/b.rs", 30),
-        ]);
-        assert_eq!(g.label, "parse_uuid");
-        let g = group(vec![
-            body("to_pb", "src/a.rs", 30),
-            body("into_proto", "src/b.rs", 30),
-        ]);
-        assert_eq!(g.label, "into_proto/to_pb");
+        let same = [body("parse_uuid", "src/a.rs", 30), body("parse_uuid", "src/b.rs", 30)];
+        assert_eq!(group(&same).label, "parse_uuid");
+        let differing = [body("to_pb", "src/a.rs", 30), body("into_proto", "src/b.rs", 30)];
+        assert_eq!(group(&differing).label, "into_proto/to_pb");
     }
 }

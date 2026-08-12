@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of_span, scope_visits, ScopeTracker};
+use crate::ast::{fn_visits, line_of_span, scope_visits, ScopeTracker};
 use crate::context::{AnalysisCtx, Counts, GroupBy};
 use crate::emit::{row, site};
 use crate::parse::display_path;
@@ -105,12 +105,13 @@ impl Collector<'_> {
         qpath.rsplit_once("::").map(|(s, _)| s.to_string()).unwrap_or_default()
     }
 
-    fn enter(&mut self, name: String, line: usize) {
+    fn enter_fn(&mut self, sig: &syn::Signature, _block: Option<&syn::Block>) {
+        let name = sig.ident.to_string();
         let q = self.scope.qualify(&name);
-        self.current.push((name, q, line));
+        self.current.push((name, q, crate::ast::line_of(&sig.ident)));
     }
 
-    fn leave(&mut self) {
+    fn leave_fn(&mut self, _sig: &syn::Signature, _block: Option<&syn::Block>) {
         if let Some((name, qpath, line)) = self.current.pop() {
             let scope = Self::scope_of(&qpath);
             self.fns.push(FnSeen {
@@ -190,16 +191,7 @@ fn error_exit(b: &syn::Block) -> Option<&'static str> {
 impl<'ast> Visit<'ast> for Collector<'_> {
     scope_visits!(item_mod, item_impl, item_trait);
 
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.enter(i.sig.ident.to_string(), crate::ast::line_of(&i.sig.ident));
-        visit::visit_item_fn(self, i);
-        self.leave();
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.enter(i.sig.ident.to_string(), crate::ast::line_of(&i.sig.ident));
-        visit::visit_impl_item_fn(self, i);
-        self.leave();
-    }
+    fn_visits!(around enter_fn, leave_fn; item_fn, impl_item_fn);
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         if let Some(last) = m.path.segments.last() {

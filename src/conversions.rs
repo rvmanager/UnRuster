@@ -5,6 +5,16 @@ use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 use crate::emit::{row, site};
 
+// unruster: ok(concepts/struct-shape:Hit/FieldDef/Violation) 2026-08-12 — two
+// of the five are shape coincidences: `fields::FieldDef` has no enclosing-fn
+// context (it catalogues a declaration, not a finding) and
+// `self_check::Violation`'s `detail` is prose about an invariant, not a
+// context. The three that really do agree share `{file, line, context}`, which
+// is a codebase-wide convention carried by 12 structs with those exact field
+// names — a naming standard a reader already recognises, not a local
+// duplication. Consolidating it is a 33-struct sweep, deliberately not taken
+// here; the payload names (`target` / `literal` / `variant`) are what each
+// check's rows are actually about and would have to survive it.
 #[derive(Debug)]
 struct Hit {
     kind: &'static str,

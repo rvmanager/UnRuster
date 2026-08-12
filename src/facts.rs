@@ -329,6 +329,20 @@ impl FactVisitor<'_> {
         });
     }
 
+    /// Record one fn item. The three fn kinds differ only in the kind label and
+    /// the visibility they carry; `near-clones` reported two of them as a
+    /// one-leaf divergence, which is exactly that difference.
+    fn record_fn(
+        &mut self,
+        kind: &'static str,
+        attrs: &[syn::Attribute],
+        sig: &syn::Signature,
+        vis: &str,
+    ) {
+        let ext = extent_of(sig, attrs, line_of(&sig.ident));
+        self.push_item(kind, sig.ident.to_string(), vis, attrs, ext, Self::fn_shape(sig));
+    }
+
     fn fn_shape(sig: &syn::Signature) -> Shape {
         let mut params = Vec::new();
         let mut has_self = false;
@@ -464,16 +478,14 @@ impl<'ast> Visit<'ast> for FactVisitor<'_> {
         );
     }
 
+    // unruster: ok(near-clones/visit_item_fn/visit_impl_item_fn) 2026-08-12 —
+    // what remains after `record_fn` was extracted is the item *kind* and the
+    // walk that matches it, which is the information these two methods exist to
+    // carry. `fn_visits!` cannot generate them: its `around` form has no way to
+    // pass a per-kind label, and adding one for a single call site would be a
+    // macro written to retire a finding rather than to share a decision.
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        let ext = extent_of(i, &i.attrs, line_of(&i.sig.ident));
-        self.push_item(
-            "fn",
-            i.sig.ident.to_string(),
-            vis_str(&i.vis),
-            &i.attrs,
-            ext,
-            Self::fn_shape(&i.sig),
-        );
+        self.record_fn("fn", &i.attrs, &i.sig, vis_str(&i.vis));
         self.push_body(&i.sig, &i.block);
         self.fn_depth += 1;
         visit::visit_item_fn(self, i);
@@ -481,15 +493,7 @@ impl<'ast> Visit<'ast> for FactVisitor<'_> {
     }
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        let ext = extent_of(i, &i.attrs, line_of(&i.sig.ident));
-        self.push_item(
-            "impl-fn",
-            i.sig.ident.to_string(),
-            vis_str(&i.vis),
-            &i.attrs,
-            ext,
-            Self::fn_shape(&i.sig),
-        );
+        self.record_fn("impl-fn", &i.attrs, &i.sig, vis_str(&i.vis));
         self.push_body(&i.sig, &i.block);
         self.fn_depth += 1;
         visit::visit_impl_item_fn(self, i);
@@ -859,6 +863,57 @@ mod tests {
                }"#,
         );
         assert_eq!(a.bodies[0].canon(), b.bodies[0].canon());
+    }
+
+    fn canon_of(src: &str) -> String {
+        let f: syn::ItemFn = syn::parse_str(src).expect("parse");
+        let (sk, leaves, _) = canonical_parts(&f.sig, &f.block);
+        BodyFact {
+            name: String::new(),
+            qpath: String::new(),
+            file: String::new(),
+            line: 0,
+            end: 0,
+            tokens: 0,
+            skeleton: sk,
+            leaves,
+        }
+        .canon()
+    }
+
+    /// Formatting is not identity. Two copies rustfmt broke differently are
+    /// still two copies. (Moved here with the canonicalizer, from `clones`.)
+    #[test]
+    fn whitespace_and_line_breaks_do_not_matter() {
+        let a = canon_of("fn f(x: u32) -> u32 { let y = x + 1; y * 2 }");
+        let b = canon_of("fn f(x: u32) -> u32 {\n    let y = x + 1;\n\n    y * 2\n}");
+        assert_eq!(a, b);
+    }
+
+    /// Called names are API, not local naming. Renaming them too would turn
+    /// the clone check into a shape-similarity metric and group everything.
+    #[test]
+    fn different_callees_are_not_clones() {
+        let a = canon_of("fn f(x: T) -> u32 { x.width() + x.height() }");
+        let b = canon_of("fn g(y: T) -> u32 { y.rows() + y.cols() }");
+        assert_ne!(a, b);
+    }
+
+    /// Literals carry meaning. Two functions that differ only in the table they
+    /// write to are not the same function.
+    #[test]
+    fn different_literals_are_not_clones() {
+        let a = canon_of(r#"fn f(d: &D) { d.exec("DELETE FROM users"); }"#);
+        let b = canon_of(r#"fn g(d: &D) { d.exec("DELETE FROM orders"); }"#);
+        assert_ne!(a, b);
+    }
+
+    /// Structure has to survive flattening: same tokens, different nesting.
+    #[test]
+    fn delimiters_are_part_of_the_key() {
+        let a = canon_of("fn f(x: T) { g(h(x)); }");
+        let b = canon_of("fn f(x: T) { g(h, x); }");
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -195,6 +195,10 @@ impl Selection {
 /// `waivers` must run the identical set to count waiver hits — if the two drift,
 /// orphan detection starts answering a different question than the gating loop
 /// asks, which is exactly the defect these helpers exist to prevent.
+// unruster: ok(config-drift/CoverageOpts) 2026-08-12 — these are the two
+// presets by construction: the gating configuration and the `--strict`
+// permissive one. Differing is what they are for, and `config-drift`'s own doc
+// names "two presets" as the deliberate case it cannot tell from a defect.
 pub fn coverage_opts() -> parallel_matches::CoverageOpts {
     parallel_matches::CoverageOpts {
         // A row the check itself labels "likely false positive" must not gate

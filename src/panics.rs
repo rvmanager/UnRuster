@@ -219,7 +219,11 @@ impl<'ast> Visit<'ast> for PanicVisitor<'_> {
 
 /// `self.state.lock().unwrap()` — the receiver's own last call is a lock
 /// acquisition, so the `Result` is a poisoning report.
-fn receiver_is_lock(recv: &syn::Expr) -> bool {
+///
+/// Shared with [`crate::doc_drift`], which reaches the same conclusion from the
+/// other direction: a poisoned-lock unwrap backs a `# Panics` section somebody
+/// wrote, and does not demand one that nobody did.
+pub(crate) fn receiver_is_lock(recv: &syn::Expr) -> bool {
     match crate::ast::peel_grouping(recv) {
         syn::Expr::MethodCall(c) => {
             c.args.is_empty() && LOCK_VERBS.contains(&c.method.to_string().as_str())

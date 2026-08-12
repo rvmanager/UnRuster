@@ -1604,7 +1604,9 @@ fn traits_of(cmd: &Cmd) -> CmdTraits {
     match cmd {
         Cmd::Audit(_) => t.waivers().corpus(),
         Cmd::Divergence(_) | Cmd::DeadCode(_) | Cmd::ConversionPairs => t.waivers(),
-        Cmd::ConfigDrift(_) | Cmd::BuilderDrift(_) | Cmd::Clones(_) => t.waivers(),
+        Cmd::ConfigDrift(_) | Cmd::BuilderDrift(_) => t.waivers(),
+        // Groups `facts` bodies by their canonical form, so it needs the corpus.
+        Cmd::Clones(_) => t.waivers().corpus(),
         Cmd::Concepts(_) | Cmd::NearClones(_) => t.waivers().corpus(),
         Cmd::Vocabulary(_) => t.waivers().corpus(),
         Cmd::DocDrift(_) | Cmd::ValidationDrift(_) => t.waivers(),
@@ -1635,7 +1637,12 @@ fn traits_of(cmd: &Cmd) -> CmdTraits {
         // wrong here rather than merely redundant.
         Cmd::Gate(_) => t.catalogue(),
 
-        Cmd::Waivers(_) => t.waivers(),
+        // `.corpus()` because `waivers` re-runs the battery to count hits, and
+        // three of those checks (`clones`, `near-clones`, `concepts`) read
+        // `ctx.corpus`. Without it the probe handed them an empty corpus, they
+        // found nothing, and every waiver against them was reported as
+        // "suppressing nothing" — advice to delete a working comment.
+        Cmd::Waivers(_) => t.waivers().corpus(),
 
         // Reports on the tool. Neither a usage query nor a waiver consumer,
         // and its own blind spots are the thing it is looking for.

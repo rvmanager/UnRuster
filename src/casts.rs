@@ -1,6 +1,9 @@
 use syn::visit::{self, Visit};
 
-use crate::ast::{fn_span, print_grouped_counts, scope_visits, ScopeTracker, top_module_of, type_to_string};
+use crate::ast::{
+    fn_span, fn_visits, print_grouped_counts, scope_visits, ScopeTracker, top_module_of,
+    type_to_string,
+};
 use crate::context::{AnalysisCtx, GroupBy};
 use crate::parse::display_path;
 use crate::semantic::{FnSigIndex, FnTypes};
@@ -34,6 +37,37 @@ struct CastVisitor<'a> {
 impl<'a> CastVisitor<'a> {
     fn enclosing(&self) -> String {
         self.scope.enclosing()
+    }
+
+    // unruster: ok(concepts/signature:fn) 2026-08-12 — this signature IS the
+    // `fn_visits!(around …)` handler contract, so the six methods that share it
+    // agree on purpose. The macro is what makes them identical; consolidating
+    // them further would mean consolidating the three visitors, which have
+    // nothing else in common.
+    /// Open a fn: track `unsafe` nesting and push the local-type inference the
+    /// receiver-typed cast classes read. Shared by every fn-shaped visit
+    /// method — see [`fn_visits`].
+    fn enter_fn(&mut self, sig: &syn::Signature, block: Option<&syn::Block>) {
+        self.unsafe_depth += usize::from(sig.unsafety.is_some());
+        let Some(block) = block else { return };
+        self.scope.enter_fn(sig.ident.to_string(), fn_span(sig, block));
+        self.fn_types_stack.push(FnTypes::build(
+            sig,
+            block,
+            self.fn_sigs,
+            self.scope.impl_stack.last().map(String::as_str),
+        ));
+    }
+
+    /// Close it. `unsafe` is recomputed from the signature rather than carried
+    /// across the walk: the two halves then read as one statement about the
+    /// same signature, and there is no guard value to drop on an early return.
+    fn leave_fn(&mut self, sig: &syn::Signature, block: Option<&syn::Block>) {
+        if block.is_some() {
+            self.fn_types_stack.pop();
+            self.scope.leave_fn();
+        }
+        self.unsafe_depth -= usize::from(sig.unsafety.is_some());
     }
 }
 
@@ -213,40 +247,7 @@ fn classify(src: Option<&str>, dst: &str) -> &'static str {
 
 impl<'ast, 'a> Visit<'ast> for CastVisitor<'a> {
     scope_visits!(item_mod, item_impl, item_trait, trait_item_fn_typed);
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        let unsafe_fn = i.sig.unsafety.is_some();
-        self.unsafe_depth += usize::from(unsafe_fn);
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        self.fn_types_stack
-            .push(FnTypes::build(
-                &i.sig,
-                &i.block,
-                self.fn_sigs,
-                self.scope.impl_stack.last().map(String::as_str),
-            ));
-        visit::visit_item_fn(self, i);
-        self.fn_types_stack.pop();
-        self.scope.leave_fn();
-        self.unsafe_depth -= usize::from(unsafe_fn);
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        let unsafe_fn = i.sig.unsafety.is_some();
-        self.unsafe_depth += usize::from(unsafe_fn);
-        self.scope
-            .enter_fn(i.sig.ident.to_string(), fn_span(&i.sig, &i.block));
-        self.fn_types_stack
-            .push(FnTypes::build(
-                &i.sig,
-                &i.block,
-                self.fn_sigs,
-                self.scope.impl_stack.last().map(String::as_str),
-            ));
-        visit::visit_impl_item_fn(self, i);
-        self.fn_types_stack.pop();
-        self.scope.leave_fn();
-        self.unsafe_depth -= usize::from(unsafe_fn);
-    }
+    fn_visits!(around enter_fn, leave_fn; item_fn, impl_item_fn);
 
     fn visit_expr_cast(&mut self, e: &'ast syn::ExprCast) {
         let dst = type_to_string(&e.ty);

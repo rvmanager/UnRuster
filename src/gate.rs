@@ -227,13 +227,13 @@ fn hits_for<'a>(c: &'a Corpus, p: &ItemFact, proposal: &FileFacts) -> Vec<Hit<'a
 
     // 5. The same sentence. Somebody already described this concept.
     if let Some(d) = &p.doc {
-        let norm = normalize_doc(d);
+        let norm = crate::concepts::normalize_doc(d);
         if norm.split(' ').filter(|w| !w.is_empty()).count() >= 6 {
             for e in c.declarations() {
                 if e.name == p.name {
                     continue;
                 }
-                if e.doc.as_deref().map(normalize_doc).as_deref() == Some(norm.as_str()) {
+                if e.doc.as_deref().map(crate::concepts::normalize_doc).as_deref() == Some(norm.as_str()) {
                     out.push(Hit {
                         verdict: Verdict::Warn,
                         kind: "doc",
@@ -307,17 +307,6 @@ fn hits_for<'a>(c: &'a Corpus, p: &ItemFact, proposal: &FileFacts) -> Vec<Hit<'a
     out
 }
 
-fn normalize_doc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_alphanumeric() {
-            o.extend(c.to_lowercase());
-        } else if !o.ends_with(' ') {
-            o.push(' ');
-        }
-    }
-    o.trim().to_string()
-}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Turning a proposal into facts

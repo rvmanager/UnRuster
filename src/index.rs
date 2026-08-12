@@ -377,6 +377,22 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[n]
 }
 
+/// The item kinds whose indexing is nothing but "record the name, visibility,
+/// extent and doc".
+///
+/// Five copies of one four-line body, differing only in the syn type and a
+/// string — which is what `near-clones` reported as a five-member family. The
+/// kinds that need more than that (`mod`, `trait`, `fn`, `impl`) keep their own
+/// methods below, because for those the body is a real decision.
+macro_rules! named_item_visits {
+    ($(($visit:ident, $ty:ty, $kind:literal)),+ $(,)?) => { $(
+        fn $visit(&mut self, i: &'ast $ty) {
+            let ext = extent_of(i, &i.attrs, line_of(&i.ident));
+            self.push(Spot::item($kind, i.ident.to_string(), vis_str(&i.vis), ext).doc(&i.attrs));
+        }
+    )+ };
+}
+
 struct IndexVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
@@ -450,14 +466,12 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
         self.scope.leave_mod();
     }
 
-    fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
-        let ext = extent_of(i, &i.attrs, line_of(&i.ident));
-        self.push(Spot::item("struct", i.ident.to_string(), vis_str(&i.vis), ext).doc(&i.attrs));
-    }
-
-    fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
-        let ext = extent_of(i, &i.attrs, line_of(&i.ident));
-        self.push(Spot::item("enum", i.ident.to_string(), vis_str(&i.vis), ext).doc(&i.attrs));
+    named_item_visits! {
+        (visit_item_struct, syn::ItemStruct, "struct"),
+        (visit_item_enum, syn::ItemEnum, "enum"),
+        (visit_item_const, syn::ItemConst, "const"),
+        (visit_item_static, syn::ItemStatic, "static"),
+        (visit_item_type, syn::ItemType, "type"),
     }
 
     fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
@@ -490,21 +504,6 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                 .allow_dead(has_allow_dead_code(&i.attrs))
                 .test_attr(crate::ast::has_test_attr(&i.attrs)),
         );
-    }
-
-    fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
-        let ext = extent_of(i, &i.attrs, line_of(&i.ident));
-        self.push(Spot::item("const", i.ident.to_string(), vis_str(&i.vis), ext).doc(&i.attrs));
-    }
-
-    fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
-        let ext = extent_of(i, &i.attrs, line_of(&i.ident));
-        self.push(Spot::item("static", i.ident.to_string(), vis_str(&i.vis), ext).doc(&i.attrs));
-    }
-
-    fn visit_item_type(&mut self, i: &'ast syn::ItemType) {
-        let ext = extent_of(i, &i.attrs, line_of(&i.ident));
-        self.push(Spot::item("type", i.ident.to_string(), vis_str(&i.vis), ext).doc(&i.attrs));
     }
 
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {

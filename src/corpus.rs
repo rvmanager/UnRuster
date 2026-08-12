@@ -50,6 +50,10 @@ impl Corpus {
                 // already read once. Worth it only because the alternative —
                 // keying on mtime — makes a restored or touched file look
                 // edited and a `git checkout` of identical content look new.
+                // unruster: ok(error-swallows/if-let-ok) 2026-08-12 — a file the
+                // walker parsed a moment ago but cannot be re-read is mid-edit
+                // or gone. Its facts are still correct and still returned; only
+                // the cache write is skipped, which is a future miss.
                 if let Ok(bytes) = std::fs::read(&pf.path) {
                     cache.put(&Cache::key(&bytes), &f);
                 }

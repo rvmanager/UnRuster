@@ -48,17 +48,7 @@
 
 use std::path::{Path, PathBuf};
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
-}
+use crate::fingerprint::{fnv1a, FNV_OFFSET, FNV_PRIME};
 
 /// A second, differently-seeded pass, concatenated with the first into a
 /// 128-bit key.
@@ -98,6 +88,11 @@ pub fn cache_root() -> Option<PathBuf> {
 }
 
 /// Directory name for one scan root: `<dir-name>-<hash of canonical path>`.
+// unruster: ok(error-swallows/.unwrap_or_else) 2026-08-12 — a root that will not
+// canonicalize (it does not exist yet, or is a broken link) still deserves a
+// stable cache directory, and the path as written is the best name available.
+// The fallback cannot collide with a real one: two spellings of one directory
+// would both canonicalize, and only an uncanonicalizable path reaches here.
 pub fn slug_for(root: &Path) -> String {
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // A file root (`unruster show -r src/main.rs …`) shares its parent's cache;
@@ -141,6 +136,13 @@ pub struct Cache {
     dead: bool,
 }
 
+// unruster: ok(silent-fallbacks) 2026-08-12 — every discarded Result in this
+// impl is the module's stated contract: "A cache that cannot be read, written
+// or created is not an error. Every operation degrades to recompute, which is
+// what the tool did before." An entry that fails to write is a future miss; an
+// entry that fails to delete is swept next time; a metadata read that fails
+// omits one row from a size report. Propagating any of them would let a broken
+// cache fail an analysis it exists only to speed up.
 impl Cache {
     /// Open (creating if needed) the cache for `root`. `None` when caching is
     /// switched off or no home directory can be found — the caller then simply
@@ -196,9 +198,13 @@ impl Cache {
         // rename then makes whichever finishes last the winner, and both wrote
         // the same bytes.
         let tmp = dst.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, crate::facts::encode(f)).is_ok() {
-            let _ = std::fs::rename(&tmp, &dst);
-        } else {
+        // One cleanup path rather than two. The `else` arm used to be the only
+        // one that removed the temp file, so a *failed rename* — a full disk, a
+        // read-only directory — left it behind on every run, and `sweep` counts
+        // entries rather than recognising them.
+        let wrote = std::fs::write(&tmp, crate::facts::encode(f)).is_ok()
+            && std::fs::rename(&tmp, &dst).is_ok();
+        if !wrote {
             let _ = std::fs::remove_file(&tmp);
         }
     }

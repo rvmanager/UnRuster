@@ -887,6 +887,23 @@ impl SourceSpans {
 
 /// Every item kind a waiver can sensibly scope to. Nested items are reached
 /// through the default walk, so a `fn` inside a `fn` body gets its own span.
+/// Record one item's span, for every item kind that has one.
+///
+/// The three things that vary are the method name, the syn type, and which
+/// keyword token marks the declaration; everything else — the `push`, the
+/// attributes, continuing the walk — is identical twelve times over.
+/// The keyword is passed as a *field path* (`sig.fn_token`), not an expression
+/// (`i.sig.fn_token`): macro hygiene gives the expansion its own `i`, so an
+/// expression naming the call site's binding cannot see it.
+macro_rules! span_visits {
+    ($(($visit:ident, $ty:ty, $($field:ident).+)),+ $(,)?) => { $(
+        fn $visit(&mut self, i: &'ast $ty) {
+            self.push(i, &i.$($field).+, &i.attrs);
+            syn::visit::$visit(self, i);
+        }
+    )+ };
+}
+
 impl<'ast> Visit<'ast> for SourceSpans {
     /// Every literal, not just strings: byte strings and raw strings can span
     /// lines too, and the cost of over-collecting is nil (a numeric literal is
@@ -906,53 +923,23 @@ impl<'ast> Visit<'ast> for SourceSpans {
         visit::visit_lit(self, l);
     }
 
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        self.push(i, &i.sig.fn_token, &i.attrs);
-        visit::visit_item_fn(self, i);
-    }
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        self.push(i, &i.impl_token, &i.attrs);
-        visit::visit_item_impl(self, i);
-    }
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        self.push(i, &i.mod_token, &i.attrs);
-        visit::visit_item_mod(self, i);
-    }
-    fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
-        self.push(i, &i.enum_token, &i.attrs);
-        visit::visit_item_enum(self, i);
-    }
-    fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
-        self.push(i, &i.struct_token, &i.attrs);
-        visit::visit_item_struct(self, i);
-    }
-    fn visit_item_union(&mut self, i: &'ast syn::ItemUnion) {
-        self.push(i, &i.union_token, &i.attrs);
-        visit::visit_item_union(self, i);
-    }
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        self.push(i, &i.trait_token, &i.attrs);
-        visit::visit_item_trait(self, i);
-    }
-    fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
-        self.push(i, &i.const_token, &i.attrs);
-        visit::visit_item_const(self, i);
-    }
-    fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
-        self.push(i, &i.static_token, &i.attrs);
-        visit::visit_item_static(self, i);
-    }
-    fn visit_item_type(&mut self, i: &'ast syn::ItemType) {
-        self.push(i, &i.type_token, &i.attrs);
-        visit::visit_item_type(self, i);
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        self.push(i, &i.sig.fn_token, &i.attrs);
-        visit::visit_impl_item_fn(self, i);
-    }
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        self.push(i, &i.sig.fn_token, &i.attrs);
-        visit::visit_trait_item_fn(self, i);
+    // Every item kind whose span this scan records, and nothing else about
+    // them differs — `near-clones` reported the twelve as one family whose
+    // members disagree only in which keyword token they point at. The keyword
+    // is the argument, so it is written as one.
+    span_visits! {
+        (visit_item_fn, syn::ItemFn, sig.fn_token),
+        (visit_item_impl, syn::ItemImpl, impl_token),
+        (visit_item_mod, syn::ItemMod, mod_token),
+        (visit_item_enum, syn::ItemEnum, enum_token),
+        (visit_item_struct, syn::ItemStruct, struct_token),
+        (visit_item_union, syn::ItemUnion, union_token),
+        (visit_item_trait, syn::ItemTrait, trait_token),
+        (visit_item_const, syn::ItemConst, const_token),
+        (visit_item_static, syn::ItemStatic, static_token),
+        (visit_item_type, syn::ItemType, type_token),
+        (visit_impl_item_fn, syn::ImplItemFn, sig.fn_token),
+        (visit_trait_item_fn, syn::TraitItemFn, sig.fn_token),
     }
 }
 

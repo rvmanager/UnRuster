@@ -210,6 +210,10 @@ pub fn advisory_json(text: &str) -> String {
 /// Entries expire, so a collision re-reported an hour later is worth saying
 /// again. Any IO failure answers "not seen before", because a store that cannot
 /// be read must not silently turn the gate off.
+// unruster: ok(silent-fallbacks) 2026-08-12 — stated two paragraphs above: any
+// IO failure here answers "not seen before", which makes the gate warn again
+// rather than fall silent. That is the safe direction for this store and the
+// reason the failures are not propagated — a hook that errors blocks an edit.
 pub fn seen_before(root: &std::path::Path, key_text: &str) -> bool {
     const TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     let Some(dir) = crate::cache::cache_root().map(|d| {

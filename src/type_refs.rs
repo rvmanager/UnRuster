@@ -15,6 +15,15 @@ struct Ref {
     matched_via: &'static str, // "name" | "alias"
 }
 
+/// The line a path's *last* segment sits on — where a reader looks for the
+/// type, not where a long qualified path begins.
+///
+/// One helper because both reference kinds need it and `near-clones` reported
+/// the two six-line copies as a one-leaf divergence.
+fn path_line(p: &syn::Path) -> usize {
+    p.segments.last().map(|s| line_of(&s.ident)).unwrap_or(0)
+}
+
 struct RefVisitor<'a> {
     targets: &'a [String], // primary name + all alias-equivalent names
     primary: &'a str,
@@ -61,14 +70,14 @@ impl<'a> RefVisitor<'a> {
 impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     scope_visits!(item_mod, item_impl, item_trait, item_fn, impl_item_fn, trait_item_fn);
 
+    // unruster: ok(near-clones/visit_type_path/visit_expr_struct) 2026-08-12 —
+    // after `path_line` was extracted, what these two still share is the
+    // three-line shape of "match the path, record the reference"; what they do
+    // not share is the reference *kind* (`type` against `ctor`), which is the
+    // column the whole check exists to fill in. Two syn node kinds, two answers.
     fn visit_type_path(&mut self, t: &'ast syn::TypePath) {
         if let Some(via) = self.matches_path_last(&t.path) {
-            let line = t
-                .path
-                .segments
-                .last()
-                .map(|s| line_of(&s.ident))
-                .unwrap_or(0);
+            let line = path_line(&t.path);
             self.record("type", path_to_string_with_args(&t.path), line, via);
         }
         visit::visit_type_path(self, t);
@@ -100,12 +109,7 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
 
     fn visit_expr_struct(&mut self, e: &'ast syn::ExprStruct) {
         if let Some(via) = self.matches_path_last(&e.path) {
-            let line = e
-                .path
-                .segments
-                .last()
-                .map(|s| line_of(&s.ident))
-                .unwrap_or(0);
+            let line = path_line(&e.path);
             self.record("ctor", path_to_string_with_args(&e.path), line, via);
         }
         visit::visit_expr_struct(self, e);

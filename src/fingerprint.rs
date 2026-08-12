@@ -48,10 +48,15 @@ use crate::emit::Val;
 /// a far cheaper mistake than a workspace being told its whole codebase is new.
 pub const SCHEME: u32 = 2;
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-fn fnv1a(bytes: &[u8]) -> u64 {
+/// FNV-1a over a byte slice.
+///
+/// Shared with [`crate::cache`], which keys its entries by content hash. The
+/// two had a copy each — `clones` reported them, and a cache whose hash drifted
+/// from this one would not be wrong so much as unexplainable.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h = FNV_OFFSET;
     for b in bytes {
         h ^= u64::from(*b);

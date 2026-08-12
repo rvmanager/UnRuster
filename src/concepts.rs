@@ -642,7 +642,10 @@ fn doc_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
 
 /// Lowercase, punctuation to spaces, whitespace collapsed. Two sentences that
 /// differ only in how they were typeset are one sentence.
-fn normalize_doc(s: &str) -> String {
+///
+/// Shared with [`crate::gate`], which asks the same question one candidate at a
+/// time. The two had a copy each and `clones` reported them.
+pub fn normalize_doc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         if c.is_alphanumeric() {
@@ -737,6 +740,11 @@ pub fn clusters(corpus: &Corpus, kind: Option<Kind>) -> Vec<Vec<&ItemFact>> {
         .collect()
 }
 
+// unruster: ok(concepts/signature:counted) 2026-08-12 — the check entry-point
+// convention: every ranked check takes the context and its own `Opts` and
+// returns `Counts`. The bodies are not clones (`clones` reports zero between
+// them) — each collects different rows, ranks them differently and writes its
+// own summary. The shared thing is the calling convention, which is the point.
 pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::Result<Counts> {
     let mut clusters: Vec<Cluster> = collect(corpus, opts.kind);
 

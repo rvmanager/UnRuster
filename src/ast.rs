@@ -202,23 +202,21 @@ impl ScopeTracker {
     /// or the prefix alone / `<top-level>` when not inside a fn. With
     /// `--spans` the fn segment carries `@start-end` source lines.
     pub fn enclosing(&self) -> String {
-        format!(
-            "{}{}",
-            enclosing(
-                &self.module,
-                &self.mod_stack,
-                &self.impl_stack,
-                &self.fn_stack,
-                false,
-            ),
-            self.span_suffix()
-        )
+        self.label(false)
     }
 
     /// Like [`enclosing`](Self::enclosing) but renders a module/impl top-level
     /// site (no enclosing fn) as a trailing `<top-level>` segment — the
     /// `callers` convention for labelling call sites.
     pub fn enclosing_with_toplevel(&self) -> String {
+        self.label(true)
+    }
+
+    /// The two public spellings above, which differed only in the flag they
+    /// passed. `near-clones` reported them as a one-leaf divergence, and it was
+    /// right: two eleven-line bodies whose entire difference was `false` against
+    /// `true` is one body with a parameter.
+    fn label(&self, toplevel: bool) -> String {
         format!(
             "{}{}",
             enclosing(
@@ -226,7 +224,7 @@ impl ScopeTracker {
                 &self.mod_stack,
                 &self.impl_stack,
                 &self.fn_stack,
-                true,
+                toplevel,
             ),
             self.span_suffix()
         )
@@ -849,6 +847,82 @@ pub fn type_short(t: &syn::Type) -> String {
 /// push/pop pairing by eye — which is the only property that mattered. Reaching
 /// for a macro to make a finding go away, on code that genuinely differs per
 /// call site, would be the same move with none of the benefit.
+/// The three fn-shaped `Visit` methods, generated from one handler.
+///
+/// Rust spells "a function" three ways — `ItemFn`, `ImplItemFn`, `TraitItemFn`
+/// — and a visitor that cares about function bodies has to implement all three
+/// identically. `near-clones` reported six such pairs across this codebase,
+/// each differing in exactly one identifier (`visit_item_fn` against
+/// `visit_impl_item_fn`), one of them 129 tokens long. That is not a family of
+/// decisions, it is one decision spelled out per syn type.
+///
+/// Two forms, because the two things a visitor does with a fn are different:
+///
+/// * `before` — inspect and keep walking. The handler takes
+///   `(&[Attribute], &Signature, Option<&Block>, is_pub)`.
+/// * `around` — wrap the walk, for the visitors that push and pop a stack.
+///   Both handlers take `(&Signature, Option<&Block>)`; a `TraitItemFn` with no
+///   default body passes `None`.
+///
+/// `Option<&Block>` rather than `&Block` so the trait case is representable at
+/// all, and so a handler that genuinely needs a body has to say what it does
+/// without one rather than being handed an empty stand-in.
+///
+/// The same trade [`scope_visits`] documents applies: these bodies become
+/// invisible to this tool's own checks. It is worth it for the same reason —
+/// the enter/leave pairing is now written once, where a reviewer can see it.
+macro_rules! fn_visits {
+    (before $m:ident; $($which:ident),+ $(,)?) => {
+        $(fn_visits!(@before $m $which);)+
+    };
+    (around $enter:ident, $leave:ident; $($which:ident),+ $(,)?) => {
+        $(fn_visits!(@around $enter $leave $which);)+
+    };
+
+    (@before $m:ident item_fn) => {
+        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+            self.$m(&i.attrs, &i.sig, Some(&i.block), matches!(i.vis, syn::Visibility::Public(_)));
+            syn::visit::visit_item_fn(self, i);
+        }
+    };
+    (@before $m:ident impl_item_fn) => {
+        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+            self.$m(&i.attrs, &i.sig, Some(&i.block), matches!(i.vis, syn::Visibility::Public(_)));
+            syn::visit::visit_impl_item_fn(self, i);
+        }
+    };
+    // A trait method is public by definition — its visibility is the trait's.
+    (@before $m:ident trait_item_fn) => {
+        fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+            self.$m(&i.attrs, &i.sig, i.default.as_ref(), true);
+            syn::visit::visit_trait_item_fn(self, i);
+        }
+    };
+
+    (@around $enter:ident $leave:ident item_fn) => {
+        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+            self.$enter(&i.sig, Some(&i.block));
+            syn::visit::visit_item_fn(self, i);
+            self.$leave(&i.sig, Some(&i.block));
+        }
+    };
+    (@around $enter:ident $leave:ident impl_item_fn) => {
+        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+            self.$enter(&i.sig, Some(&i.block));
+            syn::visit::visit_impl_item_fn(self, i);
+            self.$leave(&i.sig, Some(&i.block));
+        }
+    };
+    (@around $enter:ident $leave:ident trait_item_fn) => {
+        fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+            self.$enter(&i.sig, i.default.as_ref());
+            syn::visit::visit_trait_item_fn(self, i);
+            self.$leave(&i.sig, i.default.as_ref());
+        }
+    };
+}
+pub(crate) use fn_visits;
+
 macro_rules! scope_visits {
     ($($which:ident),+ $(,)?) => {
         $(scope_visits!(@emit $which);)+

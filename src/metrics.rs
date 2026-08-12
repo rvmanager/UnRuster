@@ -151,6 +151,23 @@ struct ComplexityVisitor {
 }
 
 impl ComplexityVisitor {
+    /// One branch, one nesting level, then the head expression and the body —
+    /// the shape `while` and `for` share.
+    ///
+    /// `near-clones` reported the two as a one-leaf divergence (`cond` against
+    /// `expr`) and it was right: the difference is only which syn field holds
+    /// the head, and Rust spells that differently for the two loops. `loop`
+    /// keeps its own method because it genuinely has no head.
+    fn loop_with_head(&mut self, head: &syn::Expr, body: &syn::Block) {
+        self.cyclo += 1;
+        self.enter();
+        self.visit_expr(head);
+        for stmt in &body.stmts {
+            self.visit_stmt(stmt);
+        }
+        self.exit();
+    }
+
     fn enter(&mut self) {
         self.nest_current += 1;
         if self.nest_current > self.nest_max {
@@ -200,23 +217,11 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
     }
 
     fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
-        self.cyclo += 1;
-        self.enter();
-        self.visit_expr(&e.cond);
-        for stmt in &e.body.stmts {
-            self.visit_stmt(stmt);
-        }
-        self.exit();
+        self.loop_with_head(&e.cond, &e.body);
     }
 
     fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
-        self.cyclo += 1;
-        self.enter();
-        self.visit_expr(&e.expr);
-        for stmt in &e.body.stmts {
-            self.visit_stmt(stmt);
-        }
-        self.exit();
+        self.loop_with_head(&e.expr, &e.body);
     }
 
     fn visit_expr_loop(&mut self, e: &'ast syn::ExprLoop) {
