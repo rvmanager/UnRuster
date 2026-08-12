@@ -179,22 +179,35 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
     // the declaration earns its keep — `concepts` found the cluster, and the
     // marker is what turns "these three resemble each other" into "this one is
     // the home and that one drifted away from it".
-    // The gating tier, not the reporting floor. `--coverage` is guidance about
-    // where a marker would pay for itself, and at the reporting floor it was
-    // guidance nobody could act on: 270 unclaimed clusters on a real codebase,
-    // "mostly `label()` methods and action newtypes where one concept, many
-    // declarations is just Rust". A suggestion list that long teaches a reader
-    // to stop reading suggestion lists.
-    for cluster in crate::concepts::clusters_above(corpus, None, crate::concepts::GATING_SCORE) {
+    //
+    // At the reporting floor, deliberately. The two statuses below ask
+    // different questions and need different evidence:
+    //
+    // * `undeclared` has a *declared home in the cluster*. Somebody wrote the
+    //   marker, which is the strongest signal available — the cluster's score
+    //   is beside the point, because the reader has already said this concept
+    //   is real. Raising the floor here hides the drift the marker exists to
+    //   catch: on a real codebase the `PlacementTool` / `ParametricDef` pair
+    //   scores 0.63, and a gating floor would have made the one row the
+    //   vocabulary produced there vanish — and orphaned the waiver written
+    //   against it.
+    // * `unclaimed` has no marker at all, so all it has is the score. That one
+    //   *does* take the gating tier: see its arm below.
+    for (score, cluster) in crate::concepts::clusters(corpus, None) {
         let declared: Vec<&ItemFact> = cluster
             .iter()
             .filter(|m| m.concept.as_deref().is_some_and(|c| !c.is_empty()))
             .copied()
             .collect();
         match declared.as_slice() {
-            // Only the clusters `concepts` itself would gate on. See the call
-            // above for the measurement.
-            [] if opts.coverage => {
+            // Nobody has claimed anything here, so the cluster's own score is
+            // the only evidence, and `--coverage` is advice rather than a
+            // finding. At the reporting floor it was advice nobody could act
+            // on: 270 unclaimed clusters on a real codebase, "mostly `label()`
+            // methods and action newtypes where one concept, many declarations
+            // is just Rust". A suggestion list that long teaches a reader to
+            // stop reading suggestion lists.
+            [] if opts.coverage && score >= crate::concepts::GATING_SCORE => {
                 let first = cluster[0];
                 findings.push(Finding {
                     status: Status::Unclaimed,

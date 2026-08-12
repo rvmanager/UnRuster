@@ -293,6 +293,7 @@ mod tests {
             tokens,
             skeleton: "·".into(),
             leaves: vec!["c".into()],
+            in_trait_impl: false,
         }
     }
 

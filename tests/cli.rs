@@ -8355,6 +8355,32 @@ impl Render for B { fn render_frame(&self, w: &mut W) -> Res { w.b() } }
     );
 }
 
+/// The summary must say which view produced the volume.
+///
+/// A session that gated 66 clusters here left a log from which the views behind
+/// ~50 of them could not be recovered: the listing was capped by `--top` and
+/// the summary reported only a total. A number nobody can attribute is not an
+/// answer.
+#[test]
+fn concepts_summary_breaks_the_count_down_by_view() {
+    let (dir, cache) = scratch_cached("concepts-breakdown");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod a { pub struct UserId(u64); }\n\
+         pub mod b { pub struct OrderId(u64); }\n\
+         pub mod c { pub struct OwnerId(u64); }\n",
+    )
+    .unwrap();
+    let out = ur()
+        .env("UNRUSTER_CACHE_DIR", &cache)
+        .args(["--root", dir.to_str().unwrap(), "--all-stdout", "--summary", "concepts"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("newtype=1"), "expected a per-view breakdown:\n{text}");
+    assert!(text.contains("gating"), "…with the gating split:\n{text}");
+}
+
 #[test]
 fn concepts_row_shape_is_stable() {
     let (dir, cache) = scratch_cached("concepts-shape");
@@ -8365,7 +8391,7 @@ fn concepts_row_shape_is_stable() {
     .unwrap();
     let text = run_in(&dir, &cache, &["concepts"]);
     for line in text.lines().filter(|l| l.contains('\t')) {
-        assert_eq!(line.split('\t').count(), 8, "concepts row shape: {line}");
+        assert_eq!(line.split('\t').count(), 9, "concepts row shape: {line}");
     }
 }
 
@@ -8456,7 +8482,7 @@ pub fn b(d: &D) -> R { let x = d.q("two", 1); let y = d.p(x); d.fin(x, y) }
     .unwrap();
     let text = run_in(&dir, &cache, &["near-clones", "--min-tokens", "8"]);
     for line in text.lines().filter(|l| l.contains('\t')) {
-        assert_eq!(line.split('\t').count(), 10, "near-clones row shape: {line}");
+        assert_eq!(line.split('\t').count(), 11, "near-clones row shape: {line}");
     }
 }
 
@@ -8656,6 +8682,27 @@ fn an_edited_file_is_not_answered_from_the_cache() {
     );
 }
 
+/// A cache is per `--root`, and a zero for the root you did not scan looks
+/// exactly like a cache that is not working.
+///
+/// A real session ran every check with `-r vectorian/src` and then
+/// `unruster cache` with no `-r`, read "0 cached file(s)", and wrote up the
+/// cache as empty — in the same session where `gate` reported 289 files served
+/// from it.
+#[test]
+fn an_empty_cache_names_the_caches_that_are_not_empty() {
+    let (dir, cache) = scratch_cached("cache-elsewhere");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct A(u8);\n").unwrap();
+    // Warm the cache for `src/`, then ask about the parent — the mistake.
+    run_in(&dir.join("src"), &cache, &["gate", "A", "--kind", "struct"]);
+    let text = run_in(&dir, &cache, &["cache"]);
+    assert!(text.contains("0 cached file(s)"), "{text}");
+    assert!(
+        text.contains("per `--root`") && text.contains("did you mean"),
+        "an empty cache must name the ones that are not:\n{text}"
+    );
+}
+
 #[test]
 fn cache_reports_its_contents_and_clears_them() {
     let (dir, cache) = scratch_cached("cache-cmd");
@@ -8795,6 +8842,31 @@ fn vocabulary_is_silent_on_a_codebase_with_no_markers() {
     );
     // …and `--coverage` is how you ask the opposite question.
     assert!(run_in(&dir, &cache, &["vocabulary", "--coverage"]).contains("unclaimed"));
+}
+
+/// A declared home makes its cluster interesting at *any* score.
+///
+/// The `--coverage` floor was briefly applied to this path too, which would
+/// have silently dropped the one row a real codebase's vocabulary produced —
+/// its `PlacementTool` / `ParametricDef` cluster scores 0.63 — and orphaned the
+/// waiver written against it. The two statuses ask different questions:
+/// `undeclared` already has a human's marker as evidence, `unclaimed` has only
+/// the score.
+#[test]
+fn an_undeclared_look_alike_is_reported_below_the_coverage_floor() {
+    let (dir, cache) = scratch_cached("vocab-below-floor");
+    // A cognate pair in one module: ~0.55, comfortably under the 0.70 gate.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "/// unruster: concept(user.id)\npub struct UserId(u64);\npub struct OwnerId(u64);\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["vocabulary"]);
+    assert!(
+        text.contains("undeclared\tuser.id"),
+        "a marked home must report its look-alike whatever the cluster scores:\n{text}"
+    );
+    assert!(text.contains("OwnerId"), "{text}");
 }
 
 /// `--coverage` reports only what `concepts` would gate on.

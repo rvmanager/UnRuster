@@ -887,6 +887,7 @@ mod tests {
             tokens: 0,
             skeleton: sk,
             leaves,
+            in_trait_impl: false,
         }
         .canon()
     }

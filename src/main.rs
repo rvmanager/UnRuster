@@ -2245,11 +2245,36 @@ fn run_cache(out: &emit::Out, root: &std::path::Path, a: &CacheArgs) -> Result<(
         "kib" => (bytes / 1024).to_string(),
         "scheme" => facts::SCHEME.to_string(),
     );
+    // A zero here means "nothing cached *for this --root*", which is not what
+    // it looks like. Naming the other project caches is what turns it back into
+    // an answer — see `Cache::siblings`.
+    let elsewhere = if n == 0 {
+        let others = c.siblings();
+        if others.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; entries are per `--root`, and {} other project cache(s) hold {} file(s) \
+                 — did you mean one of these? {}",
+                others.len(),
+                others.iter().map(|(_, n)| n).sum::<usize>(),
+                others
+                    .iter()
+                    .take(5)
+                    .map(|(slug, n)| format!("{} ({})", slug, n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    } else {
+        String::new()
+    };
     out.summary(&format!(
         "({} cached file(s), {} KiB; entries are keyed by content hash, so one is \
-         never stale — only absent. `cache --clear` to drop them.)",
+         never stale — only absent; `cache --clear` to drop them{})",
         n,
-        bytes / 1024
+        bytes / 1024,
+        elsewhere
     ));
     out.finish("cache");
     Ok(())

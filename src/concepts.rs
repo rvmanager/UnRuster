@@ -206,6 +206,26 @@ fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
 // ──────────────────────────────────────────────────────────────────────────
 // Clusters
 
+/// Cluster size at which "many declarations of one shape" stops meaning
+/// *duplicated* and starts meaning *a family*.
+///
+/// Measured, and the separation is clean. On a 4856-item codebase the check
+/// gated seven noun-shape clusters. The three the reader acted on — two
+/// parameter structs declared twice and a five-field `TransformParams` — had
+/// **2, 2 and 4** members. The four that were noise had **6, 7, 8 and 12**:
+/// `{CpRef, CpRef}` on six constraint kinds, `{CpRef×4, bool}` on seven,
+/// `{Document, NodeId×3}` on twelve test fixtures, `(Vec<NodeId>)` on eight
+/// command structs. The reader's own word for them was "inherent taxonomy".
+///
+/// The mechanism: two declarations of one shape is somebody who did not know
+/// the first existed. Twelve is a family whose members are *meant* to be
+/// parallel — a variant per constraint kind, a fixture per test — and
+/// collapsing it would delete the distinctions it exists to draw. The score's
+/// count term ramps the other way, on the reasonable-sounding but wrong premise
+/// that more copies is worse; past this point more copies is *evidence of a
+/// taxonomy*.
+const TAXONOMY_SIZE: usize = 6;
+
 /// One reported group: N declarations the tool believes name one concept.
 struct Cluster<'a> {
     kind: &'static str,
@@ -246,6 +266,11 @@ impl Cluster<'_> {
     /// mechanism this check exists to catch. *How deliberate* — a suffix cohort
     /// is a convention somebody was following, so a collision inside one is
     /// much more likely to be an oversight than a coincidence.
+    /// Is this a family rather than a duplication? See [`TAXONOMY_SIZE`].
+    fn taxonomy(&self) -> bool {
+        self.members.len() >= TAXONOMY_SIZE
+    }
+
     fn score(&self) -> f64 {
         let n = self.members.len() as f64;
         // Zero at exactly two, saturating at five: past five the answer is
@@ -255,9 +280,16 @@ impl Cluster<'_> {
         let public = self.members.iter().filter(|m| m.is_pub()).count() as f64 / n;
         let spread = ((self.modules() as f64 - 1.0) / 2.0).clamp(0.0, 1.0);
         let deliberate = if self.positional { 1.0 } else { 0.0 };
-        (0.28 + 0.22 * count + 0.14 * public + 0.16 * spread + 0.10 * deliberate
-            + 0.15 * self.agreement)
-            .min(1.0)
+        let raw = 0.28 + 0.22 * count + 0.14 * public + 0.16 * spread + 0.10 * deliberate
+            + 0.15 * self.agreement;
+        // Demoted, not dropped. A taxonomy is still worth one line of a
+        // reader's attention — it is where a *new* member would be added, and
+        // where a member that has drifted from its siblings would show — but it
+        // must not hold an agent loop open. Sized so the four measured noise
+        // rows (0.87, 0.77, 0.77, 0.89) all fall under the gate while the three
+        // real ones (n ≤ 4, so unaffected) stay above it.
+        let taxonomy = if self.taxonomy() { 0.25 } else { 0.0 };
+        (raw - taxonomy).clamp(0.0, 1.0)
     }
 
     fn first(&self) -> &ItemFact {
@@ -760,24 +792,23 @@ fn collect<'a>(corpus: &'a Corpus, kind: Option<Kind>) -> Vec<Cluster<'a>> {
     out
 }
 
-/// The member lists of every cluster scoring at or above `min_score`.
+/// Every cluster at or above [`DEFAULT_MIN_SCORE`], as `(score, members)`.
 ///
 /// Exposed for [`crate::vocabulary`], which runs the same clustering to ask a
 /// different question — "does this group of look-alikes have a declared home?"
 /// Two implementations of "what counts as one concept here" would drift apart,
 /// and the two commands would then disagree about the same three types.
-/// `vocabulary --coverage` asks for the gating tier rather than
-/// [`DEFAULT_MIN_SCORE`]: its rows are advice about where to put a marker, and
-/// advice is only advice while the list is short enough to read.
-pub fn clusters_above(
-    corpus: &Corpus,
-    kind: Option<Kind>,
-    min_score: f64,
-) -> Vec<Vec<&ItemFact>> {
+///
+/// The score comes back with the members because `vocabulary` needs different
+/// floors for its two statuses: a cluster containing a declared marker is
+/// interesting at any score, and one containing none is only worth advice at
+/// the gating tier. Returning the number is what lets it draw that line without
+/// a second pass over the corpus.
+pub fn clusters(corpus: &Corpus, kind: Option<Kind>) -> Vec<(f64, Vec<&ItemFact>)> {
     collect(corpus, kind)
         .into_iter()
-        .filter(|c| c.score() >= min_score)
-        .map(|c| c.members)
+        .filter(|c| c.score() >= DEFAULT_MIN_SCORE)
+        .map(|c| (c.score(), c.members))
         .collect()
 }
 
@@ -827,6 +858,9 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
                 "shape" => c.shape.clone(),
                 "at" => site(&first.file, first.line),
                 "item" => first.qpath.clone(),
+                // Appended after the existing columns so no reader's `awk`
+                // moves. Says why a row scores what it does.
+                "via" => if c.taxonomy() { "taxonomy" } else { "duplicate" },
                 "others" => c.members[1..]
                     .iter()
                     .map(|m| format!("{} {}:{}", m.qpath, m.file, m.line))
@@ -839,8 +873,32 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
 
     let gating = clusters.iter().filter(|c| c.score() >= GATING_SCORE).count();
     let decls: usize = clusters.iter().map(|c| c.members.len()).sum();
+    // Per-view counts, and per-view *gating* counts. Without these the only way
+    // to find out which view produced a run's volume was to list every row, and
+    // a run capped by `--top` could not answer it at all: a session that gated
+    // 66 clusters here left a log from which the views behind ~50 of them could
+    // not be recovered. A summary that reports a total nobody can attribute is
+    // a number, not an answer.
+    let mut by_kind: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for c in &clusters {
+        let e = by_kind.entry(c.kind).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += usize::from(c.score() >= GATING_SCORE);
+    }
+    let breakdown = by_kind
+        .iter()
+        .map(|(k, (n, g))| {
+            if *g > 0 {
+                format!("{}={} ({} gating)", k, n, g)
+            } else {
+                format!("{}={}", k, n)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let taxonomies = clusters.iter().filter(|c| c.taxonomy()).count();
     ctx.out.summary(&format!(
-        "({} declaration(s) across {} cluster(s){}{}; {} item(s) scanned{}{}; \
+        "({} declaration(s) across {} cluster(s){}{}; {}{}; {} item(s) scanned{}{}; \
          explain: concept-drift)",
         decls,
         clusters.len(),
@@ -854,6 +912,19 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
         },
         if below > 0 {
             format!("; {} below --min-score {:.2}", below, opts.min_score)
+        } else {
+            String::new()
+        },
+        if breakdown.is_empty() {
+            "no view fired".to_string()
+        } else {
+            breakdown
+        },
+        if taxonomies > 0 {
+            format!(
+                "; {} of {} member(s) each and demoted as taxonomies (`via` column)",
+                taxonomies, TAXONOMY_SIZE
+            )
         } else {
             String::new()
         },
@@ -1051,6 +1122,55 @@ mod tests {
             ("src/b.rs", "/// The name.\npub struct B(String);"),
         ]);
         assert!(doc_clusters(&c).is_empty());
+    }
+
+    /// The measurement that set [`TAXONOMY_SIZE`], as two tests.
+    ///
+    /// Six constraint kinds declaring `{CpRef, CpRef}` scored 0.87 — the
+    /// highest row in the whole check on that codebase — and the reader's word
+    /// for it was "inherent taxonomy". Collapsing it would delete the
+    /// distinctions the family exists to draw.
+    #[test]
+    fn a_family_of_six_declarations_is_a_taxonomy_and_does_not_gate() {
+        let src: String = ["Coincident", "Horizontal", "Vertical", "AlignX", "AlignY", "LevelH"]
+            .iter()
+            .map(|k| format!("pub struct {k} {{ pub a: CpRef, pub b: CpRef }}\n"))
+            .collect();
+        let c = corpus_of(&[("src/kinds.rs", &src), ("src/other.rs", "pub struct X;")]);
+        let cl = struct_shape_clusters(&c);
+        assert_eq!(cl.len(), 1);
+        assert!(cl[0].taxonomy(), "six members is a family");
+        assert!(
+            cl[0].score() < GATING_SCORE,
+            "score {:.2} should not gate",
+            cl[0].score()
+        );
+        assert!(cl[0].score() >= DEFAULT_MIN_SCORE, "…but stays readable");
+    }
+
+    /// …while the shape the same run *did* act on — one parameter struct
+    /// declared twice, in two modules — must still gate. Its whole point is
+    /// that it has few members.
+    #[test]
+    fn one_struct_declared_twice_across_modules_still_gates() {
+        let c = corpus_of(&[
+            (
+                "src/model/outline.rs",
+                "pub struct OutlineParams { pub start: CapStyle, pub end: CapStyle, pub width: f64 }",
+            ),
+            (
+                "src/composite/outline.rs",
+                "pub struct Outline { pub start: CapStyle, pub end: CapStyle, pub width: f64 }",
+            ),
+        ]);
+        let cl = struct_shape_clusters(&c);
+        assert_eq!(cl.len(), 1);
+        assert!(!cl[0].taxonomy());
+        assert!(
+            cl[0].score() >= GATING_SCORE,
+            "score {:.2} should gate",
+            cl[0].score()
+        );
     }
 
     #[test]

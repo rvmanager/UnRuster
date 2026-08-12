@@ -88,6 +88,9 @@ struct Pair<'a> {
     same_dir: bool,
     /// How many bodies are in this pair's family (see [`spanning_pairs`]).
     family: usize,
+    /// Both bodies implement a trait method — the shape was dictated, not
+    /// chosen. See [`Pair::score`].
+    dictated: bool,
     /// Waiver key and row identity.
     label: String,
 }
@@ -101,6 +104,21 @@ impl Pair<'_> {
     /// the interesting quantity is how *little* is not, because one differing
     /// leaf between two forty-token bodies is either a fix that landed once or
     /// a bug that was pasted twice, and both are worth a reader's next minute.
+    ///
+    /// # The trait-impl demotion, and why it is a demotion
+    ///
+    /// A run over a 2372-body codebase gated **42 of 82** pairs, and the top of
+    /// the list was per-variant trait boilerplate: `viz_endpoints` on nine
+    /// constraint kinds, `collected` on six wizards, `apply` on two actions.
+    /// Rust cannot abstract over a field inside an enum variant, so N sibling
+    /// types implementing one trait *must* produce N bodies of one shape — the
+    /// trait dictated it, and the author had no other way to write it.
+    ///
+    /// Not an exclusion, though. In that same run `Distance::residuals` and
+    /// `Radius::residuals` — two trait impls — were the same equation under two
+    /// field names, and consolidating them was the session's real find. So the
+    /// class is ranked down rather than filtered out: it stays readable, and it
+    /// stops crowding the gate.
     fn score(&self, max_diff: usize) -> f64 {
         let n = self.diffs.len() as f64;
         let span = max_diff.max(1) as f64;
@@ -109,7 +127,11 @@ impl Pair<'_> {
         let bulk = (self.tokens as f64 / 40.0).min(1.0);
         let named = if self.same_name { 0.15 } else { 0.0 };
         let local = if self.same_dir { 0.05 } else { 0.0 };
-        (0.30 + 0.25 * closeness + 0.20 * bulk + named + local).min(1.0)
+        let raw = 0.30 + 0.25 * closeness + 0.20 * bulk + named + local;
+        // Enough to move the boilerplate below the gate while leaving the
+        // biggest, closest pairs — the `residuals` shape — above it.
+        let dictated = if self.dictated { 0.20 } else { 0.0 };
+        (raw - dictated).clamp(0.0, 1.0)
     }
 
     /// `users→orders, 3→5` — the drift itself, capped so a row stays a row.
@@ -280,6 +302,7 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
                 tokens: a.tokens,
                 same_name,
                 same_dir: dir_of(&a.file) == dir_of(&b.file),
+                dictated: a.in_trait_impl && b.in_trait_impl,
                 family: sizes[i],
                 label,
                 a,
@@ -327,6 +350,10 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
                 "fn" => p.a.qpath.clone(),
                 "vs_at" => site(&p.b.file, p.b.line),
                 "vs" => p.b.qpath.clone(),
+                // Appended rather than inserted: every column before it keeps
+                // the position an existing `awk` reads it at. It says why a row
+                // scores what it does — `trait-impl` is the demoted class.
+                "via" => if p.dictated { "trait-impl" } else { "free" },
             );
             ctx.suggest("near-clones", Some(&p.label), today);
         }
@@ -453,6 +480,7 @@ mod tests {
             tokens,
             same_name: named,
             same_dir: true,
+            dictated: false,
             family: 2,
             label: "l".into(),
         }
@@ -468,6 +496,7 @@ mod tests {
             tokens: 40,
             skeleton: "·".into(),
             leaves: vec!["a".into()],
+            in_trait_impl: false,
         }
     }
 
@@ -526,6 +555,28 @@ mod tests {
         let kept = spanning_pairs(vec![(2, 0, 1), (1, 0, 2), (1, 1, 2)], 3);
         assert_eq!(kept.len(), 2);
         assert!(!kept.contains(&(0, 1)), "the expensive edge should be dropped");
+    }
+
+    /// Per-variant trait boilerplate must not crowd the gate — 42 of 82 pairs
+    /// on a real codebase were this shape — while the biggest, closest pairs in
+    /// the same class stay above it, because one of those was the session's
+    /// real find.
+    #[test]
+    fn a_dictated_pair_ranks_below_a_freely_written_one() {
+        let (a, b) = (body("f", "src/a.rs"), body("f", "src/b.rs"));
+        let free = pair(&a, &b, 1, 40, true);
+        let mut dictated = pair(&a, &b, 1, 40, true);
+        dictated.dictated = true;
+        assert!(dictated.score(2) < free.score(2));
+        assert!(free.score(2) >= GATING_SCORE);
+        // Boilerplate: two short bodies under a shared trait method name.
+        let mut small = pair(&a, &b, 2, 26, true);
+        small.dictated = true;
+        assert!(
+            small.score(2) < GATING_SCORE,
+            "score {:.2} should not gate",
+            small.score(2)
+        );
     }
 
     #[test]

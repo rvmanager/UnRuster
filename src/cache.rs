@@ -245,6 +245,38 @@ impl Cache {
         &self.dir
     }
 
+    /// Every other project cache under the same root: `(slug, entries)`,
+    /// biggest first.
+    ///
+    /// Reported when *this* root's cache is empty, because the alternative is a
+    /// trap somebody actually fell into: a session ran every check with
+    /// `-r vectorian/src` and then `unruster cache` with no `-r`, read "0
+    /// cached file(s)" for a slug it had never written, and concluded the cache
+    /// was dead — in the same session where `gate` reported 289 files served
+    /// from it. Entries are per `--root`, and a zero that means "you asked
+    /// about a different directory" has to say so.
+    pub fn siblings(&self) -> Vec<(String, usize)> {
+        let Some(parent) = self.dir.parent() else {
+            return Vec::new();
+        };
+        let Ok(rd) = std::fs::read_dir(parent) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, usize)> = rd
+            .flatten()
+            .filter(|e| e.path() != self.dir && e.path().is_dir())
+            .map(|e| {
+                let n = std::fs::read_dir(e.path().join("f"))
+                    .map(|d| d.count())
+                    .unwrap_or(0);
+                (e.file_name().to_string_lossy().into_owned(), n)
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
     /// `(entries, bytes)` currently stored.
     pub fn size(&self) -> (usize, u64) {
         let Ok(rd) = std::fs::read_dir(self.dir.join("f")) else {
