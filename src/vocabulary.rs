@@ -179,13 +179,21 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
     // the declaration earns its keep — `concepts` found the cluster, and the
     // marker is what turns "these three resemble each other" into "this one is
     // the home and that one drifted away from it".
-    for cluster in crate::concepts::clusters(corpus, None) {
+    // The gating tier, not the reporting floor. `--coverage` is guidance about
+    // where a marker would pay for itself, and at the reporting floor it was
+    // guidance nobody could act on: 270 unclaimed clusters on a real codebase,
+    // "mostly `label()` methods and action newtypes where one concept, many
+    // declarations is just Rust". A suggestion list that long teaches a reader
+    // to stop reading suggestion lists.
+    for cluster in crate::concepts::clusters_above(corpus, None, crate::concepts::GATING_SCORE) {
         let declared: Vec<&ItemFact> = cluster
             .iter()
             .filter(|m| m.concept.as_deref().is_some_and(|c| !c.is_empty()))
             .copied()
             .collect();
         match declared.as_slice() {
+            // Only the clusters `concepts` itself would gate on. See the call
+            // above for the measurement.
             [] if opts.coverage => {
                 let first = cluster[0];
                 findings.push(Finding {

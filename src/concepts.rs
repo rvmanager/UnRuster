@@ -274,11 +274,42 @@ fn ordered(mut v: Vec<&ItemFact>) -> Vec<&ItemFact> {
 // ──────────────────────────────────────────────────────────────────────────
 // 1. newtypes and aliases over one inner type
 
+/// Wrapper types whose *outer* type is the collection: `Vec`, `Option`, `Rc`,
+/// … A newtype over one of these is a *role* for a value that already has a
+/// meaning, which is the newtype pattern working rather than a concept
+/// duplicated.
+///
+/// Measured. On a real 4800-item codebase the highest-scoring row in the whole
+/// check (0.89) was eight command structs over `Vec<NodeId>` sharing the word
+/// `apply` — `ApplyBoolean`, `ApplyOffset`, … — with `Option<NodeId>`,
+/// `HashSet<NodeId>` and `Vec<NodeId>` clusters behind it. Every one was noise,
+/// and the two rows that were not (`(u64)`, `(String)`) wrapped a primitive.
+///
+/// That is not a coincidence, it is the mechanism: concept drift is
+/// re-*naming* something that carries no meaning of its own. A `u64` means
+/// nothing until a wrapper says what it is, so eight wrappers over `u64` are
+/// eight attempts to say the same thing. A `Vec<NodeId>` already means
+/// something; wrapping it names the *command*, not the payload.
+const CONTAINER_HEADS: &[&str] = &[
+    "Arc", "Box", "BTreeMap", "BTreeSet", "Cow", "HashMap", "HashSet", "Mutex", "Option", "Rc",
+    "RefCell", "Result", "RwLock", "Vec", "VecDeque",
+];
+
+/// Is `ty` a container — `Vec<…>`, `Option<…>`, a slice, an array, a tuple?
+fn is_container(ty: &str) -> bool {
+    let head = ty.split(['<', ' ']).next().unwrap_or(ty).trim_start_matches('&');
+    CONTAINER_HEADS.contains(&head)
+        || ty.starts_with('[')
+        || ty.starts_with('(') && ty.contains(',')
+}
+
 /// `struct Id(u64)`, `type Id = u64` — one concept wrapped once, several times.
 ///
 /// Aliases are included with newtypes on purpose: `type UserId = u64;` and
 /// `struct UserId(u64);` are two spellings of one intention, and a codebase
 /// that has drifted usually has both.
+///
+/// Wrappers over a container are excluded — see [`CONTAINER_HEADS`].
 fn newtype_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
     let mut by_inner: BTreeMap<&str, Vec<&ItemFact>> = BTreeMap::new();
     for i in c.declarations() {
@@ -286,6 +317,9 @@ fn newtype_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
             continue;
         }
         if let Some(inner) = i.shape.newtype_inner() {
+            if is_container(inner) {
+                continue;
+            }
             by_inner.entry(inner).or_default().push(i);
         }
     }
@@ -726,16 +760,23 @@ fn collect<'a>(corpus: &'a Corpus, kind: Option<Kind>) -> Vec<Cluster<'a>> {
     out
 }
 
-/// The member lists of every cluster scoring at or above [`DEFAULT_MIN_SCORE`].
+/// The member lists of every cluster scoring at or above `min_score`.
 ///
 /// Exposed for [`crate::vocabulary`], which runs the same clustering to ask a
 /// different question — "does this group of look-alikes have a declared home?"
 /// Two implementations of "what counts as one concept here" would drift apart,
 /// and the two commands would then disagree about the same three types.
-pub fn clusters(corpus: &Corpus, kind: Option<Kind>) -> Vec<Vec<&ItemFact>> {
+/// `vocabulary --coverage` asks for the gating tier rather than
+/// [`DEFAULT_MIN_SCORE`]: its rows are advice about where to put a marker, and
+/// advice is only advice while the list is short enough to read.
+pub fn clusters_above(
+    corpus: &Corpus,
+    kind: Option<Kind>,
+    min_score: f64,
+) -> Vec<Vec<&ItemFact>> {
     collect(corpus, kind)
         .into_iter()
-        .filter(|c| c.score() >= DEFAULT_MIN_SCORE)
+        .filter(|c| c.score() >= min_score)
         .map(|c| c.members)
         .collect()
 }
@@ -885,6 +926,22 @@ mod tests {
         let c = corpus_of(&[(
             "src/units.rs",
             "pub struct Meters(f64); pub struct Celsius(f64); pub struct Volts(f64);",
+        )]);
+        assert!(newtype_clusters(&c).is_empty());
+    }
+
+    /// The top row of the whole check on a real codebase, and pure noise:
+    /// eight command structs over one collection. Wrapping a `Vec<NodeId>`
+    /// names the command; wrapping a `u64` names the concept.
+    #[test]
+    fn wrappers_over_a_container_are_the_newtype_pattern_working() {
+        let c = corpus_of(&[(
+            "src/actions.rs",
+            "pub struct ApplyBoolean(Vec<NodeId>);\n\
+             pub struct ApplyOffset(Vec<NodeId>);\n\
+             pub struct ApplyOutline(Vec<NodeId>);\n\
+             pub struct ToggleVisible(Option<NodeId>);\n\
+             pub struct ToggleLocked(Option<NodeId>);",
         )]);
         assert!(newtype_clusters(&c).is_empty());
     }

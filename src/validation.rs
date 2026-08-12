@@ -18,9 +18,17 @@
 //!
 //! * an assertion macro — `assert!`, `assert_eq!`, `assert_ne!`, `debug_assert*`
 //! * `ensure!` — the `anyhow`/`snafu` spelling of the same thing
-//! * a **guard**: `if <cond> { return Err(…) }` or `if <cond> { bail!(…) }`,
-//!   including the `else` form. This is the one that matters, because it is how
-//!   most Rust actually validates, and no check here could see it before.
+//! * a **guard**: `if <cond> { return Err(…) }`, `if <cond> { bail!(…) }`, or
+//!   `if <cond> { return None }`, including the `else` form. This is the one
+//!   that matters, because it is how most Rust actually validates, and no check
+//!   here could see it before.
+//!
+//! The `None` form was missing from the first cut, and a run over a real
+//! codebase named the cost: `Arena::pop_input_at` and `pop_shape_id_at` reject
+//! an out-of-range index by returning `None`, and this check called them
+//! unvalidated siblings of functions that reject with `Err`. Returning `None`
+//! for input the function refuses is the same decision spelled for a fallible
+//! *lookup* rather than a fallible *operation*.
 //!
 //! Deliberately excluded: `?`, `.ok_or(…)`, `.expect(…)`. Those propagate or
 //! assert a failure someone *else* detected; they are not this function
@@ -61,7 +69,8 @@ pub const GATING_SCORE: f64 = 0.70;
 /// One place a function states what it requires.
 #[derive(Debug, Clone)]
 pub struct Site {
-    /// `assert` | `debug-assert` | `ensure` | `guard-return-err` | `guard-bail`
+    /// `assert` | `debug-assert` | `ensure` | `guard-return-err` |
+    /// `guard-return-none` | `guard-bail`
     pub kind: &'static str,
     /// Qualified path of the enclosing fn. Cohorts are formed from the `fns`
     /// list rather than from here, so a site needs no more identity than the
@@ -139,11 +148,12 @@ impl Collector<'_> {
     }
 }
 
-/// Does this block do nothing but leave the function with an error?
+/// Does this block do nothing but leave the function empty-handed?
 ///
-/// `return Err(…)`, `bail!(…)`, or a bare `Err(…)` as the block's tail. The
-/// last form is what an `if … { Err(e) } else { Ok(v) }` looks like, and
-/// missing it would drop the commonest guard in expression-style Rust.
+/// `return Err(…)`, `bail!(…)`, `return None`, or any of those as the block's
+/// tail expression. The tail forms are what `if … { Err(e) } else { Ok(v) }`
+/// and `if … { None } else { Some(v) }` look like, and missing them would drop
+/// the commonest guard in expression-style Rust.
 fn error_exit(b: &syn::Block) -> Option<&'static str> {
     fn is_err_call(e: &syn::Expr) -> bool {
         match crate::ast::peel_expr(e) {
@@ -153,6 +163,16 @@ fn error_exit(b: &syn::Block) -> Option<&'static str> {
             ),
             _ => false,
         }
+    }
+    /// A bare `None`. Only ever a guard here because the block is the body of
+    /// an `if` whose other branch produced a value — a fn that returns `None`
+    /// unconditionally is not validating, it is a stub, and has no `if` for
+    /// this to be reached from.
+    fn is_none(e: &syn::Expr) -> bool {
+        matches!(
+            crate::ast::peel_expr(e),
+            syn::Expr::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "None")
+        )
     }
     for st in &b.stmts {
         let e = match st {
@@ -172,8 +192,12 @@ fn error_exit(b: &syn::Block) -> Option<&'static str> {
         };
         match crate::ast::peel_expr(e) {
             syn::Expr::Return(r) => {
-                if r.expr.as_deref().is_some_and(is_err_call) {
+                let Some(v) = r.expr.as_deref() else { continue };
+                if is_err_call(v) {
                     return Some("guard-return-err");
+                }
+                if is_none(v) {
+                    return Some("guard-return-none");
                 }
             }
             syn::Expr::Macro(m) => {
@@ -182,6 +206,7 @@ fn error_exit(b: &syn::Block) -> Option<&'static str> {
                 }
             }
             other if is_err_call(other) => return Some("guard-return-err"),
+            other if is_none(other) => return Some("guard-return-none"),
             _ => {}
         }
     }
@@ -490,6 +515,17 @@ mod tests {
         );
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].kind, "guard-return-err");
+    }
+
+    /// The form a fallible *lookup* uses. A run over a real codebase reported
+    /// `Arena::pop_input_at` as an unvalidated sibling because it rejects an
+    /// out-of-range index with `None` rather than `Err`.
+    #[test]
+    fn a_return_none_guard_counts_as_validation() {
+        let s = sites_of("fn f(v: &[u8], i: usize) -> Option<u8> { if i >= v.len() { return None; } Some(v[i]) }");
+        assert_eq!(s.iter().map(|x| x.kind).collect::<Vec<_>>(), ["guard-return-none"]);
+        let t = sites_of("fn f(v: &[u8], i: usize) -> Option<u8> { if i >= v.len() { None } else { Some(v[i]) } }");
+        assert_eq!(t.len(), 1, "the expression form counts too");
     }
 
     #[test]

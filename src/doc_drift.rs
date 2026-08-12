@@ -50,9 +50,10 @@
 //! [`crate::panics`] ranks its sites and hides the idiomatic ones — a
 //! poisoned-lock `unwrap`, an assertion over a source literal — because those
 //! are not the crashes it hunts. That filtering is exactly wrong for a doc
-//! check: a `# Panics` section should document a lock unwrap too. So [`Panic`]
-//! below is its own predicate, tiered rather than ranked, and the tier each
-//! class requires is the asymmetry documented there.
+//! check: a `# Panics` section should be *backed* by a lock unwrap too, even
+//! though it is not *demanded* by one. So [`Panic`] below is its own predicate,
+//! tiered rather than ranked, and the tier each class requires is the asymmetry
+//! documented there.
 
 use syn::visit::{self, Visit};
 
@@ -113,10 +114,25 @@ struct Hit {
 /// Rust idiom and which [`crate::panics`] already declines to report;
 /// [`crate::panics::receiver_is_lock`] is shared rather than re-derived here.
 ///
+/// And it covers `.expect("…")`, which is the one that mattered. A run over a
+/// 4800-item codebase produced **33 `panics-undocumented` rows of which 32 were
+/// noise**, every one of them an `.expect` naming its own invariant —
+/// `.expect("u32 fits usize")`, `.expect("cache was just filled")`. That is the
+/// invariant *already written down*, at the site, where a reader of the code
+/// meets it; demanding a second copy under a `# Panics` heading is
+/// documentation churn, and the reader of that run said so. `crate::panics`
+/// scores `.expect` lowest of all the aborting kinds (0.20) for exactly this
+/// reason — "the author wrote down what must hold" — so the two checks now
+/// agree about it. The 33rd row was a bare `panic!` on a reachable input, and
+/// it survives.
+///
+/// A bare `.unwrap()` stays [`Panic::Explicit`]: it records nothing, so the
+/// doc comment is the only place the invariant could live.
+///
 /// So:
-/// * `panics-undocumented` requires [`Panic::Explicit`] — the author wrote
-///   `unwrap`, `expect`, `panic!` or an assertion on something that is not a
-///   lock, and did not mention it.
+/// * `panics-undocumented` requires [`Panic::Explicit`] — a bare `unwrap`,
+///   `panic!` or an assertion, naming nothing at the site and nothing in the
+///   docs either.
 /// * `panics-doc-unbacked` accepts either tier, because a `# Panics` section is
 ///   very often *about* an index or a lock, and calling such a section unbacked
 ///   would be the same mistake pointed the other way.
@@ -124,11 +140,12 @@ struct Hit {
 enum Panic {
     /// Nothing in the body can abort.
     None,
-    /// A real panic path that convention leaves undocumented: an index or slice
-    /// (usually provably in bounds at the site), a poisoned-lock unwrap.
+    /// A real panic path that is either provably fine at the site or already
+    /// documents itself: an index or slice, a poisoned-lock unwrap, an
+    /// `.expect("…")` whose message states the invariant.
     Incidental,
-    /// `unwrap` / `expect` / `panic!` / `unreachable!` / `todo!` / `assert*!`
-    /// on anything else.
+    /// `unwrap` on something other than a lock, or `panic!` / `unreachable!` /
+    /// `todo!` / `assert*!` — an abort that names nothing at the site.
     Explicit,
 }
 
@@ -138,7 +155,11 @@ fn panics(block: &syn::Block) -> Panic {
         fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
             let m = e.method.to_string();
             if m == "unwrap" || m == "expect" || m == "unwrap_err" || m == "expect_err" {
-                self.0 = self.0.max(if crate::panics::receiver_is_lock(&e.receiver) {
+                // `.expect("…")` carries its own invariant; a lock unwrap is the
+                // idiom. Neither demands a heading, both back one.
+                let self_documenting = m.starts_with("expect")
+                    || crate::panics::receiver_is_lock(&e.receiver);
+                self.0 = self.0.max(if self_documenting {
                     Panic::Incidental
                 } else {
                     Panic::Explicit
@@ -608,8 +629,32 @@ mod tests {
         assert!(kinds("/// Reads it.\npub fn f(v: &[u32]) -> u32 { v[0] }", false).is_empty());
     }
 
-    /// And the two rows that survived it: the poisoned-lock idiom, which
-    /// `panics` also declines to report.
+    /// The class that made this check 97% noise on a real codebase: an
+    /// `.expect` naming its own invariant is the invariant written down, and a
+    /// `# Panics` heading repeating it is churn.
+    #[test]
+    fn an_expect_naming_its_invariant_does_not_demand_a_panics_section() {
+        assert!(kinds(
+            "/// Converts it.\npub fn f(n: usize) -> u32 { u32::try_from(n).expect(\"u32 fits usize\") }",
+            false
+        )
+        .is_empty());
+        // …but the bare form records nothing, so the doc is the only place the
+        // invariant could live.
+        assert_eq!(
+            kinds("/// Converts it.\npub fn f(n: usize) -> u32 { u32::try_from(n).unwrap() }", false),
+            ["panics-undocumented"]
+        );
+        // …and an `.expect` still *backs* a heading somebody wrote.
+        assert!(kinds(
+            "/// Converts it.\n///\n/// # Panics\n///\n/// Never on 64-bit.\n\
+             pub fn f(n: usize) -> u32 { u32::try_from(n).expect(\"fits\") }",
+            false
+        )
+        .is_empty());
+    }
+
+    /// And the poisoned-lock idiom, which `panics` also declines to report.
     #[test]
     fn a_poisoned_lock_unwrap_does_not_demand_a_panics_section() {
         assert!(kinds(

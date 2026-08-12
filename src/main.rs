@@ -1648,14 +1648,21 @@ fn traits_of(cmd: &Cmd) -> CmdTraits {
         // and its own blind spots are the thing it is looking for.
         Cmd::SelfCheck(_) => t,
 
+        // These three consult the waiver ledger and print `--suggest-waivers`
+        // lines like every other check; they were simply never marked. The
+        // result was the tool contradicting itself in consecutive lines —
+        // "`panics` does not support waivers, so --suggest-waivers has nothing
+        // to offer here", immediately above the suggestion it had just offered.
+        // A reader who believes the note goes off and invents a parallel
+        // `// NOTE (unruster … false positive)` convention this tool cannot
+        // read, which is exactly what happened on a real codebase.
+        Cmd::Panics(_) | Cmd::ArithDrift(_) | Cmd::PassThrough(_) => t.waivers(),
+
         Cmd::Inventory(_)
         | Cmd::Impls(_)
         | Cmd::Fields(_)
         | Cmd::Metrics(_)
         | Cmd::Tests(_)
-        | Cmd::Panics(_)
-        | Cmd::ArithDrift(_)
-        | Cmd::PassThrough(_)
         | Cmd::Conversions(_)
         | Cmd::BlindSpots
         | Cmd::Playbook
@@ -1665,9 +1672,14 @@ fn traits_of(cmd: &Cmd) -> CmdTraits {
 
 /// The waiver-aware command names, for the one message that lists them.
 ///
-/// Behaviour comes from [`traits_of`]; this only renders. `waiver_names_match_traits`
-/// keeps the two from drifting.
+/// Behaviour comes from [`traits_of`]; this only renders. Kept in step by
+/// `no_check_denies_the_waiver_support_it_has` and
+/// `the_unsupported_note_lists_every_waivable_check` in `tests/cli.rs`, which
+/// drive the binary rather than compare the two lists — this doc used to name a
+/// `waiver_names_match_traits` test that was never written, and the two drifted
+/// far enough that three checks denied waiver support they had.
 const WAIVER_AWARE_NAMES: &[&str] = &[
+    "arith-drift",
     "audit",
     "builder-drift",
     "casts",
@@ -1677,10 +1689,12 @@ const WAIVER_AWARE_NAMES: &[&str] = &[
     "conversion-pairs",
     "dead-code",
     "divergence",
+    "doc-drift",
     "enum-coverage",
     "error-swallows",
-    "doc-drift",
     "near-clones",
+    "panics",
+    "pass-through",
     "stringly",
     "validation-drift",
     "vocabulary",

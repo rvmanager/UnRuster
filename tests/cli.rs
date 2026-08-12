@@ -8778,9 +8778,14 @@ fn vocabulary_reports_a_nameless_marker() {
 #[test]
 fn vocabulary_is_silent_on_a_codebase_with_no_markers() {
     let (dir, cache) = scratch_cached("vocab-none");
+    // Three cognate declarations across modules — the shape `concepts` gates
+    // on, and therefore the shape `--coverage` reports. A *pair* in one module
+    // is deliberately below the floor; see the next test.
     std::fs::write(
         dir.join("src/lib.rs"),
-        "pub struct UserId(u64);\npub struct OrderId(u64);\n",
+        "pub mod a { pub struct UserId(u64); }\n\
+         pub mod b { pub struct OrderId(u64); }\n\
+         pub mod c { pub struct OwnerId(u64); }\n",
     )
     .unwrap();
     let text = run_in(&dir, &cache, &["vocabulary"]);
@@ -8790,6 +8795,26 @@ fn vocabulary_is_silent_on_a_codebase_with_no_markers() {
     );
     // …and `--coverage` is how you ask the opposite question.
     assert!(run_in(&dir, &cache, &["vocabulary", "--coverage"]).contains("unclaimed"));
+}
+
+/// `--coverage` reports only what `concepts` would gate on.
+///
+/// At the reporting floor it listed 270 clusters on a real codebase — "mostly
+/// `label()` methods and action newtypes where one concept, many declarations
+/// is just Rust". Advice that long is advice nobody reads.
+#[test]
+fn vocabulary_coverage_reports_only_the_gating_tier() {
+    let (dir, cache) = scratch_cached("vocab-floor");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct UserId(u64);\npub struct OrderId(u64);\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["vocabulary", "--coverage"]);
+    assert!(
+        !text.contains("unclaimed"),
+        "a cognate pair in one module is below the gate and must not be advised on:\n{text}"
+    );
 }
 
 /// The sentence that survives the refactor which removed the panic.
@@ -8914,4 +8939,65 @@ fn validation_drift_is_silent_when_no_sibling_validates() {
         !text.lines().any(|l| l.contains('\t')),
         "expected no rows:\n{text}"
     );
+}
+
+/// Every check that honours a waiver must be a check the tool *says* honours
+/// waivers.
+///
+/// The doc on `WAIVER_AWARE_NAMES` claimed a `waiver_names_match_traits` test
+/// kept it in step with `traits_of`. That test was never written, and the two
+/// drifted: `panics`, `arith-drift` and `pass-through` all consult the ledger
+/// and print suggestions, while `traits_of` marked them unsupported — so
+/// `unruster panics --suggest-waivers` printed "does not support waivers, so
+/// --suggest-waivers has nothing to offer here" and then printed the
+/// suggestion. Found by a run over a real codebase, whose notes had by then
+/// concluded that two checks "don't support waivers" and told readers to write
+/// a parallel `// NOTE (unruster … false positive)` comment instead.
+///
+/// Driven through the binary rather than over the two lists, so it fails on the
+/// behaviour a reader sees rather than on a copy of it.
+#[test]
+fn no_check_denies_the_waiver_support_it_has() {
+    let (dir, cache) = scratch_cached("waiver-support");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn f(s: &str) -> u8 { s.parse().unwrap() }\n\
+         pub fn g(a: u8, b: u8) -> u8 { a.saturating_add(b) + a + b }\n\
+         pub fn h(x: u8) -> u8 { f(\"1\") + x }\n",
+    )
+    .unwrap();
+    for check in ["panics", "arith-drift", "pass-through", "dead-code", "conversion-pairs"] {
+        let out = ur()
+            .env("UNRUSTER_CACHE_DIR", &cache)
+            .args(["--root", dir.to_str().unwrap(), "--all-stdout", "--suggest-waivers", check])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !text.contains("does not support waivers"),
+            "`{check}` denies waiver support, but it is in WAIVABLE_CHECKS:\n{text}"
+        );
+    }
+}
+
+/// …and the note, when it does fire, must list every check that qualifies —
+/// a reader who takes an incomplete list at face value concludes the missing
+/// ones cannot be waived.
+#[test]
+fn the_unsupported_note_lists_every_waivable_check() {
+    let (dir, cache) = scratch_cached("waiver-list");
+    std::fs::write(dir.join("src/lib.rs"), "pub struct A(u8);\n").unwrap();
+    let out = ur()
+        .env("UNRUSTER_CACHE_DIR", &cache)
+        .args(["--root", dir.to_str().unwrap(), "--all-stdout", "--suggest-waivers", "inventory"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("does not support waivers"), "expected the note: {text}");
+    // `divergence-handling` is an axis of `divergence`, not a command of its
+    // own; every other waivable check name is also a command name.
+    for check in ["panics", "arith-drift", "pass-through", "dead-code", "concepts", "doc-drift"] {
+        assert!(text.contains(check), "note omits `{check}`:\n{text}");
+    }
 }

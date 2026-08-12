@@ -220,6 +220,12 @@ pub struct BodyFact {
     /// are already alpha-renamed to `_0`, `_1`, … so a copy-paste that renamed
     /// its locals still matches.
     pub leaves: Vec<String>,
+    /// This body implements a trait method.
+    ///
+    /// Carried for [`crate::near_clones`]: N sibling types implementing one
+    /// trait produce N bodies of one shape *because the trait said so*, which
+    /// is a weaker signal than two free functions that grew alike.
+    pub in_trait_impl: bool,
 }
 
 impl BodyFact {
@@ -326,6 +332,7 @@ impl FactVisitor<'_> {
             tokens,
             skeleton,
             leaves,
+            in_trait_impl: self.trait_impl_depth > 0,
         });
     }
 
@@ -641,7 +648,8 @@ fn render(
 /// v2: items carry `in_trait_impl`.
 /// v3: …and `local`.
 /// v4: …and `concept`.
-pub const SCHEME: u32 = 4;
+/// v5: bodies carry `in_trait_impl`.
+pub const SCHEME: u32 = 5;
 
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
@@ -707,13 +715,14 @@ pub fn encode(f: &FileFacts) -> String {
     }
     for b in &f.bodies {
         s.push_str(&format!(
-            "B\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "B\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             esc(&b.name),
             esc(&b.qpath),
             esc(&b.file),
             b.line,
             b.end,
             b.tokens,
+            u8::from(b.in_trait_impl),
             esc(&b.skeleton),
             esc(&b.leaves.join(&SUB.to_string()))
         ));
@@ -752,8 +761,8 @@ pub fn decode(text: &str) -> Option<FileFacts> {
                     shape: Shape::decode(c[13].chars().next()?, &unesc(c[14])),
                 });
             }
-            Some(&"B") if c.len() == 9 => {
-                let leaves = unesc(c[8]);
+            Some(&"B") if c.len() == 10 => {
+                let leaves = unesc(c[9]);
                 out.bodies.push(BodyFact {
                     name: unesc(c[1]),
                     qpath: unesc(c[2]),
@@ -761,7 +770,8 @@ pub fn decode(text: &str) -> Option<FileFacts> {
                     line: c[4].parse().ok()?,
                     end: c[5].parse().ok()?,
                     tokens: c[6].parse().ok()?,
-                    skeleton: unesc(c[7]),
+                    in_trait_impl: c[7] == "1",
+                    skeleton: unesc(c[8]),
                     leaves: if leaves.is_empty() {
                         Vec::new()
                     } else {
