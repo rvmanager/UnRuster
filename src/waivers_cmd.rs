@@ -60,6 +60,9 @@ pub struct WaiverOpts<'a> {
     pub undated: bool,
     /// Actually modify files. Without it, mutating actions preview and exit 0.
     pub write: bool,
+    /// Let `--remove` take the waivers that suppress only findings below
+    /// audit's thresholds. Off by default — see the guard in [`mutate`].
+    pub include_below_audit: bool,
     /// `--apply <file>`: a TSV of `file, line, check, key, scope, reason` rows
     /// to insert. `-` reads stdin. See [`parse_applications`].
     pub apply: Option<&'a str>,
@@ -76,12 +79,19 @@ pub struct WaiverOpts<'a> {
 /// sync.
 fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
     let quiet = crate::emit::Out::silent();
-    // unruster: ok(config-drift/AnalysisCtx) 2026-08-06 — the two probe contexts
-    // must disagree about `summary`. Hit counting happens in
-    // `retain_unsuppressed`, which runs whether or not rows are printed, so this
-    // one can skip the row loops; baseline recording happens *in* those loops,
-    // so `battery_at_ref` cannot. Config-drift ranks this 0.85 because the two
+    // The three probe contexts disagree about `summary` on purpose. Hit
+    // counting happens in `retain_unsuppressed`, which runs whether or not rows
+    // are printed, so this one can skip the row loops; baseline recording
+    // happens *in* those loops, so `battery_at_ref` cannot, and `self-check`'s
+    // type-query probe compares the counts the runs return, so it cannot
+    // either. `config-drift` ranks the disagreement 0.85 because the contexts
     // are otherwise identical — which is exactly why they sit one field apart.
+    //
+    // No waiver here any more: a third context made `self_check` the first
+    // site, so the row anchors there and the waiver that used to sit on this
+    // line stopped suppressing anything. `waivers --orphaned` reported it as
+    // `0 0` the first time the ledger was rebuilt from scratch. The reasoning
+    // was worth keeping; the dead ledger entry was not.
     let probe = AnalysisCtx {
         files: ctx.files,
         idx: ctx.idx,
@@ -450,11 +460,24 @@ fn mutate(
         //
         // Held back rather than silently kept, because the count in the
         // footer has to keep matching what was written.
-        if what == Mutation::Remove && w.hits() == 0 && w.below_audit() > 0 {
+        //
+        // `--include-below-audit` is the opt-in, and it exists because the
+        // guard's own advice was "remove it by hand". A reader clearing a
+        // ledger wholesale — retiring a check, re-validating every judgment
+        // from scratch — was told to go and do by hand the one thing this
+        // command is for, on eleven sites, with no flag that could express it.
+        // A safety rail nobody can lower is a rail that gets stepped around,
+        // and stepping around it means hand-editing source the tool could have
+        // edited correctly.
+        if what == Mutation::Remove
+            && !opts.include_below_audit
+            && w.hits() == 0
+            && w.below_audit() > 0
+        {
             skipped.push(format!(
                 "{}:{} — suppresses {} finding(s) below audit's thresholds, so the reason \
-                 still holds; it is only absent from the gating loop. Remove it by hand if \
-                 you want it gone",
+                 still holds; it is only absent from the gating loop. \
+                 `--include-below-audit` removes these too",
                 w.file,
                 w.comment_line,
                 w.below_audit()

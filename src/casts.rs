@@ -40,7 +40,7 @@ impl<'a> CastVisitor<'a> {
     }
 
     // unruster: ok(concepts/signature:fn) 2026-08-12 — this signature IS the
-    // `fn_visits!(around …)` handler contract, so the six methods that share it
+    // `fn_visits!(around …)` handler contract, so the eight methods that share it
     // agree on purpose. The macro is what makes them identical; consolidating
     // them further would mean consolidating the three visitors, which have
     // nothing else in common.

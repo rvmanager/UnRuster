@@ -535,6 +535,14 @@ struct WaiversArgs {
     #[arg(long)]
     write: bool,
 
+    /// Let `--remove` take the waivers it otherwise holds back: the ones whose
+    /// finding still exists but scores below audit's gating tier. Those record
+    /// a judgment that is still true, so removing them re-exposes a real site
+    /// the moment a threshold moves — which is why it takes saying so. Use it
+    /// when clearing a ledger wholesale rather than pruning dead entries.
+    #[arg(long, requires = "remove")]
+    include_below_audit: bool,
+
     /// Exit 1 if any waiver is undated or at least N days old. For CI, in the
     /// shape of `--fail-on-findings`.
     #[arg(long, value_name = "DAYS")]
@@ -2272,6 +2280,7 @@ fn dispatch(
                     legacy_only: a.legacy,
                     undated: a.undated,
                     write: a.write,
+                    include_below_audit: a.include_below_audit,
                     apply: a.apply.as_deref(),
                     fail_on_stale: a.fail_on_stale,
                     today,

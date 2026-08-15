@@ -10725,3 +10725,59 @@ fn the_battery_on_this_repo_gates_on_nothing() {
         "unruster must be clean by its own gating tier:\n{text}"
     );
 }
+
+/// `--remove` holds back the waivers whose finding still exists below audit's
+/// gating tier, and its advice was "remove it by hand". That is the one thing
+/// this command is for.
+///
+/// Found by clearing this repo's own ledger to re-validate every judgment from
+/// scratch: eleven of twenty-nine were unreachable by any flag combination. A
+/// safety rail nobody can lower is a rail that gets stepped around, and
+/// stepping around it means hand-editing source the tool could edit correctly.
+#[test]
+fn remove_can_be_told_to_take_the_below_audit_waivers_too() {
+    let dir = scratch("remove-below-audit");
+    // A `widen-int` cast: a real row, and one `audit` never gates on.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn widen(a: u8) -> u64 {\n    \
+         a as u64 // unruster: ok(casts/widen-int) 2026-01-01 — lossless by construction\n\
+         }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let run = |args: &[&str]| -> String {
+        let mut full = vec!["--root", root, "--all-stdout", "waivers"];
+        full.extend(args);
+        let out = ur().args(&full).output().unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // Held back by default, and the note names the flag rather than sending the
+    // reader off to do it by hand.
+    let text = run(&["--remove", "--today", TODAY]);
+    assert!(text.contains("0 waiver(s) would be removed"), "{text}");
+    assert!(
+        text.contains("`--include-below-audit` removes these too"),
+        "the guard must name the way past it:\n{text}"
+    );
+
+    // With the opt-in, taken — and still a dry run until `--write`.
+    let text = run(&["--remove", "--include-below-audit", "--today", TODAY]);
+    assert!(text.contains("1 waiver(s) would be removed"), "{text}");
+    assert!(
+        std::fs::read_to_string(dir.join("src/lib.rs"))
+            .unwrap()
+            .contains("unruster: ok"),
+        "the opt-in must not also imply --write"
+    );
+
+    run(&["--remove", "--include-below-audit", "--write", "--today", TODAY]);
+    let after = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    assert!(!after.contains("unruster: ok"), "the waiver survived:\n{after}");
+    assert!(after.contains("a as u64"), "the code must survive:\n{after}");
+}
