@@ -6,7 +6,7 @@
 use assert_cmd::Command;
 use predicates::str::contains;
 
-const FIXTURE: &str = "fixtures/sample";
+const FIXTURE: &str = "tests/fixtures/sample";
 
 fn ur() -> Command {
     Command::cargo_bin("unruster").unwrap()
@@ -1633,7 +1633,7 @@ fn every_name_taking_command_takes_a_qualified_name() {
     // for a copied name teaches the reader it does not work.
     //
     // Fixed once for `fields`/`field-uses`/`variants` and left there. The other
-    // six kept the defect for six more releases: an `svggen` session asked
+    // six kept the defect for six more releases: one refactoring session asked
     // `enum-coverage scene::Kind` — the enum it had just read with `show`, and
     // one carrying a `/// unruster: sealed` marker put there for this very
     // command — got "0 total variant(s)" under "not as an enum — it is: enum",
@@ -2373,8 +2373,8 @@ fn if_chain_trait_routed_else_tagged_and_hidden() {
 }
 
 #[test]
-fn if_chain_vectorian_dispatcher_two_of_seventeen() {
-    // Mirrors apply_static_handle_drag_to_doc's pre-fix shape: 2/17 coverage,
+fn if_chain_wide_dispatcher_two_of_seventeen() {
+    // Mirrors a real dispatcher's pre-fix shape: 2/17 coverage,
     // Center+Rotation covered, Start/End among the missing.
     let out = ur_stdout(&["--root", FIXTURE, "enum-coverage", "DragHandle"]);
     let row = coverage_row_for(&out, "apply_static_handle_drag");
@@ -2455,8 +2455,8 @@ fn top_caps_every_command_and_announces_it() {
         let said = String::from_utf8_lossy(&out.stdout);
         if rows == 1 && said.contains("showing") {
             assert!(
-                said.contains("raise or drop --top"),
-                "{args:?} truncated without saying so: {said}"
+                said.contains("--top 0` for the rest"),
+                "{args:?} truncated without naming the command that lists the rest: {said}"
             );
         }
     }
@@ -2491,12 +2491,12 @@ fn root_is_accepted_after_the_subcommand() {
 /// fine and died on use.
 #[test]
 fn builder_drift_positional_does_not_collide_with_global_root() {
-    ur().args(["--root", "fixtures/drift/src", "builder-drift", "Cmd::new"])
+    ur().args(["--root", "tests/fixtures/drift/src", "builder-drift", "Cmd::new"])
         .assert()
         .success()
         .stdout(contains("Cmd::new"));
     // And the same filter with the root supplied *after* the subcommand.
-    ur().args(["builder-drift", "Cmd::new", "-r", "fixtures/drift/src"])
+    ur().args(["builder-drift", "Cmd::new", "-r", "tests/fixtures/drift/src"])
         .assert()
         .success()
         .stdout(contains("Cmd::new"));
@@ -3750,7 +3750,7 @@ fn playbook_pub_surface_audit() {
 fn tests_lists_test_fns() {
     // Self-referential: against the unruster root, must find the fixture's
     // `#[test] fn it_runs` and direct test attrs.
-    ur().args(["--root", "fixtures/sample", "tests"])
+    ur().args(["--root", "tests/fixtures/sample", "tests"])
         .assert()
         .success()
         .stdout(contains("it_runs"));
@@ -3904,7 +3904,7 @@ fn a_tests_fingerprint_survives_an_edit_above_it() {
 #[test]
 fn tests_row_shape_default() {
     // Default rows: attr, file:start-end, qpath  → 3 cols.
-    let out = ur_stdout(&["--root", "fixtures/sample", "tests"]);
+    let out = ur_stdout(&["--root", "tests/fixtures/sample", "tests"]);
     assert!(!rows_of(&out).is_empty());
     assert_tsv_cols(&out, 3);
 }
@@ -3912,7 +3912,7 @@ fn tests_row_shape_default() {
 #[test]
 fn tests_row_shape_with_hint() {
     // With-hint rows: attr, file:start-end, qpath, hint  → 4 cols.
-    let out = ur_stdout(&["--root", "fixtures/sample", "tests", "--with-hint"]);
+    let out = ur_stdout(&["--root", "tests/fixtures/sample", "tests", "--with-hint"]);
     assert!(!rows_of(&out).is_empty());
     assert_tsv_cols(&out, 4);
 }
@@ -4410,7 +4410,7 @@ fn explain_matches_multi_word_topic() {
 
 /// Second fixture, kept apart from `sample` so new cases here can't shift the
 /// row counts the sample-fixture tests assert on.
-const DIV: &str = "fixtures/divergence";
+const DIV: &str = "tests/fixtures/divergence";
 
 #[test]
 fn audit_prints_each_section_header_before_its_rows() {
@@ -4854,14 +4854,14 @@ fn rewording_a_waivers_reason_does_not_stop_it_matching() {
 
 // ── waiver grammar: scope, keys, lifecycle ────────────────────────────────
 //
-// `fixtures/waivers` is separate from `fixtures/divergence` so these cases
+// `tests/fixtures/waivers` is separate from `tests/fixtures/divergence` so these cases
 // can't shift the row counts asserted above.
 
-const WV: &str = "fixtures/waivers/src";
-const SCOPE_FIXTURE: &str = "fixtures/scope/src";
-const DIVGROUP: &str = "fixtures/divgroup/src";
-const TYPO_FIXTURE: &str = "fixtures/typo/src";
-const DRIFT: &str = "fixtures/drift/src";
+const WV: &str = "tests/fixtures/waivers/src";
+const SCOPE_FIXTURE: &str = "tests/fixtures/scope/src";
+const DIVGROUP: &str = "tests/fixtures/divgroup/src";
+const TYPO_FIXTURE: &str = "tests/fixtures/typo/src";
+const DRIFT: &str = "tests/fixtures/drift/src";
 /// Pinned "today" — the system clock is the only non-deterministic input in
 /// the tool, and an unpinned age would make these assertions rot.
 const TODAY: &str = "2026-08-06";
@@ -4879,7 +4879,7 @@ fn scratch_fixture(name: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::copy(
-        "fixtures/waivers/src/lib.rs",
+        "tests/fixtures/waivers/src/lib.rs",
         dir.join("src").join("lib.rs"),
     )
     .unwrap();
@@ -5750,8 +5750,8 @@ fn the_truncation_note_survives_the_redirect_callers_actually_write() {
         .output()
         .unwrap();
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("raise or drop --top"),
-        "the cut did not survive `2>/dev/null`:\n{}",
+        String::from_utf8_lossy(&out.stdout).contains("`unruster inventory --top 0` for the rest"),
+        "the cut did not survive `2>/dev/null`, or stopped naming the command:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
     // And it stays out of the row stream a consumer parses.
@@ -5890,7 +5890,7 @@ fn conversions_class_filter_accepts_every_kind() {
 #[test]
 fn config_drift_unknown_type_reports_and_exits_2() {
     let out = ur()
-        .args(["--root", "fixtures/drift", "config-drift", "NoSuchOpts"])
+        .args(["--root", "tests/fixtures/drift", "config-drift", "NoSuchOpts"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
@@ -5900,7 +5900,7 @@ fn config_drift_unknown_type_reports_and_exits_2() {
 
 #[test]
 fn config_drift_min_score_gate_drops_everything_below_it() {
-    let out = ur_stdout(&["--root", "fixtures/drift", "config-drift", "--min-score", "9999"]);
+    let out = ur_stdout(&["--root", "tests/fixtures/drift", "config-drift", "--min-score", "9999"]);
     assert!(rows_of(&out).is_empty(), "a 9999 gate must drop every row");
 }
 
@@ -6239,8 +6239,8 @@ fn min_confidence_resolved_drops_shadowed_sites() {
 // separate collisions produced duplicate keys in one object; `json.loads`
 // keeps the last, so findings were attributed to the wrong file and line.
 
-const ARITH_FIXTURE: &str = "fixtures/arith";
-const TEST_CRATE_FIXTURE: &str = "fixtures/testcrate";
+const ARITH_FIXTURE: &str = "tests/fixtures/arith";
+const TEST_CRATE_FIXTURE: &str = "tests/fixtures/testcrate";
 
 /// The keys of one JSON row object, in order, including repeats.
 ///
@@ -6343,10 +6343,13 @@ fn conversion_pairs_names_both_of_its_sites() {
 
 #[test]
 fn a_context_column_does_not_collide_with_context_snippets() {
-    // Nine checks emit a column *called* `context` (the enclosing item) and
-    // `--context N` adds an array under the same key. Worse than the site
-    // collision: the two values are different types, so a consumer reading the
-    // column as a string got a list of source lines.
+    // Nine checks emit a column for the enclosing item and `--context N` adds
+    // an array of source lines. They used to share the key `context`, and the
+    // two values are different types, so a consumer reading the column as a
+    // string got a list of source lines. The column is `in_fn` now — the same
+    // collision one layer up, in the *name*, cost a reader's first grouping
+    // script a `KeyError` while the enclosing fn sat under a key that reads as
+    // "surrounding text".
     for cmd in ["error-swallows", "stringly", "casts", "catch-all-arms"] {
         let out = ur_stdout(&["--root", FIXTURE, "--json", "--context", "1", cmd]);
         assert_no_duplicate_keys(&out, cmd);
@@ -6356,8 +6359,12 @@ fn a_context_column_does_not_collide_with_context_snippets() {
             "{cmd}: snippets need a key of their own:\n{s}"
         );
         assert!(
-            s.contains("\"context\": \""),
+            s.contains("\"in_fn\": \""),
             "{cmd}: the enclosing-item column must survive:\n{s}"
+        );
+        assert!(
+            !s.contains("\"context\": "),
+            "{cmd}: `context` names the snippet flag and nothing else now:\n{s}"
         );
     }
 }
@@ -6584,7 +6591,7 @@ fn an_even_split_is_below_the_audit_floor() {
 
 // ── scope: test-support crates ────────────────────────────────────────────
 
-/// Every package in `fixtures/testcrate`, as `unruster inventory` sees it.
+/// Every package in `tests/fixtures/testcrate`, as `unruster inventory` sees it.
 ///
 /// The fixture is a four-member workspace built to pin all four verdicts:
 ///
@@ -7855,6 +7862,30 @@ fn self_check_probes_zero_widens_rather_than_empties() {
     );
 }
 
+/// The qualified-name class has to be watched on the type side too.
+///
+/// Six commands — `type-refs`, `takes-mut`, `enum-coverage`, `catch-all-arms`,
+/// `parallel-matches`, `divergence` — rejected module-qualified names for six
+/// releases while `self-check` reported `ok query-form-invariance 120 0 0`
+/// throughout: that invariant opens with `if d.kind != "fn"` and resolves
+/// through `QueryMatcher`, which none of the six touch.
+#[test]
+fn self_check_watches_the_type_and_enum_query_forms_too() {
+    let text = String::from_utf8(ur_stdout(&["--root", FIXTURE, "self-check"])).unwrap();
+    let row = text
+        .lines()
+        .find(|l| l.contains("type-query-form-invariance"))
+        .unwrap_or_else(|| panic!("the invariant is not registered:\n{text}"));
+    let cols: Vec<&str> = row.split('\t').collect();
+    assert_eq!(cols[0], "ok", "expected the invariant to hold: {row}");
+    let probes: usize = cols[2].parse().unwrap();
+    assert!(
+        probes > 0,
+        "a green tick over an empty probe set is the result this command exists \
+         to make impossible: {row}"
+    );
+}
+
 /// An invariant that examined nothing has not passed. `ok` over an empty probe
 /// set is the most expensive output here, because it is indistinguishable from
 /// a real result.
@@ -7946,7 +7977,7 @@ fn leads_are_reported_without_failing_the_run() {
 /// A bare name in **argument position** is how a callback is written
 /// (`.map(parse)`) and how every ordinary variable is written. The walk applied
 /// its shadow check to direct calls and to nothing else, so `fn_ref` arguments
-/// were recorded with `shadowed: false` hard-coded: `svggen`'s `out::path()`
+/// were recorded with `shadowed: false` hard-coded: one project's `out::path()`
 /// came back with 30 callers across 7 modules at `resolved`, every row a
 /// parameter, a `let` or a `match` binding, and `--candidates` ranked the fn
 /// 4th of 286 on the strength of it. No confidence tier separated the fakes
@@ -8080,7 +8111,7 @@ fn self_check_audits_the_walk_against_an_independent_binder_scan() {
 // ── `--candidates` guards the axis that matters ──────────────────────────
 
 /// The ranker skipped names with more than one definition *in this tree*,
-/// which is the wrong axis: `svggen`'s private `geom::boolean::collect` has
+/// which is the wrong axis: one project's private `geom::boolean::collect` has
 /// exactly one definition there and was ranked 7th of 286 on "475 callers
 /// across 40 modules" — every one of them an `Iterator::collect`. The evidence
 /// is in how the sites are written, and a free fn is never called `.name()`.
@@ -8398,6 +8429,75 @@ impl Render for B { fn render_frame(&self, w: &mut W) -> Res { w.b() } }
     assert!(
         !text.contains("render_frame"),
         "a trait's signature is not a duplicated decision:\n{text}"
+    );
+}
+
+/// Two cohorts identical on every scoring term except how many functions in
+/// the tree wear the signature. Only the rare one gates.
+///
+/// The `hit` cohort is three public fns over `(&Handle, u8) -> bool`, a shape
+/// nothing else uses. The `active` cohort is three public fns over
+/// `(&Panel, u8) -> bool`, a shape nine fns share. Both are three members
+/// across two modules with the shared word last, so `count`, `public`,
+/// `spread` and `positional` are equal and only rarity separates them. Before
+/// the rarity weight both scored 0.76/0.74 and both gated.
+#[test]
+fn concepts_gates_a_rare_signature_and_not_a_common_one() {
+    let (dir, cache) = scratch_cached("concepts-sig-rarity");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub struct Handle(pub u32);
+pub struct Panel(pub u32);
+pub mod rare_a {
+    use crate::Handle;
+    pub fn shape_hit(h: &Handle, x: u8) -> bool { (h.0 as u8) > x }
+    pub fn label_hit(h: &Handle, x: u8) -> bool { (h.0 as u8) >= x }
+}
+pub mod rare_b {
+    use crate::Handle;
+    pub fn guide_hit(h: &Handle, x: u8) -> bool { (h.0 as u8) == x }
+}
+pub mod common_a {
+    use crate::Panel;
+    pub fn panel_active(p: &Panel, x: u8) -> bool { (p.0 as u8) < x }
+    pub fn tool_active(p: &Panel, x: u8) -> bool { (p.0 as u8) <= x }
+    // Filler: same signature, no shared name word, so they cluster with
+    // nothing. They exist only to make the signature common. Every body here
+    // is distinct so `clones` owns none of them.
+    pub fn alpha_ready(p: &Panel, x: u8) -> bool { p.0 > x as u32 }
+    pub fn beta_visible(p: &Panel, x: u8) -> bool { p.0 >= x as u32 }
+    pub fn gamma_locked(p: &Panel, x: u8) -> bool { p.0 == x as u32 }
+}
+pub mod common_b {
+    use crate::Panel;
+    pub fn wizard_active(p: &Panel, x: u8) -> bool { (p.0 as u8) != x }
+    pub fn delta_hidden(p: &Panel, x: u8) -> bool { p.0 < x as u32 }
+    pub fn epsilon_frozen(p: &Panel, x: u8) -> bool { p.0 <= x as u32 }
+    pub fn zeta_pinned(p: &Panel, x: u8) -> bool { p.0 != x as u32 }
+}
+"#,
+    )
+    .unwrap();
+    let text = run_in(
+        &dir,
+        &cache,
+        &["concepts", "--kind", "signature", "--top", "0", "--min-score", "0"],
+    );
+    let score = |word: &str| -> f64 {
+        text.lines()
+            .find(|l| l.split('\t').nth(3) == Some(word))
+            .unwrap_or_else(|| panic!("no `{word}` cluster:\n{text}"))
+            .split('\t')
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert!(score("hit") >= 0.70, "the rare signature must gate:\n{text}");
+    assert!(
+        score("active") < 0.70,
+        "a signature nine fns share must not gate:\n{text}"
     );
 }
 
@@ -8731,7 +8831,7 @@ fn an_edited_file_is_not_answered_from_the_cache() {
 /// A cache is per `--root`, and a zero for the root you did not scan looks
 /// exactly like a cache that is not working.
 ///
-/// A real session ran every check with `-r vectorian/src` and then
+/// A real session ran every check with `-r <project>/src` and then
 /// `unruster cache` with no `-r`, read "0 cached file(s)", and wrote up the
 /// cache as empty — in the same session where `gate` reported 289 files served
 /// from it.
@@ -9039,6 +9139,58 @@ fn validation_drift_finds_the_sibling_that_checks_nothing() {
     );
 }
 
+/// Past `CONVENTION_SIZE` a shared word is a naming convention, not a shared
+/// contract, and must not hold the gate open.
+///
+/// `edit::*parse*` (9 members) and `Document::*transform*` (10) produced 20
+/// gating findings across two sessions and zero defects. Both cohorts here
+/// have one unchecked sibling among careful ones; only the small one gates.
+#[test]
+fn validation_drift_demotes_a_cohort_large_enough_to_be_a_convention() {
+    let (dir, cache) = scratch_cached("valid-convention");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct P;\n\
+         impl P {\n\
+           pub fn parse_head(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(1) }\n\
+           pub fn parse_body(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(2) }\n\
+           pub fn parse_tail(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(3) }\n\
+           pub fn parse_addr(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(4) }\n\
+           pub fn parse_span(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(5) }\n\
+           pub fn parse_pair(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(6) }\n\
+           pub fn parse_trailer(s: &str) -> Result<u8, E> { Ok(7) }\n\
+         }\n\
+         pub struct Q;\n\
+         impl Q {\n\
+           pub fn decode_head(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(1) }\n\
+           pub fn decode_body(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(2) }\n\
+           pub fn decode_tail(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(3) }\n\
+           pub fn decode_addr(s: &str) -> Result<u8, E> { if s.is_empty() { return Err(E); } Ok(4) }\n\
+           pub fn decode_trailer(s: &str) -> Result<u8, E> { Ok(5) }\n\
+         }\n",
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["validation-drift", "--min-score", "0"]);
+    let score = |needle: &str| -> f64 {
+        text.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no row for {needle}:\n{text}"))
+            .split('\t')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert!(
+        score("decode_trailer") >= 0.70,
+        "a five-member cohort is a contract:\n{text}"
+    );
+    assert!(
+        score("parse_trailer") < 0.70,
+        "a seven-member cohort is a naming convention:\n{text}"
+    );
+}
+
 /// A scope where nobody validates is a design, not a divergence.
 #[test]
 fn validation_drift_is_silent_when_no_sibling_validates() {
@@ -9122,7 +9274,7 @@ fn the_unsupported_note_lists_every_waivable_check() {
 
 // ── module-uses, at, and the navigation additions ─────────────────────────
 //
-// Every test below covers a hole an `svggen` refactoring session fell into
+// Every test below covers a hole one refactoring session fell into
 // while unruster was on its PATH. The session's own workarounds are quoted at
 // the command that now answers the question.
 
@@ -9547,4 +9699,1029 @@ pub fn go() -> u32 { crate::a::helpers::one() + crate::b::helpers::two() }
     )
     .to_string();
     assert!(one.contains("outside `a::helpers`"), "{one}");
+}
+
+// ── the two defects a full sweep of a 4,867-item codebase surfaced ─────────
+
+#[test]
+fn a_suggested_waiver_never_outlives_the_row_it_describes() {
+    // A hint carries no location — it is a remark about the row above it. With
+    // `--top` capping rows but not hints, `panics --top 3 --suggest-waivers`
+    // printed three rows and thirty waiver comments, and `stringly --top 2`
+    // printed two rows and two hundred. In JSON it was worse than noise:
+    // `hint` appends to `rows.last_mut()`, so every dropped row's suggestion
+    // piled onto the last surviving one — a `casts` row of class `other`
+    // carrying `ok(casts/unknown)` and `ok(casts/usize-cross)`, keys that
+    // waive nothing if pasted.
+    let hints = |args: &[&str]| -> usize {
+        let mut full = vec!["--root", FIXTURE];
+        full.extend(args);
+        String::from_utf8_lossy(&ur_stdout_allow_findings(&full))
+            .lines()
+            .filter(|l| l.contains("unruster: ok("))
+            .count()
+    };
+    let rows = |args: &[&str]| -> usize {
+        let mut full = vec!["--root", FIXTURE];
+        full.extend(args);
+        rows_of(&ur_stdout_allow_findings(&full))
+            .iter()
+            .filter(|l| !l.starts_with("(note:") && !l.contains("unruster: ok("))
+            .count()
+    };
+    // Uncapped: every row still earns its suggestion.
+    let all = rows(&["casts", "--top", "0"]);
+    assert!(all > 3, "fixture too small to test a cap: {all}");
+    assert_eq!(
+        hints(&["casts", "--top", "0", "--suggest-waivers"]),
+        all,
+        "an uncapped run must suggest for every row"
+    );
+    // Capped: exactly as many suggestions as rows that survived.
+    assert_eq!(
+        hints(&["casts", "--top", "2", "--suggest-waivers"]),
+        2,
+        "hints outlived the rows they describe"
+    );
+
+    // And in JSON each surviving row carries its own single hint, keyed to its
+    // own class rather than to a site the cap dropped.
+    let out = ur_stdout_allow_findings(&[
+        "--root", FIXTURE, "casts", "--top", "2", "--suggest-waivers", "--json",
+    ]);
+    let s = String::from_utf8_lossy(&out);
+    for row in s.split("{\"class\"").skip(1) {
+        let n = row.matches("unruster: ok(").count();
+        assert!(n <= 1, "a row absorbed {n} hints:\n{row}");
+    }
+}
+
+/// A ledger with one waiver of each orphan kind: one whose finding is gone, and
+/// one whose finding merely scores under the audit gate.
+fn orphan_fixture(name: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    let mut src = std::fs::read_to_string("tests/fixtures/divergence/src/lib.rs").unwrap();
+    // Break the shared name word so the pair drops from `name+scope` (0.50,
+    // above the 0.45 gate) to `scope` alone (0.30, below it).
+    src = src.replace("handle_anchor_delete_anim", "purge_timeline_entry");
+    let mut lines: Vec<String> = src.lines().map(str::to_string).collect();
+    let anchor = lines
+        .iter()
+        .position(|l| l.contains("fn purge_timeline_entry"))
+        .expect("fixture shape changed");
+    lines.insert(
+        anchor,
+        "// unruster: ok(divergence/Anchor::MiddleKnot) 2026-08-01 — the timeline \
+         never carries a middle knot."
+            .to_string(),
+    );
+    lines.insert(
+        0,
+        "// unruster: ok(dead-code/gone_helper) 2026-08-01 — the fn it named was deleted."
+            .to_string(),
+    );
+    std::fs::write(dir.join("src/lib.rs"), lines.join("\n")).unwrap();
+    dir
+}
+
+#[test]
+fn remove_leaves_a_waiver_that_still_suppresses_something() {
+    // `--orphaned` selects on the *audit* hit count, which is the right
+    // question for a listing and the wrong one for a deletion. A waiver with no
+    // audit hits but a live `below_audit` count is suppressing a real finding
+    // that scores under the gate; its comment is still true, and deleting it
+    // re-exposes the site the moment a threshold moves.
+    //
+    // A sweep of a 4,867-item codebase hit exactly this: `--orphaned --remove`
+    // offered to strip a dated `divergence/NodeContent::Clip` waiver whose
+    // finding scores 0.40 against the 0.45 gate, and only a manual
+    // `--no-suppress` cross-check caught it. The summary one line above already
+    // distinguished the two cases; `--remove` did not.
+    let dir = orphan_fixture("waiver-orphan-kinds");
+    let root = dir.to_str().unwrap();
+
+    // The ledger sees both kinds, and says so.
+    let ledger = String::from_utf8_lossy(
+        &ur().args(["--root", root, "waivers"]).output().unwrap().stderr,
+    )
+    .to_string();
+    assert!(
+        ledger.contains("(1 suppress nothing at all, 1 only below audit thresholds)"),
+        "fixture did not produce one of each kind:\n{ledger}"
+    );
+
+    // The removal preview touches only the dead one.
+    let out = ur().args(["--root", root, "waivers", "--orphaned", "--remove"]).output().unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        all.contains("gone_helper"),
+        "the dead waiver was not offered for removal:\n{all}"
+    );
+    assert!(
+        !all.lines().any(|l| l.starts_with('-') && l.contains("Anchor::MiddleKnot")),
+        "a waiver that still suppresses a finding was queued for deletion:\n{all}"
+    );
+    assert!(
+        all.contains("1 waiver(s) would be removed"),
+        "expected exactly one removal:\n{all}"
+    );
+    assert!(
+        all.contains("still suppressing"),
+        "the held-back waiver was not explained:\n{all}"
+    );
+
+    // And the listing's advice matches what `--remove` will actually do.
+    assert!(
+        ledger.contains("`--remove` will not touch them"),
+        "the note still recommends removing them:\n{ledger}"
+    );
+}
+
+// ─── setup traps: a wrong answer that reads as a clean one ─────────────────
+//
+// The doctrine at `src/main.rs`'s empty-scan branch: a scan that saw nothing is
+// a setup error, and reporting it as a clean run is the worst possible answer
+// because `until unruster audit; do fix; done` terminates immediately and a CI
+// gate passes vacuously. These cover the two places it had not been applied.
+
+/// A scratch *crate*: `Cargo.toml` at the root, one source file, and an empty
+/// sibling directory to run from.
+fn scratch_crate(name: &str, sub: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"walkup-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn only_item() -> u8 { 7 }\n").unwrap();
+    std::fs::create_dir_all(dir.join(sub)).unwrap();
+    dir
+}
+
+/// A cwd that drifted into a directory with no `.rs` in it is the same question
+/// about the crate that directory sits in. Reproduces today from `impl_logs/`
+/// inside this repo, and it killed a *batched* invocation twice in one session.
+#[test]
+fn a_directory_with_no_rs_files_scans_the_crate_above_it() {
+    let dir = scratch_crate("walkup-found", "impl_logs");
+    let out = ur()
+        .current_dir(dir.join("impl_logs"))
+        .args(["inventory"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "expected exit 0, got {:?}:\n{all}", out.status);
+    assert!(
+        all.contains("nearest Cargo.toml"),
+        "the chosen root must announce itself:\n{all}"
+    );
+    assert!(all.contains("only_item"), "the crate was not scanned:\n{all}");
+}
+
+/// An explicit `--root` that finds nothing stays an error — the user named a
+/// place and it was wrong, and guessing a different one answers a question
+/// nobody asked.
+#[test]
+fn an_explicit_root_with_no_rs_files_is_still_a_setup_error() {
+    let dir = scratch_crate("walkup-explicit", "impl_logs");
+    let out = ur()
+        .current_dir(&dir)
+        .args(["--root", "impl_logs", "inventory"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "expected exit 2:\n{all}");
+    assert!(
+        all.contains("no .rs files found"),
+        "expected the setup error:\n{all}"
+    );
+    assert!(
+        !all.contains("nearest Cargo.toml"),
+        "a named root must not be second-guessed:\n{all}"
+    );
+}
+
+/// An empty `--changed-since` scope is not a clean tree.
+///
+/// On a committed tree with real gating findings,
+/// `audit --changed-since HEAD --findings-only` reports "0 gating + 0 advisory
+/// … clean … exit 0". The agent that saw it wrote "It's odd that the second run
+/// reports zero" and spent two further commands establishing that nothing had
+/// changed.
+#[test]
+fn an_empty_changed_since_scope_says_so_rather_than_reading_as_clean() {
+    let dir = scratch("changed-empty");
+    // A tree with a finding, fully committed, so `HEAD` has an empty diff.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn drop_it(p: &std::path::Path) {\n    \
+         let _ = std::fs::remove_file(p);\n}\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    let root = dir.to_str().unwrap();
+
+    let clean = ur()
+        .args(["--root", root, "--all-stdout", "--changed-since", "HEAD", "audit"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&clean.stdout).to_string();
+    assert!(
+        text.contains("empty scope, not a clean result"),
+        "an empty diff must not read as a clean run:\n{text}"
+    );
+
+    // A tree with real changes gets no note, and the findings are reported as
+    // they always were.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn drop_it(p: &std::path::Path) {\n    \
+         let _ = std::fs::remove_file(p);\n}\npub const EDIT: u8 = 1;\n",
+    )
+    .unwrap();
+    let dirty = ur()
+        .args(["--root", root, "--all-stdout", "--changed-since", "HEAD", "audit"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&dirty.stdout).to_string();
+    assert!(
+        !text.contains("empty scope"),
+        "a scope with files in it is not empty:\n{text}"
+    );
+}
+
+/// The summary counts undated waivers; `--undated` lists them.
+///
+/// Without it a reader re-implemented the tool's own grammar as
+/// `grep -rn "unruster: ok(" src/ | grep -vE "ok\([^)]*\) [0-9]{4}-…"`, or used
+/// `--stale 9999` as an obscure workaround.
+#[test]
+fn waivers_undated_lists_exactly_what_the_summary_counts() {
+    let root = "tests/fixtures/waivers";
+    let listing = String::from_utf8(ur_stdout(&[
+        "--root", root, "waivers", "--undated", "--today", TODAY,
+    ]))
+    .unwrap();
+    let rows: Vec<&str> = listing.lines().filter(|l| l.contains('\t')).collect();
+    assert!(!rows.is_empty(), "expected the undated waiver:\n{listing}");
+    for r in &rows {
+        assert!(
+            r.starts_with("—\t"),
+            "every row must be undated (age `—`): {r}"
+        );
+    }
+    // The count the summary has always reported.
+    let all = String::from_utf8(ur_stdout(&[
+        "--root", root, "--all-stdout", "waivers", "--today", TODAY,
+    ]))
+    .unwrap();
+    let n = all
+        .lines()
+        .find_map(|l| {
+            l.split("; ")
+                .find(|p| p.ends_with(" undated"))
+                .and_then(|p| p.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .unwrap_or_else(|| panic!("no undated count in the summary:\n{all}"));
+    assert_eq!(rows.len(), n, "listing and summary disagree:\n{listing}");
+}
+
+/// `near-clones`' recommended fix trades duplication for parameter count, and
+/// `audit`'s `metrics` section gated on `cyclo` alone — so the cost of the fix
+/// was invisible in the loop that recommended it. Merging two 7-argument
+/// drawing helpers produced an 8-argument one and tripped clippy's
+/// `too_many_arguments`, which nothing in the battery could have predicted.
+#[test]
+fn audit_shows_the_parameter_count_a_near_clone_merge_would_buy() {
+    let dir = scratch("audit-params");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn draw_two_point_symbol(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8) \
+         -> u8 { a + b + c + d + e + f + g + h }\n\
+         pub fn small(a: u8, b: u8) -> u8 { a + b }\n",
+    )
+    .unwrap();
+    let out = ur()
+        .args([
+            "--root",
+            dir.to_str().unwrap(),
+            "--all-stdout",
+            "audit",
+            "--findings-only",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains("params >= 7"),
+        "expected the params section:\n{text}"
+    );
+    let section: Vec<&str> = text
+        .lines()
+        .skip_while(|l| !l.contains("params >= 7"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("##"))
+        .collect();
+    assert!(
+        section.iter().any(|l| l.contains("draw_two_point_symbol")),
+        "the merged fn is the row:\n{text}"
+    );
+    assert!(
+        !section.iter().any(|l| l.contains("\tsmall\t")),
+        "a 2-arg fn is not a finding:\n{text}"
+    );
+    // Advisory: it is the cost side of a trade the reader is making on purpose,
+    // not a defect. Run alone, it must not hold the loop open.
+    let alone = ur()
+        .args([
+            "--root",
+            dir.to_str().unwrap(),
+            "--all-stdout",
+            "audit",
+            "--only",
+            "metrics-params",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        alone.status.code(),
+        Some(0),
+        "the section must not gate:\n{}",
+        String::from_utf8_lossy(&alone.stdout)
+    );
+}
+
+/// `hits` is documented as "findings suppressed that the audit battery would
+/// have gated on", and it did not mean that.
+///
+/// Hit counting happens in `retain_unsuppressed`, which every check runs
+/// *before* its own class filter and score gate — so a row the gating battery
+/// produced and then discarded still counted as a hit, and a waiver that was
+/// holding nothing open reported as load-bearing.
+#[test]
+fn a_waiver_below_the_audit_tier_is_counted_below_it() {
+    let dir = scratch("waiver-tier");
+    // `widen-int` is a cast class `audit` does not ask for, so the row exists
+    // in the permissive pass and nowhere in the gating one.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn widen(a: u8) -> u64 {\n    \
+         a as u64 // unruster: ok(casts/widen-int) 2026-01-01 — lossless by construction\n\
+         }\n",
+    )
+    .unwrap();
+    let text = String::from_utf8(ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "--all-stdout",
+        "waivers",
+        "--today",
+        TODAY,
+    ]))
+    .unwrap();
+    let row = text
+        .lines()
+        .find(|l| l.contains("widen-int"))
+        .unwrap_or_else(|| panic!("expected the waiver:\n{text}"));
+    let cols: Vec<&str> = row.split('\t').collect();
+    // …	suppresses	below_audit	…
+    assert_eq!(cols[5], "0", "a widen cast never reaches audit's tier: {row}");
+    assert_eq!(cols[6], "1", "but it is a real row below it: {row}");
+    assert!(
+        text.contains("below audit"),
+        "the ledger must say which kind of dead weight this is:\n{text}"
+    );
+}
+
+/// A macro body you just added is a blind spot you just created, and the
+/// tree-wide count does not say so. A session went 45 → 49 unwarned while its
+/// own dedup edits introduced four.
+#[test]
+fn a_new_macro_body_in_the_diff_reports_as_a_new_blind_spot() {
+    let dir = scratch("blindspot-delta");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn plain() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    let root = dir.to_str().unwrap();
+
+    let run = || -> String {
+        let out = ur()
+            .args(["--root", root, "--all-stdout", "--changed-since", "HEAD", "inventory"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // A change that adds no macro: no delta clause.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn plain() -> u8 { 1 }\npub fn also() -> u8 { 2 }\n",
+    )
+    .unwrap();
+    let text = run();
+    assert!(
+        !text.contains("new in the changed files"),
+        "no macro was added:\n{text}"
+    );
+
+    // Now one that does.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "macro_rules! opaque { ($($t:tt)*) => { $($t)* }; }\n\
+         pub fn plain() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    let text = run();
+    assert!(
+        text.contains("1 of the tree's blind spots are new in the changed files"),
+        "the blind spot this diff created went unreported:\n{text}"
+    );
+
+    // …and a blind spot that was *already there* is not new, however much else
+    // in the file changed. The first cut rebuilt the snapshot's path into the
+    // working tree's spelling, which does not survive `--root .`, so the
+    // "before" count was always zero and every pre-existing macro in a touched
+    // file read as freshly created. Running this tool on its own source is what
+    // surfaced it, reporting two of its own `macro_rules!` as "0 there before".
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "macro"]);
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "macro_rules! opaque { ($($t:tt)*) => { $($t)* }; }\n\
+         pub fn plain() -> u8 { 1 }\n\
+         pub fn added_later() -> u8 { 2 }\n",
+    )
+    .unwrap();
+    let text = run();
+    assert!(
+        !text.contains("new in the changed files"),
+        "an existing macro in a changed file is not a new blind spot:\n{text}"
+    );
+}
+
+/// The same check with an absolute `--root`, which is the spelling the note's
+/// first cut happened to work under. Both have to agree.
+#[test]
+fn the_blind_spot_delta_is_the_same_from_inside_the_tree() {
+    let dir = scratch("blindspot-cwd");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "macro_rules! opaque { ($($t:tt)*) => { $($t)* }; }\npub fn plain() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "macro_rules! opaque { ($($t:tt)*) => { $($t)* }; }\n\
+         pub fn plain() -> u8 { 1 }\n\
+         pub fn added_later() -> u8 { 2 }\n",
+    )
+    .unwrap();
+    // `--root .` from inside the tree: the spelling that broke the mapping.
+    let out = ur()
+        .current_dir(&dir)
+        .args(["--all-stdout", "--changed-since", "HEAD", "inventory"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !text.contains("new in the changed files"),
+        "`--root .` must not invent a blind spot the tree already had:\n{text}"
+    );
+}
+
+/// `callers` answers "who calls this"; a rename has to touch more than that.
+/// A session handed 14 correct call sites went straight to
+/// `grep -rn "<names>" src/ | grep -v "^src/<defining file>"` for the `use`
+/// lines, which `callers` never reported.
+#[test]
+fn callers_with_imports_lists_the_use_lines_a_rename_must_touch() {
+    let dir = scratch("callers-imports");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod helper { pub fn or_identity_logged(x: u8) -> u8 { x } }\n\
+         pub mod a {\n  \
+           use crate::helper::or_identity_logged;\n  \
+           pub fn one() -> u8 { or_identity_logged(1) }\n  \
+           pub fn two() -> u8 { or_identity_logged(2) }\n\
+         }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    // Default shape is untouched: four columns, call sites only.
+    let plain = ur_stdout(&["--root", root, "callers", "or_identity_logged"]);
+    assert_tsv_cols(&plain, 4);
+    let plain_text = String::from_utf8(plain).unwrap();
+    assert!(!plain_text.contains("\tuse"), "no import rows by default:\n{plain_text}");
+
+    // …but it says the import sites exist, so nobody has to reach for grep.
+    let noted = String::from_utf8(ur_stdout(&[
+        "--root", root, "--all-stdout", "callers", "or_identity_logged",
+    ]))
+    .unwrap();
+    assert!(
+        noted.contains("--with-imports"),
+        "the import sites went unmentioned:\n{noted}"
+    );
+
+    let with = ur_stdout(&["--root", root, "callers", "or_identity_logged", "--with-imports"]);
+    assert_tsv_cols(&with, 5);
+    let text = String::from_utf8(with).unwrap();
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains('\t')).collect();
+    assert_eq!(rows.len(), 3, "two calls and one import:\n{text}");
+    assert_eq!(
+        rows.iter().filter(|r| r.ends_with("\tuse")).count(),
+        1,
+        "exactly one `use` row:\n{text}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("crate::helper::or_identity_logged")),
+        "the import row names the path as written:\n{text}"
+    );
+}
+
+/// Deleting a dead `pub fn` exposes the private helpers only it called.
+///
+/// rustc's own `dead_code` lint reports zero for a dead `pub fn` in a lib crate
+/// — it cannot, since `pub` is API surface — so the first round of the cascade
+/// is only visible here, and the rest of it cost four build-delete-rebuild
+/// cycles to find by hand.
+#[test]
+fn dead_code_transitive_reports_the_orphans_a_deletion_would_expose() {
+    let dir = scratch("dead-transitive");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn a() -> u8 { b() }\nfn b() -> u8 { c() }\nfn c() -> u8 { 3 }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    // Default: only `a`, and the column shape is untouched.
+    let plain = ur_stdout(&["--root", root, "dead-code"]);
+    assert_tsv_cols(&plain, 4);
+    let plain_text = String::from_utf8(plain).unwrap();
+    assert_eq!(
+        plain_text.lines().filter(|l| l.contains('\t')).count(),
+        1,
+        "only `a` is dead as the tree stands:\n{plain_text}"
+    );
+
+    let out = ur_stdout(&["--root", root, "dead-code", "--transitive"]);
+    assert_tsv_cols(&out, 5);
+    let text = String::from_utf8(out).unwrap();
+    let via = |name: &str| -> String {
+        text.lines()
+            .find(|l| l.split('\t').nth(2) == Some(name))
+            .unwrap_or_else(|| panic!("no row for {name}:\n{text}"))
+            .split('\t')
+            .nth(4)
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(via("a"), "direct");
+    assert_eq!(via("b"), "transitive after a", "and it says what has to go first");
+    assert_eq!(via("c"), "transitive after b");
+}
+
+// ─── routing: naming the better command at the point of need ───────────────
+//
+// Zero pull-through on all five 0.1.82 additions across 5,997 lines of one
+// session — `at`, `module-uses`, `metrics --by`, `tests --mentions`,
+// `show <Variant>`, none used once. Meanwhile: 14 `sed -n 'N,Mp'` range reads,
+// 7 `grep -n` against `src/`, and one grep that was `module-uses`' exact idiom
+// down to the `grep -v` excluding the defining file. They are all in `--help`,
+// which was read at line 20. Nothing pointed at them when the question arose.
+
+/// Each note fires only in its intended condition — a note on every invocation
+/// is noise of its own.
+#[test]
+fn navigation_notes_fire_only_where_the_question_arises() {
+    let dir = scratch("routes");
+    // `shared` is called from four other modules and from nowhere in its own;
+    // `local` is called once, from its own module.
+    let mut src = String::from(
+        "pub mod core {\n  \
+           pub fn shared() -> u8 { 1 }\n  \
+           pub fn local() -> u8 { 2 }\n  \
+           pub fn user() -> u8 { local() }\n\
+         }\n",
+    );
+    for m in ["a", "b", "c", "d"] {
+        src.push_str(&format!(
+            "pub mod {m} {{ pub fn f() -> u8 {{ crate::core::shared() }} }}\n"
+        ));
+    }
+    std::fs::write(dir.join("src/lib.rs"), &src).unwrap();
+    let root = dir.to_str().unwrap();
+    let run = |args: &[&str]| -> String {
+        let mut full = vec!["--root", root, "--all-stdout"];
+        full.extend(args);
+        let out = ur().args(&full).output().unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // callers → module-uses, only when the fn is its module's outward surface.
+    assert!(
+        run(&["callers", "shared"]).contains("module-uses core"),
+        "a fn called only from four other modules is a boundary question"
+    );
+    assert!(
+        !run(&["callers", "local"]).contains("module-uses"),
+        "a helper with one in-module caller is not"
+    );
+
+    // outline → at, only for a file long enough to be navigated.
+    assert!(
+        !run(&["outline", "src/lib.rs"]).contains("reverse lookup"),
+        "a nine-item file is read whole, not navigated"
+    );
+
+    // metrics → --by, only once the per-fn ranking is long.
+    assert!(
+        !run(&["metrics"]).contains("--by file"),
+        "a nine-fn ranking does not need grouping"
+    );
+
+    // dead-code → tests --mentions, only when there is something to delete.
+    assert!(
+        run(&["dead-code"]).contains("tests --mentions"),
+        "the moment before a deletion is when the blast radius matters"
+    );
+    assert!(
+        !run(&["dead-code", "--vis", "priv"]).contains("tests --mentions"),
+        "no rows, nothing to warn about"
+    );
+}
+
+/// The two size-gated routes, on inputs big enough to trip them.
+#[test]
+fn the_size_gated_navigation_notes_fire_when_the_list_is_long() {
+    let dir = scratch("routes-big");
+    let mut src = String::new();
+    for i in 0..25 {
+        src.push_str(&format!("pub fn f{i}() -> u8 {{ {i} }}\n"));
+    }
+    std::fs::write(dir.join("src/lib.rs"), &src).unwrap();
+    let root = dir.to_str().unwrap();
+    let run = |args: &[&str]| -> String {
+        let mut full = vec!["--root", root, "--all-stdout"];
+        full.extend(args);
+        String::from_utf8_lossy(&ur().args(&full).output().unwrap().stdout).into_owned()
+    };
+    assert!(
+        run(&["outline", "src/lib.rs"]).contains("reverse lookup"),
+        "a 25-item file is one a reader navigates"
+    );
+    let m = run(&["metrics"]);
+    assert!(m.contains("--by file"), "25 ranked fns is where `--by` helps:\n{m}");
+    // …and asking for the grouped view is not then told it exists.
+    assert!(
+        !run(&["metrics", "--by", "file"]).contains("--by file` or"),
+        "a caller who already grouped is not nagged"
+    );
+}
+
+/// `audit --findings-only` is sold as a digest of what gates. A row cap that
+/// can hide a gating row breaks that silently — and every session's first
+/// `audit` was piped to `head` and cut, one of them costing three recovery
+/// commands.
+#[test]
+fn the_audit_row_cap_never_hides_a_gating_row() {
+    let dir = scratch("audit-digest");
+    // Six `let _ = remove_file(..)` sites: an external mutation dropped on the
+    // floor, which is the top of `error-swallows`' gating tier.
+    let mut src = String::new();
+    for i in 0..6 {
+        src.push_str(&format!(
+            "pub fn gone{i}(p: &std::path::Path) {{ let _ = std::fs::remove_file(p); }}\n"
+        ));
+    }
+    // …and some advisory noise for the cap to actually bite on.
+    for i in 0..6 {
+        src.push_str(&format!(
+            "pub fn quiet{i}(s: &str) -> u8 {{ s.parse::<u8>().unwrap_or_default() }}\n"
+        ));
+    }
+    std::fs::write(dir.join("src/lib.rs"), &src).unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur()
+        .args([
+            "--root", root, "--all-stdout", "audit", "--findings-only", "--only",
+            "error-swallows", "--top", "2",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let gating = text
+        .lines()
+        .filter(|l| l.contains('\t'))
+        .filter(|l| {
+            l.split('\t')
+                .nth(1)
+                .and_then(|s| s.parse::<f64>().ok())
+                .is_some_and(|s| s >= 0.55)
+        })
+        .count();
+    assert_eq!(
+        gating, 6,
+        "every gating row survives `--top 2`:\n{text}"
+    );
+    assert!(
+        text.contains("the cap never hides one"),
+        "and the note says the cap did not apply to them:\n{text}"
+    );
+    assert!(
+        text.contains("`unruster error-swallows --top 0` for the rest"),
+        "the pointer names the check, not the battery:\n{text}"
+    );
+}
+
+/// The shape of the report, said before the report. Same mechanism that fixed
+/// `show`: a note placed after the body is cut by the very pipe it warns about.
+#[test]
+fn audit_says_how_it_is_bounded_before_the_first_section() {
+    let out = ur()
+        .args(["--root", FIXTURE, "--all-stdout", "audit", "--findings-only"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let first_section = text
+        .lines()
+        .position(|l| l.starts_with("##"))
+        .unwrap_or(usize::MAX);
+    let budget_note = text
+        .lines()
+        .position(|l| l.contains("complete about what holds the exit code open"))
+        .unwrap_or_else(|| panic!("no budget note:\n{text}"));
+    assert!(
+        budget_note < first_section,
+        "the note must survive `head`:\n{text}"
+    );
+}
+
+/// The single largest time sink in one 6,000-line session: 95 sites → JSON
+/// dump → grouping script → hand-built rationale taxonomy → patch script, a
+/// pipeline written four separate times because `--suggest-waivers` output
+/// carried no location.
+#[test]
+fn waivers_apply_writes_a_batch_of_verified_judgments() {
+    let dir = scratch("waivers-apply");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn a(v: &Vec<u8>) -> u8 {\n    u8::try_from(v.len()).unwrap()\n}\n\
+         pub fn b(s: &str) -> u8 {\n    s.parse::<u8>().unwrap()\n}\n",
+    )
+    .unwrap();
+    let batch = dir.join("batch.tsv");
+    std::fs::write(
+        &batch,
+        "file\tline\tcheck\tkey\tscope\treason\n\
+         src/lib.rs\t2\tpanics\t.unwrap\tsite\tin-process length, cannot fail\n\
+         src/lib.rs\t4\tpanics\t.unwrap\titem\tthe caller validated s already\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let run = |args: &[&str]| -> (String, Option<i32>) {
+        let mut full = vec!["--root", root, "--all-stdout", "waivers"];
+        full.extend(args);
+        let out = ur().args(&full).current_dir(&dir).output().unwrap();
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.code(),
+        )
+    };
+
+    // Dry run by default: it previews and changes nothing.
+    let before = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    let (text, code) = run(&["--apply", "batch.tsv", "--today", TODAY]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("dry run"), "{text}");
+    assert!(text.contains("2 waiver(s) would be applied"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+        before,
+        "a dry run wrote to source"
+    );
+
+    // …and `--write` does exactly what it previewed.
+    let (text, code) = run(&["--apply", "batch.tsv", "--write", "--today", TODAY]);
+    assert_eq!(code, Some(0), "{text}");
+    let after = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    assert!(
+        after.contains(
+            "u8::try_from(v.len()).unwrap() // unruster: ok(panics/.unwrap) 2026-08-06 — \
+             in-process length, cannot fail"
+        ),
+        "site scope trails its own line:\n{after}"
+    );
+    assert!(
+        after.contains(
+            "// unruster: ok(panics/.unwrap) 2026-08-06 — the caller validated s already\n\
+             pub fn b"
+        ),
+        "item scope sits above the declaration:\n{after}"
+    );
+
+    // The ledger now holds them, dated.
+    let (ledger, _) = run(&["--today", TODAY]);
+    assert!(ledger.contains("0 undated"), "both carry today's date:\n{ledger}");
+    assert!(ledger.contains("2 of 2 waiver(s) shown"), "{ledger}");
+}
+
+/// It writes to a user's source, so it refuses rather than guesses. Every one
+/// of these is a placement the tool could have invented and must not.
+#[test]
+fn waivers_apply_refuses_every_row_it_cannot_place() {
+    let dir = scratch("waivers-apply-refuse");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn a(v: &Vec<u8>) -> u8 {\n    u8::try_from(v.len()).unwrap()\n}\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let try_row = |row: &str| -> String {
+        let batch = dir.join("bad.tsv");
+        std::fs::write(&batch, row).unwrap();
+        let out = ur()
+            .args([
+                "--root", root, "--all-stdout", "waivers", "--apply", "bad.tsv", "--today", TODAY,
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_ne!(out.status.code(), Some(0), "a refused row must not exit 0");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    assert!(
+        try_row("src/lib.rs\t2\tpanics\t.unwrap\titem\tnope\n").contains("no item is declared"),
+        "item scope above a statement is not item scope"
+    );
+    assert!(
+        try_row("src/lib.rs\t2\tpanics\t.unwrap\t\tnope\n").contains("scope must be"),
+        "there is no default scope"
+    );
+    assert!(
+        try_row("src/lib.rs\t2\tpanics\t.unwrap\tsite\t\n").contains("empty reason"),
+        "a waiver without a reason is a silenced finding"
+    );
+    assert!(
+        try_row("src/lib.rs\t2\tno-such-check\t.unwrap\tsite\tnope\n")
+            .contains("is not a check this tool has"),
+        "a check name that waives nothing must not be written"
+    );
+    assert!(
+        try_row("src/lib.rs\t99\tpanics\t.unwrap\tsite\tnope\n").contains("past the end"),
+        "a line that does not exist"
+    );
+    // Nothing was written by any of them.
+    assert!(
+        !std::fs::read_to_string(dir.join("src/lib.rs"))
+            .unwrap()
+            .contains("unruster:"),
+        "a refused batch still wrote to source"
+    );
+}
+
+/// `--suggest-waivers --json` carries the location and the key as fields, so
+/// the batch file is a `jq` away rather than a script.
+#[test]
+fn suggest_waivers_json_carries_what_apply_needs() {
+    let dir = scratch("suggest-json");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn b(s: &str) -> u8 {\n    s.parse::<u8>().unwrap()\n}\n",
+    )
+    .unwrap();
+    let text = String::from_utf8(ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "--json",
+        "--suggest-waivers",
+        "panics",
+    ]))
+    .unwrap();
+    assert!(text.contains("\"waiver_check\": \"panics\""), "{text}");
+    assert!(text.contains("\"waiver_key\": \".unwrap\""), "{text}");
+    assert!(text.contains("\"line\": 2"), "beside the location:\n{text}");
+}
+
+/// "Under a `tests/` directory" is a claim about the tree you asked about, not
+/// about the path that leads to it.
+///
+/// The rule walked the whole path, so `--root a/tests/fixtures/sample`
+/// classified every file under it as test code and the run died with "no .rs
+/// files found" — the tool refusing to answer a question whose subject the
+/// caller had named explicitly. It is why this repo's own fixtures could not
+/// live under `tests/` until now.
+#[test]
+fn the_test_dir_rule_is_relative_to_the_scan_root() {
+    let dir = scratch("scope-relative");
+    std::fs::create_dir_all(dir.join("tests/fixtures/demo/src")).unwrap();
+    std::fs::write(
+        dir.join("tests/fixtures/demo/Cargo.toml"),
+        "[package]\nname = \"demo-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tests/fixtures/demo/src/lib.rs"),
+        "pub fn only_item() -> u8 { 7 }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn shipped() -> u8 { 1 }\n").unwrap();
+
+    // Rooted at the fixture: its own `src/` is production, because nothing
+    // below that root is under a `tests/` directory.
+    let inner = dir.join("tests/fixtures/demo");
+    let text = String::from_utf8(ur_stdout(&["--root", inner.to_str().unwrap(), "inventory"]))
+        .unwrap();
+    assert!(
+        text.contains("only_item"),
+        "an explicitly named root must be scanned:\n{text}"
+    );
+
+    // Rooted above it: the same files are test code again, and the production
+    // scan sees only the crate's own source.
+    let text =
+        String::from_utf8(ur_stdout(&["--root", dir.to_str().unwrap(), "inventory"])).unwrap();
+    assert!(text.contains("shipped"), "{text}");
+    assert!(
+        !text.contains("only_item"),
+        "a `tests/` directory below the root is still test code:\n{text}"
+    );
+}
+
+/// The whole point of the move: the battery on its own repo reports only real
+/// findings. Every gating row used to come from the deliberately-defective
+/// fixtures, so `unruster audit` on this checkout exited 1 forever and the
+/// advertised `until unruster audit; do fix; done` loop could never close here.
+#[test]
+fn the_battery_on_this_repo_gates_on_nothing() {
+    let out = ur().args(["audit", "--findings-only"]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "unruster must be clean by its own gating tier:\n{text}"
+    );
 }

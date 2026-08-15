@@ -579,6 +579,29 @@ fn enum_shape_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
 // ──────────────────────────────────────────────────────────────────────────
 // 4. cognate fns with one signature
 
+/// How much a shared signature says about two functions being one concept,
+/// given how many functions tree-wide wear that signature.
+///
+/// Measured. On a 4867-item codebase every one of the 52 gating `signature`
+/// clusters was a false positive, and they clustered on three shapes:
+/// `() -> bool` with the word *active*, `() -> usize` with *count*,
+/// `() -> &str` with *label*. Each of those signatures is worn by dozens of
+/// functions, so sharing it carries no information — it says only that Rust
+/// has booleans. `(AabbHandle, Rect, egui::Pos2) -> bool` on three functions is
+/// a real interface somebody designed twice.
+///
+/// The flat weight the check used before could not tell those apart, and the
+/// existing [`TAXONOMY_SIZE`] demotion could not either: `cognate_partition`
+/// splits a large signature family into small word-groups *first*, so the
+/// clusters that reach the score are small by construction no matter how
+/// common the signature is. Rarity has to be measured before the split.
+///
+/// Reciprocal in the population, pinned at 1.0 for a signature only two
+/// functions share — the case where the old flat weight was right.
+fn signature_rarity(population: usize) -> f64 {
+    (1.0 / (population as f64 - 1.0).max(1.0)).clamp(0.0, 1.0)
+}
+
 /// The same operation, written twice, over the same types.
 ///
 /// This is the shape `clones` cannot see. `clones` groups on the body, and two
@@ -634,6 +657,8 @@ fn signature_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
             continue;
         }
         let sig = sig.clone();
+        // How many fns tree-wide wear this signature, *before* the word split.
+        let population = members.len();
         out.extend(cognate_partition(
             members,
             "signature",
@@ -646,7 +671,7 @@ fn signature_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
                     // two functions sharing an interface and a name word is
                     // suggestive, where two structs sharing every field type is
                     // nearly conclusive.
-                    0.4,
+                    0.4 * signature_rarity(population),
                 )
             },
         ));
@@ -827,9 +852,16 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
         clusters.retain(|c| c.members.iter().any(|m| ctx.in_scope(&m.file)));
     }
 
-    let waived = ctx.retain_unsuppressed("concepts", &mut clusters, |c| {
-        crate::suppress::Site::keyed(c.first().file.as_str(), c.first().line, &c.label)
-    });
+    // The tier `audit` gates on is applied below — after this retain, because a
+    // suppressed row must not be counted at all. Telling the ledger which side
+    // of it each hit falls on is what makes `hits` mean "suppressed something
+    // the audit battery would have gated on", which is what the column claims.
+    let waived = ctx.retain_unsuppressed_tiered(
+        "concepts",
+        &mut clusters,
+        |c| crate::suppress::Site::keyed(c.first().file.as_str(), c.first().line, &c.label),
+        |c| c.score() >= opts.min_score && c.score() >= GATING_SCORE,
+    );
 
     let below = {
         let n = clusters.len();

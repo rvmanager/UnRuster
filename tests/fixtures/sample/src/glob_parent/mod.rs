@@ -1,4 +1,5 @@
-//! The parent half of a glob import, laid out the way `svggen`'s `geom` is:
+//! The parent half of a glob import, laid out the way one real project's
+//! `geom` module is:
 //! a `mod.rs` holding the shared helpers and a submodule that reaches them
 //! through `use super::*;`.
 

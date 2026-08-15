@@ -265,12 +265,36 @@ pub struct Out {
     /// Applied *after* fingerprint recording: a cap bounds what is listed, not
     /// what was found, so `--since` baselines and summary counts are unaffected.
     row_budget: Cell<Option<usize>>,
+    /// Score at or above which a row is exempt from [`Self::row_budget`].
+    ///
+    /// `audit --findings-only` promises a *complete* digest of what gates, and
+    /// a cap that can hide a gating row breaks that promise silently. Rows
+    /// arrive score-sorted, so in practice this only fires on a section whose
+    /// gating tier is longer than the section's default cap — but "in practice"
+    /// is what a truncation note is for, and this is what makes the guarantee
+    /// hold. `None` caps every row alike.
+    row_budget_floor: Cell<Option<f64>>,
+    /// Rows kept past the budget by [`Self::row_budget_floor`], so the cap note
+    /// reports what it actually did.
+    kept_over_budget: Cell<usize>,
     /// Rows the budget suppressed in the current section, so the cap can
     /// announce itself. A silent truncation reads as "that is all there is".
     dropped: Cell<usize>,
     /// Rows the budget let through, so the note can say "showing N of M"
     /// rather than making the reader add two numbers together.
     emitted: Cell<usize>,
+    /// Whether the most recent [`Out::row`] actually reached the output, so
+    /// [`Out::hint`] can decline to speak about a row nobody saw.
+    ///
+    /// A hint is a remark *about the row above it* and has no location of its
+    /// own, so one printed after a dropped row belongs to nothing. Without this
+    /// flag `panics --top 3 --suggest-waivers` printed three rows and thirty
+    /// waiver comments, and `stringly --top 2` printed two rows and two
+    /// hundred; in JSON they were worse than noise, because `hint` appends to
+    /// `rows.last_mut()` and every dropped row's suggestion piled onto the last
+    /// surviving one — a `casts` row of class `other` carrying waiver keys for
+    /// `unknown` and `usize-cross`, which waive nothing if pasted.
+    last_row_emitted: Cell<bool>,
     /// Note texts already emitted this run, so a note is said once.
     ///
     /// `show a::f b::f` fired the "N other items are also named `f`" note once
@@ -318,8 +342,11 @@ impl Out {
             silent: false,
             show_fingerprints: false,
             row_budget: Cell::new(None),
+            row_budget_floor: Cell::new(None),
+            kept_over_budget: Cell::new(0),
             dropped: Cell::new(0),
             emitted: Cell::new(0),
+            last_row_emitted: Cell::new(false),
             said: RefCell::new(std::collections::HashSet::new()),
             current_check: RefCell::new(String::new()),
             recorded: RefCell::new(None),
@@ -342,8 +369,11 @@ impl Out {
             silent: true,
             show_fingerprints: false,
             row_budget: Cell::new(None),
+            row_budget_floor: Cell::new(None),
+            kept_over_budget: Cell::new(0),
             dropped: Cell::new(0),
             emitted: Cell::new(0),
+            last_row_emitted: Cell::new(false),
             said: RefCell::new(std::collections::HashSet::new()),
             current_check: RefCell::new(String::new()),
             recorded: RefCell::new(None),
@@ -438,8 +468,32 @@ impl Out {
     /// Set the display cap for the rows that follow. `None` lifts it.
     pub fn set_row_budget(&self, n: Option<usize>) {
         self.row_budget.set(n);
+        self.row_budget_floor.set(None);
+        self.kept_over_budget.set(0);
         self.dropped.set(0);
         self.emitted.set(0);
+    }
+
+    /// As [`Self::set_row_budget`], but exempting rows whose `score` cell is at
+    /// or above `floor` — the tier `audit` gates on. See [`Self::row_budget_floor`].
+    pub fn set_row_budget_keeping(&self, n: Option<usize>, floor: Option<f64>) {
+        self.set_row_budget(n);
+        self.row_budget_floor.set(floor);
+    }
+
+    /// Does this row's `score` cell clear [`Self::row_budget_floor`]?
+    ///
+    /// A row with no `score` cell never does: the exemption is for the tier a
+    /// check ranks, and a check that does not rank cannot have one.
+    fn above_floor(&self, cells: &[(&'static str, Val)]) -> bool {
+        let Some(floor) = self.row_budget_floor.get() else {
+            return false;
+        };
+        cells
+            .iter()
+            .find(|(k, _)| *k == "score")
+            .and_then(|(_, v)| v.tsv().parse::<f64>().ok())
+            .is_some_and(|s| s >= floor)
     }
 
     /// The `--top` note for the rows since the budget was last set, or `None`
@@ -449,10 +503,28 @@ impl Out {
         if dropped == 0 {
             return None;
         }
+        let kept = self.kept_over_budget.get();
+        let check = self.current_check.borrow().clone();
         Some(format!(
-            "(note: showing {} of {} row(s) — raise or drop --top for the rest)",
+            "(note: showing {} of {} row(s){} — {} for the rest)",
             self.emitted.get(),
-            self.emitted.get() + dropped
+            self.emitted.get() + dropped,
+            if kept > 0 {
+                format!(
+                    ", including all {} above the gating tier — the cap never hides one",
+                    kept
+                )
+            } else {
+                String::new()
+            },
+            if check.is_empty() {
+                "raise or drop --top".to_string()
+            } else {
+                // Name the command, not the flag: a reader who wants the tail of
+                // one section wants that section, and `--top 0` on the battery
+                // gives them twenty others as well.
+                format!("`unruster {} --top 0`", check)
+            }
         ))
     }
 
@@ -535,20 +607,26 @@ impl Out {
             list.push(f.clone());
         }
         if self.silent || self.summary_only {
+            self.last_row_emitted.set(false);
             return;
         }
         // The cap. After recording (above) so fingerprints and `--since`
         // baselines still see every finding, and before rendering so the cap
         // only bounds the listing.
         match self.row_budget.get() {
+            Some(0) if self.above_floor(&cells) => {
+                self.kept_over_budget.set(self.kept_over_budget.get() + 1);
+            }
             Some(0) => {
                 self.dropped.set(self.dropped.get() + 1);
+                self.last_row_emitted.set(false);
                 return;
             }
             Some(n) => self.row_budget.set(Some(n - 1)),
             None => {}
         }
         self.emitted.set(self.emitted.get() + 1);
+        self.last_row_emitted.set(true);
         let context = self.context_for(&cells);
         if self.json() {
             let mut cells = cells;
@@ -577,6 +655,26 @@ impl Out {
         }
     }
 
+    /// Attach extra fields to the row just emitted, in JSON only.
+    ///
+    /// TSV's contract is a fixed column count per section, so a field that
+    /// exists for some rows and not others cannot go there — but JSON is an
+    /// object per row and can carry it without moving anything. Used by
+    /// `--suggest-waivers` to put the check and key next to the `file`/`line`
+    /// they belong to, which is what makes `<check> --json | jq | waivers
+    /// --apply -` a one-liner.
+    pub fn tag_last_row(&self, fields: &[(&'static str, String)]) {
+        if !self.json() || self.silent || self.summary_only || !self.last_row_emitted.get() {
+            return;
+        }
+        let mut st = self.state.borrow_mut();
+        if let Some(r) = st.current().rows.last_mut() {
+            for (k, v) in fields {
+                r.cells.push((k, Val::Str(v.clone())));
+            }
+        }
+    }
+
     /// Emit a non-tabular line (tree renderings, cohort matrices, playbook
     /// text). JSON keeps it as a `{"text": …}` row so nothing is silently lost.
     pub fn line(&self, text: &str) {
@@ -599,6 +697,13 @@ impl Out {
     /// snippets so JSON keeps it with its row instead of stranding it.
     pub fn hint(&self, text: &str) {
         if self.summary_only || self.silent {
+            return;
+        }
+        // A hint carries no location of its own — it is a remark about the row
+        // above it. When `--top` dropped that row there is nothing for it to be
+        // about, and in JSON it would attach to whichever row survived last.
+        // See [`Out::last_row_emitted`] for what that cost.
+        if !self.last_row_emitted.get() {
             return;
         }
         if self.json() {

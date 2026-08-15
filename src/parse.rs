@@ -154,8 +154,16 @@ pub enum TestReason {
 /// outranks a crate merely being *called* `foo-test`. The name rule covers what
 /// the graph structurally cannot — a run rooted inside a single harness crate,
 /// where there is no manifest anywhere in the tree that dev-depends on it.
-fn test_reason(path: &Path, ws: &crate::workspace::Workspace) -> Option<TestReason> {
-    if is_under_test_dir(path) {
+///
+/// The directory rule is asked about the path *below `root`*, not the whole
+/// path. "Under a `tests/` directory" is a statement about the tree you asked
+/// about; a `tests` component in the path that merely *leads to* the root is
+/// not. Asking about the whole path made `--root a/tests/fixtures/sample`
+/// classify every file in it as test code and report "no .rs files found" —
+/// the tool refusing to answer a question whose subject the caller had named
+/// explicitly.
+fn test_reason(path: &Path, root: &Path, ws: &crate::workspace::Workspace) -> Option<TestReason> {
+    if is_under_test_dir(path.strip_prefix(root).unwrap_or(path)) {
         return Some(TestReason::TestDir);
     }
     if looks_like_test_named(path) {
@@ -221,7 +229,7 @@ pub fn parse_dir(
         // actually fired. `None` under `--scope tests` means the opposite
         // thing — production code, skipped for not being test code — which is
         // why the reason is an `Option` rather than a defaulted enum.
-        let reason = test_reason(path, &ws);
+        let reason = test_reason(path, root, &ws);
         if out_of_scope(reason.is_some(), scope) {
             scope_skips.push((path.to_path_buf(), reason));
             continue;

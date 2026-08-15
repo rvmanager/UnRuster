@@ -220,7 +220,7 @@ pub fn run(
                 "via" => r.matched_via,
                 "confidence" => conf_of(r.matched_via).as_str(),
                 "written" => r.written.clone(),
-                "context" => r.context.clone(),
+                "in_fn" => r.context.clone(),
                 "at" => site(&r.file, r.line),
             );
         }

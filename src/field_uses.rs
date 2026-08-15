@@ -343,7 +343,7 @@ fn tally_and_print(ctx: &AnalysisCtx, all: &[FieldHit]) -> (usize, usize, usize,
                 "kind" => h.kind.as_str(),
                 "via" => h.via,
                 "receiver" => h.receiver.clone(),
-                "context" => h.context.clone(),
+                "in_fn" => h.context.clone(),
                 "at" => site(&h.file, h.line),
             );
         }

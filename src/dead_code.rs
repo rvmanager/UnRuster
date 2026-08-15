@@ -3,28 +3,98 @@ use std::collections::BTreeSet;
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
-use crate::ast::path_to_string;
+use crate::ast::{fn_visits, path_to_string, scope_visits, ScopeTracker};
 use crate::context::AnalysisCtx;
 use crate::parse::ParsedFile;
 use crate::emit::row;
 
-/// Build a set of every "called" last-segment name we observe across the tree.
+/// Build a set of every "called" last-segment name we observe across the tree,
+/// attributed to the item whose body named it.
+///
+/// The attribution is what `--transitive` runs on. A call set that is one flat
+/// set of names cannot answer "and what would be dead once these three go",
+/// because it cannot subtract the names those three contributed. Keeping the
+/// per-item breakdown costs one map and makes the fixed point a set union.
 struct CallSink {
-    called: BTreeSet<String>,
+    /// Names used outside any fn body: module-level consts and statics, struct
+    /// field attributes, `macro_rules!` definitions. These never go away as a
+    /// consequence of deleting a fn.
+    outside: BTreeSet<String>,
+    /// Per fn, the names its own body used.
+    per_item: std::collections::BTreeMap<String, BTreeSet<String>>,
+    /// Qualified path of the fn currently being walked, innermost last.
+    stack: Vec<String>,
+    scope: ScopeTracker,
+}
+
+impl CallSink {
+    fn new() -> Self {
+        CallSink {
+            outside: BTreeSet::new(),
+            per_item: std::collections::BTreeMap::new(),
+            stack: Vec::new(),
+            scope: ScopeTracker::new(""),
+        }
+    }
+
+    fn saw(&mut self, name: String) {
+        match self.stack.last() {
+            Some(owner) => {
+                self.per_item.entry(owner.clone()).or_default().insert(name);
+            }
+            None => {
+                self.outside.insert(name);
+            }
+        }
+    }
+
+    /// Every name in play once the bodies of `gone` are removed from the tree.
+    fn called_without(&self, gone: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut out = self.outside.clone();
+        for (owner, names) in &self.per_item {
+            if gone.contains(owner) {
+                continue;
+            }
+            out.extend(names.iter().cloned());
+        }
+        out
+    }
+
+    fn called(&self) -> BTreeSet<String> {
+        self.called_without(&BTreeSet::new())
+    }
+
+    /// Open a fn: everything walked from here belongs to it until [`Self::leave_fn`].
+    /// Shared by every fn-shaped visit method — see [`fn_visits`].
+    fn enter_fn(&mut self, sig: &syn::Signature, _block: Option<&syn::Block>) {
+        let q = self.scope.qualify(&sig.ident.to_string());
+        self.stack.push(q);
+    }
+
+    /// Close it.
+    fn leave_fn(&mut self, _sig: &syn::Signature, _block: Option<&syn::Block>) {
+        self.stack.pop();
+    }
 }
 
 impl<'ast> Visit<'ast> for CallSink {
+    scope_visits!(item_mod, item_impl, item_trait);
+    // The three fn shapes differ only in the `syn` type they carry, which is
+    // what this macro is for. Written out, they were three bodies one edit
+    // apart and `near-clones` said so on the first run over this file.
+    fn_visits!(around enter_fn, leave_fn; item_fn, impl_item_fn, trait_item_fn);
+
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*e.func {
             let s = path_to_string(&p.path);
             let last = crate::ast::last_segment(&s).to_string();
-            self.called.insert(last);
+            self.saw(last);
         }
         visit::visit_expr_call(self, e);
     }
 
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
-        self.called.insert(e.method.to_string());
+        self.saw(e.method.to_string());
         visit::visit_expr_method_call(self, e);
     }
 
@@ -32,13 +102,13 @@ impl<'ast> Visit<'ast> for CallSink {
         // Track fn-references-as-values (`let f = some_fn; f();`) too.
         let s = path_to_string(&e.path);
         let last = crate::ast::last_segment(&s).to_string();
-        self.called.insert(last);
+        self.saw(last);
         visit::visit_expr_path(self, e);
     }
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         if let Some(last) = m.path.segments.last() {
-            self.called.insert(last.ident.to_string());
+            self.saw(last.ident.to_string());
         }
         for expr in crate::macro_scan::macro_exprs(m) {
             self.visit_expr(&expr);
@@ -57,7 +127,11 @@ impl<'ast> Visit<'ast> for CallSink {
         // dead fn; under-collecting sends someone to delete live code. This is
         // the same treatment `visit_item_macro` already gives `macro_rules!`
         // bodies, for the same reason.
-        collect_idents(&m.tokens, &mut self.called);
+        let mut names = BTreeSet::new();
+        collect_idents(&m.tokens, &mut names);
+        for n in names {
+            self.saw(n);
+        }
     }
 
     /// Functions named inside an attribute — as a string, or as an expression.
@@ -77,7 +151,7 @@ impl<'ast> Visit<'ast> for CallSink {
     /// quotes:
     ///
     /// ```ignore
-    /// #[arg(long, default_value_t = svggen_points())]
+    /// #[arg(long, default_value_t = default_points())]
     /// pub points: usize,
     /// ```
     ///
@@ -92,10 +166,14 @@ impl<'ast> Visit<'ast> for CallSink {
         match &a.meta {
             // `#[serde(default = "f", with = "m")]` — the interesting case.
             syn::Meta::List(ml) => {
-                collect_path_strings(&ml.tokens, &mut self.called);
+                let mut names = BTreeSet::new();
+                collect_path_strings(&ml.tokens, &mut names);
                 // `#[arg(default_value_t = f())]`, `#[arg(value_parser = f)]`.
                 // Doc comments are `Meta::NameValue`, so no prose reaches here.
-                collect_idents(&ml.tokens, &mut self.called);
+                collect_idents(&ml.tokens, &mut names);
+                for n in names {
+                    self.saw(n);
+                }
             }
             // `#[doc = "…"]` lands here too; prose fails the path test.
             syn::Meta::NameValue(nv) => {
@@ -104,7 +182,11 @@ impl<'ast> Visit<'ast> for CallSink {
                     ..
                 }) = &nv.value
                 {
-                    insert_if_path(&s.value(), &mut self.called);
+                    let mut names = BTreeSet::new();
+                    insert_if_path(&s.value(), &mut names);
+                    for n in names {
+                        self.saw(n);
+                    }
                 }
             }
             syn::Meta::Path(_) => {}
@@ -124,7 +206,11 @@ impl<'ast> Visit<'ast> for CallSink {
             .map(|s| s.ident == "macro_rules")
             .unwrap_or(false);
         if is_macro_rules {
-            collect_idents(&im.mac.tokens, &mut self.called);
+            let mut names = BTreeSet::new();
+            collect_idents(&im.mac.tokens, &mut names);
+            for n in names {
+                self.saw(n);
+            }
         }
         visit::visit_item_macro(self, im);
     }
@@ -190,64 +276,115 @@ fn collect_idents(ts: &TokenStream, out: &mut BTreeSet<String>) {
 /// which the AST path reported as having zero callers while this set contained
 /// them all along.
 pub(crate) fn called_names(call_source: &[ParsedFile]) -> BTreeSet<String> {
-    let mut sink = CallSink {
-        called: BTreeSet::new(),
-    };
+    sink_over(call_source).called()
+}
+
+/// One walk of the whole tree, with per-item attribution.
+fn sink_over(call_source: &[ParsedFile]) -> CallSink {
+    let mut sink = CallSink::new();
     for f in call_source {
+        sink.scope = ScopeTracker::new(f.module.as_str());
         sink.visit_file(&f.ast);
     }
-    sink.called
+    sink
 }
+
+/// How many rounds of "remove these, look again" `--transitive` will run.
+///
+/// A cap rather than a true fixed point only in the pathological case: each
+/// round can only shrink the call set, so it converges, and four rounds covered
+/// the deepest real cascade seen — three dead `pub fn`s exposing four private
+/// orphans over four build-delete-rebuild cycles driven by a Python loop over
+/// `cargo build` warnings.
+const TRANSITIVE_ROUNDS: usize = 16;
 
 pub fn run(
     ctx: &AnalysisCtx,
     call_source: &[ParsedFile],
     vis: Option<crate::inventory::VisFilter>,
     include_trait_impls: bool,
+    transitive: bool,
 ) -> anyhow::Result<usize> {
     let index = ctx.idx;
     let summary = ctx.summary;
-    let mut sink = CallSink {
-        called: BTreeSet::new(),
-    };
-    for f in call_source {
-        sink.visit_file(&f.ast);
-    }
+    let sink = sink_over(call_source);
 
-    let mut hits: Vec<(&str, &crate::index::Defn)> = Vec::new();
-    for d in index.iter() {
-        match d.kind {
-            "fn" | "impl-fn" | "trait-fn" => {}
-            _ => continue,
+    // Everything about an item except whether anything calls it. Split out so
+    // the transitive rounds re-ask only the one question that can change.
+    let reportable = |d: &crate::index::Defn| -> bool {
+        if !matches!(d.kind, "fn" | "impl-fn" | "trait-fn") {
+            return false;
         }
         if let Some(v) = vis {
             if d.vis != v.as_str() {
-                continue;
+                return false;
             }
         }
         if matches!(d.name.as_str(), "main" | "start") {
-            continue;
+            return false;
         }
         // Trait-impl methods are skipped by default (dyn dispatch is
         // invisible to us); --include-trait-impls reports them when their
         // method name is never called anywhere in the tree.
         if d.kind == "trait-fn" || (d.in_trait_impl && !include_trait_impls) {
-            continue;
+            return false;
         }
         if d.allow_dead {
-            continue;
+            return false;
         }
         // The harness calls a `#[test]` fn, and the harness is in no call site.
         // Without this, `--scope all` — the scope every command's own note
         // recommends — answered with 600 rows of which every single one was a
         // test fn.
-        if d.is_test {
-            continue;
+        !d.is_test
+    };
+
+    let called = sink.called();
+    // `(kind, defn, what would have to go first)`. `None` means nothing:
+    // the item is dead as the tree stands.
+    let mut hits: Vec<(&str, &crate::index::Defn, Option<String>)> = index
+        .iter()
+        .filter(|d| reportable(d) && !called.contains(&d.name))
+        .map(|d| (d.kind, d, None))
+        .collect();
+
+    // Deleting a dead `pub fn` exposes the private helpers only it called, and
+    // deleting those exposes theirs. Verified locally that rustc's own
+    // `dead_code` lint reports *zero* for a dead `pub fn` in a lib crate — it
+    // cannot, since `pub` is API surface — so the first round of this cascade
+    // is only visible here, and the rest of it cost four build-delete-rebuild
+    // cycles to find by hand.
+    if transitive {
+        let mut gone: BTreeSet<String> = hits.iter().map(|h| h.1.qpath.clone()).collect();
+        let mut frontier: Vec<String> = gone.iter().cloned().collect();
+        for _ in 0..TRANSITIVE_ROUNDS {
+            let called = sink.called_without(&gone);
+            let fresh: Vec<&crate::index::Defn> = index
+                .iter()
+                .filter(|d| {
+                    !gone.contains(&d.qpath) && reportable(d) && !called.contains(&d.name)
+                })
+                .collect();
+            if fresh.is_empty() {
+                break;
+            }
+            let next: Vec<String> = fresh.iter().map(|d| d.qpath.clone()).collect();
+            for d in fresh {
+                // Which of the just-removed items was naming it — the answer to
+                // "what would have to go first".
+                let blocker = frontier
+                    .iter()
+                    .find(|q| {
+                        sink.per_item
+                            .get(*q)
+                            .is_some_and(|names| names.contains(&d.name))
+                    })
+                    .cloned();
+                hits.push((d.kind, d, Some(blocker.unwrap_or_else(|| "—".to_string()))));
+            }
+            gone.extend(next.iter().cloned());
+            frontier = next;
         }
-        if sink.called.contains(&d.name) {
-            continue;
-        }
-        hits.push((d.kind, d));
     }
 
     ctx.retain_changed(&mut hits, |h| &h.1.file);
@@ -257,34 +394,85 @@ pub fn run(
     // dominated by call paths no syntactic scan can see (serde attribute
     // strings, dyn dispatch, FFI) — without a waiver the audit loop could never
     // reach zero.
-    let waived = ctx.retain_unsuppressed("dead-code", &mut hits, |h| {
-        crate::suppress::Site::keyed(h.1.file.as_str(), h.1.line, h.1.name.as_str())
-    });
+    //
+    // A transitive row is not a gating finding: it is dead *conditionally*, and
+    // the condition is an edit nobody has made yet.
+    let waived = ctx.retain_unsuppressed_tiered(
+        "dead-code",
+        &mut hits,
+        |h| crate::suppress::Site::keyed(h.1.file.as_str(), h.1.line, h.1.name.as_str()),
+        |h| h.2.is_none(),
+    );
     hits.sort_by(|a, b| a.1.file.cmp(&b.1.file).then_with(|| a.1.line.cmp(&b.1.line)));
 
     // The summary counts the whole result set; `--top` only bounds the list.
     let total = hits.len();
+    let cascaded = hits.iter().filter(|h| h.2.is_some()).count();
     if !summary {
         let today = crate::suppress::Date::today();
-        for (kind, d) in &hits {
-            row!(
-                ctx.out,
-                "kind" => *kind,
-                "vis" => d.vis,
-                "qpath" => d.qpath.clone(),
-                "at" => ctx.at(&d.file, d.line, d.end),
-            );
+        for (kind, d, after) in &hits {
+            // The `via` column exists only under `--transitive`: appending it
+            // unconditionally would move every existing reader's `awk`, and it
+            // says nothing when every row is direct.
+            match after {
+                None if !transitive => row!(
+                    ctx.out,
+                    "kind" => *kind,
+                    "vis" => d.vis,
+                    "qpath" => d.qpath.clone(),
+                    "at" => ctx.at(&d.file, d.line, d.end),
+                ),
+                None => row!(
+                    ctx.out,
+                    "kind" => *kind,
+                    "vis" => d.vis,
+                    "qpath" => d.qpath.clone(),
+                    "at" => ctx.at(&d.file, d.line, d.end),
+                    "via" => "direct",
+                ),
+                Some(blocker) => row!(
+                    ctx.out,
+                    "kind" => *kind,
+                    "vis" => d.vis,
+                    "qpath" => d.qpath.clone(),
+                    "at" => ctx.at(&d.file, d.line, d.end),
+                    "via" => format!("transitive after {}", blocker),
+                ),
+            }
             ctx.suggest("dead-code", Some(&d.name), today);
         }
     }
+    // Named where the deletion is about to happen. This check's call set is
+    // identifier-based, so a fn a test only names *inside a string* — a fixture
+    // literal, an expected-output assertion — is not a call and does not save
+    // it from this list. `tests --mentions` reads those, and reads macro bodies
+    // where an AST walk stops, which is where most assertions live.
+    if let Some((_, first, _)) = hits.first() {
+        ctx.out.note(&format!(
+            "(note: `tests --mentions {}` lists the tests that name it — including inside \
+             string literals and macro bodies, which are not call sites and so are not in \
+             this check's call set. Worth one look before deleting.)",
+            first.name
+        ));
+    }
     ctx.out.summary(&format!(
-        "({} candidate dead fn(s); vis={}; include_trait_impls={}{}; heuristic — call-set \
+        "({} candidate dead fn(s){}; vis={}; include_trait_impls={}{}; heuristic — call-set \
          built from full tree incl. tests; `#[allow(dead_code)]` skipped; pub items may still \
-         have external callers we can't see.)",
+         have external callers we can\'t see.{})",
         total,
+        if cascaded > 0 {
+            format!(", {} of them only once the others are gone", cascaded)
+        } else {
+            String::new()
+        },
         vis.map_or("any", crate::inventory::VisFilter::as_str),
         include_trait_impls,
-        ctx.waived_note(waived)
+        ctx.waived_note(waived),
+        if transitive {
+            ""
+        } else {
+            " `--transitive` also reports the private orphans each deletion would expose."
+        }
     ));
     Ok(total)
 }

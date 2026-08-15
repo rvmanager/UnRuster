@@ -68,7 +68,7 @@ Top-level flags:
 - --cfg KEY[=VALUE]: repeatable. Items whose cfg evaluates to definitively
   False under this env are stripped. Unknown keys leave items in.
 - --summary: skip per-row output, keep summary line.
-- --exclude GLOB: repeatable; drop files matching the glob (e.g. 'fixtures/**').
+- --exclude GLOB: repeatable; drop files matching the glob (e.g. 'vendor/**').
 - --fail-on-findings: exit 1 when findings remain (0 = clean, 2 = error).
 - --spans: enclosing-fn labels become `name@start-end` (fetch the body via
   `sed -n 'start,endp' file`).
@@ -688,6 +688,12 @@ structs should split, or duplicate concepts should merge.
   concept in two shapes (merge); heavy `.clone()` on one type =
   fragmented ownership (Rc/Arc/borrow); sprawling `to_*`/`from_*`
   namespaces on one type = collapse to standard trait impls.
+  The trade: parameterising two near-clones into one fn buys the
+  deduplication with parameter count. Merging a pair of 7-arg
+  drawing helpers produced an 8-arg one and tripped clippy's
+  `too_many_arguments`. Check the cost before and after with
+  `unruster metrics --sort params --threshold 7`; `audit` now runs
+  that pass itself, advisory, alongside the cyclo one.
 
 ──── 2. ENCAPSULATION & API SURFACE ─────────────────────────────────
 What's leaking out, what should be hidden, what's the cost of changing

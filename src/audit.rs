@@ -3,7 +3,7 @@
 //! entry point of an agent loop:
 //!
 //! ```text
-//! until unruster audit --exclude 'fixtures/**'; do <fix top finding>; done
+//! until unruster audit; do <fix top finding>; done
 //! ```
 //!
 //! Sections reuse each command's own scanner and row format, so drilling down
@@ -35,6 +35,17 @@ use crate::{
 /// Cyclomatic-complexity threshold above which a fn counts as an audit
 /// finding (matches the playbook's god-fn guidance).
 const CYCLO_THRESHOLD: usize = 15;
+
+/// Parameter count above which a fn counts as an audit finding.
+///
+/// Clippy's own `too_many_arguments` default, and it is here because the
+/// standard `near-clones` fix trades duplication for parameter count.
+/// Parameterising two near-clones into one `draw_two_point_symbol` pushed it
+/// from 7 arguments to 8 and tripped that very lint — a consequence `audit`
+/// could not see, since its `metrics` section gates on `cyclo` alone. Advisory:
+/// this is the cost side of a trade the reader is making on purpose, not a
+/// defect.
+const PARAMS_THRESHOLD: usize = 7;
 
 /// Row cap for the two checks that get inline source context. Bounds the
 /// output: at most this many rows × (2·[`CONTEXT_LINES`] + 1) snippet lines.
@@ -118,8 +129,34 @@ pub const CHECKS: &[&str] = &[
     "casts",
     "stringly",
     "metrics",
+    // The same check, ranked the other way. Named separately so `--only` /
+    // `--skip` can address the two sections independently — they answer
+    // different questions and a reader who wants the complexity ranking rarely
+    // wants the argument-count one in the same breath.
+    "metrics-params",
     "pass-through",
 ];
+
+/// The score at which a `Tiered` check's rows start gating.
+///
+/// The one place the mapping from a section's check name to its own
+/// `GATING_SCORE` is written down. Each check owns its constant; this says
+/// which section is asking. An unlisted name is treated as gating nothing,
+/// which is the safe direction for a *cap* — it can only show more rows.
+fn tier_floor(check: &str) -> f64 {
+    match check {
+        "error-swallows" => crate::error_swallows::GATING_SCORE,
+        "panics" => crate::panics::GATING_SCORE,
+        "clones" => crate::clones::GATING_SCORE,
+        "near-clones" => crate::near_clones::GATING_SCORE,
+        "concepts" => crate::concepts::GATING_SCORE,
+        "doc-drift" => crate::doc_drift::GATING_SCORE,
+        "validation-drift" => crate::validation::GATING_SCORE,
+        // `vocabulary` gates on a status rather than a score, and its rows
+        // carry no `score` cell for the floor to read.
+        _ => f64::INFINITY,
+    }
+}
 
 /// Which checks this run should execute.
 ///
@@ -350,7 +387,7 @@ pub fn run_silent_battery(
             parallel_matches::run_enum_coverage(ctx, None, cfg.coverage)
         }),
         ("dead-code", &|| {
-            dead_code::run(ctx, dead_call_source, None, false)
+            dead_code::run(ctx, dead_call_source, None, false, false)
         }),
         ("conversion-pairs", &|| conversion_pairs::run(ctx)),
         ("clones", &|| {
@@ -470,6 +507,30 @@ pub fn run(
     let mut advisory = 0usize;
     let mut checks = 0usize;
     let mut skipped_clean = 0usize;
+    // Line one, before any section, so it survives the `head` it is warning
+    // about. Every session's first `audit` was piped and cut; one of them cost
+    // three recovery commands (`| head -200`, then `cat` the tool-results file,
+    // then `sed -n '199,500p'`). The same mechanism that fixed `show` — say how
+    // much is coming, *before* it comes.
+    if !ctx.summary {
+        ctx.out.note(&format!(
+            "(note: {} check(s){}; each section caps its advisory rows{} and names the \
+             command that lists the rest. Every gating row is shown whatever the cap, so \
+             this digest is complete about what holds the exit code open — read it whole \
+             rather than piping it to `head`.)",
+            CHECKS.len(),
+            if findings_only {
+                ", clean ones dropped"
+            } else {
+                ""
+            },
+            match top {
+                Some(0) => " (uncapped by --top 0)".to_string(),
+                Some(n) => format!(" at --top {}", n),
+                None => String::new(),
+            }
+        ));
+    }
     // Each check's own summary line belongs with its rows, on one stream.
     // Splitting them cost a full round-trip of "re-run with 2> redirected"
     // every time someone read this output for the first time.
@@ -486,6 +547,24 @@ pub fn run(
     // readable in full; the rest are uncapped. `--top` overrides every one of
     // them, and the emitter enforces it after fingerprint recording, so no cap
     // can affect a count, a waiver hit, or a `--since` baseline.
+    // The row cap must never hide a gating row. `--findings-only` is sold as a
+    // complete digest of what gates, and every session's first `audit` was
+    // piped to `head` and cut — three recovery commands in one of them — so a
+    // cap that can silently drop the rows the exit code is about is the same
+    // defect one layer in. Rows arrive score-sorted, so this only fires when a
+    // section's gating tier is longer than its default cap.
+    let floor_of = |gate: Gate, check: &str| -> Option<f64> {
+        if strict {
+            return Some(f64::NEG_INFINITY);
+        }
+        match gate {
+            // Every row gates: none of them may be dropped.
+            Gate::Gating => Some(f64::NEG_INFINITY),
+            // No row gates: the cap is the whole story.
+            Gate::Advisory => None,
+            Gate::Tiered => Some(tier_floor(check)),
+        }
+    };
     let mut section = |title: &str,
                        check: &str,
                        gate: Gate,
@@ -505,7 +584,8 @@ pub fn run(
         // anonymous object.
         let prev = ctx.out.set_check(check);
         ctx.out.section(title);
-        ctx.out.set_row_budget(top.or(cap));
+        ctx.out
+            .set_row_budget_keeping(top.or(cap), floor_of(gate, check));
         // A check announces its own `(0 …)` line before anyone can know the
         // section is empty, so `--findings-only` catches the line rather than
         // predicting it. The header is deferred by `section` for the same
@@ -516,6 +596,9 @@ pub fn run(
         let n = count()?;
         ctx.out.hold_summary(held);
         let own_summary = ctx.out.take_held_summary();
+        // Taken while this check is still the current one: the note names the
+        // command that gives the rest, and `set_check` below restores `audit`.
+        let cap_note = ctx.out.cap_note();
         ctx.out.set_check(&prev);
         // `--strict` promotes every advisory row, so it wants the total, not
         // the tier: the flag means "nothing at all", not "nothing important".
@@ -543,7 +626,7 @@ pub fn run(
         if let Some(s) = own_summary {
             ctx.out.summary(&s);
         }
-        if let Some(note) = ctx.out.cap_note() {
+        if let Some(note) = cap_note {
             ctx.out.row_note(&note);
         }
         ctx.out.set_row_budget(None);
@@ -586,7 +669,7 @@ pub fn run(
         "dead-code",
         Gate::Gating,
         None,
-        &mut || Ok(Counts::flat(dead_code::run(ctx, dead_call_source, None, false)?)),
+        &mut || Ok(Counts::flat(dead_code::run(ctx, dead_call_source, None, false, false)?)),
     )?;
     section(
         "[high] conversion-pairs — one concept in two shapes (explain: replication)",
@@ -825,6 +908,24 @@ pub fn run(
         Gate::Advisory,
         Some(DEFAULT_METRICS_TOP),
         &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true, crate::context::GroupBy::Fn)?)),
+    )?;
+    section(
+        &format!(
+            "[low] metrics — fns with params >= {} (explain: god-function)",
+            PARAMS_THRESHOLD
+        ),
+        "metrics-params",
+        Gate::Advisory,
+        Some(DEFAULT_METRICS_TOP),
+        &mut || {
+            Ok(Counts::flat(metrics::run(
+                ctx,
+                SortKey::Params,
+                Some(PARAMS_THRESHOLD),
+                true,
+                crate::context::GroupBy::Fn,
+            )?))
+        },
     )?;
     section(
         "[low] pass-through — single-call wrapper fns (explain: replication)",

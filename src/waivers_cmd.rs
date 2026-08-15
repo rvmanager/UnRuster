@@ -43,6 +43,8 @@ pub enum Action {
     Remove,
     /// Rewrite legacy waivers with the check that actually hit them.
     Upgrade,
+    /// Insert waiver comments from a file of verified judgments.
+    Apply,
 }
 
 pub struct WaiverOpts<'a> {
@@ -51,8 +53,16 @@ pub struct WaiverOpts<'a> {
     pub stale: Option<i64>,
     pub orphaned: bool,
     pub legacy_only: bool,
+    /// Only waivers carrying no date. The summary has always *counted* these;
+    /// without a way to list them, a reader reached for the tool's own grammar
+    /// as a regex — `grep -rn "unruster: ok(" src/ | grep -vE "…"` — or for
+    /// `--stale 9999` as a workaround, since a dated waiver cannot be that old.
+    pub undated: bool,
     /// Actually modify files. Without it, mutating actions preview and exit 0.
     pub write: bool,
+    /// `--apply <file>`: a TSV of `file, line, check, key, scope, reason` rows
+    /// to insert. `-` reads stdin. See [`parse_applications`].
+    pub apply: Option<&'a str>,
     pub fail_on_stale: Option<i64>,
     pub today: Date,
 }
@@ -122,6 +132,9 @@ fn selected(w: &Waiver, opts: &WaiverOpts) -> bool {
     if opts.orphaned && w.hits() > 0 {
         return false;
     }
+    if opts.undated && w.date.is_some() {
+        return false;
+    }
     if let Some(days) = opts.stale {
         match w.date {
             Some(d) if d.age_days(opts.today) >= days => {}
@@ -151,6 +164,13 @@ fn age_str(w: &Waiver, today: Date) -> String {
 }
 
 pub fn run(ctx: &AnalysisCtx, call_source: &[ParsedFile], opts: WaiverOpts) -> Result<usize> {
+    // Before the empty-ledger guard: `--apply` is how a ledger *starts*, and
+    // refusing to run without one would make the first batch impossible. It
+    // also reads no hit counts, so the two-pass probe below is pure cost.
+    if opts.action == Action::Apply {
+        let source = opts.apply.expect("--apply carries its input path");
+        return apply(ctx, source, &opts);
+    }
     if ctx.suppressions.is_empty() {
         ctx.out.summary(
             "(0 waiver(s); nothing to list — `// unruster: ok(<check>) <date> — <reason>` \
@@ -212,6 +232,7 @@ pub fn run(ctx: &AnalysisCtx, call_source: &[ParsedFile], opts: WaiverOpts) -> R
         Action::List => list(ctx, &chosen, &opts),
         Action::Remove => return mutate(ctx, &chosen, &opts, Mutation::Remove),
         Action::Upgrade => return mutate(ctx, &chosen, &opts, Mutation::Upgrade),
+        Action::Apply => unreachable!("handled before the ledger is read"),
     }
 
     // Exit-code gate for CI, mirroring `--fail-on-findings`.
@@ -358,13 +379,28 @@ fn list(ctx: &AnalysisCtx, chosen: &[&Waiver], opts: &WaiverOpts) {
         undated,
         widest,
     ));
-    if orphaned > 0 {
-        ctx.out.note(
-            "(note: a waiver earning nothing in `audit` is either describing a finding that \
-             is gone (the comment now lies) or one the audit filters out anyway. Either way \
-             it is not holding the gating loop open. `waivers --orphaned --remove` previews \
-             the cleanup; add --write to apply)",
-        );
+    // The two halves of `orphaned` want opposite actions, and one note covering
+    // both used to recommend `--remove --write` over the whole set. That is
+    // right for the dead half and destructive for the other: a waiver whose
+    // finding merely scores under the gate is still accurate, and deleting it
+    // re-exposes the site the next time a threshold moves. `--remove` now holds
+    // those back on its own; the advice has to say the same thing the code does.
+    if dead > 0 {
+        ctx.out.note(&format!(
+            "(note: {} waiver(s) suppress nothing at all — the finding is gone and the \
+             comment now lies. `waivers --orphaned --remove` previews the cleanup; add \
+             --write to apply)",
+            dead
+        ));
+    }
+    if sub_threshold > 0 {
+        ctx.out.note(&format!(
+            "(note: {} waiver(s) suppress only findings below audit's thresholds. The \
+             reason still holds and `--remove` will not touch them — they are listed \
+             because they are not holding the gating loop open, not because they are \
+             wrong. Check one with `<check> --no-suppress` before deciding)",
+            sub_threshold
+        ));
     }
     note_groupable(ctx, all);
     note_date_herd(ctx, all);
@@ -397,6 +433,34 @@ fn mutate(
     let mut by_file: BTreeMap<&str, Vec<&Waiver>> = BTreeMap::new();
     let mut skipped: Vec<String> = Vec::new();
     for w in chosen {
+        // `--orphaned` selects on the *audit* hit count, and that is the right
+        // question for a listing: it answers "is this holding the gating loop
+        // open". It is the wrong question for a deletion. A waiver with no
+        // audit hits but a live `below_audit` count is suppressing a real
+        // finding that simply scores under the gate — the module header calls
+        // that case harmless, and its comment is still true.
+        //
+        // Deleting it destroys a verified judgment and re-exposes the site the
+        // moment a threshold moves, which is the exact re-litigation the whole
+        // waiver system exists to prevent. One session hit this: `--orphaned
+        // --remove` offered to strip a dated `divergence/NodeContent::Clip`
+        // waiver whose finding scores 0.40 against a 0.45 gate, and only a
+        // manual `--no-suppress` cross-check caught it. The summary line one
+        // row above already distinguished the two cases; this did not.
+        //
+        // Held back rather than silently kept, because the count in the
+        // footer has to keep matching what was written.
+        if what == Mutation::Remove && w.hits() == 0 && w.below_audit() > 0 {
+            skipped.push(format!(
+                "{}:{} — suppresses {} finding(s) below audit's thresholds, so the reason \
+                 still holds; it is only absent from the gating loop. Remove it by hand if \
+                 you want it gone",
+                w.file,
+                w.comment_line,
+                w.below_audit()
+            ));
+            continue;
+        }
         if what == Mutation::Upgrade {
             if !w.is_legacy() {
                 continue;
@@ -486,9 +550,14 @@ fn mutate(
         }
     }
 
+    // Verb-aware: `--remove` holds waivers back too now, and "not upgraded"
+    // over a removal preview names an action nobody asked for.
+    let held = match what {
+        Mutation::Remove => "not removed",
+        Mutation::Upgrade => "not upgraded",
+    };
     for s in &skipped {
-        ctx.out
-            .note(&format!("(note: not upgraded — {})", s));
+        ctx.out.note(&format!("(note: {} — {})", held, s));
     }
     // Counted in waivers, not lines: a three-line wrapped reason is one
     // judgment being retired, and reporting "3" would overstate the change.
@@ -505,7 +574,17 @@ fn mutate(
         if skipped.is_empty() {
             String::new()
         } else {
-            format!("; {} left alone as ambiguous", skipped.len())
+            // The two mutations hold rows back for different reasons, and one
+            // word cannot carry both: `--upgrade` skips what it cannot name a
+            // check for, `--remove` skips what is still suppressing something.
+            format!(
+                "; {} left alone{}",
+                skipped.len(),
+                match what {
+                    Mutation::Remove => " as still suppressing",
+                    Mutation::Upgrade => " as ambiguous",
+                }
+            )
         },
         if opts.write {
             String::new()
@@ -513,6 +592,285 @@ fn mutate(
             "; dry run — add --write to apply".to_string()
         }
     ));
+    Ok(0)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// `--apply` — writing a batch of verified judgments back into the source
+
+/// One row of an `--apply` input file: where the waiver goes, what it waives,
+/// and why.
+///
+/// Every field comes from the caller. Nothing here is inferred, and that is the
+/// point: this is the only code path in the tool that *adds* comments to a
+/// user's source, and a placement the tool guessed is a judgment nobody made.
+struct Application {
+    file: String,
+    line: usize,
+    check: String,
+    /// The check-specific key, or `None` for a bare `ok(<check>)`.
+    key: Option<String>,
+    scope: crate::suppress::Scope,
+    reason: String,
+}
+
+/// Why bulk application exists.
+///
+/// The single largest time sink in one 6,000-line session: 95 `panics` sites →
+/// JSON dump → grouping script → a hand-built five-class rationale taxonomy →
+/// a patch script, and that pipeline was written **four separate times** across
+/// the session. `--suggest-waivers` did not help, because its output carried no
+/// location — it printed the comment and left the reader to find the line.
+///
+/// TSV rather than JSON, deliberately. The tool has no JSON reader and adding
+/// one to parse six fields would be a dependency for a format `jq` already
+/// emits:
+///
+/// ```text
+/// unruster panics --json --suggest-waivers \
+///   | jq -r '.sections[].rows[] | select(.waiver_check)
+///            | [.file, .line, .waiver_check, .waiver_key, "site", "in-process length"]
+///            | @tsv' \
+///   | unruster waivers --apply -
+/// ```
+///
+/// Columns: `file`, `line`, `check`, `key`, `scope`, `reason`. `key` may be
+/// empty or `-` for a bare `ok(<check>)`. `scope` is `site` (a trailing comment
+/// on that line) or `item` (a standalone comment above it, which requires
+/// `line` to be an item's declaration line). Blank lines and `#` comments are
+/// skipped, as is a header row whose first cell is `file`.
+fn parse_applications(text: &str) -> (Vec<Application>, Vec<String>) {
+    let mut rows = Vec::new();
+    let mut bad = Vec::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line_no = n + 1;
+        // `\r` only. A general `trim_end` would eat the tab before an empty
+        // trailing cell, and an empty *reason* has to be reported as an empty
+        // reason rather than as a malformed row.
+        let l = raw.strip_suffix('\r').unwrap_or(raw);
+        if l.trim().is_empty() || l.trim_start().starts_with('#') {
+            continue;
+        }
+        let cells: Vec<&str> = l.split('\t').collect();
+        if cells.first().map(|c| c.trim()) == Some("file") {
+            continue; // header
+        }
+        if cells.len() < 6 {
+            bad.push(format!(
+                "input line {}: expected 6 tab-separated cells \
+                 (file, line, check, key, scope, reason), found {}",
+                line_no,
+                cells.len()
+            ));
+            continue;
+        }
+        let Ok(at) = cells[1].trim().parse::<usize>() else {
+            bad.push(format!(
+                "input line {}: `{}` is not a line number",
+                line_no, cells[1]
+            ));
+            continue;
+        };
+        let check = cells[2].trim().to_string();
+        if !crate::suppress::known_check_names().contains(&check.as_str()) {
+            bad.push(format!(
+                "input line {}: `{}` is not a check this tool has — known: {}",
+                line_no,
+                check,
+                crate::suppress::known_check_names().join(", ")
+            ));
+            continue;
+        }
+        let scope = match cells[4].trim() {
+            "site" => crate::suppress::Scope::Site,
+            "item" => crate::suppress::Scope::Item,
+            other => {
+                bad.push(format!(
+                    "input line {}: scope must be `site` or `item`, not `{}`. There is no \
+                     default: a placement the tool guessed is a judgment nobody made",
+                    line_no, other
+                ));
+                continue;
+            }
+        };
+        let reason = cells[5].trim().to_string();
+        if reason.is_empty() {
+            bad.push(format!(
+                "input line {}: empty reason. A waiver records a human judgment; without \
+                 one it is a silenced finding",
+                line_no
+            ));
+            continue;
+        }
+        let key = match cells[3].trim() {
+            "" | "-" => None,
+            k => Some(k.to_string()),
+        };
+        rows.push(Application {
+            file: cells[0].trim().to_string(),
+            line: at,
+            check,
+            key,
+            scope,
+            reason,
+        });
+    }
+    (rows, bad)
+}
+
+/// The comment text a row becomes, without indentation.
+fn waiver_line(a: &Application, today: Date) -> String {
+    let spec = match &a.key {
+        Some(k) => format!("{}/{}", a.check, k),
+        None => a.check.clone(),
+    };
+    format!("// unruster: ok({}) {} — {}", spec, today, a.reason)
+}
+
+/// Insert one waiver comment per row, grouped by file and applied bottom-up so
+/// earlier line numbers stay valid — [`mutate`]'s discipline, pointed the other
+/// way.
+///
+/// Dry-run by default. Refuses rather than guesses: an `item`-scoped row whose
+/// line is not an item's declaration, a line that already carries a waiver, a
+/// line past the end of the file, and an unreadable file are all reported and
+/// left alone.
+fn apply(ctx: &AnalysisCtx, source: &str, opts: &WaiverOpts) -> Result<usize> {
+    let text = if source == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(source)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {}", source, e))?
+    };
+    let (rows, mut refused) = parse_applications(&text);
+
+    // Item declaration lines, so an `item` scope can be verified rather than
+    // trusted. Without this the command would happily put a standalone comment
+    // above a statement and call it item scope, which is the "infers placement"
+    // failure the design rules out.
+    //
+    // Keyed on the canonical path: the index spells files the way `--root`
+    // reached them and an input row spells them the way its author did, and a
+    // mismatch here would refuse every correct row for the wrong reason.
+    let real = |f: &str| std::fs::canonicalize(f).ok();
+    let item_lines: std::collections::BTreeSet<(std::path::PathBuf, usize)> = ctx
+        .idx
+        .iter()
+        .filter_map(|d| real(&d.file).map(|p| (p, d.line)))
+        .collect();
+
+    let mut by_file: BTreeMap<String, Vec<&Application>> = BTreeMap::new();
+    for a in &rows {
+        if a.scope == crate::suppress::Scope::Item
+            && !real(&a.file).is_some_and(|p| item_lines.contains(&(p, a.line)))
+        {
+            refused.push(format!(
+                "{}:{} — scope `item` but no item is declared on that line. Item scope \
+                 covers a whole declaration, so it has to sit above one; use `site` for a \
+                 statement",
+                a.file, a.line
+            ));
+            continue;
+        }
+        by_file.entry(a.file.clone()).or_default().push(a);
+    }
+
+    let mut written = 0usize;
+    for (file, mut items) in by_file {
+        let Ok(src) = std::fs::read_to_string(&file) else {
+            refused.push(format!("{} — cannot read; skipped", file));
+            continue;
+        };
+        let mut lines: Vec<String> = src.lines().map(str::to_string).collect();
+        // Bottom-up, so an insertion above does not shift the rows below it.
+        items.sort_by_key(|a| std::cmp::Reverse(a.line));
+        for a in items {
+            if a.line == 0 || a.line > lines.len() {
+                refused.push(format!(
+                    "{}:{} — past the end of the file ({} lines)",
+                    file,
+                    a.line,
+                    lines.len()
+                ));
+                continue;
+            }
+            let target = lines[a.line - 1].clone();
+            // A second waiver on one line is two judgments where the ledger
+            // shows one, and the parser reads only the first.
+            let already = target.contains("unruster:")
+                || (a.scope == crate::suppress::Scope::Item
+                    && a.line >= 2
+                    && lines[a.line - 2].contains("unruster:"));
+            if already {
+                refused.push(format!(
+                    "{}:{} — already carries a waiver; left alone",
+                    file, a.line
+                ));
+                continue;
+            }
+            let comment = waiver_line(a, opts.today);
+            match a.scope {
+                crate::suppress::Scope::Site => {
+                    let rebuilt = format!("{} {}", target.trim_end(), comment);
+                    preview(ctx, &file, a.line, &target, Some(&rebuilt));
+                    lines[a.line - 1] = rebuilt;
+                }
+                crate::suppress::Scope::Item => {
+                    let indent: String = target
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .collect();
+                    let inserted = format!("{}{}", indent, comment);
+                    preview(ctx, &file, a.line, &target, None);
+                    ctx.out.line(&format!("+{}:{}: {}", file, a.line, inserted));
+                    lines.insert(a.line - 1, inserted);
+                }
+            }
+            written += 1;
+        }
+        if opts.write {
+            let mut body = lines.join("\n");
+            if src.ends_with('\n') {
+                body.push('\n');
+            }
+            std::fs::write(&file, body)?;
+        }
+    }
+
+    for r in &refused {
+        ctx.out.note(&format!("(note: not applied — {})", r));
+    }
+    ctx.out.summary(&format!(
+        "({} waiver(s) {}{}{}{})",
+        written,
+        if opts.write { "applied" } else { "would be applied" },
+        if refused.is_empty() {
+            String::new()
+        } else {
+            format!("; {} refused", refused.len())
+        },
+        if opts.write {
+            String::new()
+        } else {
+            "; dry run — add --write to apply".to_string()
+        },
+        if opts.write && written > 0 {
+            "; run `cargo fmt` if your project reflows comments"
+        } else {
+            ""
+        }
+    ));
+    // A refused row is a request the tool did not carry out. Reporting exit 0
+    // over it would be the same vacuous pass the empty-scan guard exists for.
+    if !refused.is_empty() {
+        anyhow::bail!(
+            "{} of {} row(s) could not be applied; nothing about them was guessed",
+            refused.len(),
+            refused.len() + written
+        );
+    }
     Ok(0)
 }
 

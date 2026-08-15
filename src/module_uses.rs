@@ -284,14 +284,38 @@ impl ReachVisitor<'_> {
 
 /// Every leaf name a `use` tree brings into scope, with its line.
 fn use_leaves(t: &syn::UseTree, out: &mut Vec<(String, usize)>) {
+    let mut full = Vec::new();
+    use_paths(t, "", &mut full);
+    out.extend(full.into_iter().map(|(_, name, line)| (name, line)));
+}
+
+/// As [`use_leaves`], but carrying the path each leaf was reached by:
+/// `use a::{b, c as d}` yields `("a::b", "b", …)` and `("a::c", "c", …)`.
+///
+/// Shared with `callers --with-imports`, which needs the spelling as well as
+/// the name and would otherwise grow a second, subtly different unwrapper.
+pub(crate) fn use_paths(t: &syn::UseTree, prefix: &str, out: &mut Vec<(String, String, usize)>) {
+    let joined = |seg: &str| {
+        if prefix.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{}::{}", prefix, seg)
+        }
+    };
     match t {
-        syn::UseTree::Path(p) => use_leaves(&p.tree, out),
-        syn::UseTree::Name(n) => out.push((n.ident.to_string(), line_of(&n.ident))),
+        syn::UseTree::Path(p) => use_paths(&p.tree, &joined(&p.ident.to_string()), out),
+        syn::UseTree::Name(n) => {
+            let name = n.ident.to_string();
+            out.push((joined(&name), name, line_of(&n.ident)))
+        }
         // `use trace::labelled as l;` — the item is still `labelled`.
-        syn::UseTree::Rename(r) => out.push((r.ident.to_string(), line_of(&r.ident))),
+        syn::UseTree::Rename(r) => {
+            let name = r.ident.to_string();
+            out.push((joined(&name), name, line_of(&r.ident)))
+        }
         syn::UseTree::Group(g) => {
             for t in &g.items {
-                use_leaves(t, out);
+                use_paths(t, prefix, out);
             }
         }
         // A glob names nothing in particular; the bare references it enables

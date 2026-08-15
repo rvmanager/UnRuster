@@ -431,6 +431,12 @@ fn run_bulk(
     Ok(rows.len())
 }
 
+/// Rows past which a per-fn ranking is worth routing to `--by file|module`.
+///
+/// Matches `audit`'s own default metrics cap: past twenty rows the reader is
+/// already scrolling, which is the moment the grouped view answers better.
+const ROUTE_TO_GROUPING_ABOVE: usize = 20;
+
 pub fn run(
     ctx: &AnalysisCtx,
     sort: SortKey,
@@ -501,6 +507,18 @@ pub fn run(
         }
     }
 
+    // A long per-fn ranking is where the question stops being "which fn" and
+    // starts being "which file". `--by` was added for exactly that and went
+    // unused across 5,997 lines of one session, because nothing pointed at it
+    // when the list got long. Only when it is long: a note on every invocation
+    // is noise of its own.
+    if fns.len() >= ROUTE_TO_GROUPING_ABOVE {
+        ctx.out.note(&format!(
+            "(note: {} fns ranked — `--by file` or `--by module` totals the same metric per \
+             file or per module, which is the shape of the question once the list is this long)",
+            fns.len()
+        ));
+    }
     ctx.out.summary(&format!(
         "({} fns, {} structs, {} enums; sort={}{})",
         fns.len(),

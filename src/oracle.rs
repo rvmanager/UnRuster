@@ -164,7 +164,7 @@ pub fn read_tree(root: &Path, exclude: &[String]) -> (Vec<SourceFile>, Vec<Unrea
     (out, unreadable)
 }
 
-/// `fixtures/**`-style matching, kept to the one shape the callers use rather
+/// `vendor/**`-style matching, kept to the one shape the callers use rather
 /// than pulling in a glob dependency this module does not otherwise need.
 fn glob_hit(pattern: &str, path: &str) -> bool {
     match pattern.strip_suffix("/**") {

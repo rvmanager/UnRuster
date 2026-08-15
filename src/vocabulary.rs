@@ -251,9 +251,16 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
     if ctx.changed.is_some() {
         findings.retain(|f| ctx.in_scope(&f.item.file));
     }
-    let waived = ctx.retain_unsuppressed("vocabulary", &mut findings, |f| {
-        crate::suppress::Site::keyed(f.item.file.as_str(), f.item.line, &f.concept)
-    });
+    // The tier `audit` gates on is applied below — after this retain, because a
+    // suppressed row must not be counted at all. Telling the ledger which side
+    // of it each hit falls on is what makes `hits` mean "suppressed something
+    // the audit battery would have gated on", which is what the column claims.
+    let waived = ctx.retain_unsuppressed_tiered(
+        "vocabulary",
+        &mut findings,
+        |f| crate::suppress::Site::keyed(f.item.file.as_str(), f.item.line, &f.concept),
+        |f| f.status.gating(),
+    );
 
     findings.sort_by(|a, b| {
         b.status

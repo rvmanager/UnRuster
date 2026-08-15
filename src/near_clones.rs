@@ -317,9 +317,18 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
         pairs.retain(|p| ctx.in_scope(&p.a.file) || ctx.in_scope(&p.b.file));
     }
 
-    let waived = ctx.retain_unsuppressed("near-clones", &mut pairs, |p| {
-        crate::suppress::Site::keyed(p.a.file.as_str(), p.a.line, &p.label)
-    });
+    // The tier `audit` gates on is applied below — after this retain, because a
+    // suppressed row must not be counted at all. Telling the ledger which side
+    // of it each hit falls on is what makes `hits` mean "suppressed something
+    // the audit battery would have gated on", which is what the column claims.
+    let waived = ctx.retain_unsuppressed_tiered(
+        "near-clones",
+        &mut pairs,
+        |p| crate::suppress::Site::keyed(p.a.file.as_str(), p.a.line, &p.label),
+        |p| {
+            p.score(opts.max_diff) >= opts.min_score && p.score(opts.max_diff) >= GATING_SCORE
+        },
+    );
 
     let below = {
         let n = pairs.len();

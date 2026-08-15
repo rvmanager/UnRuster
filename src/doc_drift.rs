@@ -464,9 +464,16 @@ pub fn run_counted(ctx: &AnalysisCtx, opts: &Opts) -> anyhow::Result<Counts> {
     let scanned = documented_fns(ctx.files);
 
     ctx.retain_changed(&mut hits, |h| h.file.as_str());
-    let waived = ctx.retain_unsuppressed("doc-drift", &mut hits, |h| {
-        crate::suppress::Site::keyed(h.file.as_str(), h.line, &h.key)
-    });
+    // The tier `audit` gates on is applied below — after this retain, because a
+    // suppressed row must not be counted at all. Telling the ledger which side
+    // of it each hit falls on is what makes `hits` mean "suppressed something
+    // the audit battery would have gated on", which is what the column claims.
+    let waived = ctx.retain_unsuppressed_tiered(
+        "doc-drift",
+        &mut hits,
+        |h| crate::suppress::Site::keyed(h.file.as_str(), h.line, &h.key),
+        |h| h.score >= opts.min_score && h.score >= GATING_SCORE,
+    );
     let below = {
         let n = hits.len();
         hits.retain(|h| h.score >= opts.min_score);

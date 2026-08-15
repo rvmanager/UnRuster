@@ -48,6 +48,12 @@
 //! this check's output on its own codebase was seven `run`/`run_*` pairs — one
 //! entry point and one variant of it, which is not a cohort that should agree
 //! about anything.
+//!
+//! And it must be a *small* cohort. `parse_header`/`parse_body` above is the
+//! positive example precisely because there are two of them; in a parser where
+//! nine functions are named `parse_*`, the word has stopped saying that they
+//! share a contract and started saying only that somebody named things
+//! consistently. See [`CONVENTION_SIZE`].
 
 use std::collections::BTreeMap;
 
@@ -334,7 +340,33 @@ struct Drift {
     scope: String,
 }
 
+/// Cohort size at which a shared word stops being a contract and starts being
+/// a naming convention.
+///
+/// Measured on two codebases. `edit::*parse*` (9 members) and
+/// `Document::*transform*` (10) produced 20 gating findings between them and
+/// zero defects: in a parser every function is named `parse_*`, and the word
+/// says nothing about whether they share an input contract. The cohorts that
+/// produced real findings were small — a handful of siblings in one impl.
+///
+/// The score's `weight` term ramps the wrong way here. It saturates at four
+/// checked siblings, so a nine-member family scores *higher* than a three-
+/// member one, on the reasonable-sounding but wrong premise that more careful
+/// siblings means more evidence. Past this point more siblings is evidence of
+/// a *convention*.
+///
+/// Demoted rather than dropped, on [`crate::concepts::TAXONOMY_SIZE`]'s
+/// reasoning: a large cohort is still where a *new* member would be added, and
+/// a reader scanning advisory rows may want it. It must not hold the gating
+/// loop open.
+const CONVENTION_SIZE: usize = 6;
+
 impl Drift {
+    /// How many functions share this cohort's word inside this scope.
+    fn cohort(&self) -> usize {
+        self.checked.len() + self.unchecked
+    }
+
     /// Rank by how outnumbered the unchecked sibling is.
     ///
     /// The same shape `arith-drift` uses, and for the same reason: three
@@ -347,7 +379,14 @@ impl Drift {
         // Two checked siblings say more than one; saturating at four, past
         // which the answer is already yes.
         let weight = ((c - 1.0) / 3.0).clamp(0.0, 1.0);
-        (0.25 + 0.45 * ratio + 0.30 * weight).min(1.0)
+        // See [`CONVENTION_SIZE`]. Sized so the two measured families — nine
+        // and ten members, scoring 0.73 — land at 0.48 and stay advisory.
+        let convention = if self.cohort() >= CONVENTION_SIZE {
+            0.25
+        } else {
+            0.0
+        };
+        (0.25 + 0.45 * ratio + 0.30 * weight - convention).clamp(0.0, 1.0)
     }
 }
 
@@ -421,9 +460,16 @@ pub fn run_drift_counted(ctx: &AnalysisCtx, min_score: f64) -> anyhow::Result<Co
     if ctx.changed.is_some() {
         drifts.retain(|d| ctx.in_scope(&d.file));
     }
-    let waived = ctx.retain_unsuppressed("validation-drift", &mut drifts, |d| {
-        crate::suppress::Site::keyed(d.file.as_str(), d.line, &d.name)
-    });
+    // The tier `audit` gates on is applied below — after this retain, because a
+    // suppressed row must not be counted at all. Telling the ledger which side
+    // of it each hit falls on is what makes `hits` mean "suppressed something
+    // the audit battery would have gated on", which is what the column claims.
+    let waived = ctx.retain_unsuppressed_tiered(
+        "validation-drift",
+        &mut drifts,
+        |d| crate::suppress::Site::keyed(d.file.as_str(), d.line, &d.name),
+        |d| d.score() >= min_score && d.score() >= GATING_SCORE,
+    );
     let below = {
         let n = drifts.len();
         drifts.retain(|d| d.score() >= min_score);
@@ -453,8 +499,12 @@ pub fn run_drift_counted(ctx: &AnalysisCtx, min_score: f64) -> anyhow::Result<Co
     }
 
     let gating = drifts.iter().filter(|d| d.score() >= GATING_SCORE).count();
+    // Same disclosure `concepts` makes about taxonomies: a demoted row still
+    // prints, and a reader who cannot see *why* it scores what it does will
+    // re-derive the arithmetic by hand.
+    let conventions = drifts.iter().filter(|d| d.cohort() >= CONVENTION_SIZE).count();
     ctx.out.summary(&format!(
-        "({} unchecked sibling(s){}{}; {} validation site(s) across {} fn(s) scanned; \
+        "({} unchecked sibling(s){}{}{}; {} validation site(s) across {} fn(s) scanned; \
          explain: validation-drift)",
         drifts.len(),
         if gating > 0 {
@@ -467,6 +517,14 @@ pub fn run_drift_counted(ctx: &AnalysisCtx, min_score: f64) -> anyhow::Result<Co
         },
         if below > 0 {
             format!("; {} below --min-score {:.2}", below, min_score)
+        } else {
+            String::new()
+        },
+        if conventions > 0 {
+            format!(
+                "; {} in cohort(s) of {}+ member(s) and demoted as naming conventions",
+                conventions, CONVENTION_SIZE
+            )
         } else {
             String::new()
         },

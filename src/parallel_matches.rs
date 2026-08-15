@@ -711,7 +711,7 @@ fn print_coverage_row(
             "gap" => r.gap,
             "covered" => covered,
             "at" => at,
-            "context" => context,
+            "in_fn" => context,
         );
     } else {
         row!(
@@ -722,7 +722,7 @@ fn print_coverage_row(
             "variants" => r.site.variants.clone(),
             "missing" => r.missing.clone(),
             "at" => at,
-            "context" => context,
+            "in_fn" => context,
         );
     }
 }
@@ -740,7 +740,7 @@ fn print_group_sites(ctx: &AnalysisCtx, sites: &[&Site]) {
         };
         row!(
             ctx.out,
-            "context" => format!("  {}{}", s.context, tag),
+            "in_fn" => format!("  {}{}", s.context, tag),
             "at" => site_cell(&s.file, s.line),
         );
     }

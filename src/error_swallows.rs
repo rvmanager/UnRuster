@@ -215,6 +215,26 @@ const DECODE_VERBS: &[&str] = &[
     "to_string", "strip_prefix", "strip_suffix", "split_once", "from_hex", "to_vec",
 ];
 
+/// Is `name` one of the conversion verbs, by the same rule
+/// [`classify_effect`] uses?
+///
+/// Exposed for [`crate::panics`], which has to find *which* call in a chain
+/// was the fallible conversion before it can ask where that conversion's input
+/// came from. Sharing the predicate is the point: a provenance rule keyed off a
+/// second, hand-copied verb list would go quiet the moment either list moved.
+pub fn names_a_decode_verb(name: &str) -> bool {
+    verb_matches(name, DECODE_VERBS)
+}
+
+/// As [`names_a_decode_verb`], plus the IO verbs.
+///
+/// The question it answers is "could this call have brought data in from
+/// outside the process" — asked of a local fn before its return type is trusted
+/// as in-process.
+pub fn names_a_decode_or_io_verb(name: &str) -> bool {
+    verb_matches(name, DECODE_VERBS) || verb_matches(name, IO_VERBS)
+}
+
 /// Does `name` name one of `verbs`, either exactly or as its leading word?
 fn verb_matches(name: &str, verbs: &[&str]) -> bool {
     verbs.iter().any(|v| {
@@ -888,9 +908,24 @@ pub fn run_counted(
     ctx.retain_changed(&mut all, |h| &h.file);
     // Keyed by swallow kind (`let-_`, `.ok`, …) so a waiver written for the
     // `let _ =` on a line doesn't also cover a `.unwrap_or_default()` on it.
-    let waived = ctx.retain_unsuppressed("error-swallows", &mut all, |h| {
-        crate::suppress::Site::keyed(h.file.as_str(), h.line, h.kind)
-    });
+    // The tier `audit` gates on is applied below — after this retain, because a
+    // suppressed row must not be counted at all. Telling the ledger which side
+    // of it each hit falls on is what makes `hits` mean "suppressed something
+    // the audit battery would have gated on", which is what the column claims.
+    let waived = ctx.retain_unsuppressed_tiered(
+        "error-swallows",
+        &mut all,
+        |h| crate::suppress::Site::keyed(h.file.as_str(), h.line, h.kind),
+        |h| {
+            let kept = match h.benign {
+                Some("infallible-write") => opts.include_infallible,
+                Some("logged-fallback") | Some("combinator-ok") | Some("propagated")
+                | Some("option-default") | Some("fallthrough-is-handler") => opts.include_logged,
+                _ => true,
+            };
+            kept && h.score() >= opts.min_score && h.score() >= GATING_SCORE
+        },
+    );
     let before = all.len();
     all.retain(|h| match h.benign {
         Some("infallible-write") => opts.include_infallible,
@@ -947,7 +982,7 @@ pub fn run_counted(
                 "kind" => h.kind,
                 "score" => format!("{:.2}", h.score()),
                 "effect" => h.effect.as_str(),
-                "context" => h.context.clone(),
+                "in_fn" => h.context.clone(),
                 "at" => site(&h.file, h.line),
             );
             ctx.suggest("error-swallows", Some(h.kind), today);

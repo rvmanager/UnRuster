@@ -277,7 +277,7 @@ fn run_one(
                 ctx.out,
                 "kind" => s.kind,
                 "variant" => format!("{}::{}", enum_name, s.variant),
-                "context" => s.context.clone(),
+                "in_fn" => s.context.clone(),
                 "at" => site(&s.file, s.line),
             );
         }

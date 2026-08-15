@@ -134,6 +134,9 @@ pub fn run(ctx: &AnalysisCtx, root: &std::path::Path, exclude: &[String], opts: 
         check_query_forms(ctx, &sites, d, &mut v);
     }
 
+    let n_types = check_type_query_forms(ctx, budget, &mut v);
+    ran.push(("type-query-form-invariance", n_types));
+
     emit(ctx, &ran, &v, &leads);
     // Leads deliberately excluded: they are questions, not verdicts.
     Ok(v.len())
@@ -443,7 +446,7 @@ impl<'ast> syn::visit::Visit<'ast> for BinderScan {
 ///
 /// The defect this exists for: a bare identifier in *argument position* is how
 /// a callback is written (`.map(parse)`) and how every variable is written, and
-/// the walk recorded the first reading unconditionally. `svggen`'s `out::path()`
+/// the walk recorded the first reading unconditionally. One project's `out::path()`
 /// was reported with 30 callers across 7 modules, at `resolved`, every one of
 /// them a parameter or a `match` binding — and `--candidates` then ranked the
 /// fn 4th of 286 on the strength of it. No confidence tier separated the fake
@@ -614,6 +617,192 @@ fn check_query_forms(
             ),
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Metamorphic: the same thing, for the commands that take a type or an enum
+// ---------------------------------------------------------------------------
+
+/// How many types to probe, as a fraction of `--probes`.
+///
+/// Each type runs up to six commands twice, and every one of those is a
+/// whole-tree scan, so this budget divides rather than multiplies. The probe
+/// set is ordered the way [`probe_set`] is — hardest shapes first — so a small
+/// number is not a small sample.
+const TYPE_PROBE_DIVISOR: usize = 12;
+
+/// One name-taking command, invoked through a silent `Out` so only its count
+/// escapes.
+struct TypeQuery {
+    label: &'static str,
+    /// `"enum"`, or `""` for anything nameable as a type.
+    kind: &'static str,
+    ask: fn(&AnalysisCtx, &str) -> anyhow::Result<usize>,
+}
+
+const TYPE_QUERIES: &[TypeQuery] = &[
+    TypeQuery {
+        label: "type-refs",
+        kind: "",
+        ask: |c, t| crate::type_refs::run(c, t, None),
+    },
+    TypeQuery {
+        label: "takes-mut",
+        kind: "",
+        ask: crate::takes_mut::run,
+    },
+    TypeQuery {
+        label: "enum-coverage",
+        kind: "enum",
+        ask: |c, t| {
+            crate::parallel_matches::run_enum_coverage(
+                c,
+                Some(t),
+                crate::parallel_matches::CoverageOpts::default(),
+            )
+        },
+    },
+    TypeQuery {
+        label: "catch-all-arms",
+        kind: "enum",
+        ask: |c, t| crate::catch_all::run(c, Some(t)),
+    },
+    TypeQuery {
+        label: "parallel-matches",
+        kind: "enum",
+        ask: |c, t| {
+            crate::parallel_matches::run(c, Some(t), crate::parallel_matches::ScanOpts::default())
+        },
+    },
+    TypeQuery {
+        label: "divergence",
+        kind: "enum",
+        ask: |c, t| crate::divergence::run(c, Some(t), 0.0),
+    },
+];
+
+/// `Kind` and `scene::Kind` name the same enum, so every command that takes one
+/// must answer identically.
+///
+/// [`check_query_forms`] cannot see this class. It opens with
+/// `if d.kind != "fn"` and resolves through `callers::QueryMatcher`, and the
+/// type- and enum-target commands never touch `QueryMatcher` — so six of them
+/// rejected module-qualified names for six releases while `self-check` reported
+/// `ok query-form-invariance 120 0 0` throughout. A session that hit it on
+/// `enum-coverage scene::Kind` — an enum carrying a `/// unruster: sealed`
+/// marker placed there for that command — fell back to a hand-typed
+/// `grep -rn 'Kind::Circle\|Kind::Ellipse\|…'` for the rest of the refactor.
+///
+/// Counts, not rows: the commands share no row type, and a count that differs
+/// between two spellings of one name is already the defect. The probe runs
+/// through a silent `Out` — the pattern `waivers_cmd::populate_hits` uses.
+///
+/// Returns the number of (type, command) pairs compared, so an empty probe set
+/// reports as `none` rather than as a green tick over nothing.
+fn check_type_query_forms(ctx: &AnalysisCtx, budget: usize, out: &mut Vec<Violation>) -> usize {
+    let quiet = crate::emit::Out::silent();
+    let probe = AnalysisCtx { // unruster: ok(config-drift/AnalysisCtx) 2026-08-15 — the third probe context, and it disagrees on `summary` on purpose: this one compares the counts the runs return, which are produced inside the row loops, so it cannot skip them the way `populate_hits` does
+        files: ctx.files,
+        idx: ctx.idx,
+        sem: ctx.sem,
+        corpus: ctx.corpus,
+        // NOT `summary: true`, for the reason `battery_at_ref` gives: every
+        // check guards its row loop with `if !summary`, and what this invariant
+        // compares is the count those runs return. A probe that skipped the
+        // loops could compare two zeroes and report a green tick over nothing,
+        // which is the one result this command exists to make impossible.
+        // `Out::silent()` is what suppresses the printing.
+        summary: false,
+        spans: false,
+        changed: None,
+        out: &quiet,
+        suppressions: ctx.suppressions,
+        suggest_waivers: false,
+    };
+    let mut pairs = 0;
+    for d in type_probe_set(ctx, budget) {
+        for q in TYPE_QUERIES {
+            if !q.kind.is_empty() && d.kind != q.kind {
+                continue;
+            }
+            pairs += 1;
+            // An `Err` is `TargetNotFound`, which is itself an answer: the two
+            // spellings have to agree about *that* too, and disagreeing about
+            // it is exactly the shape of the six defects.
+            let bare = (q.ask)(&probe, &d.name).map_err(|_| ());
+            let qualified = (q.ask)(&probe, &d.qpath).map_err(|_| ());
+            if bare != qualified {
+                out.push(Violation {
+                    invariant: "type-query-form-invariance",
+                    subject: d.qpath.clone(),
+                    file: d.file.clone(),
+                    line: d.line,
+                    detail: format!(
+                        "`{} {}` answers {} but `{} {}` answers {}",
+                        q.label,
+                        d.name,
+                        reply(&bare),
+                        q.label,
+                        d.qpath,
+                        reply(&qualified)
+                    ),
+                });
+            }
+        }
+    }
+    pairs
+}
+
+fn reply(r: &Result<usize, ()>) -> String {
+    match r {
+        Ok(n) => format!("{} row(s)", n),
+        Err(()) => "no such target".to_string(),
+    }
+}
+
+/// Types whose name is qualified and unambiguous, hardest shapes first.
+///
+/// A type whose `qpath` is already bare cannot exercise the invariant, and one
+/// whose bare name is shared by two declarations is a genuinely ambiguous query
+/// where the two forms are *allowed* to differ.
+fn type_probe_set<'a>(ctx: &'a AnalysisCtx, budget: usize) -> Vec<&'a Defn> {
+    let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
+    for d in ctx.idx.iter() {
+        if matches!(d.kind, "struct" | "enum" | "union" | "type") {
+            *by_name.entry(d.name.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut scored: Vec<(u32, &Defn)> = ctx
+        .idx
+        .iter()
+        .filter(|d| matches!(d.kind, "struct" | "enum"))
+        .filter(|d| d.qpath != d.name && by_name.get(d.name.as_str()).copied() == Some(1))
+        .map(|d| {
+            let mut s = 0;
+            // Enums reach four more commands than structs do, and all four of
+            // the known defects were on the enum side.
+            if d.kind == "enum" {
+                s += 4;
+            }
+            // A deeper path is more qualifier for a `last_segment` to lose.
+            s += d.qpath.matches("::").count() as u32;
+            if d.vis == "priv" {
+                s += 1;
+            }
+            (s, d)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.file.cmp(&b.1.file))
+            .then_with(|| a.1.line.cmp(&b.1.line))
+    });
+    let take = if budget == usize::MAX {
+        usize::MAX
+    } else {
+        (budget / TYPE_PROBE_DIVISOR).max(1)
+    };
+    scored.into_iter().take(take).map(|(_, d)| d).collect()
 }
 
 // ---------------------------------------------------------------------------

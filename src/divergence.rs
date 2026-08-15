@@ -79,7 +79,7 @@ const STOPWORDS: &[&str] = &[
     "show", "draw", "paint", "update", "apply", "make", "build", "into", "inner", "impl_",
 ];
 
-/// Split a qualified fn label (`app::cage_drag::VectorianApp::handle_cage_delete`)
+/// Split a qualified fn label (`app::cage_drag::EditorApp::handle_cage_delete`)
 /// into its scope (everything before the last segment) and lowercase name words.
 fn split_label(label: &str) -> (String, Vec<String>) {
     // `--spans` appends `@start-end`; strip it so labels pair across modes.

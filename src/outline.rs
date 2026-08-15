@@ -53,6 +53,12 @@ fn in_file(d: &Defn, want: &std::path::Path) -> bool {
     have.len() >= want.len() && have[have.len() - want.len()..] == want[..]
 }
 
+/// Items past which an outline is long enough to route to `at`.
+///
+/// A file with a handful of items is one a reader is about to read whole; a
+/// file with twenty is one they are navigating.
+const ROUTE_TO_AT_ABOVE: usize = 20;
+
 pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<usize> {
     let want = std::path::Path::new(path);
     let mut items: Vec<&Defn> = ctx.idx.iter().filter(|d| in_file(d, want)).collect();
@@ -126,6 +132,19 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
             }
             ctx.out.row(cells);
         }
+    }
+    // The reverse lookup, named where the forward one just happened. A file
+    // long enough to need an outline is a file whose line numbers a reader
+    // already has — from a compiler error, a stack trace, a `grep -n` — and
+    // `at <file>:<line>` turns one into an item. It went unused across a whole
+    // session in which fourteen `sed -n 'N,Mp'` range reads were written by
+    // hand, because nothing points at it when the question arises.
+    if items.len() >= ROUTE_TO_AT_ABOVE {
+        ctx.out.note(&format!(
+            "(note: `at {}:<line>` is the reverse lookup — it names the item a line number \
+             falls in, and prints its extent so a read needs no guessed range)",
+            files[0]
+        ));
     }
     // The pointer sits here because this is where a reader *has* a list of
     // names and is about to read several of them. Told only in `--help`, the

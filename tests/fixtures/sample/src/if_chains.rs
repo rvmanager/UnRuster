@@ -124,7 +124,7 @@ pub fn trait_routed_else(m: &Mode) -> u8 {
     }
 }
 
-// ── Vectorian-like dispatcher: 17 unit variants, only 2 covered (2/17). ──────
+// ── A wide real-world dispatcher: 17 unit variants, only 2 covered (2/17). ──
 
 #[derive(PartialEq)]
 pub enum DragHandle {

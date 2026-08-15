@@ -250,7 +250,7 @@ impl Cache {
     ///
     /// Reported when *this* root's cache is empty, because the alternative is a
     /// trap somebody actually fell into: a session ran every check with
-    /// `-r vectorian/src` and then `unruster cache` with no `-r`, read "0
+    /// `-r <project>/src` and then `unruster cache` with no `-r`, read "0
     /// cached file(s)" for a slug it had never written, and concluded the cache
     /// was dead — in the same session where `gate` reported 289 files served
     /// from it. Entries are per `--root`, and a zero that means "you asked

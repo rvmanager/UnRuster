@@ -196,9 +196,16 @@ pub fn run_counted(
     // filter matched on an empty key, so the comment the tool told you to write
     // was inert and only a bare `ok(clones)` did anything. A suggestion that
     // does nothing is worse than no suggestion, because it looks like it worked.
-    let waived = ctx.retain_unsuppressed("clones", &mut groups, |g| {
-        crate::suppress::Site::keyed(g.members[0].file.as_str(), g.members[0].line, &g.label)
-    });
+    // The tier `audit` gates on is applied below — after this retain, because a
+    // suppressed row must not be counted at all. Telling the ledger which side
+    // of it each hit falls on is what makes `hits` mean "suppressed something
+    // the audit battery would have gated on", which is what the column claims.
+    let waived = ctx.retain_unsuppressed_tiered(
+        "clones",
+        &mut groups,
+        |g| crate::suppress::Site::keyed(g.members[0].file.as_str(), g.members[0].line, &g.label),
+        |g| g.score() >= min_score && g.score() >= GATING_SCORE,
+    );
 
     // Before the counts below, so a filtered row is not a finding rather than
     // a hidden one.

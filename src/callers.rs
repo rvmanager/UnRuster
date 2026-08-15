@@ -113,8 +113,9 @@ pub(crate) fn fn_ref_path(e: &syn::Expr) -> Option<String> {
 /// result at the direct-call site and *nowhere else* — so [`fn_ref_path`]
 /// arguments were recorded with `shadowed: false` hard-coded. A bare name in
 /// argument position is the shape a callback is written in (`.map(parse)`),
-/// and also the shape every ordinary variable is written in: `svggen`'s
-/// `raster::load(path: &str)` calling `image::open(path)` was reported as a
+/// and also the shape every ordinary variable is written in: one real
+/// project's `raster::load(path: &str)` calling `image::open(path)` was
+/// reported as a
 /// `resolved` call to the unrelated `out::path()`, and all 30 "callers" of that
 /// fn across 7 modules were locals, parameters and match bindings. Nothing
 /// filtered it — `resolved` is the tier the docs say to trust — and
@@ -613,6 +614,7 @@ pub fn run_callers(
     depth: Option<usize>,
     by: Option<GroupBy>,
     min_confidence: Option<Confidence>,
+    with_imports: bool,
 ) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
@@ -681,22 +683,49 @@ pub fn run_callers(
         ));
     }
 
+    // Import sites are collected whether or not they are listed: an unlisted
+    // one still gets a one-line pointer, which is the difference between a
+    // reader knowing to look and a reader reaching for grep.
+    let mut imports = import_sites(files, &queried_item_name(query));
+    ctx.retain_changed(&mut imports, |i| &i.file);
+
     if !transitive {
-        emit_caller_rows(ctx, &direct, by, query, unique_name, method_widened, &matcher);
+        emit_caller_rows(
+            ctx,
+            &direct,
+            by,
+            query,
+            unique_name,
+            method_widened,
+            &matcher,
+            with_imports.then_some(imports.as_slice()),
+        );
         let unique = direct
             .iter()
             .map(|s| s.caller.as_str())
             .collect::<BTreeSet<_>>();
         ctx.out.summary(&format!(
-            "({} call site(s) across {} caller(s))",
+            "({} call site(s) across {} caller(s){})",
             direct.len(),
-            unique.len()
+            unique.len(),
+            if with_imports {
+                format!(
+                    "; {} import site(s) in {} file(s)",
+                    imports.len(),
+                    imports.iter().map(|i| i.file.as_str()).collect::<BTreeSet<_>>().len()
+                )
+            } else {
+                String::new()
+            }
         ));
-        if !known && direct.is_empty() {
+        note_imports(ctx, &imports, with_imports, query);
+        note_module_route(ctx, &direct, query);
+        if !known && direct.is_empty() && !(with_imports && !imports.is_empty()) {
             return Err(TargetNotFound::err("fn, method, or macro matching", query));
         }
-        return Ok(direct.len());
+        return Ok(direct.len() + if with_imports { imports.len() } else { 0 });
     }
+    note_imports(ctx, &imports, with_imports, query);
 
     // Emit transitive callers grouped by depth.
     let mut rows = transitive_callers(&sites, query, depth.unwrap_or(usize::MAX));
@@ -849,6 +878,147 @@ fn transitive_callers(
     visited.into_iter().collect()
 }
 
+/// One `use` line that brings the queried name into a module's scope.
+///
+/// `callers` answers "who calls this", and a rename or a removal has to touch
+/// more than that. A session that had just been handed 14 correct call sites
+/// for three helpers went straight to
+/// `grep -rn "<three names>" src/ | grep -v "^src/<defining file>"` for the
+/// `use` lines, which `callers` never reported.
+struct ImportSite {
+    /// The module the `use` sits in — the analogue of a call site's caller.
+    scope: String,
+    /// The path as written, so a reader can see which spelling to edit.
+    path: String,
+    file: String,
+    line: usize,
+}
+
+/// Every `use` line in the tree whose leaf names `want`.
+fn import_sites(files: &[crate::parse::ParsedFile], want: &str) -> Vec<ImportSite> {
+    struct V<'a> {
+        file: &'a str,
+        want: &'a str,
+        scope: ScopeTracker,
+        out: Vec<ImportSite>,
+    }
+    impl<'ast> Visit<'ast> for V<'_> {
+        scope_visits!(item_mod);
+
+        fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+            let mut leaves = Vec::new();
+            crate::module_uses::use_paths(&u.tree, "", &mut leaves);
+            for (path, name, line) in leaves {
+                if name != self.want {
+                    continue;
+                }
+                self.out.push(ImportSite {
+                    scope: self.scope.enclosing(),
+                    path,
+                    file: self.file.to_string(),
+                    line,
+                });
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for f in files {
+        let display = crate::parse::display_path(&f.path);
+        let mut v = V {
+            file: &display,
+            want,
+            scope: ScopeTracker::new(f.module.as_str()),
+            out: Vec::new(),
+        };
+        v.visit_file(&f.ast);
+        out.extend(v.out);
+    }
+    out.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+    out
+}
+
+/// The bare item name a query is asking about, whatever form it was typed in:
+/// `Type::method`, `.method`, `::name` and `name!` all name `name`.
+fn queried_item_name(query: &str) -> String {
+    crate::ast::last_segment(query.trim_start_matches('.').trim_end_matches('!')).to_string()
+}
+
+/// Callers spread across enough modules to make this a question about the
+/// *module*, not the fn.
+///
+/// Below this it is one helper with a couple of users, and `callers` is the
+/// whole answer.
+const ROUTE_TO_MODULE_USES_ABOVE: usize = 3;
+
+/// When every caller lives outside the target's own module and there are
+/// several of them, the reader is scoping a boundary rather than a function.
+///
+/// `module-uses` was added for exactly that and went unused across 5,997 lines
+/// of one session — in which a grep was written that matched its idiom down to
+/// the `grep -v` excluding the defining file. It is in `--help`; nothing points
+/// at it when the question arises.
+fn note_module_route(ctx: &AnalysisCtx, hits: &[&CallSite], query: &str) {
+    let Some(d) = ctx.idx.lookup(crate::ast::last_segment(query)).first().copied() else {
+        return;
+    };
+    if d.module.is_empty() || hits.is_empty() {
+        return;
+    }
+    let outside: BTreeSet<&str> = hits
+        .iter()
+        .map(|h| crate::config_drift::module_of(&h.caller))
+        .filter(|m| *m != d.module)
+        .collect();
+    // Every caller outside, and enough of them to be a surface rather than a
+    // helper's two users.
+    if outside.len() < ROUTE_TO_MODULE_USES_ABOVE
+        || outside.len()
+            != hits
+                .iter()
+                .map(|h| crate::config_drift::module_of(&h.caller))
+                .collect::<BTreeSet<_>>()
+                .len()
+    {
+        return;
+    }
+    ctx.out.note(&format!(
+        "(note: every caller is outside `{}`, across {} module(s). If the question is what \
+         removing that module would cost rather than what this one fn is worth, \
+         `module-uses {}` gives the whole surface — paths, imports, bare names and \
+         doc-comment mentions.)",
+        d.module,
+        outside.len(),
+        d.module
+    ));
+}
+
+/// A pointer, when the import sites exist and were not asked for. One line
+/// beats the `grep -rn "<name>" src/ | grep -v "^src/<defining file>"` a reader
+/// otherwise writes.
+fn note_imports(ctx: &AnalysisCtx, imports: &[ImportSite], listed: bool, query: &str) {
+    if listed || imports.is_empty() {
+        return;
+    }
+    let files = imports
+        .iter()
+        .map(|i| i.file.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    ctx.out.note(&format!(
+        "(note: {} file(s) also import `{}` by name. A rename or a removal has to touch \
+         those `use` lines too, and they are not call sites — `callers {} --with-imports` \
+         lists them)",
+        files,
+        queried_item_name(query),
+        query
+    ));
+}
+
+/// The `via` column, present only under `--with-imports`.
+///
+/// Appending it unconditionally would move every existing reader's `awk`, and
+/// the column says nothing when the answer is call sites only.
+#[allow(clippy::too_many_arguments)]
 fn emit_caller_rows(
     ctx: &AnalysisCtx,
     hits: &[&CallSite],
@@ -857,6 +1027,7 @@ fn emit_caller_rows(
     unique_name: bool,
     method_widened: bool,
     matcher: &QueryMatcher,
+    imports: Option<&[ImportSite]>,
 ) {
     if ctx.summary {
         return;
@@ -878,12 +1049,36 @@ fn emit_caller_rows(
                     .then_with(|| a.line.cmp(&b.line))
             });
             for s in sorted {
+                let conf =
+                    widened_confidence(s, query, unique_name, method_widened, matcher).as_str();
+                match imports {
+                    None => row!(
+                        ctx.out,
+                        "caller" => s.caller.clone(),
+                        "target" => s.target.clone(),
+                        "confidence" => conf,
+                        "at" => site(&s.file, s.line),
+                    ),
+                    Some(_) => row!(
+                        ctx.out,
+                        "caller" => s.caller.clone(),
+                        "target" => s.target.clone(),
+                        "confidence" => conf,
+                        "at" => site(&s.file, s.line),
+                        "via" => "call",
+                    ),
+                }
+            }
+            for i in imports.unwrap_or(&[]) {
                 row!(
                     ctx.out,
-                    "caller" => s.caller.clone(),
-                    "target" => s.target.clone(),
-                    "confidence" => widened_confidence(s, query, unique_name, method_widened, matcher).as_str(),
-                    "at" => site(&s.file, s.line),
+                    "caller" => i.scope.clone(),
+                    "target" => i.path.clone(),
+                    // An import is a textual fact about a `use` line, not a
+                    // resolution — there is nothing to be uncertain about.
+                    "confidence" => "resolved",
+                    "at" => site(&i.file, i.line),
+                    "via" => "use",
                 );
             }
         }

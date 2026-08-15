@@ -312,9 +312,23 @@ pub fn run(
     ctx.retain_changed(&mut all, |h| &h.file);
     // Keyed by cast class, so `ok(casts/ptr)` on an FFI shim doesn't also
     // waive a narrowing cast that lands inside the same span.
-    let waived = ctx.retain_unsuppressed("casts", &mut all, |h| {
-        crate::suppress::Site::keyed(h.file.as_str(), h.line, h.class)
-    });
+    // The tier is a *class* filter here rather than a score, and it is applied
+    // below — after this retain, because a suppressed row must not be counted
+    // at all. So the ledger is told which side of it each hit falls on: a
+    // waiver over a `widen-int` cast is not holding the audit loop open, and
+    // reporting `hits=1` for it said it was.
+    let reported = |h: &Hit| {
+        (class_filter.is_empty() || class_filter.iter().any(|c| c.as_str() == h.class))
+            && !(hide_widen && matches!(h.class, "widen-int" | "widen-float" | "usize-widen"))
+            && !(!include_unsafe_ptr && h.class == "ptr" && h.in_unsafe)
+            && !(!class_filter.contains(&CastClass::UsizeWiden) && h.class == "usize-widen")
+    };
+    let waived = ctx.retain_unsuppressed_tiered(
+        "casts",
+        &mut all,
+        |h| crate::suppress::Site::keyed(h.file.as_str(), h.line, h.class),
+        reported,
+    );
     if !class_filter.is_empty() {
         let wanted: Vec<&str> = class_filter.iter().map(|c| c.as_str()).collect();
         all.retain(|h| wanted.contains(&h.class));
@@ -363,7 +377,7 @@ pub fn run(
                         "class" => h.class,
                         "src" => h.src.clone(),
                         "dst" => h.dst.clone(),
-                        "context" => h.context.clone(),
+                        "in_fn" => h.context.clone(),
                         "at" => site(&h.file, h.line),
                     );
                     ctx.suggest("casts", Some(h.class), today);

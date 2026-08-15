@@ -251,6 +251,12 @@ pub struct Waiver {
 impl Waiver {
     /// Findings suppressed that the audit battery would have gated on. This is
     /// the number that decides whether a waiver is earning its place.
+    ///
+    /// Counted through [`Suppressions::matches_tiered`], which is what makes
+    /// the sentence above true rather than aspirational: hit counting happens
+    /// inside `retain_unsuppressed`, before each check applies its own class
+    /// filter and score gate, so the check has to say which side of its tier
+    /// the row fell on.
     pub fn hits(&self) -> usize {
         self.hits.get()
     }
@@ -370,7 +376,30 @@ impl Suppressions {
     /// Does a waiver cover this finding? Records the hit, so
     /// `unruster waivers` can report what each waiver is actually buying and
     /// flag the ones that no longer suppress anything.
+    ///
+    /// For a check with no gating tier of its own, every row it produces is the
+    /// whole of what it can contribute, so `gating` is `true` — see
+    /// [`Self::matches_tiered`] for the checks where it is not.
     pub fn matches(&self, check: &str, site: Site<'_>) -> bool {
+        self.matches_tiered(check, site, true)
+    }
+
+    /// As [`Self::matches`], but told whether this finding would have reached
+    /// `audit`'s **gating** tier.
+    ///
+    /// [`Waiver::hits`] is documented as "findings suppressed that the audit
+    /// battery would have gated on", and it did not mean that. Hit counting
+    /// happens here, inside `retain_unsuppressed`, which every check runs
+    /// *before* it applies its own class filter and score gate — so a row the
+    /// gating battery produced and then discarded still counted as a hit. A
+    /// `casts/widen-int` waiver and an `error-swallows` row scoring 0.50 both
+    /// reported `hits=1` while `audit` filtered them out of the tier that
+    /// gates, which is the one number the column exists to report.
+    ///
+    /// A below-tier hit is not nothing: it is exactly the `below_audit` case
+    /// the ledger already distinguishes — the reason still holds, the waiver is
+    /// simply not holding the gating loop open.
+    pub fn matches_tiered(&self, check: &str, site: Site<'_>, gating: bool) -> bool {
         let Some(idxs) = self.by_file.get(site.file) else {
             return false;
         };
@@ -387,7 +416,14 @@ impl Suppressions {
                 continue;
             }
             if self.mode.get() == MODE_GATING {
-                w.hits.set(w.hits.get() + 1);
+                // A row the gating pass produced and then filtered out is not a
+                // gating hit — and it is not this pass's `below_audit` either.
+                // The permissive pass counts every row exactly once, which is
+                // what that column has always meant; incrementing here as well
+                // would report it twice.
+                if gating {
+                    w.hits.set(w.hits.get() + 1);
+                }
             } else {
                 w.below_audit.set(w.below_audit.get() + 1);
             }
@@ -1010,11 +1046,37 @@ fn scan_source(out: &mut Suppressions, display: &str, src: &str, spans: &FileSpa
         // reason so a reflowed waiver reads the same as an unwrapped one.
         let mut end = i;
         let mut reason = head.reason.clone();
+        // …and the date with it. A generated key can be long enough that the
+        // date wraps: `--suggest-waivers` builds `near-clones/<fn_a>/<fn_b>`
+        // by concatenating two function names, so the tool emits a line it
+        // could not fully read back. The waiver still *suppressed* correctly —
+        // check and key parse — but the date was lost, so `--fail-on-stale`
+        // fired on it forever and `--stale N` always included it. A real
+        // ledger reported "4 undated" waivers that all carried dates.
+        //
+        // Only when the head line carried no reason of its own, which is the
+        // wrapped shape. A date-looking word opening the second line of a
+        // reason that already started is prose, not a field.
+        let mut date = head.date;
         while end + 1 < lines.len() && is_continuation(lines[end + 1]) {
-            let extra = lines[end + 1]
+            let mut extra = lines[end + 1]
                 .trim_start()
                 .trim_start_matches('/')
                 .trim();
+            if date.is_none() && reason.is_empty() {
+                let tok = extra.find(char::is_whitespace).unwrap_or(extra.len());
+                if let Some(d) = Date::parse(&extra[..tok]) {
+                    date = Some(d);
+                    let rest = extra[tok..].trim_start();
+                    extra = rest
+                        .strip_prefix('—')
+                        .or_else(|| rest.strip_prefix("--"))
+                        .or_else(|| rest.strip_prefix('-'))
+                        .or_else(|| rest.strip_prefix(':'))
+                        .unwrap_or(rest)
+                        .trim_start();
+                }
+            }
             if !extra.is_empty() {
                 if !reason.is_empty() {
                     reason.push(' ');
@@ -1064,7 +1126,7 @@ fn scan_source(out: &mut Suppressions, display: &str, src: &str, spans: &FileSpa
             scope,
             check: head.check,
             key: head.key,
-            date: head.date,
+            date,
             reason,
             trailing: head.trailing,
             comment_col: head.comment_col,
@@ -1207,7 +1269,11 @@ mod tests {
     /// Every `retain_unsuppressed("<name>"` / `suggest("<name>"` literal in
     /// `src/`, excluding this module (which names every check by construction).
     fn checks_used_in_source() -> std::collections::BTreeSet<String> {
-        const CALLS: &[&str] = &["retain_unsuppressed(\"", "suggest(\""];
+        const CALLS: &[&str] = &[
+            "retain_unsuppressed(\"",
+            "retain_unsuppressed_tiered(\"",
+            "suggest(\"",
+        ];
         let mut found = std::collections::BTreeSet::new();
         let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
         while let Some(dir) = stack.pop() {
@@ -1459,6 +1525,44 @@ mod tests {
         assert_eq!(w.comment_end, 3);
         // The waiver still lands on the code line, not on its own comment.
         assert_eq!(w.covers, (4, 4));
+    }
+
+    /// A long generated key pushes the date onto the next line. The waiver
+    /// still suppressed correctly, so the loss was silent: a real ledger
+    /// reported "4 undated" waivers that all carried dates, and
+    /// `--fail-on-stale` fired on them forever.
+    #[test]
+    fn a_date_wrapped_onto_the_continuation_line_is_still_the_date() {
+        let src = "// unruster: ok(near-clones/cmd_toggle_visibility/cmd_toggle_construction)\n\
+                   // 2026-08-15 — two commands, one shape, deliberately parallel\n\
+                   fn f() {\n    let _ = g();\n}\n";
+        let s = scan_str(src);
+        assert_eq!(s.len(), 1, "{:?}", s.all());
+        let w = &s.all()[0];
+        assert_eq!(w.date, Date::parse("2026-08-15"));
+        assert_eq!(
+            w.reason,
+            "two commands, one shape, deliberately parallel",
+            "the date must not survive into the reason"
+        );
+        assert_eq!(w.check.as_deref(), Some("near-clones"));
+    }
+
+    /// A date-looking word opening the second line of a reason that already
+    /// started is prose, not a field.
+    #[test]
+    fn a_date_after_a_reason_has_started_stays_in_the_reason() {
+        let src = "// unruster: ok(casts/ptr) — verified against the vendor note\n\
+                   // 2026-08-15 was when they confirmed it\n\
+                   fn f() {\n    let _ = g();\n}\n";
+        let s = scan_str(src);
+        let w = &s.all()[0];
+        assert_eq!(w.date, None);
+        assert!(
+            w.reason.contains("2026-08-15 was when"),
+            "reason: {}",
+            w.reason
+        );
     }
 
     #[test]

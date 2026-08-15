@@ -114,7 +114,7 @@ struct Cli {
     cfg: Vec<String>,
 
     /// Exclude files matching this glob, relative to the root (repeatable),
-    /// e.g. `--exclude 'fixtures/**'`. Applied on top of .gitignore.
+    /// e.g. `--exclude 'vendor/**'`. Applied on top of .gitignore.
     #[arg(long, global = true)]
     exclude: Vec<String>,
 
@@ -141,6 +141,11 @@ struct Cli {
     /// Output shape. `tsv` (default) streams tab-separated rows; `json` emits
     /// one document with `file`/`line` and numeric columns as real fields, so
     /// cross-row filtering and ranking need no `awk`.
+    ///
+    /// The enclosing function of a site is `in_fn`. It was `context` until
+    /// 0.1.83, which collided with `--context`'s snippet lines and cost a
+    /// reader's first grouping script a `KeyError: 'item'` — the name said
+    /// "surrounding text" where the value is a qualified path.
     #[arg(long, global = true, value_enum, default_value = "tsv")]
     format: Format,
 
@@ -494,6 +499,12 @@ struct WaiversArgs {
     #[arg(long)]
     legacy: bool,
 
+    /// Only waivers carrying no date. The summary counts them; this lists
+    /// them, so nobody has to re-implement the waiver grammar as a regex or
+    /// reach for `--stale 9999`.
+    #[arg(long)]
+    undated: bool,
+
     /// Strip the matching waiver comments from source. Previews unless
     /// `--write` is also given.
     #[arg(long, conflicts_with = "upgrade")]
@@ -504,6 +515,20 @@ struct WaiversArgs {
     /// reported and left alone. Previews unless `--write` is also given.
     #[arg(long)]
     upgrade: bool,
+
+    /// Insert waiver comments from a TSV of verified judgments; `-` reads
+    /// stdin. Columns: `file`, `line`, `check`, `key`, `scope`, `reason`.
+    /// `key` may be empty or `-`; `scope` is `site` (a trailing comment on that
+    /// line) or `item` (a standalone comment above it, which requires `line` to
+    /// be an item's declaration line). Nothing is inferred — a row the tool
+    /// cannot place is refused and named. Previews unless `--write` is given.
+    ///
+    ///   unruster panics --json --suggest-waivers \
+    ///     | jq -r '.sections[].rows[] | select(.waiver_check)
+    ///              | [.file, .line, .waiver_check, .waiver_key, "site", "WHY"] | @tsv' \
+    ///     | unruster waivers --apply -
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["remove", "upgrade"])]
+    apply: Option<String>,
 
     /// Actually modify files. Without it `--remove` / `--upgrade` print the
     /// diff and change nothing.
@@ -1058,6 +1083,13 @@ struct CallersArgs {
     /// Group call sites by the calling fn, by file, or by top-level module.
     #[arg(long, value_enum)]
     by: Option<context::GroupBy>,
+    /// Also list the `use` lines that bring this name into scope, as rows with
+    /// `via=use`. A rename or a removal has to touch those too, and they are
+    /// not call sites — without this the answer is complete about calls and
+    /// silently partial about the edit. Adds a `via` column; the default output
+    /// keeps its four.
+    #[arg(long)]
+    with_imports: bool,
     /// Keep only rows at or above this confidence tier
     /// (heuristic < inferred < resolved < exact).
     #[arg(long, value_enum)]
@@ -1191,6 +1223,13 @@ struct DeadCodeArgs {
     /// syntactic scan, so these rows need per-site review.
     #[arg(long)]
     include_trait_impls: bool,
+    /// Also report the private orphans each deletion would expose, iterated to
+    /// a fixed point. Deleting three dead `pub fn`s once exposed four more over
+    /// four build-delete-rebuild rounds; this closes that loop in one command.
+    /// Adds a `via` column (`direct` / `transitive after <item>`); the default
+    /// output keeps its four. Transitive rows are conditional and do not gate.
+    #[arg(long)]
+    transitive: bool,
 }
 
 #[derive(Args)]
@@ -2059,7 +2098,15 @@ fn dispatch(
             if let Some(pattern) = a.among.as_deref() {
                 callers::run_callers_among(ctx, &a.name, pattern)
             } else {
-                callers::run_callers(ctx, &a.name, a.transitive, a.depth, a.by, a.min_confidence)
+                callers::run_callers(
+                    ctx,
+                    &a.name,
+                    a.transitive,
+                    a.depth,
+                    a.by,
+                    a.min_confidence,
+                    a.with_imports,
+                )
             }
         }
         Cmd::Callees(a) => callers::run_callees(ctx, &a.name),
@@ -2090,7 +2137,7 @@ fn dispatch(
             let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
             let call_source = all_files.as_deref().unwrap_or(files);
             let vis = a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub));
-            dead_code::run(ctx, call_source, vis, a.include_trait_impls)
+            dead_code::run(ctx, call_source, vis, a.include_trait_impls, a.transitive)
         }
         Cmd::CatchAllArms(a) => catch_all::run(ctx, a.name.as_deref()),
         Cmd::ParallelMatches(a) => parallel_matches::run(
@@ -2209,6 +2256,8 @@ fn dispatch(
                 waivers_cmd::Action::Remove
             } else if a.upgrade {
                 waivers_cmd::Action::Upgrade
+            } else if a.apply.is_some() {
+                waivers_cmd::Action::Apply
             } else {
                 waivers_cmd::Action::List
             };
@@ -2221,7 +2270,9 @@ fn dispatch(
                     stale: a.stale,
                     orphaned: a.orphaned,
                     legacy_only: a.legacy,
+                    undated: a.undated,
                     write: a.write,
+                    apply: a.apply.as_deref(),
                     fail_on_stale: a.fail_on_stale,
                     today,
                 },
@@ -2285,6 +2336,83 @@ fn battery_at_ref(
             f
         })
         .collect())
+}
+
+/// Say how many blind spots the changed files gained since `git_ref`.
+///
+/// The tree-wide blind-spot line answers "how much of this codebase is dark".
+/// It does not fire when *you* darken some of it: a session went 45 → 49 while
+/// its own dedup edits introduced four macro bodies no check can read, silently.
+/// The same agent had earlier declined a macro-based refactor precisely because
+/// macros are known blind spots, so the disclosure already shapes design
+/// decisions — it just did not fire when you created one.
+///
+/// Best-effort throughout. A ref that cannot be materialized, a snapshot that
+/// will not parse, a file that is new in the working tree — none of those are
+/// errors here, because this is a note attached to somebody else's question.
+#[allow(clippy::too_many_arguments)]
+fn report_new_blind_spots(
+    out: &emit::Out,
+    git_ref: &str,
+    root: &std::path::Path,
+    scope: Scope,
+    cfg: &[String],
+    exclude: &[String],
+    files: &[parse::ParsedFile],
+    changed: &std::collections::HashSet<std::path::PathBuf>,
+) {
+    let in_diff = |display: &str| {
+        std::fs::canonicalize(display)
+            .map(|p| changed.contains(&p))
+            .unwrap_or(false)
+    };
+    let now = macro_scan::count_in(files, in_diff);
+    if now == 0 {
+        return;
+    }
+    // The same files as they were at the ref. `snapshot` materializes the tree
+    // into a temp directory, so the changed set's canonical paths do not match
+    // — the comparison is by path *relative to the scan root* instead.
+    let Ok(snap) = baseline::snapshot(git_ref, root) else {
+        return;
+    };
+    let Ok(before_files) = parse::parse_dir(&snap.scan_root, scope, cfg, exclude) else {
+        return;
+    };
+    // Both sides reduced to a path *relative to their own scan root*, rather
+    // than the snapshot's path rebuilt into the working tree's spelling. That
+    // rebuild does not survive `--root .`: `display_path` strips the leading
+    // `./` from the working tree's paths but leaves the root itself as `.`, so
+    // the reconstruction produced `./src/emit.rs` against a set holding
+    // `src/emit.rs` and matched nothing — every blind spot in a changed file
+    // then read as new. Found by running this tool on its own source, which
+    // reported two pre-existing `macro_rules!` bodies as "0 there before".
+    let rel_to = |display: &str, base: &str| -> String {
+        let rest = display.strip_prefix(base).unwrap_or(display);
+        rest.trim_start_matches('/').to_string()
+    };
+    let prefix = parse::display_path(&snap.scan_root);
+    let here = parse::display_path(root);
+    let want: std::collections::HashSet<String> = files
+        .iter()
+        .map(|f| parse::display_path(&f.path))
+        .filter(|d| in_diff(d))
+        .map(|d| rel_to(&d, &here))
+        .collect();
+    let then = macro_scan::count_in(&before_files, |display| {
+        want.contains(&rel_to(display, &prefix))
+    });
+    if now > then {
+        out.note(&format!(
+            "(note: {} of the tree's blind spots are new in the changed files since {} \
+             ({} there before, {} now) — code inside them was not analyzed by any check; \
+             `unruster blind-spots` lists them)",
+            now - then,
+            git_ref,
+            then,
+            now
+        ));
+    }
 }
 
 /// The project's fact cache, unless `--no-cache` or there is no home directory
@@ -2482,8 +2610,45 @@ fn run_gate_hook(
     Ok(())
 }
 
+/// How far above the working directory to look for a crate.
+///
+/// Bounded because the failure mode of an unbounded walk is worse than the one
+/// it fixes: a user in `~/` with a `Cargo.toml` three levels up would get a
+/// surprise scan of a project they were not asking about. Four levels covers
+/// the shapes that actually occur — `docs/`, `impl_logs/`, `target/x/y/` — and
+/// the chosen root is always printed.
+const CRATE_WALK_LEVELS: usize = 4;
+
+/// The nearest ancestor of `start` holding a `Cargo.toml`, if one is within
+/// [`CRATE_WALK_LEVELS`]. `start` itself is not considered: it has already been
+/// scanned and found empty.
+fn nearest_crate_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let abs = std::fs::canonicalize(start).ok()?;
+    let mut cur = abs.as_path();
+    for _ in 0..CRATE_WALK_LEVELS {
+        cur = cur.parent()?;
+        if cur.join("Cargo.toml").is_file() {
+            return Some(cur.to_path_buf());
+        }
+    }
+    None
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parsed through `ArgMatches` rather than `Cli::parse()` for one fact the
+    // derive API throws away: whether `--root` was *named*. An explicit root
+    // that finds nothing is a place the user chose and got wrong, and stays an
+    // error; an implicit `.` that finds nothing is a working directory that
+    // drifted, which is recoverable. See the walk below.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli = match <Cli as clap::FromArgMatches>::from_arg_matches(&matches) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
+    let root_was_named = !matches!(
+        matches.value_source("root"),
+        Some(clap::parser::ValueSource::DefaultValue) | None
+    );
     let format = if cli.json { Format::Json } else { cli.format };
     let mut out = emit::Out::new(format, cli.summary, cli.all_stdout, cli.context);
     out.show_fingerprints = cli.fingerprints;
@@ -2534,28 +2699,61 @@ fn main() -> Result<()> {
         ..
     } = cli;
     // Exit-code contract: any setup error (bad glob, bad git ref, IO) is 2.
-    let files = match parse::parse_dir(&root, scope, &cfg, &exclude) {
+    let scan_of = |r: &std::path::Path| match parse::parse_dir(r, scope, &cfg, &exclude) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: {:#}", e);
             std::process::exit(2);
         }
     };
+    let mut root = root;
+    let mut files = scan_of(&root);
+    // A cwd that drifted into a subdirectory with no `.rs` in it — `impl_logs/`,
+    // `docs/`, a scratch dir a previous `cd` left behind — is not a question
+    // about that directory. It is the same question about the crate it sits in,
+    // and answering it costs one `Cargo.toml` lookup. Twice in one session this
+    // killed a *batched* invocation: `show 'scene::LineSpec' 'tune::TUNABLE'`
+    // lost both targets to a stale working directory.
+    //
+    // Only when `--root` was not named. A root the user chose and got wrong
+    // stays an error — guessing a different one would answer a question nobody
+    // asked.
+    if files.is_empty() && !root_was_named {
+        if let Some(crate_root) = nearest_crate_root(&root) {
+            let rescanned = scan_of(&crate_root);
+            if !rescanned.is_empty() {
+                out.note(&format!(
+                    "(note: no .rs files under `{}`; scanned {} instead — the nearest \
+                     Cargo.toml above the working directory. Pass --root to choose another.)",
+                    root.display(),
+                    crate_root.display()
+                ));
+                root = crate_root;
+                files = rescanned;
+            }
+        }
+    }
     if files.is_empty() {
         // Exit 2, not 0. A scan that saw nothing is a setup error — a typo'd
         // `--root`, a wrong cwd, an over-broad `--exclude` — and reporting it
         // as a clean run is the worst possible answer: `until unruster audit;
         // do fix; done` terminates immediately and a CI gate passes
         // vacuously. This actually happened: an agent ran
-        // `unruster -r vectorian/src audit` from the wrong directory and got
+        // `unruster -r <project>/src audit` from the wrong directory and got
         // "0 gating + 0 advisory across 12 checks; clean; exit 0" under a
         // warning it had no reason to read.
         eprintln!(
             "error: no .rs files found under {} (scope={:?}) — nothing was analysed, so \
              this is a setup error rather than a clean result. Check --root, the working \
-             directory, --scope, and --exclude.",
+             directory, --scope, and --exclude.{}",
             root.display(),
-            scope
+            scope,
+            if root_was_named {
+                ""
+            } else {
+                " (No Cargo.toml with .rs files under it above the working directory \
+                  either, within 4 levels.)"
+            }
         );
         std::process::exit(2);
     }
@@ -2591,6 +2789,29 @@ fn main() -> Result<()> {
         },
         None => None,
     };
+    // An empty changed set is an empty *scope*, not a clean tree, and the two
+    // read identically without this line: on a committed tree with two real
+    // gating findings, `audit --changed-since HEAD --findings-only` reports
+    // "0 gating + 0 advisory … clean … exit 0". An agent that saw exactly that
+    // wrote "It's odd that the second run reports zero" and spent two further
+    // commands establishing that nothing had changed.
+    //
+    // Note, not exit 2. The [`nearest_crate_root`] doctrine says a vacuous pass
+    // is the worst answer, and it applies — but `audit --changed-since` on a
+    // no-op commit is a *legitimate* CI shape, and failing it would break
+    // pipelines that are doing nothing wrong. The disclosure is the part that
+    // costs nobody anything.
+    if let Some(set) = &changed {
+        if set.is_empty() {
+            out.note(&format!(
+                "(note: 0 files changed vs {}, so nothing was scanned — this is an empty \
+                 scope, not a clean result.)",
+                changed_since.as_deref().unwrap_or("the ref")
+            ));
+        } else if let Some(git_ref) = changed_since.as_deref() {
+            report_new_blind_spots(&out, git_ref, &root, scope, &cfg, &exclude, &files, set);
+        }
+    }
     let cache = open_cache(no_cache, &root);
     // Derived here even for the single-check commands, so that an ordinary
     // `unruster audit` leaves the fact cache warm and the next `gate` — the one

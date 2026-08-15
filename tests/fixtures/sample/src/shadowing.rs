@@ -1,6 +1,6 @@
 //! A bare name in *argument position* is how a callback is written
 //! (`.map(parse)`) and how every ordinary variable is written, and the call
-//! walk used to record the first reading unconditionally. `svggen`'s
+//! walk used to record the first reading unconditionally. One project's
 //! `out::path()` was reported with 30 callers across 7 modules at `resolved`
 //! confidence — every row a parameter, a `let` or a `match` binding — and
 //! `contract-drift --candidates` then ranked the fn 4th of 286 on the strength

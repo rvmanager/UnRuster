@@ -120,6 +120,41 @@ pub fn blind_spot_sites() -> Vec<(String, usize, String)> {
     out
 }
 
+/// Blind spots in `files`, counted without touching the sealed tree-wide set.
+///
+/// The tree-wide count answers "how much of this codebase is dark". This one
+/// answers a different question — "how much of it did *this diff* darken" —
+/// and it has to be askable of a snapshot at a git ref, which is not the tree
+/// [`survey`] sealed. A session went 45 → 49 blind spots while its own dedup
+/// edits introduced four macro bodies no check can read, unwarned; the same
+/// agent had earlier *declined* a macro-based refactor precisely because macros
+/// are known blind spots, so the disclosure already shapes design decisions. It
+/// just did not fire when you created one.
+pub fn count_in(files: &[crate::parse::ParsedFile], keep: impl Fn(&str) -> bool) -> usize {
+    struct Counter {
+        n: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Counter {
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if !is_quoting_macro(m) && !is_matches_macro(m) {
+                let exprs = parse_exprs(&m.tokens);
+                if exprs.is_empty() && tokens_have_substance(&m.tokens) {
+                    self.n += 1;
+                }
+            }
+            syn::visit::visit_macro(self, m);
+        }
+    }
+    let mut c = Counter { n: 0 };
+    for f in files {
+        if !keep(&crate::parse::display_path(&f.path)) {
+            continue;
+        }
+        syn::visit::Visit::visit_file(&mut c, &f.ast);
+    }
+    c.n
+}
+
 pub fn blind_spots() -> usize {
     UNPARSED_MACRO_BODIES
         .lock()

@@ -17,7 +17,7 @@
 //!
 //! Nodes are every package found under the scan root — not just the ones a
 //! `[workspace] members` list names, so several independent manifests under one
-//! root (this repo's own `fixtures/`) each get classified. Edges are
+//! root (this repo's own `tests/fixtures/`) each get classified. Edges are
 //! dependencies resolved *by package name*, which is what makes `uv-test =
 //! { workspace = true }` resolve: the inherited entry keeps the name even
 //! though the path lives in the root manifest.

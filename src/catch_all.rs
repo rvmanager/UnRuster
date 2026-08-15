@@ -92,7 +92,7 @@ fn scan_one(
                 row!(
                     ctx.out,
                     "enum" => enum_name,
-                    "context" => h.context.clone(),
+                    "in_fn" => h.context.clone(),
                     "variants" => h.variants.join(","),
                     "at" => at,
                 );
@@ -103,7 +103,7 @@ fn scan_one(
                 row!(
                     ctx.out,
                     "enum" => enum_name,
-                    "context" => h.context.clone(),
+                    "in_fn" => h.context.clone(),
                     "variants" => h.variants.join(","),
                     "at" => at,
                 );

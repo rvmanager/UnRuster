@@ -930,7 +930,7 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     // how a callback is written (`.map(parse)`) *and* how every variable is
     // written, and the caller column shows only the enclosing fn — so a set
     // made entirely of locals reads exactly like a real one. `out::path()` in
-    // `svggen` had 30 such "callers" across 7 modules, every row a parameter or
+    // one real project had 30 such "callers" across 7 modules, every row a parameter
     // a `match` binding, and a whole contract-drift exercise was spent on them.
     let shadowed = sites.iter().filter(|s| s.shadowed).count();
     if shadowed > 0 {
@@ -1644,7 +1644,7 @@ fn run_candidates(ctx: &AnalysisCtx, opts: &ContractOpts) -> anyhow::Result<usiz
     ///
     /// The split is the whole point. A free `fn` is never called as `.name()`,
     /// so counting method sites toward one credits it with evidence that
-    /// belongs to a type this tool never indexed: `svggen`'s private
+    /// belongs to a type this tool never indexed: one project's private
     /// `geom::boolean::collect` was ranked 7th of 286 with "475 callers across
     /// 40 modules", which is `Iterator::collect` and nothing else. The
     /// in-tree-homonym guard below could not catch it — `collect` really is

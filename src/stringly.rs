@@ -213,7 +213,7 @@ pub fn run(
                         ctx.out,
                         "class" => h.class,
                         "literal" => h.literal.clone(),
-                        "context" => h.context.clone(),
+                        "in_fn" => h.context.clone(),
                         "at" => site(&h.file, h.line),
                     );
                     ctx.suggest("stringly", Some(&h.literal), today);

@@ -3,6 +3,13 @@ use crate::index::NameIndex;
 use crate::parse::ParsedFile;
 use crate::semantic::Semantic;
 
+/// Length past which a suggested waiver line is likely to be reflowed.
+///
+/// `rustfmt`'s default `max_width` is 100 and its `wrap_comments` follows it.
+/// The line the tool prints is indented two spaces on purpose (it is meant to
+/// be pasted above an item), so the number that matters is the same 100.
+const WRAPPABLE_WAIVER_LEN: usize = 100;
+
 /// The shared, read-only inputs every analysis command works from: the parsed
 /// production files, the name index, semantic info (use-maps, fn signatures,
 /// type aliases), and the global `--summary` flag. Built once in `main` and
@@ -130,11 +137,34 @@ impl AnalysisCtx<'_> {
         items: &mut Vec<T>,
         site_of: impl Fn(&T) -> crate::suppress::Site<'_>,
     ) -> usize {
+        self.retain_unsuppressed_tiered(check, items, site_of, |_| true)
+    }
+
+    /// As [`Self::retain_unsuppressed`], plus the one fact the waiver ledger
+    /// needs and could not have: whether this finding would have reached
+    /// `audit`'s gating tier.
+    ///
+    /// Every check calls the retain *before* its own class filter and score
+    /// gate — it has to, because a suppressed row must not be counted at all —
+    /// so without this the `hits` column counted rows the gating battery had
+    /// already discarded, and reported a waiver as load-bearing that was not.
+    /// See [`crate::suppress::Suppressions::matches_tiered`].
+    pub fn retain_unsuppressed_tiered<T>(
+        &self,
+        check: &str,
+        items: &mut Vec<T>,
+        site_of: impl Fn(&T) -> crate::suppress::Site<'_>,
+        gating_of: impl Fn(&T) -> bool,
+    ) -> usize {
         if self.suppressions.is_empty() {
             return 0;
         }
         let before = items.len();
-        items.retain(|it| !self.suppressions.matches(check, site_of(it)));
+        items.retain(|it| {
+            !self
+                .suppressions
+                .matches_tiered(check, site_of(it), gating_of(it))
+        });
         before - items.len()
     }
 
@@ -161,8 +191,31 @@ impl AnalysisCtx<'_> {
             Some(k) => format!("{}/{}", check, k),
             None => check.to_string(),
         };
-        self.out
-            .hint(&format!("  // unruster: ok({}) {} — WHY?", spec, today));
+        let line = format!("  // unruster: ok({}) {} — WHY?", spec, today);
+        self.out.hint(&line);
+        // Structured, alongside the prose, so `--json` output is a `jq` away
+        // from `waivers --apply`. Without it the suggestion carried no
+        // location: a reader building a batch had to re-derive which row each
+        // comment belonged to, and that pipeline was hand-written four separate
+        // times in one session.
+        self.out.tag_last_row(&[
+            ("waiver_check", check.to_string()),
+            ("waiver_key", key.unwrap_or_default().to_string()),
+        ]);
+        // A `near-clones` key concatenates two function names, and the line it
+        // produces can outrun a formatter's width. The parser now reads a date
+        // off the first continuation line, so a wrap no longer loses it — but a
+        // line nobody can read without scrolling is still worth one word of
+        // warning, and item scope is shorter than the alternative.
+        if line.len() > WRAPPABLE_WAIVER_LEN {
+            self.out.note(&format!(
+                "(note: that waiver line is {} chars and will likely be wrapped by a \
+                 formatter. Keep the date on the line after the `ok(...)` — the parser \
+                 reads it there — or place the waiver above the item instead of \
+                 trailing the site, which shortens the key.)",
+                line.len()
+            ));
+        }
     }
 
     /// The target did not resolve: say which of the two reasons, and return the

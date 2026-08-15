@@ -237,7 +237,7 @@ pub fn run(
                         ctx.out,
                         "kind" => h.kind,
                         "target" => h.target.clone(),
-                        "context" => h.context.clone(),
+                        "in_fn" => h.context.clone(),
                         "at" => site(&h.file, h.line),
                     );
                 }
