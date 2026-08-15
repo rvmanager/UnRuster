@@ -175,3 +175,158 @@ fn nothing_here(
     ctx.out.note(&msg);
     Err(crate::context::TargetNotFound::err("file", path))
 }
+
+/// `at <file>:<line>` — which item owns a line.
+///
+/// The reverse of every other lookup here, and the one an agent needs when a
+/// line number arrives from somewhere else: a compiler error, a stack trace, a
+/// `grep -n` hit, a review comment. The observed escape, verbatim:
+///
+/// ```text
+/// awk 'NR<=5728 && /^(pub )?fn |^    pub fn /{l=NR": "$0} END{}' src/cmd/mod.rs >/dev/null; \
+///   grep -n '^pub fn \|^fn ' src/cmd/mod.rs | awk -F: '$1<5728' | tail -3
+/// ```
+///
+/// That is a reverse span lookup, hand-rolled over data `outline` already
+/// computes, with the same `^fn` anchor this module's header explains is wrong
+/// in both directions — and no way to see the `impl` block the answer sits in.
+///
+/// Answers with the whole containing chain rather than the innermost item
+/// alone. `impl-fn` rows carry a bare method name, so "you are in `lookup`" is
+/// only half an answer when four types have one; the `impl` and `mod` rows
+/// above it are what make the innermost row mean something.
+pub fn run_at(ctx: &AnalysisCtx, target: &str, root: &std::path::Path) -> anyhow::Result<usize> {
+    let (path, line) = match split_file_line(target) {
+        Some(v) => v,
+        None => {
+            // `answer`, not `note`: this is the whole reply to the query, and a
+            // reader who wrote `2>/dev/null` must still receive it. Same rule
+            // `say_unknown` follows for every other failed lookup.
+            ctx.out.answer(&format!(
+                "note: `{}` is not a `<file>:<line>` target. Write the line number after a \
+                 colon, as `grep -n`, `outline` and rustc all print it: `at src/trace.rs:2111`.",
+                target
+            ));
+            return Err(crate::context::TargetNotFound::err("file:line", target));
+        }
+    };
+
+    let want = std::path::Path::new(path);
+    let in_this_file: Vec<&Defn> = ctx.idx.iter().filter(|d| in_file(d, want)).collect();
+    if in_this_file.is_empty() {
+        return nothing_here(ctx, path, root);
+    }
+
+    let mut files: Vec<&str> = in_this_file.iter().map(|d| d.file.as_str()).collect();
+    files.sort_unstable();
+    files.dedup();
+    if files.len() > 1 {
+        ctx.out.note(&format!(
+            "note: `{}` matches {} files ({}) — a line number means a different place in \
+             each, so pass a longer path to pick one",
+            path,
+            files.len(),
+            files.join(", ")
+        ));
+    }
+
+    // Doc comments and attributes count as inside the item: a reader pointed at
+    // a `#[arg(long)]` line is asking about the field it decorates, and an
+    // extent that started at `decl` would answer "nothing owns this".
+    let mut chain: Vec<&Defn> = in_this_file
+        .iter()
+        .copied()
+        .filter(|d| d.doc_start <= line && line <= d.end)
+        .collect();
+    // Outermost first: widest span, then earliest start. Read top-down it is a
+    // breadcrumb — module, impl, method.
+    chain.sort_by(|a, b| {
+        (b.end - b.doc_start)
+            .cmp(&(a.end - a.doc_start))
+            .then_with(|| a.doc_start.cmp(&b.doc_start))
+    });
+
+    if chain.is_empty() {
+        return between_items(ctx, path, line, &in_this_file);
+    }
+
+    if !ctx.summary {
+        for d in &chain {
+            ctx.out.row(vec![
+                ("kind", Val::from(d.kind)),
+                ("vis", Val::from(d.vis)),
+                ("name", Val::from(d.qpath.clone())),
+                ("loc", Val::from(d.end.saturating_sub(d.line) + 1)),
+                // Always the span, never the bare declaration line: the span is
+                // the answer to "what owns this", and `--spans` must not be the
+                // difference between an answer and half of one.
+                ("at", crate::emit::span_site(&d.file, d.doc_start, d.end)),
+            ]);
+        }
+    }
+    // The innermost row is the answer; the summary names it so a reader does
+    // not have to work out which end of the chain they wanted.
+    let inner = chain[chain.len() - 1];
+    ctx.out.summary(&format!(
+        "({}:{} is in `{}` ({} {}-{}); {} enclosing item(s) listed outermost first — \
+         `show {}` prints it)",
+        path,
+        line,
+        inner.qpath,
+        inner.kind,
+        inner.doc_start,
+        inner.end,
+        chain.len().saturating_sub(1),
+        inner.qpath
+    ));
+    Ok(chain.len())
+}
+
+/// Split `src/trace.rs:2111` into its path and line.
+///
+/// On the *last* colon, so a Windows-style `C:\…:12` and a path containing one
+/// still split where the number is. A target with no line number is a mistake
+/// worth naming rather than defaulting to line 1, which would answer confidently
+/// about the top of the file.
+fn split_file_line(target: &str) -> Option<(&str, usize)> {
+    let (path, num) = target.rsplit_once(':')?;
+    let line: usize = num.trim().parse().ok()?;
+    (!path.is_empty() && line > 0).then_some((path, line))
+}
+
+/// The line is in the file but inside no item — a header comment, a `use`
+/// block, a blank run between two items.
+///
+/// Naming the neighbours is the whole value: "nothing owns line 12" is true and
+/// useless, where "it is after the `use` block and before `fn build` at 67"
+/// tells the reader where they actually are. Exits 0, because this is a real
+/// answer about a real line rather than a lookup that failed.
+fn between_items(
+    ctx: &AnalysisCtx,
+    path: &str,
+    line: usize,
+    items: &[&Defn],
+) -> anyhow::Result<usize> {
+    let before = items
+        .iter()
+        .filter(|d| d.end < line)
+        .max_by_key(|d| d.end);
+    let after = items
+        .iter()
+        .filter(|d| d.doc_start > line)
+        .min_by_key(|d| d.doc_start);
+    let describe = |d: Option<&Defn>, rel: &str| match d {
+        Some(d) => format!("{} `{}` ({} {}-{})", rel, d.qpath, d.kind, d.doc_start, d.end),
+        None => format!("{} nothing", rel),
+    };
+    ctx.out.summary(&format!(
+        "({}:{} is inside no item — it is {}, {}. Between-item lines are `use` blocks, \
+         module headers and blank runs; `outline {}` lists the items.)",
+        path,
+        line,
+        describe(before.copied(), "after"),
+        describe(after.copied(), "before"),
+        path
+    ));
+    Ok(0)
+}

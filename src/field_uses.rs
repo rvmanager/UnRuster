@@ -351,6 +351,50 @@ fn tally_and_print(ctx: &AnalysisCtx, all: &[FieldHit]) -> (usize, usize, usize,
     (reads, writes, inits, ti_count, q_count)
 }
 
+/// A field that is built and never read is a finding, so say the word.
+///
+/// The counts were already right. `field-uses render::Built radius` answered
+/// `(0 reads, 0 writes, 3 inits; …)` in a session whose entire purpose was
+/// finding removable machinery — three construction sites, nothing anywhere
+/// reading the value — and the reader moved on without remarking on it. A
+/// number a reader has to interpret is a finding the tool declined to make.
+///
+/// Held to the run that could honestly conclude it: any filter (`--class`,
+/// `--via-receiver`, `--min-confidence`) means the zero is the filter's doing,
+/// and `--candidates` is a wider net whose zero says less, not more. The scope
+/// caveat is real and stays attached — a field read only from tests reads as
+/// write-only under the default `--scope production`.
+fn note_write_only(
+    ctx: &AnalysisCtx,
+    ty: &str,
+    field: &str,
+    reads: usize,
+    writes: usize,
+    inits: usize,
+    opts: &FieldUsesOpts,
+) {
+    let unfiltered = opts.strict
+        && opts.kinds.is_empty()
+        && opts.via_receiver.is_none()
+        && opts.min_confidence.is_none();
+    if !unfiltered || reads > 0 || inits == 0 {
+        return;
+    }
+    ctx.out.note(&format!(
+        "note: no site reads `{}::{}` — {} init(s){} and no read, so the value is written and \
+         never used. Confirm with `--scope all` before removing it: a field read only from \
+         tests looks exactly like this one.",
+        ty,
+        field,
+        inits,
+        if writes > 0 {
+            format!(", {} write(s)", writes)
+        } else {
+            String::new()
+        }
+    ));
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
     ty: &str,
@@ -392,6 +436,7 @@ pub fn run(
         "({} reads, {} writes, {} inits; via: {} type-inferred, {} unknown receiver; strict={})",
         reads, writes, inits, ti_count, q_count, opts.strict
     ));
+    note_write_only(ctx, ty, field, reads, writes, inits, &opts);
 
     if opts.strict && all.is_empty() && opts.via_receiver.is_none() && opts.kinds.is_empty() {
         let cand = collect(files, ty, field, false, fn_sigs, false);

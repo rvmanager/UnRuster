@@ -206,6 +206,30 @@ impl AnalysisCtx<'_> {
             let mut kinds: Vec<&str> = existing.iter().map(|d| d.kind).collect();
             kinds.sort_unstable();
             kinds.dedup();
+            // The item is already the kind that was asked for, so "not as an
+            // enum — it is: enum" is the sentence this used to print, and it
+            // sends the reader looking for a spelling problem that isn't there.
+            // What actually happened is that the declaration is empty: `enum
+            // Never {}` has no variants to score, and `enum-coverage Never`
+            // has nothing to say about it. Naming the declaration ends the
+            // search where naming the kind restarted it.
+            //
+            // `fields` on a tuple struct does not land here — it asks for a
+            // "struct with named fields" against a kind of "struct", so the
+            // phrase already carries the difference.
+            if kinds.contains(&what) {
+                self.out.answer(&format!(
+                    "note: `{}` is {} {} in the scanned tree, so the name is right — but the \
+                     declaration is empty, and an empty one gives this command nothing to \
+                     report. Check the source at {}:{}.",
+                    name,
+                    article(what),
+                    what,
+                    existing[0].file,
+                    existing[0].line
+                ));
+                return;
+            }
             self.out.answer(&format!(
                 "note: `{}` is in the scanned tree but not as {} {} — it is: {}",
                 name,

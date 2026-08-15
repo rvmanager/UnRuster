@@ -379,6 +379,14 @@ pub(crate) fn variant_names_of(files: &[ParsedFile], enum_name: &str) -> Vec<Str
 /// coverage: six false-positive rows on one real codebase, and
 /// `enum-coverage Op` unable to answer for either enum. Keeping the sets apart
 /// lets each site be scored against the definition it actually dispatches on.
+///
+/// `enum_name` must arrive bare — callers reduce it with
+/// [`crate::ast::last_segment`]. A qualified `edit::Op` therefore selects no
+/// *fewer* definitions than `Op` does: the qualifier is accepted so a name
+/// copied off `show` resolves, not to narrow the scan. Narrowing it would be a
+/// different answer from the one `fields`, `field-uses` and `variants` give the
+/// same spelling, and one command disagreeing with the rest about what a name
+/// means is what sent a reader back to `grep` in the first place.
 pub(crate) fn variant_sets_of(files: &[ParsedFile], enum_name: &str) -> Vec<Vec<String>> {
     struct V<'a> {
         target: &'a str,
@@ -472,6 +480,11 @@ pub fn run(
     target: Option<&str>,
     opts: ScanOpts,
 ) -> anyhow::Result<usize> {
+    // Reduce `scene::Kind` to `Kind` before anything reads it: `variant_sets_of`
+    // matches an `ItemEnum`'s bare ident, and the name is threaded on into the
+    // `Enum::Variant` strings the scan compares against. See the note on
+    // [`variant_sets_of`] for why the qualifier cannot narrow the answer.
+    let target = target.map(crate::ast::last_segment);
     match target {
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);
@@ -823,6 +836,10 @@ pub fn run_enum_coverage(
     target: Option<&str>,
     opts: CoverageOpts,
 ) -> anyhow::Result<usize> {
+    // As in [`run`]: the target reaches `variant_sets_of` and `enum_sealed` as a
+    // bare ident or matches nothing. A `/// unruster: sealed` marker is read the
+    // same way, so a qualified query used to lose the SEALED tag too.
+    let target = target.map(crate::ast::last_segment);
     match target {
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);

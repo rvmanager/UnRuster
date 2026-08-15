@@ -33,12 +33,16 @@ struct TestInfo {
     /// and `--scope <value>`, keeps the subcommand and following flags. None
     /// when no args call detected.
     hint: Option<String>,
+    /// How `--mentions <ident>` matched this body, if it did. `None` under no
+    /// `--mentions`, and also for a body that does not name it.
+    mention: Option<&'static str>,
 }
 
 struct TestVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
     grammar: &'a CliGrammar,
+    mentions: Option<&'a str>,
     out: Vec<TestInfo>,
 }
 
@@ -55,6 +59,7 @@ impl<'a> TestVisitor<'a> {
         let line_end = body.span().end().line.max(line_start);
         let qpath = self.qualify(&sig.ident.to_string());
         let (subcommand, hint) = scan_body_for_args(body, self.grammar);
+        let mention = self.mentions.and_then(|m| mention_of(body, m));
         self.out.push(TestInfo {
             attr: attr_kind,
             qpath,
@@ -63,8 +68,76 @@ impl<'a> TestVisitor<'a> {
             line_end,
             subcommand,
             hint,
+            mention,
         });
     }
+}
+
+/// How a test body names `want`: as an identifier, inside a string literal, or
+/// both. `None` when it does not name it at all.
+///
+/// Both, and labelled, because they are different evidence. A test that writes
+/// `Kind::Circle` breaks when the variant goes; a test whose fixture string
+/// contains `circle r=50` breaks when the *language* drops the word, which is a
+/// different migration on a different day. The session that needed this counted
+/// them together —
+///
+/// ```text
+/// for s in circle ellipse rect …; do grep -cE "(^|[^a-z-])$s( |=|\")" tests/render.rs; done
+/// ```
+///
+/// — over an 18k-line file, and got one number per word with no way to tell the
+/// two apart, no test names, and a regex hand-tuned to avoid matching
+/// `rectangle`.
+///
+/// Walks the block's raw token stream rather than the AST, which is what makes
+/// it complete: a test's assertions live inside `assert_eq!` and `matches!`,
+/// and a `Visit` impl does not descend into a macro's tokens. Whole-word
+/// matching inside literals, so `rect` does not match `rectangle`.
+fn mention_of(body: &syn::Block, want: &str) -> Option<&'static str> {
+    use quote::ToTokens;
+    fn walk(ts: proc_macro2::TokenStream, want: &str, ident: &mut bool, string: &mut bool) {
+        for t in ts {
+            match t {
+                proc_macro2::TokenTree::Ident(i) if i == want => *ident = true,
+                proc_macro2::TokenTree::Literal(l) => {
+                    if !*string && literal_names(&l.to_string(), want) {
+                        *string = true;
+                    }
+                }
+                proc_macro2::TokenTree::Group(g) => walk(g.stream(), want, ident, string),
+                _ => {}
+            }
+        }
+    }
+    let (mut ident, mut string) = (false, false);
+    walk(body.to_token_stream(), want, &mut ident, &mut string);
+    match (ident, string) {
+        (true, true) => Some("both"),
+        (true, false) => Some("ident"),
+        (false, true) => Some("string"),
+        (false, false) => None,
+    }
+}
+
+/// Whether a literal token's text contains `want` as a whole word.
+///
+/// A word boundary here is "not a character an identifier can continue with",
+/// and `-` counts as one so a KDL/CSS-ish `corner-tl` is found by `corner`
+/// while `rectangle` is not found by `rect`.
+fn literal_names(lit: &str, want: &str) -> bool {
+    let boundary = |c: Option<char>| !c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let mut from = 0usize;
+    while let Some(i) = lit[from..].find(want) {
+        let at = from + i;
+        let before = lit[..at].chars().next_back();
+        let after = lit[at + want.len()..].chars().next();
+        if boundary(before) && boundary(after) {
+            return true;
+        }
+        from = at + want.len();
+    }
+    false
 }
 
 impl<'ast, 'a> Visit<'ast> for TestVisitor<'a> {
@@ -285,6 +358,9 @@ pub struct TestsOpts<'a> {
     /// List only the tests invoking this subcommand ([`NO_SUBCOMMAND`] for the
     /// ones whose subcommand could not be detected).
     pub only: Option<&'a str>,
+    /// List only the tests whose body names this identifier — the blast radius
+    /// of removing it. Adds a `via` column saying how each one names it.
+    pub mentions: Option<&'a str>,
 }
 
 pub fn run(
@@ -300,10 +376,30 @@ pub fn run(
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()),
             grammar,
+            mentions: opts.mentions,
             out: Vec::new(),
         };
         v.visit_file(&f.ast);
         all.extend(v.out);
+    }
+
+    // Before the subcommand views, so `--mentions` composes with them: "which
+    // of the tests that name `Kind` drive the `trace` subcommand" is one
+    // question, and answering it needed two greps and an eyeball join.
+    if let Some(want) = opts.mentions {
+        let scanned = all.len();
+        all.retain(|t| t.mention.is_some());
+        if all.is_empty() {
+            // Not an error: "no test names this" is a real and useful answer
+            // before a removal — it is the cheap case, and reporting it as a
+            // failed lookup would make the reader doubt the spelling instead.
+            ctx.out.summary(&format!(
+                "(0 of {} test fn(s) name `{}` — nothing in the test suite depends on it \
+                 by that spelling)",
+                scanned, want
+            ));
+            return Ok(0);
+        }
     }
 
     // The histogram says *how many* tests cover each subcommand; this says
@@ -311,7 +407,13 @@ pub fn run(
     // to grep the test file for the subcommand string and read what came back
     // — which is the same locate-by-guessing that `show` exists to end.
     if let Some(want) = opts.only {
-        return listing(ctx, filter_to(ctx, all, want)?, opts.with_hint, Some(want));
+        return listing(
+            ctx,
+            filter_to(ctx, all, want)?,
+            opts.with_hint,
+            Some(want),
+            opts.mentions,
+        );
     }
 
     if opts.by_subcommand {
@@ -350,7 +452,7 @@ pub fn run(
         return Ok(all.len());
     }
 
-    listing(ctx, all, opts.with_hint, None)
+    listing(ctx, all, opts.with_hint, None, opts.mentions)
 }
 
 /// Keep only the tests that exercise `want`, or fail with the alternatives.
@@ -411,34 +513,40 @@ fn listing(
     mut all: Vec<TestInfo>,
     with_hint: bool,
     only: Option<&str>,
+    mentions: Option<&str>,
 ) -> anyhow::Result<usize> {
     all.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line_start.cmp(&b.line_start)));
 
     if !ctx.summary {
         for t in &all {
+            // Cells built rather than four `row!` arms over two independent
+            // optional columns: that shape was already two near-copies before
+            // `--mentions` and would have been four, which is what
+            // `near-clones` reports on other people's code.
+            //
+            // Both optional columns follow the same rule — a column appears
+            // only when its flag asked for it, so an existing `tests`
+            // invocation's TSV keeps its shape. `via` leads because it is what
+            // the reader scans under `--mentions`.
+            let mut cells: Vec<(&'static str, crate::emit::Val)> = Vec::with_capacity(5);
+            if let Some(via) = t.mention {
+                cells.push(("via", via.into()));
+            }
+            cells.push(("attr", t.attr.into()));
             // A typed span cell, not the `format!("{}:{}-{}")` string this
             // built by hand. Same TSV text, but `--context N` can now find the
             // site and print the body, and `--json` gets real
             // `file`/`line`/`end_line` fields instead of one opaque string —
             // which is the whole reason the column existed.
-            let range = crate::emit::span_site(&t.file, t.line_start, t.line_end);
+            cells.push((
+                "range",
+                crate::emit::span_site(&t.file, t.line_start, t.line_end),
+            ));
+            cells.push(("qpath", t.qpath.clone().into()));
             if with_hint {
-                let h = t.hint.as_deref().unwrap_or("");
-                row!(
-                    ctx.out,
-                    "attr" => t.attr,
-                    "range" => range,
-                    "qpath" => t.qpath.clone(),
-                    "hint" => h,
-                );
-            } else {
-                row!(
-                    ctx.out,
-                    "attr" => t.attr,
-                    "range" => range,
-                    "qpath" => t.qpath.clone(),
-                );
+                cells.push(("hint", t.hint.as_deref().unwrap_or("").into()));
             }
+            ctx.out.row(cells);
         }
     }
 
@@ -448,15 +556,31 @@ fn listing(
         *by_attr.entry(t.attr).or_insert(0) += 1;
     }
     let parts: Vec<String> = by_attr.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
-    let scope = match only {
-        Some(s) => format!(" invoking `{}`", s),
-        None => String::new(),
+    let scope = match (only, mentions) {
+        (Some(s), Some(m)) => format!(" invoking `{}` and naming `{}`", s, m),
+        (Some(s), None) => format!(" invoking `{}`", s),
+        (None, Some(m)) => format!(" naming `{}`", m),
+        (None, None) => String::new(),
     };
     ctx.out.summary(&format!(
-        "({} test fn(s){}; {})",
+        "({} test fn(s){}; {}{})",
         all.len(),
         scope,
-        parts.join(", ")
+        parts.join(", "),
+        // The two ways a body can name an identifier are different evidence and
+        // break on different days — see `mention_of`.
+        match mentions {
+            Some(_) => {
+                let by = |k: &str| all.iter().filter(|t| t.mention == Some(k)).count();
+                format!(
+                    "; via: {} ident, {} string, {} both",
+                    by("ident"),
+                    by("string"),
+                    by("both")
+                )
+            }
+            None => String::new(),
+        }
     ));
     Ok(all.len())
 }

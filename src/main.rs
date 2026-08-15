@@ -38,6 +38,7 @@ mod index;
 mod inventory;
 mod macro_scan;
 mod metrics;
+mod module_uses;
 mod near_clones;
 mod oracle;
 mod outline;
@@ -307,6 +308,13 @@ enum Cmd {
     /// methods and multi-line signatures — and every row says where the item
     /// ends, so the follow-up read is exact rather than a 150-line window.
     Outline(OutlineArgs),
+    /// Which item owns a line: `at src/trace.rs:2111`. The reverse lookup, for
+    /// when the line number came from somewhere else — a compiler error, a
+    /// stack trace, a `grep -n` hit, a review comment. Prints the whole
+    /// containing chain outermost first (mod, impl, fn), because a bare method
+    /// name is half an answer when four types have one. A line inside no item
+    /// says which items it sits between rather than nothing.
+    At(AtArgs),
     /// Find call sites of a function, method, or macro.
     Callers(CallersArgs),
     /// List callees made from inside a function or method.
@@ -330,6 +338,14 @@ enum Cmd {
     TypeRefs(TypeRefsArgs),
     /// Find fns whose signature takes `&mut <Type>`.
     TakesMut(TakesMutArgs),
+    /// What the rest of the tree takes from one module — the coupling surface a
+    /// removal has to pay for. `type-refs` answers this for one type and
+    /// `callers` for one fn; neither answers it for a module, which is the unit
+    /// a removal is scoped by. The `via` column separates real linkage
+    /// (`path`, `use`, `name`) from doc-comment prose (`doc`), which a grep for
+    /// `mod::` cannot do and which a rename breaks silently. `--by file` ranks
+    /// the items reached, `--by module` the modules reaching them.
+    ModuleUses(ModuleUsesArgs),
     /// Rank fns by LOC, params, cyclomatic complexity, or nesting depth;
     /// structs by field count; enums by variant count. Use `--threshold N` to
     /// filter by the sort metric.
@@ -531,6 +547,8 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::Inventory(_) => "inventory",
         Cmd::Show(_) => "show",
         Cmd::Outline(_) => "outline",
+        Cmd::At(_) => "at",
+        Cmd::ModuleUses(_) => "module-uses",
         Cmd::Callers(_) => "callers",
         Cmd::Callees(_) => "callees",
         Cmd::CoCall(_) => "co-call",
@@ -594,6 +612,7 @@ impl Cmd {
             | Cmd::Inventory(_)
             | Cmd::Show(_)
             | Cmd::Outline(_)
+            | Cmd::At(_)
             | Cmd::Callers(_)
             | Cmd::Callees(_)
             | Cmd::CoCall(_)
@@ -603,6 +622,7 @@ impl Cmd {
             | Cmd::Impls(_)
             | Cmd::TypeRefs(_)
             | Cmd::TakesMut(_)
+            | Cmd::ModuleUses(_)
             | Cmd::Metrics(_)
             | Cmd::DeadCode(_)
             | Cmd::CatchAllArms(_)
@@ -956,6 +976,36 @@ struct ShowArgs {
 }
 
 #[derive(Args)]
+struct ModuleUsesArgs {
+    /// The module, by path or by any trailing part of one: `build`,
+    /// `geom::build` and `crate::geom::build` all resolve. Submodules count as
+    /// inside it — a removal takes them along, so their traffic is internal.
+    module: String,
+    /// `fn` (default) lists every site; `file` ranks the module's items by how
+    /// often they are reached; `module` ranks the modules doing the reaching.
+    /// The two aggregations are the `sort | uniq -c | sort -rn` this replaces.
+    #[arg(long, value_enum, default_value = "fn")]
+    by: context::GroupBy,
+    /// Keep only rows at or above this tier. `path` and `use` sites are
+    /// `resolved`; a bare name matched because nothing else in the tree carries
+    /// it, and every doc reference, are `inferred`.
+    #[arg(long, value_enum)]
+    min_confidence: Option<context::Confidence>,
+    /// Drop the doc-comment references and report code linkage only.
+    #[arg(long)]
+    no_docs: bool,
+}
+
+#[derive(Args)]
+struct AtArgs {
+    /// `<file>:<line>` — the spelling `grep -n`, `outline` and rustc all print,
+    /// so a location can be pasted straight in. The file resolves like
+    /// `outline`'s: any trailing part of the path, on whole components.
+    #[arg(value_name = "FILE:LINE")]
+    target: String,
+}
+
+#[derive(Args)]
 struct OutlineArgs {
     /// The file, as a path or any trailing part of one: `src/geom/window.rs`,
     /// `geom/window.rs` and `window.rs` all resolve. Matching is on whole path
@@ -1114,9 +1164,17 @@ struct MetricsArgs {
     #[arg(long, value_enum, default_value = "loc")]
     sort: metrics::SortKey,
     /// Only show fns where the sort metric is >= N. E.g. with
-    /// `--sort cyclo --threshold 15`, only fns with cyclo >= 15.
+    /// `--sort cyclo --threshold 15`, only fns with cyclo >= 15. Under
+    /// `--by file|module` it filters on the line count instead.
     #[arg(long)]
     threshold: Option<usize>,
+    /// What to size: `fn` (default) ranks fns, structs and enums; `file` and
+    /// `module` rank whole files and modules by line count, with their item and
+    /// fn counts — the `wc -l src/*.rs | sort -rn` question, answered against
+    /// the same parse the rest of the tool uses. `--sort` ranks fns and has no
+    /// effect on the other two.
+    #[arg(long, value_enum, default_value = "fn")]
+    by: context::GroupBy,
 }
 
 #[derive(Args)]
@@ -1436,6 +1494,14 @@ struct TestsArgs {
     /// Composes with `--with-hint` and with `--context N` to read the bodies.
     #[arg(long, value_name = "NAME")]
     subcommand: Option<String>,
+    /// List only the tests whose body names this identifier — the blast radius
+    /// of removing a type, fn or variant, before you remove it. Adds a `via`
+    /// column: `ident` for `Kind::Circle` in code, `string` for the word inside
+    /// a fixture literal (whole-word, so `rect` misses `rectangle`), `both` for
+    /// a body that does each. Reads macro bodies too, where an AST walk stops —
+    /// most assertions live inside `assert_eq!`.
+    #[arg(long, value_name = "IDENT")]
+    mentions: Option<String>,
 }
 
 #[derive(Args)]
@@ -1622,6 +1688,7 @@ fn traits_of(cmd: &Cmd) -> CmdTraits {
         | Cmd::FieldUses(_)
         | Cmd::TypeRefs(_)
         | Cmd::TakesMut(_)
+        | Cmd::ModuleUses(_)
         | Cmd::Variants(_)
         | Cmd::ParallelMatches(_)
         | Cmd::CatchAllArms(_) => t.usage(),
@@ -1629,7 +1696,7 @@ fn traits_of(cmd: &Cmd) -> CmdTraits {
         // Catalogue and navigation: they report what is there, so an
         // unreadable macro body is not an answer they were ever giving.
         // `cache` reports on this tool's own state and reads no code at all.
-        Cmd::Show(_) | Cmd::Outline(_) | Cmd::Cache(_) => t.catalogue(),
+        Cmd::Show(_) | Cmd::Outline(_) | Cmd::At(_) | Cmd::Cache(_) => t.catalogue(),
 
         // The gate answers "what already exists", which is a usage query
         // pointed at declarations rather than call sites — and it deliberately
@@ -1978,6 +2045,16 @@ fn dispatch(
                 flat: a.flat,
             },
         ),
+        Cmd::At(a) => outline::run_at(ctx, &a.target, root),
+        Cmd::ModuleUses(a) => module_uses::run(
+            ctx,
+            &a.module,
+            &module_uses::ModuleUsesOpts {
+                by: a.by,
+                min_confidence: a.min_confidence,
+                include_docs: !a.no_docs,
+            },
+        ),
         Cmd::Callers(a) => {
             if let Some(pattern) = a.among.as_deref() {
                 callers::run_callers_among(ctx, &a.name, pattern)
@@ -2006,7 +2083,7 @@ fn dispatch(
             Some(ty) => takes_mut::run(ctx, ty),
             None => takes_mut::run_candidates(ctx),
         },
-        Cmd::Metrics(a) => metrics::run(ctx, a.sort, a.threshold, false),
+        Cmd::Metrics(a) => metrics::run(ctx, a.sort, a.threshold, false, a.by),
         Cmd::DeadCode(a) => {
             // Build the call-set from the FULL tree so production items called
             // only from tests aren't false-flagged as dead.
@@ -2114,6 +2191,7 @@ fn dispatch(
                     with_hint: a.with_hint,
                     by_subcommand: a.by_subcommand,
                     only: a.subcommand.as_deref(),
+                    mentions: a.mentions.as_deref(),
                 },
                 &cli_grammar(),
             )

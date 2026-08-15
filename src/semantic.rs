@@ -41,8 +41,25 @@ impl UseMap {
     /// from the parent) reported "no item named". The suggestion list then
     /// offered six near-misses in other modules and not the answer.
     pub fn build_in(file: &syn::File, module: &str) -> Self {
+        Self::build_in_items(&file.items, module)
+    }
+
+    /// As [`build_in`](Self::build_in), for one *block* of items rather than a
+    /// whole file — the contents of an inline `mod foo { … }`.
+    ///
+    /// A file's use-map reads only its top-level items, which is right for the
+    /// one-module-per-file crate this tool mostly meets and wrong for the
+    /// commonest exception: `mod tests { use super::*; }`, and any crate that
+    /// nests modules inline. `module-uses` on such a crate saw the `use` line
+    /// and then missed every bare reference it enabled, because the imports
+    /// were a scope down from where anything looked for them.
+    ///
+    /// Callers that walk into inline modules keep a stack of these and resolve
+    /// innermost-first; a caller that only ever sees a file keeps using
+    /// `build_in` and is unaffected.
+    pub fn build_in_items(items: &[syn::Item], module: &str) -> Self {
         let mut um = UseMap::default();
-        for item in &file.items {
+        for item in items {
             if let syn::Item::Use(u) = item {
                 let mut prefix = Vec::new();
                 collect_uses(&u.tree, &mut prefix, &mut um);

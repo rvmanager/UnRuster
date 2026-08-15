@@ -18,7 +18,9 @@
 //! line through the closing brace, and when the name does not resolve it says
 //! what the near names are instead of printing nothing.
 
-use crate::ast::last_segment;
+use syn::visit::Visit;
+
+use crate::ast::{last_segment, module_of_path};
 use crate::context::{AnalysisCtx, TargetNotFound};
 use crate::emit::{row, site, span_site, Format, Val};
 use crate::index::Defn;
@@ -289,22 +291,118 @@ fn header(ctx: &AnalysisCtx, d: &Defn, range: Option<(usize, usize)>) {
     );
 }
 
+/// `Enum::Variant` — the one target shaped like an item that the index does not
+/// hold, resolved on demand.
+///
+/// Variants are deliberately absent from [`NameIndex`](crate::index::NameIndex):
+/// putting them in would mean `lookup("Circle")` answering with a variant, and
+/// every command that resolves a name would inherit the ambiguity. But a variant
+/// is exactly what a reader asks to see in a clap-derive CLI, where the variant
+/// *is* the unit — one `Command::Outline` carries a dozen documented `#[arg]`
+/// fields. The escape observed was
+///
+/// ```text
+/// sed -n "$(grep -n 'Outline {' src/cli.rs | head -1 | cut -d: -f1),+70p" src/cli.rs
+/// ```
+///
+/// which is this command's own module-header idiom, `+70` guess and all, for
+/// the one target it could not resolve.
+///
+/// Synthesised rather than indexed, so the cost lands only on a query that has
+/// already failed the normal lookup: `kind` is `"variant"`, which
+/// [`sig_shape`] treats as `Whole`, so `--part sig` prints the declaration and
+/// `--part full` prints it with its docs.
+fn variant_defns(ctx: &AnalysisCtx, query: &str) -> Vec<Defn> {
+    let want_variant = last_segment(query);
+    let enum_path = module_of_path(query);
+    if enum_path.is_empty() {
+        return Vec::new();
+    }
+    let want_enum = last_segment(enum_path);
+
+    struct V<'a> {
+        want_enum: &'a str,
+        want_variant: &'a str,
+        file: &'a str,
+        scope: crate::ast::ScopeTracker,
+        out: Vec<Defn>,
+    }
+    impl<'ast> Visit<'ast> for V<'_> {
+        fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+            self.scope.enter_mod(m.ident.to_string());
+            syn::visit::visit_item_mod(self, m);
+            self.scope.leave_mod();
+        }
+        fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
+            if e.ident != self.want_enum {
+                return;
+            }
+            let enum_qpath = self.scope.qualify(&e.ident.to_string());
+            for v in &e.variants {
+                if v.ident != self.want_variant {
+                    continue;
+                }
+                let decl = crate::ast::line_of(&v.ident);
+                let ext = crate::ast::extent_of(v, &v.attrs, decl);
+                self.out.push(Defn {
+                    kind: "variant",
+                    name: v.ident.to_string(),
+                    qpath: format!("{}::{}", enum_qpath, v.ident),
+                    file: self.file.to_string(),
+                    line: ext.decl,
+                    doc_start: ext.doc_start,
+                    end: ext.end,
+                    // A variant has no body to cut away from a signature, so
+                    // `--part sig` and `--part full` are the same range.
+                    sig_end: ext.end,
+                    doc: crate::ast::doc_summary(&v.attrs),
+                    depth: 0,
+                    // Variants inherit the enum's visibility; they have none of
+                    // their own to report.
+                    vis: crate::ast::vis_str(&e.vis),
+                    module: self.scope.module.clone(),
+                    owner: Some(e.ident.to_string()),
+                    trait_name: None,
+                    in_trait_impl: false,
+                    allow_dead: false,
+                    is_test: false,
+                });
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for f in ctx.files {
+        let mut v = V {
+            want_enum,
+            want_variant,
+            file: &crate::parse::display_path(&f.path),
+            scope: crate::ast::ScopeTracker::new(f.module.as_str()),
+            out: Vec::new(),
+        };
+        v.visit_file(&f.ast);
+        out.extend(v.out);
+    }
+    out
+}
+
 /// Resolve `query` to the items it names, in source order.
 ///
 /// Split from the printing because they fail differently: everything here ends
 /// in either a set of items or a `TargetNotFound` with an explanation of *why*
 /// nothing matched, and there are four distinct reasons. Interleaving that with
 /// the rendering was what put this command over the tool's own complexity gate.
-fn resolve<'a>(
-    ctx: &'a AnalysisCtx,
-    query: &str,
-    opts: &ShowOpts,
-) -> anyhow::Result<Vec<&'a Defn>> {
+///
+/// Returns owned `Defn`s because one of the four outcomes — an `Enum::Variant`
+/// — is built here rather than borrowed from the index. A handful of clones per
+/// query against a whole-tree parse is not a cost worth an arena.
+fn resolve(ctx: &AnalysisCtx, query: &str, opts: &ShowOpts) -> anyhow::Result<Vec<Defn>> {
     let found = ctx.idx.lookup(query);
-    let mut hits: Vec<&Defn> = match opts.kind {
-        Some(k) => found.iter().copied().filter(|d| d.kind == k).collect(),
-        None => found.clone(),
-    };
+    let mut hits: Vec<Defn> = found
+        .iter()
+        .filter(|d| opts.kind.is_none_or(|k| d.kind == k))
+        .map(|d| (*d).clone())
+        .collect();
 
     // The name resolved and `--kind` then emptied it. Saying "no item named X"
     // here would be a lie that sends the reader hunting for a typo they did not
@@ -321,6 +419,12 @@ fn resolve<'a>(
         ));
         return Err(TargetNotFound::err("item", query));
     }
+    // Not an item — but `Enum::Variant` is shaped like one and is not indexed.
+    // Asked before `not_found` so a reader who spelled a real target correctly
+    // gets it, and after the index so no variant can shadow an item.
+    if hits.is_empty() && opts.kind.is_none_or(|k| k == "variant") {
+        hits = variant_defns(ctx, query);
+    }
     if hits.is_empty() {
         return not_found(ctx, query).map(|()| Vec::new());
     }
@@ -329,10 +433,10 @@ fn resolve<'a>(
     // the block alongside every method it contains is not an ambiguity a reader
     // needs to resolve, so a query that names a type prefers the type.
     if hits.len() > 1 && !query.contains("::") {
-        let named: Vec<&Defn> = hits
+        let named: Vec<Defn> = hits
             .iter()
-            .copied()
             .filter(|d| d.name == last_segment(query))
+            .cloned()
             .collect();
         if !named.is_empty() {
             hits = named;
@@ -356,10 +460,16 @@ fn resolve<'a>(
 /// actually writes that put it a line *above* the header it qualifies, reading
 /// as though the tool had answered before it was asked. A note about a result
 /// goes under the result.
-fn note_siblings(ctx: &AnalysisCtx, query: &str, hits: &[&Defn]) {
+fn note_siblings(ctx: &AnalysisCtx, query: &str, hits: &[Defn]) {
     let bare = last_segment(query);
     // Only for a query that narrowed: a bare-name query already listed them.
     if query == bare {
+        return;
+    }
+    // A variant's bare name is not an index key, so `lookup` would answer with
+    // whatever unrelated item happens to share it — `show Command::Show` would
+    // report "1 other item also named `Show`" and mean the `Show` args struct.
+    if hits.iter().any(|d| d.kind == "variant") {
         return;
     }
     let others = ctx.idx.lookup(bare).len().saturating_sub(hits.len());
@@ -373,10 +483,18 @@ fn note_siblings(ctx: &AnalysisCtx, query: &str, hits: &[&Defn]) {
     ));
 }
 
+/// Lines of source above which the print announces its own size first.
+///
+/// Chosen against the pipes people actually write — `head -20` through
+/// `head -200`. Under 40 lines a `| head -N` rarely cuts anything, and a note
+/// on every small item would be noise on the most-used command in the tool.
+const ANNOUNCE_SIZE_ABOVE: usize = 40;
+
 /// Print one resolved item: its header row, then whatever `--part` asked for.
 fn show_one(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
     let range = range_of(d, opts);
     header(ctx, d, range);
+    note_size_and_route(ctx, d, range, opts);
     match range {
         Some((start, end)) if prints_source(opts.part) => {
             print_source(ctx, &d.file, start, end, opts)
@@ -391,6 +509,50 @@ fn show_one(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
     }
     note_container_sig(ctx, d, opts);
     note_field_route(ctx, d);
+}
+
+/// Say how much source is coming, *before* it comes — and for an enum, name the
+/// command that answers the same question in one line per variant.
+///
+/// Every other note in this file is printed under the thing it qualifies, which
+/// is right for a remark about a result. This one is not a remark about the
+/// result; it is a warning that the result is about to be longer than the
+/// reader's pipe. [`DEFAULT_MAX_LINES`] already documents that seventeen of
+/// twenty invocations in one session were piped and five were cut — and a note
+/// placed after the body is cut by the very pipe it is warning about. Under the
+/// `2>&1 | head -N` an agent actually writes, this lands on line two and
+/// survives.
+///
+/// The header row carries `file:start-end` and so has always *implied* the
+/// count. It was implied at `show scene::Kind` — a 161-line enum read under
+/// `head -120`, which cut mid-variant, after which the reader analysed a
+/// truncated variant list without ever learning it was truncated. Arithmetic a
+/// reader has to do is a fact the tool did not report.
+fn note_size_and_route(ctx: &AnalysisCtx, d: &Defn, range: Option<(usize, usize)>, opts: &ShowOpts) {
+    if !prints_source(opts.part) {
+        return;
+    }
+    let Some((start, end)) = range else { return };
+    let lines = end.saturating_sub(start) + 1;
+    if lines <= ANNOUNCE_SIZE_ABOVE {
+        return;
+    }
+    // For an enum the compact route is not "read less of this", it is a
+    // different command with a complete answer: one row per variant, plus the
+    // ctor and match sites, immune to any `head`.
+    let route = if d.kind == "enum" {
+        format!(
+            " — `variants {}` lists them one per line, with their construction and match sites",
+            d.qpath
+        )
+    } else {
+        String::new()
+    };
+    ctx.out.note(&format!(
+        "note: {} line(s) of source follow{}. This command bounds itself; piping it to \
+         `head` cuts mid-item and says nothing.",
+        lines, route
+    ));
 }
 
 /// After printing a struct, name the two commands that answer the question a
@@ -444,7 +606,7 @@ fn note_container_sig(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
 }
 
 /// Render one query's resolved matches. Returns how many rows it emitted.
-fn emit_hits(ctx: &AnalysisCtx, query: &str, hits: &[&Defn], opts: &ShowOpts) -> usize {
+fn emit_hits(ctx: &AnalysisCtx, query: &str, hits: &[Defn], opts: &ShowOpts) -> usize {
     // More than one match and no `--all`: list them rather than print them.
     // Concatenating four function bodies under one header is the failure mode
     // this command was built to remove — the reader cannot tell where one ends.

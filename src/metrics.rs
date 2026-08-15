@@ -309,12 +309,138 @@ fn sort_fns(fns: &mut [FnMetric], sort: SortKey) {
     }
 }
 
+/// One file or module, sized. What `--by file` / `--by module` report.
+#[derive(Debug)]
+struct BulkMetric {
+    /// The file path, or the module path. `retain_changed` keys on `file`, so
+    /// a module row carries the first file that contributed to it.
+    label: String,
+    file: String,
+    lines: usize,
+    /// Only ever > 1 for a module row.
+    files: usize,
+    items: usize,
+    fns: usize,
+}
+
+/// Size every file, or every module, instead of every fn.
+///
+/// The gap this closes, verbatim from a session about to restructure a 59k-line
+/// crate: `wc -l src/*.rs src/geom/*.rs src/cmd/*.rs | sort -rn | head -25`.
+/// `metrics` ranked fns, structs and enums and had nothing to say about the
+/// unit the reader was actually deciding about — which module is big enough to
+/// be worth splitting, and how much of it is code rather than doc comment.
+///
+/// `lines` is the file's real line count, read from disk rather than derived
+/// from the last item's end line: a file's trailing `mod tests` under `--scope
+/// production`, or its module header, is length a reader is sizing up too.
+/// `items`/`fns` come from the index, which was built from the same parse, so
+/// the two columns cannot disagree with `inventory`.
+fn bulk(ctx: &AnalysisCtx, by_module: bool, threshold: Option<usize>) -> Vec<BulkMetric> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<String, BulkMetric> = BTreeMap::new();
+    for f in ctx.files {
+        let file = display_path(&f.path);
+        // A file that cannot be re-read is not a reason to drop the row — the
+        // item counts are still right, and a `lines: 0` beside them is visibly
+        // odd in a way a silently missing file is not.
+        let lines = std::fs::read_to_string(&f.path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        let (mut items, mut fns) = (0usize, 0usize);
+        for d in ctx.idx.iter().filter(|d| d.file == file) {
+            items += 1;
+            if matches!(d.kind, "fn" | "impl-fn" | "trait-fn") {
+                fns += 1;
+            }
+        }
+        let label = if by_module {
+            match f.module.as_str() {
+                "" => "<crate root>".to_string(),
+                m => m.to_string(),
+            }
+        } else {
+            file.clone()
+        };
+        let e = acc.entry(label.clone()).or_insert_with(|| BulkMetric {
+            label,
+            file: file.clone(),
+            lines: 0,
+            files: 0,
+            items: 0,
+            fns: 0,
+        });
+        e.lines += lines;
+        e.files += 1;
+        e.items += items;
+        e.fns += fns;
+    }
+    let mut out: Vec<BulkMetric> = acc.into_values().collect();
+    if let Some(t) = threshold {
+        out.retain(|m| m.lines >= t);
+    }
+    // Biggest first — the `sort -rn` the idiom this replaces always ended with.
+    out.sort_by(|a, b| b.lines.cmp(&a.lines).then_with(|| a.label.cmp(&b.label)));
+    out
+}
+
+/// `--by file` / `--by module`: rank whole files or modules by size.
+///
+/// Split out of [`run`] rather than branching inside it. The two share their
+/// entry point and nothing else — different rows, different sort, a different
+/// meaning for `--threshold` — and folding them together took `run` to cyclo
+/// 17, past this tool's own god-function threshold. Failing your own check on
+/// the commit that adds a check is a poor advertisement for it.
+fn run_bulk(
+    ctx: &AnalysisCtx,
+    by_module: bool,
+    threshold: Option<usize>,
+) -> anyhow::Result<usize> {
+    let mut rows = bulk(ctx, by_module, threshold);
+    ctx.retain_changed(&mut rows, |m| &m.file);
+    let unit = if by_module { "module" } else { "file" };
+    if !ctx.summary {
+        for m in &rows {
+            let mut cells: Vec<(&'static str, crate::emit::Val)> = vec![
+                ("kind", unit.into()),
+                ("lines", format!("lines:{}", m.lines).into()),
+            ];
+            // Only a module can span more than one file, so the column would be
+            // a constant `files:1` in the other view.
+            if by_module {
+                cells.push(("files", format!("files:{}", m.files).into()));
+            }
+            cells.push(("items", format!("items:{}", m.items).into()));
+            cells.push(("fns", format!("fns:{}", m.fns).into()));
+            cells.push(("name", m.label.clone().into()));
+            ctx.out.row(cells);
+        }
+    }
+    ctx.out.summary(&format!(
+        "({} {}(s), {} line(s) total; sorted by lines{}; `--sort` ranks fns and does not \
+         apply here)",
+        rows.len(),
+        unit,
+        rows.iter().map(|m| m.lines).sum::<usize>(),
+        threshold
+            .map(|t| format!("; threshold={} line(s)", t))
+            // unruster: ok(error-swallows/.unwrap_or_default) 2026-08-15 — `threshold` is an
+            // Option<usize> flag; an absent flag renders as the empty string by design.
+            .unwrap_or_default()
+    ));
+    Ok(rows.len())
+}
+
 pub fn run(
     ctx: &AnalysisCtx,
     sort: SortKey,
     threshold: Option<usize>,
     fns_only: bool,
+    by: crate::context::GroupBy,
 ) -> anyhow::Result<usize> {
+    if by != crate::context::GroupBy::Fn {
+        return run_bulk(ctx, by == crate::context::GroupBy::Module, threshold);
+    }
     let files = ctx.files;
     let summary = ctx.summary;
     let mut fns: Vec<FnMetric> = Vec::new();

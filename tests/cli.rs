@@ -1623,36 +1623,75 @@ fn fields_lists_struct_fields_with_counts() {
 }
 
 #[test]
-fn the_type_commands_take_a_qualified_name_like_every_other_command() {
+fn every_name_taking_command_takes_a_qualified_name() {
     // `show` prints the *qualified* path in its header row, the playbook says
     // targets resolve by last `::` segment, and `impls --of`/`callers` do — but
-    // these three compared the raw string against a bare `ident`, so the name a
-    // reader had just copied off `show` matched nothing. `fields index::Defn`
+    // these commands compared the raw string against a bare `ident`, so the name
+    // a reader had just copied off `show` matched nothing. `fields index::Defn`
     // answered "(0 field(s))" under a note contradicting itself ("not as a
     // struct with named fields — it is: struct"). A command that says "none"
     // for a copied name teaches the reader it does not work.
+    //
+    // Fixed once for `fields`/`field-uses`/`variants` and left there. The other
+    // six kept the defect for six more releases: an `svggen` session asked
+    // `enum-coverage scene::Kind` — the enum it had just read with `show`, and
+    // one carrying a `/// unruster: sealed` marker put there for this very
+    // command — got "0 total variant(s)" under "not as an enum — it is: enum",
+    // and went back to hand-typing `grep -rn 'Kind::Circle\|Kind::Ellipse\|…'`
+    // for the rest of the refactor. So this covers every command that takes a
+    // name, not the three that were broken the first time.
+    //
+    // Exit 2 is tolerated on purpose: it is what the *broken* form returns, and
+    // a regression here should fail on the disagreement rather than on an
+    // assertion about somebody's exit code.
     let rows = |args: &[&str]| -> usize {
         let mut full = vec!["--root", FIXTURE];
         full.extend(args);
-        rows_of(&ur_stdout_allow_findings(&full)).len()
+        let out = ur().args(&full).output().unwrap();
+        let code = out.status.code();
+        assert!(
+            matches!(code, Some(0) | Some(1) | Some(2)),
+            "command errored (exit {:?}): {:?}",
+            code,
+            full
+        );
+        rows_of(&out.stdout).len()
     };
-    assert_eq!(
-        rows(&["fields", "Document"]),
-        rows(&["fields", "main::Document"]),
-        "fields disagreed with itself over a qualified name"
-    );
-    assert_eq!(
-        rows(&["field-uses", "Document", "transform"]),
-        rows(&["field-uses", "main::Document", "transform"]),
-        "field-uses disagreed with itself over a qualified name"
-    );
-    assert_eq!(
-        rows(&["variants", "Token"]),
-        rows(&["variants", "main::Token"]),
-        "variants disagreed with itself over a qualified name"
-    );
-    // Non-zero, or the equality above is satisfied by two empty answers.
-    assert!(rows(&["fields", "main::Document"]) > 0);
+    // (command, bare target, qualified target, trailing args)
+    let cases: [(&str, &str, &str, &[&str]); 9] = [
+        ("fields", "Document", "main::Document", &[]),
+        ("field-uses", "Document", "main::Document", &["transform"]),
+        ("variants", "Token", "main::Token", &[]),
+        ("type-refs", "Document", "main::Document", &[]),
+        ("takes-mut", "Document", "main::Document", &[]),
+        ("enum-coverage", "Token", "main::Token", &[]),
+        ("catch-all-arms", "Token", "main::Token", &[]),
+        ("parallel-matches", "Token", "main::Token", &[]),
+        ("divergence", "Token", "main::Token", &[]),
+    ];
+    for (cmd, bare, qualified, rest) in cases {
+        let with = |target: &str| -> usize {
+            let mut args = vec![cmd, target];
+            args.extend_from_slice(rest);
+            rows(&args)
+        };
+        let n = with(bare);
+        // Non-zero, or the equality below is satisfied by two empty answers.
+        assert!(
+            n > 0,
+            "`{} {}` found nothing on the fixture — this case proves nothing",
+            cmd,
+            bare
+        );
+        assert_eq!(
+            n,
+            with(qualified),
+            "`{}` disagreed with itself over a qualified name ({} vs {})",
+            cmd,
+            bare,
+            qualified
+        );
+    }
 }
 
 #[test]
@@ -4525,6 +4564,13 @@ fn help_shows_the_command_list_within_the_first_screen() {
     // can discover from a command list because it is written in *their*
     // source. The other two commands and every repair recipe went to
     // `explain vocabulary` / `explain doc-drift` / `explain validation-drift`.
+    //
+    // Raised 75 → 76 for `module-uses` and `at`, which cost one line between
+    // them: `at` shares `outline`'s line because a reader who has found one has
+    // found the other, and `module-uses` earns the remaining line on the same
+    // terms as `gate` — it answers a question no other command answers, so a
+    // reader who does not see it here reaches for `grep -rn 'mod::'` instead,
+    // which is exactly what it exists to replace.
     let out = ur_stdout(&["--help"]);
     let s = String::from_utf8_lossy(&out);
     let idx = s
@@ -4532,8 +4578,8 @@ fn help_shows_the_command_list_within_the_first_screen() {
         .position(|l| l.starts_with("Commands:"))
         .expect("expected a Commands: section in --help");
     assert!(
-        idx < 75,
-        "Commands: must appear within the first 75 help lines, found at {}",
+        idx < 76,
+        "Commands: must appear within the first 76 help lines, found at {}",
         idx
     );
 }
@@ -9072,4 +9118,433 @@ fn the_unsupported_note_lists_every_waivable_check() {
     for check in ["panics", "arith-drift", "pass-through", "dead-code", "concepts", "doc-drift"] {
         assert!(text.contains(check), "note omits `{check}`:\n{text}");
     }
+}
+
+// ── module-uses, at, and the navigation additions ─────────────────────────
+//
+// Every test below covers a hole an `svggen` refactoring session fell into
+// while unruster was on its PATH. The session's own workarounds are quoted at
+// the command that now answers the question.
+
+/// The removal-planning fixture: one module, reached three ways from outside.
+fn coupling_fixture(name: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod trace {
+    pub const RESOLUTION: u32 = 512;
+    pub enum Body { Circle, Free }
+    pub fn labelled() -> u32 { RESOLUTION }
+    pub fn round(v: f64) -> f64 { v }
+    /// Internal traffic: names a sibling from inside the module, so it must
+    /// not be reported as an outside use.
+    pub fn inner() -> u32 { labelled() }
+}
+pub mod report {
+    /// The floor comes from [`crate::trace::labelled`], which is prose about
+    /// the module and not a call into it.
+    pub fn floor() -> u32 { crate::trace::RESOLUTION }
+}
+pub mod measure {
+    use crate::trace::labelled;
+    pub fn go() -> u32 { labelled() }
+}
+pub mod render {
+    use crate::trace::Body;
+    pub fn draw(b: &Body) -> u8 {
+        match b { Body::Circle => 1, Body::Free => 2 }
+    }
+}
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn module_uses_separates_code_linkage_from_doc_comment_prose() {
+    // The session that motivated the command ran, in order:
+    //
+    //   grep -rhoE '\btrace::[a-z_A-Z]+' src/ --include=*.rs | sort | uniq -c
+    //   grep -rlE '\btrace::' src --include='*.rs'
+    //   for f in report edit json measure; do grep -noE 'trace::[a-zA-Z_]+' src/$f.rs; done
+    //   grep -rnE 'trace::[a-zA-Z_]+' src --include='*.rs' | grep -v '^src/trace.rs'
+    //
+    // — and then had to work out by hand which hits were `///` links. Four of
+    // the eight were.
+    let dir = coupling_fixture("mu-tiers");
+    let root = dir.to_str().unwrap();
+    let rows = rows_of(&ur_stdout(&["--root", root, "--scope", "all", "module-uses", "trace"]));
+    let via = |k: &str| rows.iter().filter(|r| r.starts_with(&format!("{k}\t"))).count();
+
+    // `crate::trace::RESOLUTION` — written through the module.
+    assert!(via("path") >= 1, "no `path` row: {rows:#?}");
+    // `use crate::trace::labelled;` plus the bare call it enables, and the
+    // same for `Body` — which is also matched mid-path in `Body::Circle`.
+    assert!(via("use") >= 4, "expected the use sites: {rows:#?}");
+    // The `[`crate::trace::labelled`]` in report's doc comment, and only it.
+    assert_eq!(via("doc"), 1, "doc references miscounted: {rows:#?}");
+
+    // Internal traffic stays internal: `trace::inner` calls `labelled` from
+    // inside the module, and reporting it would drown the rows that matter.
+    assert!(
+        !rows.iter().any(|r| r.contains("trace::inner")),
+        "a use from inside the module leaked into the answer: {rows:#?}"
+    );
+    // Rows name the *definition*, so two spellings of one item group together.
+    assert!(
+        rows.iter().any(|r| r.contains("trace::labelled")),
+        "rows do not carry the resolved item: {rows:#?}"
+    );
+}
+
+#[test]
+fn module_uses_has_no_bare_name_tier() {
+    // A first cut matched a bare spelling against the module's item names and
+    // reported 5,869 uses of this crate's own `index`, of which 5,794 were
+    // local bindings called `doc` colliding with a private `index::Spot::doc`.
+    // Reaching another module's item in Rust takes a path or a `use`, so a
+    // bare-name tier could only ever add false positives.
+    let dir = scratch("mu-no-bare");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod inner {
+    pub struct Holder;
+    impl Holder { pub fn doc(&self) -> u32 { 1 } }
+}
+pub mod other {
+    /// A local binding sharing a method's name is not a use of that method.
+    /// (Deliberately no qualified path in this doc: a `///` that names one is a
+    /// `doc` row, which the doc-tier test covers.)
+    pub fn go() -> usize { let doc = "x"; doc.len() }
+}
+"#,
+    )
+    .unwrap();
+    let rows = rows_of(&ur_stdout(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "--scope",
+        "all",
+        "module-uses",
+        "inner",
+    ]));
+    assert!(
+        rows.is_empty(),
+        "a local binding was reported as a module use: {rows:#?}"
+    );
+}
+
+#[test]
+fn module_uses_aggregates_on_both_axes() {
+    // `--by file` is `sort | uniq -c | sort -rn` over the items; `--by module`
+    // the same over the consumers. The session ran both as separate greps.
+    let dir = coupling_fixture("mu-by");
+    let root = dir.to_str().unwrap();
+    let sites = rows_of(&ur_stdout(&["--root", root, "--scope", "all", "module-uses", "trace"]));
+    for axis in ["file", "module"] {
+        let grouped = rows_of(&ur_stdout(&[
+            "--root", root, "--scope", "all", "module-uses", "trace", "--by", axis,
+        ]));
+        assert!(!grouped.is_empty(), "--by {axis} returned nothing");
+        // Every site lands in exactly one bucket, so the counts must total.
+        let total: usize = grouped
+            .iter()
+            .map(|r| r.split('\t').next().unwrap().parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(
+            total,
+            sites.len(),
+            "--by {axis} lost or duplicated sites: {grouped:#?}"
+        );
+    }
+}
+
+#[test]
+fn module_uses_can_drop_the_doc_rows() {
+    let dir = coupling_fixture("mu-nodocs");
+    let root = dir.to_str().unwrap();
+    let rows = rows_of(&ur_stdout(&[
+        "--root", root, "--scope", "all", "module-uses", "trace", "--no-docs",
+    ]));
+    assert!(
+        !rows.iter().any(|r| r.starts_with("doc\t")),
+        "--no-docs kept a doc row: {rows:#?}"
+    );
+    // `--min-confidence resolved` is the other spelling of the same request.
+    let strict = rows_of(&ur_stdout(&[
+        "--root", root, "--scope", "all", "module-uses", "trace",
+        "--min-confidence", "resolved",
+    ]));
+    assert_eq!(rows.len(), strict.len(), "the two filters disagree");
+}
+
+#[test]
+fn module_uses_names_the_modules_when_the_target_is_not_one() {
+    // A module derived from a file path is not in the name index, so the usual
+    // near-name list has nothing to rank. The module paths are the candidates.
+    let dir = coupling_fixture("mu-unknown");
+    let out = ur_output_allow_2(&["--root", dir.to_str().unwrap(), "module-uses", "tracer"]);
+    assert!(out.contains("no module `tracer`"), "{out}");
+    assert!(out.contains("trace"), "no candidate offered: {out}");
+}
+
+#[test]
+fn at_reports_the_whole_containing_chain() {
+    // Replaces this, verbatim from the session:
+    //
+    //   awk 'NR<=5728 && /^(pub )?fn |^    pub fn /{l=NR": "$0} END{}' src/cmd/mod.rs \
+    //     >/dev/null; grep -n '^pub fn \|^fn ' src/cmd/mod.rs | awk -F: '$1<5728' | tail -3
+    //
+    // A bare method name is half an answer when four types have one, so the
+    // enclosing `impl` is part of the answer rather than a second lookup.
+    let dir = scratch("at-chain");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct S;\nimpl S {\n    /// doc\n    pub fn deep(&self) -> u32 {\n        1\n    }\n}\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let rows = rows_of(&ur_stdout(&["--root", root, "at", "src/lib.rs:5"]));
+    assert_eq!(rows.len(), 2, "expected impl + method: {rows:#?}");
+    assert!(rows[0].contains("impl S"), "outermost first: {rows:#?}");
+    assert!(rows[1].contains("deep"), "innermost last: {rows:#?}");
+
+    // An attribute or doc line belongs to the item it decorates — an extent
+    // starting at the declaration would answer "nothing owns this".
+    let on_doc = rows_of(&ur_stdout(&["--root", root, "at", "src/lib.rs:3"]));
+    assert!(
+        on_doc.iter().any(|r| r.contains("deep")),
+        "a doc line disowned its item: {on_doc:#?}"
+    );
+}
+
+#[test]
+fn at_says_which_items_a_between_line_sits_between() {
+    // "Nothing owns line 1" is true and useless. Exits 0: this is a real
+    // answer about a real line, not a lookup that failed.
+    let dir = scratch("at-between");
+    std::fs::write(dir.join("src/lib.rs"), "\n\npub fn only() -> u32 { 1 }\n").unwrap();
+    let out = ur().args(["--root", dir.to_str().unwrap(), "at", "src/lib.rs:1"]).output().unwrap();
+    assert!(out.status.success(), "between-item lines must not be an error");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("inside no item"), "{err}");
+    assert!(err.contains("only"), "the neighbour was not named: {err}");
+}
+
+#[test]
+fn at_rejects_a_target_with_no_line_number() {
+    // Defaulting to line 1 would answer confidently about the top of the file.
+    let out = ur_output_allow_2(&["--root", FIXTURE, "at", "src/main.rs"]);
+    assert!(out.contains("<file>:<line>"), "{out}");
+}
+
+#[test]
+fn show_prints_an_enum_variant() {
+    // The escape this closes, verbatim — the module header's own idiom, `+70`
+    // guess and all, for the one target `show` could not resolve:
+    //
+    //   sed -n "$(grep -n 'Outline {' src/cli.rs | head -1 | cut -d: -f1),+70p" src/cli.rs
+    let dir = scratch("show-variant");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub enum Command {\n    /// Outline a region.\n    Outline {\n        input: String,\n    },\n    Tint,\n}\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let out = String::from_utf8_lossy(&ur_stdout(&["--root", root, "show", "Command::Outline"])).to_string();
+    assert!(out.contains("variant\t"), "kind column: {out}");
+    // Doc comment through the closing brace — lines 2..5, not a guess.
+    assert!(out.contains("Outline a region"), "docs dropped: {out}");
+    assert!(out.contains("input: String"), "body dropped: {out}");
+    assert!(!out.contains("Tint"), "ran past the variant: {out}");
+
+    // An item still wins over a variant of the same spelling — variants are
+    // resolved only after the index comes up empty.
+    let miss = ur_output_allow_2(&["--root", root, "show", "Command::Nope"]);
+    assert!(miss.contains("no item named"), "{miss}");
+}
+
+#[test]
+fn show_announces_a_long_print_before_printing_it() {
+    // A note *under* the body is cut by the very pipe it warns about. One
+    // session read a 161-line enum under `head -120`, analysed a truncated
+    // variant list, and was never told. This lands on line two.
+    let dir = scratch("show-size");
+    let body: String = (0..60).map(|i| format!("    V{i},\n")).collect();
+    std::fs::write(dir.join("src/lib.rs"), format!("pub enum Big {{\n{body}}}\n")).unwrap();
+    let out = ur().args(["--root", dir.to_str().unwrap(), "show", "Big"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("line(s) of source follow"), "{err}");
+    // And for an enum, the compact command that cannot be truncated at all.
+    assert!(err.contains("variants Big"), "no route offered: {err}");
+}
+
+#[test]
+fn tests_mentions_finds_the_blast_radius_of_a_name() {
+    // Replaces a hand-tuned regex loop over an 18k-line test file:
+    //
+    //   for s in circle ellipse rect …; do
+    //     grep -cE "(^|[^a-z-])$s( |=|\")" tests/render.rs; done
+    //
+    // — one number per word, no test names, and no way to tell a `Kind::Circle`
+    // in code from the word inside a fixture string.
+    let dir = scratch("tests-mentions");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub struct Rect;
+#[cfg(test)]
+mod t {
+    use super::*;
+    #[test]
+    fn in_code() { let _r = Rect; }
+    #[test]
+    fn in_a_literal() { assert!("a Rect here".len() > 0); }
+    #[test]
+    fn in_both() { let _r = Rect; assert!("Rect".len() > 0); }
+    #[test]
+    fn only_a_longer_word() { assert!("rectangle".len() > 0); }
+}
+"#,
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let rows = rows_of(&ur_stdout(&["--root", root, "--scope", "all", "tests", "--mentions", "Rect"]));
+    let by = |k: &str| rows.iter().filter(|r| r.starts_with(&format!("{k}\t"))).count();
+    assert_eq!(by("ident"), 1, "{rows:#?}");
+    assert_eq!(by("string"), 1, "{rows:#?}");
+    assert_eq!(by("both"), 1, "{rows:#?}");
+    // Whole-word only: `rectangle` is not `Rect`, and the case differs anyway.
+    assert!(
+        !rows.iter().any(|r| r.contains("only_a_longer_word")),
+        "substring match: {rows:#?}"
+    );
+
+    // Nothing naming it is a real answer before a removal, not a failed lookup.
+    let out = ur().args(["--root", root, "--scope", "all", "tests", "--mentions", "Absent"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("name `Absent`"));
+
+    // The default listing keeps its shape: no `via` column unless asked.
+    let plain = rows_of(&ur_stdout(&["--root", root, "--scope", "all", "tests"]));
+    assert!(
+        plain.iter().all(|r| r.starts_with("test\t")),
+        "an unasked-for column appeared: {plain:#?}"
+    );
+}
+
+#[test]
+fn metrics_by_file_and_module_size_what_wc_did() {
+    // Replaces `wc -l src/*.rs src/geom/*.rs | sort -rn | head -25`, run to
+    // decide which module was big enough to be worth splitting.
+    let dir = scratch("metrics-by");
+    std::fs::write(dir.join("src/lib.rs"), "pub mod big;\npub fn tiny() {}\n").unwrap();
+    let long: String = (0..40).map(|i| format!("pub fn f{i}() {{}}\n")).collect();
+    std::fs::write(dir.join("src/big.rs"), long).unwrap();
+    let root = dir.to_str().unwrap();
+
+    let files = rows_of(&ur_stdout(&["--root", root, "metrics", "--by", "file"]));
+    assert_eq!(files.len(), 2, "{files:#?}");
+    // Biggest first — the `sort -rn` the idiom always ended with.
+    assert!(files[0].contains("big.rs"), "not sorted by size: {files:#?}");
+    assert!(files[0].contains("lines:40"), "line count wrong: {files:#?}");
+    assert!(files[0].contains("fns:40"), "fn count wrong: {files:#?}");
+
+    let mods = rows_of(&ur_stdout(&["--root", root, "metrics", "--by", "module"]));
+    assert!(mods[0].contains("big"), "{mods:#?}");
+    assert!(mods.iter().any(|m| m.contains("<crate root>")), "{mods:#?}");
+
+    // `--threshold` filters on lines here rather than on the fn metric.
+    let big_only = rows_of(&ur_stdout(&["--root", root, "metrics", "--by", "file", "--threshold", "10"]));
+    assert_eq!(big_only.len(), 1, "{big_only:#?}");
+
+    // The default view is untouched.
+    let fns = rows_of(&ur_stdout(&["--root", root, "metrics"]));
+    assert!(fns.iter().all(|r| r.starts_with("fn\t") || r.starts_with("struct\t") || r.starts_with("enum\t")));
+}
+
+#[test]
+fn a_field_that_is_built_and_never_read_says_so() {
+    // `field-uses render::Built radius` answered `(0 reads, 0 writes, 3 inits)`
+    // in a session whose whole purpose was finding removable machinery, and the
+    // reader moved on. A number someone has to interpret is a finding the tool
+    // declined to make.
+    let dir = scratch("write-only");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct Built { pub radius: Option<f64>, pub used: u32 }\n\
+         pub fn make(r: f64) -> Built { Built { radius: Some(r), used: 1 } }\n\
+         pub fn read_it(b: &Built) -> u32 { b.used }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let err = |args: &[&str]| {
+        let mut full = vec!["--root", root];
+        full.extend(args);
+        String::from_utf8_lossy(&ur().args(&full).output().unwrap().stderr).to_string()
+    };
+    let one = err(&["field-uses", "Built", "radius"]);
+    assert!(one.contains("never used"), "{one}");
+    assert!(one.contains("--scope all"), "the caveat must travel with it: {one}");
+    // A field that *is* read stays quiet.
+    assert!(!err(&["field-uses", "Built", "used"]).contains("never used"));
+    // And the listing command names them together.
+    let all = err(&["fields", "Built"]);
+    assert!(all.contains("written and never read: radius"), "{all}");
+}
+
+#[test]
+fn an_empty_declaration_is_not_reported_as_the_wrong_kind() {
+    // `enum-coverage Never` used to answer "not as an enum — it is: enum",
+    // which sends the reader looking for a spelling problem that is not there.
+    // The declaration is empty; say that.
+    let dir = scratch("empty-enum");
+    std::fs::write(dir.join("src/lib.rs"), "pub enum Never {}\npub struct Doc { pub n: u32 }\n").unwrap();
+    let root = dir.to_str().unwrap();
+    let out = ur_output_allow_2(&["--root", root, "enum-coverage", "Never"]);
+    assert!(out.contains("the declaration is empty"), "{out}");
+    assert!(!out.contains("not as an enum"), "still contradicts itself: {out}");
+    // A genuinely wrong kind still names the kinds that exist.
+    let wrong = ur_output_allow_2(&["--root", root, "enum-coverage", "Doc"]);
+    assert!(wrong.contains("not as an enum — it is: struct"), "{wrong}");
+}
+
+#[test]
+fn module_uses_keeps_its_summary_readable_when_the_name_is_ambiguous() {
+    // `module-uses tests` on this crate matches 26 inline `mod tests` blocks,
+    // and the summary spelled every one of them out — `arith_drift::tests`
+    // through `workspace::tests`, inside a sentence about counts. The note
+    // above the rows already lists them, which is where a list belongs.
+    let dir = scratch("mu-ambiguous");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod a { pub mod helpers { pub fn one() -> u32 { 1 } } }
+pub mod b { pub mod helpers { pub fn two() -> u32 { 2 } } }
+pub fn go() -> u32 { crate::a::helpers::one() + crate::b::helpers::two() }
+"#,
+    )
+    .unwrap();
+    let out = ur().args(["--root", dir.to_str().unwrap(), "module-uses", "helpers"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let summary = err
+        .lines()
+        .find(|l| l.starts_with("(") && l.contains("site(s) outside"))
+        .unwrap_or_else(|| panic!("no summary in:\n{err}"));
+    assert!(summary.contains("(2 modules)"), "summary does not count them: {summary}");
+    assert!(
+        !summary.contains("a::helpers"),
+        "summary spelled the matches out instead of counting them: {summary}"
+    );
+    // The note still names every one — the list is not lost, only moved.
+    assert!(err.contains("a::helpers") && err.contains("b::helpers"), "{err}");
+    // And a single match still prints its own path, not "(1 modules)".
+    let one = String::from_utf8_lossy(
+        &ur().args(["--root", dir.to_str().unwrap(), "module-uses", "a::helpers"]).output().unwrap().stderr,
+    )
+    .to_string();
+    assert!(one.contains("outside `a::helpers`"), "{one}");
 }

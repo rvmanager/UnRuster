@@ -72,9 +72,15 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
 
     // 2. Count read/write/init sites per field, via the same strict collector
     //    `field-uses` uses — so these counts equal the sum of its rows.
+    let mut write_only: Vec<&str> = Vec::new();
     for fd in &defs {
         let (reads, writes, inits) =
             crate::field_uses::count_kinds(files, ty, &fd.name, &ctx.sem.fn_sigs);
+        // Built and never read. `r:0` was already in the row; naming it is the
+        // difference between a count and a finding — see `note_write_only`.
+        if reads == 0 && inits > 0 {
+            write_only.push(&fd.name);
+        }
         if !summary {
             row!(
                 ctx.out,
@@ -94,5 +100,13 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
         ty,
         ty
     ));
+    if !write_only.is_empty() {
+        ctx.out.note(&format!(
+            "note: written and never read: {} — no site reads {}. Confirm with `--scope all` \
+             before removing: a field read only from tests looks exactly like this.",
+            write_only.join(", "),
+            if write_only.len() == 1 { "it" } else { "them" }
+        ));
+    }
     Ok(defs.len())
 }

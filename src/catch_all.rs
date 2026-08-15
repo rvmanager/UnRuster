@@ -8,6 +8,10 @@ use crate::parallel_matches::{collect_sites, enum_sealed, variant_names_of};
 use crate::emit::row;
 
 pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
+    // Bare ident or nothing matches — the same reduction `parallel-matches` and
+    // `enum-coverage` do, kept here so the three views of one scanner answer a
+    // copied-in `scene::Kind` alike.
+    let target = target.map(crate::ast::last_segment);
     match target {
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);

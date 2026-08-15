@@ -127,6 +127,11 @@ pub fn run(
     ty: &str,
     min_confidence: Option<Confidence>,
 ) -> anyhow::Result<usize> {
+    // Targets resolve by last `::` segment here as everywhere else: every row
+    // this command prints is matched against a bare `ident`, so the qualified
+    // path a reader copies off `show`'s header row has to be reduced to one
+    // first. See `fields`, `field-uses` and `variants`, which already do.
+    let ty = crate::ast::last_segment(ty);
     let files = ctx.files;
     let index = ctx.idx;
     let aliases = &ctx.sem.aliases;

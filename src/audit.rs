@@ -420,7 +420,7 @@ pub fn run_silent_battery(
             stringly::run(ctx, false, false, None)
         }),
         ("metrics", &|| {
-            metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true)
+            metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true, crate::context::GroupBy::Fn)
         }),
         ("pass-through", &|| pass_through::run(ctx, 1)),
     ];
@@ -824,7 +824,7 @@ pub fn run(
         "metrics",
         Gate::Advisory,
         Some(DEFAULT_METRICS_TOP),
-        &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true)?)),
+        &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true, crate::context::GroupBy::Fn)?)),
     )?;
     section(
         "[low] pass-through — single-call wrapper fns (explain: replication)",

@@ -179,6 +179,10 @@ impl<'ast> Visit<'ast> for MutSurfaceVisitor<'_> {
 }
 
 pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
+    // `TakesMutVisitor` compares against `type_last_segment` of the parameter
+    // and against a bare name on the impl stack, so the target has to arrive in
+    // the same shape — the convention `fields`/`field-uses`/`variants` follow.
+    let ty = crate::ast::last_segment(ty);
     let files = ctx.files;
     let index = ctx.idx;
     let summary = ctx.summary;

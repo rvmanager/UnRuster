@@ -14,7 +14,8 @@ AGENT QUICKSTART
   unruster divergence --handling     one callee, different care (.expect vs .ok())
   unruster contract-drift <fn>       its callers, body withheld; `--reveal` after you judge
   unruster explain <topic>           one repair recipe (cheap); `playbook` for all
-  unruster outline <file>            the file's items, each with file:start-end
+  unruster module-uses <mod>         what the rest of the tree takes from a module (removals)
+  unruster outline <f>  at <f>:<n>   a file's items with spans; which item owns a line
   unruster show <name>               one item's exact source; bounds itself, never pipe to head
   --json                             every command; named keys (TSV has no header row)
 

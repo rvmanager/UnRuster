@@ -353,9 +353,12 @@ pub fn run(
     min_score: f64,
 ) -> anyhow::Result<usize> {
     // Sites are collected up front and held for the whole run so pairs can
-    // borrow them across enums.
+    // borrow them across enums. The sweep branch takes its names from
+    // `enum_names()`, which are already bare — a named target has to be reduced
+    // to match, since `variant_names_of` and `collect_sites` both compare
+    // against an `ItemEnum`'s own ident.
     let names: Vec<String> = match target {
-        Some(n) => vec![n.to_string()],
+        Some(n) => vec![crate::ast::last_segment(n).to_string()],
         None => ctx.idx.enum_names(),
     };
     let single = target.is_some();
