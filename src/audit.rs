@@ -959,6 +959,43 @@ pub fn run(
         .collect();
     let waivers = ledger.len();
     let hidden: usize = ledger.iter().map(|w| w.hits()).sum();
+
+    // A zero-hit waiver is either dead or merely below the gate, and the
+    // battery that just ran cannot tell which: it ran only the gating pass, so
+    // `below_audit` is still zero for every waiver whatever the truth is. That
+    // is what made the old line call all of them "suppressing nothing" and send
+    // readers to `waivers` to be told otherwise.
+    //
+    // The permissive pass is what separates them, and it is a second battery —
+    // so it runs only when the answer would change what this line says, which
+    // is when something looks dead. A ledger where every waiver earns a gating
+    // hit pays nothing. The run that does pay is the one that was about to tell
+    // its reader to go run `waivers` (two passes) by hand, so one pass here is
+    // strictly cheaper than the errand it replaces.
+    if ledger.iter().any(|w| w.hits() == 0) {
+        let quiet = crate::emit::Out::silent();
+        let probe = AnalysisCtx {
+            files: ctx.files,
+            idx: ctx.idx,
+            sem: ctx.sem,
+            corpus: ctx.corpus,
+            summary: true,
+            spans: false,
+            // Unscoped on purpose, matching `waivers`: whether a waiver
+            // suppresses anything is a property of the tree, not of the diff.
+            // The `ledger` above is what carries `--changed-since` scope.
+            changed: None,
+            out: &quiet,
+            suppressions: ctx.suppressions,
+            suggest_waivers: false,
+        };
+        let prev = ctx
+            .suppressions
+            .set_hit_mode(crate::suppress::HitMode::BelowAudit);
+        run_silent_battery(&probe, dead_call_source, BatteryConfig::permissive(), sel);
+        ctx.suppressions.set_hit_mode(prev);
+    }
+
     ctx.out.summary(&format!(
         "(audit: {} gating + {} advisory finding(s) across {} check(s){}{}; {}{}{})",
         gating,
@@ -1010,9 +1047,42 @@ pub fn run(
             // scope that missed. Saying only "N waivers hiding M findings"
             // left a real codebase with 33 waivers hiding 30 findings and
             // nobody noticing that at least three of them did nothing.
-            let dead = ledger.iter().filter(|w| w.hits() == 0).count();
+            //
+            // But `hits() == 0` alone is not that claim, and reporting it as
+            // one cried wolf. `hits` counts only what reached audit's *gating*
+            // tier; a waiver over a row that exists at a lower score suppresses
+            // something real and still reads zero here. A clean run ended
+            // "0 gating + 0 advisory … 9 of them suppressing nothing", which
+            // sent a reader to the ledger to be told by `waivers` that all nine
+            // were fine and `--remove` would not touch them. The alarm was also
+            // permanent: nothing the reader could do would clear it, because
+            // nothing was wrong. `below_audit` is the column that separates the
+            // two, and it is on the same struct — this line just never asked.
+            let dead = ledger
+                .iter()
+                .filter(|w| w.hits() == 0 && w.below_audit() == 0)
+                .count();
+            let below_only = ledger
+                .iter()
+                .filter(|w| w.hits() == 0 && w.below_audit() > 0)
+                .count();
+            let mut tail = String::new();
+            if dead > 0 {
+                tail.push_str(&format!(", {} of them suppressing nothing", dead));
+            }
+            // Stated, because a reader comparing `waivers` output against this
+            // line has to be able to account for every waiver — but phrased as
+            // a fact rather than a finding, and without the call to action.
+            // These are working waivers that happen not to be holding the gate
+            // open, which is the normal resting state of a tuned ledger.
+            if below_only > 0 {
+                tail.push_str(&format!(
+                    ", {} suppressing only below audit's thresholds",
+                    below_only
+                ));
+            }
             format!(
-                "; {} waiver(s){} hiding {} finding(s){} — `unruster waivers` to review",
+                "; {} waiver(s){} hiding {} finding(s){}{}",
                 waivers,
                 // Say which ledger, so a count far below the file's own is read
                 // as a scope and not as waivers having gone missing.
@@ -1022,10 +1092,14 @@ pub fn run(
                     ""
                 },
                 hidden,
+                tail,
+                // Only when there is a decision to make. Appending it to every
+                // run is what taught readers to walk to the ledger and find
+                // nothing there.
                 if dead > 0 {
-                    format!(", {} of them suppressing nothing", dead)
+                    " — `unruster waivers` to review"
                 } else {
-                    String::new()
+                    ""
                 }
             )
         } else if !ctx.suppressions.is_empty() {

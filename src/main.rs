@@ -233,7 +233,11 @@ enum Cmd {
     /// declarations also share a *word* of their names — `UserId`/`OrderId`
     /// share `Id` and cluster, `Meters`/`Celsius` share nothing and do not —
     /// which is what separates a duplicated concept from a fact about Rust.
-    /// `--kind` runs one view. (explain: concept-drift)
+    /// `--kind` runs one view. Deliberate families are demoted rather than
+    /// reported and the `via` column says so: `taxonomy` for six or more
+    /// members, `family` for a private single-module set of cognate fns (a
+    /// dispatch table — what splitting a god function produces). Neither is
+    /// tunable by flag; see `explain concept-drift`. (explain: concept-drift)
     Concepts(ConceptsArgs),
     /// Two bodies that were one body until somebody edited one. `clones` is
     /// EXACT and so goes quiet exactly when copies start to diverge — which is
@@ -470,8 +474,10 @@ enum Cmd {
     /// List, audit, and clean up in-source `// unruster: ok(…)` waivers.
     /// Every row reports how many findings it actually suppresses, so a
     /// broad item-scoped waiver can't hide its own reach. `--orphaned`
-    /// finds waivers that suppress nothing (the finding is gone; the comment
-    /// now lies), `--stale N` those older than N days, `--remove` strips them
+    /// finds waivers earning nothing in `audit` — the summary says how many
+    /// of those suppress nothing at all (the finding is gone; the comment now
+    /// lies) rather than only below its thresholds (still true, still
+    /// working), `--stale N` those older than N days, `--remove` strips them
     /// (dry-run unless `--write`), `--upgrade` rewrites legacy waivers with
     /// the check that actually hit them.
     Waivers(WaiversArgs),
@@ -490,8 +496,10 @@ struct WaiversArgs {
     #[arg(long, value_name = "DAYS")]
     stale: Option<i64>,
 
-    /// Only waivers that suppressed nothing this run — the code moved on and
-    /// the comment no longer describes anything. Mechanical, unlike `--stale`.
+    /// Only waivers earning nothing in `audit` — nothing at all, or only rows
+    /// below its thresholds. The summary line splits those two, and only the
+    /// first means the comment now lies; `--remove` skips the second unless
+    /// `--include-below-audit`. Mechanical, unlike `--stale`.
     #[arg(long)]
     orphaned: bool,
 

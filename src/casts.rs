@@ -380,7 +380,7 @@ pub fn run(
                         "in_fn" => h.context.clone(),
                         "at" => site(&h.file, h.line),
                     );
-                    ctx.suggest("casts", Some(h.class), today);
+                    ctx.suggest("casts", Some(h.class), today, (&h.file, h.line));
                 }
             }
         }

@@ -499,7 +499,7 @@ pub fn run_counted(ctx: &AnalysisCtx, opts: &Opts) -> anyhow::Result<Counts> {
                 "fn" => h.item.clone(),
                 "detail" => h.detail.clone(),
             );
-            ctx.suggest("doc-drift", Some(&h.key), today);
+            ctx.suggest("doc-drift", Some(&h.key), today, (&h.file, h.line));
         }
     }
 

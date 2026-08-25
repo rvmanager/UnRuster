@@ -266,9 +266,59 @@ impl Cluster<'_> {
     /// mechanism this check exists to catch. *How deliberate* — a suffix cohort
     /// is a convention somebody was following, so a collision inside one is
     /// much more likely to be an oversight than a coincidence.
-    /// Is this a family rather than a duplication? See [`TAXONOMY_SIZE`].
+    /// Is this a family rather than a duplication? Either by size (see
+    /// [`TAXONOMY_SIZE`]) or by shape (see [`Self::dispatch_family`]).
     fn taxonomy(&self) -> bool {
-        self.members.len() >= TAXONOMY_SIZE
+        self.members.len() >= TAXONOMY_SIZE || self.dispatch_family()
+    }
+
+    /// A `signature` cluster that is one module's dispatch table: three or more
+    /// private functions, all in that module, all named on the same word in the
+    /// same position.
+    ///
+    /// This exists because the check was reporting the *output of the repair
+    /// another check prescribes*. `metrics` gates a god function on cyclomatic
+    /// complexity and parameter count, and the fix is to split it into one
+    /// function per case and give them a uniform interface so the dispatch
+    /// `match` stays a flat table. That fix, by construction, produces private
+    /// same-module siblings sharing a signature — which is what `signature`
+    /// clusters on. A real session did exactly this: splitting three parser and
+    /// renderer giants cleared six `metrics` findings and immediately raised
+    /// five `concepts` ones, none of them real, and cost seven waivers to
+    /// silence. A tool that reports its own advice back as a defect teaches
+    /// people to stop reading it.
+    ///
+    /// The three conditions are what separate a table from a duplication, and
+    /// each is load-bearing:
+    ///
+    /// * **Private.** A duplicated *exported* interface is the expensive case
+    ///   this check exists for — every downstream caller pays for it, and no
+    ///   dispatch table needs its arms to be `pub`.
+    /// * **One module.** Members that can see each other were written together;
+    ///   the drift this check hunts happens between declarations that cannot.
+    ///   This is the condition that keeps the one finding worth having in that
+    ///   session — `graph::Plot::px` against `number_line::Line::px`, two
+    ///   modules, a genuine question about whether one scale type should serve
+    ///   both.
+    /// * **Positionally named.** `nl_point`/`nl_interval`/`nl_ray` is somebody
+    ///   writing a table. Three same-module functions that merely happen to
+    ///   share a signature are not, and stay reported.
+    ///
+    /// Three, not two: a same-module pair is what the check's own guidance
+    /// already calls a lead rather than a gate, and it takes a third member
+    /// before "family" is the simpler explanation than "written twice".
+    ///
+    /// Deliberately `signature`-only. The noun kinds were measured against real
+    /// findings that [`TAXONOMY_SIZE`] documents — a four-member parameter
+    /// struct among them — and demoting small noun clusters on these grounds
+    /// would hide exactly those.
+    fn dispatch_family(&self) -> bool {
+        self.kind == "signature"
+            && self.members.len() >= 3
+            && self.word.is_some()
+            && self.positional
+            && self.modules() == 1
+            && self.members.iter().all(|m| !m.is_pub())
     }
 
     fn score(&self) -> f64 {
@@ -294,6 +344,38 @@ impl Cluster<'_> {
 
     fn first(&self) -> &ItemFact {
         self.members[0]
+    }
+}
+
+/// `; demoted: …` for the summary line, naming each demotion route that fired
+/// and its criterion — or empty when none did.
+///
+/// Both routes, spelled out, because the output used to say only that a
+/// demotion had happened. A reader who met that went looking through
+/// `concepts --help` for a `--min-members` flag to lower, found only
+/// `--min-score`, and concluded the demotion could not be relied on — then
+/// wrote a waiver for a family the tool had already accepted. The rule that
+/// fired has to be legible from the run that fired it.
+fn demotion_note(clusters: &[Cluster]) -> String {
+    let families = clusters.iter().filter(|c| c.dispatch_family()).count();
+    let by_size = clusters.iter().filter(|c| c.taxonomy()).count() - families;
+    let mut parts: Vec<String> = Vec::new();
+    if by_size > 0 {
+        parts.push(format!(
+            "{} of {}+ member(s) each (`via taxonomy`)",
+            by_size, TAXONOMY_SIZE
+        ));
+    }
+    if families > 0 {
+        parts.push(format!(
+            "{} private single-module sibling set(s) (`via family`)",
+            families
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("; demoted: {}", parts.join(", "))
     }
 }
 
@@ -856,10 +938,17 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
     // suppressed row must not be counted at all. Telling the ledger which side
     // of it each hit falls on is what makes `hits` mean "suppressed something
     // the audit battery would have gated on", which is what the column claims.
-    let waived = ctx.retain_unsuppressed_tiered(
+    // Multi-site: a cluster is its members, and a waiver above any one of
+    // them is a reader saying the family is deliberate.
+    let waived = ctx.retain_unsuppressed_multi(
         "concepts",
         &mut clusters,
-        |c| crate::suppress::Site::keyed(c.first().file.as_str(), c.first().line, &c.label),
+        |c| {
+            c.members
+                .iter()
+                .map(|m| crate::suppress::Site::keyed(m.file.as_str(), m.line, &c.label))
+                .collect()
+        },
         |c| c.score() >= opts.min_score && c.score() >= GATING_SCORE,
     );
 
@@ -892,14 +981,23 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
                 "item" => first.qpath.clone(),
                 // Appended after the existing columns so no reader's `awk`
                 // moves. Says why a row scores what it does.
-                "via" => if c.taxonomy() { "taxonomy" } else { "duplicate" },
+                // Three values, not two: a reader who has been told "six or
+                // more members is a taxonomy" and then meets a demoted cluster
+                // of three needs the row itself to say which rule fired.
+                "via" => if c.dispatch_family() {
+                    "family"
+                } else if c.taxonomy() {
+                    "taxonomy"
+                } else {
+                    "duplicate"
+                },
                 "others" => c.members[1..]
                     .iter()
                     .map(|m| format!("{} {}:{}", m.qpath, m.file, m.line))
                     .collect::<Vec<_>>()
                     .join("  "),
             );
-            ctx.suggest("concepts", Some(&c.label), today);
+            ctx.suggest("concepts", Some(&c.label), today, (&first.file, first.line));
         }
     }
 
@@ -928,7 +1026,6 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let taxonomies = clusters.iter().filter(|c| c.taxonomy()).count();
     ctx.out.summary(&format!(
         "({} declaration(s) across {} cluster(s){}{}; {}{}; {} item(s) scanned{}{}; \
          explain: concept-drift)",
@@ -952,14 +1049,7 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
         } else {
             breakdown
         },
-        if taxonomies > 0 {
-            format!(
-                "; {} of {} member(s) each and demoted as taxonomies (`via` column)",
-                taxonomies, TAXONOMY_SIZE
-            )
-        } else {
-            String::new()
-        },
+        demotion_note(&clusters),
         corpus.items.len(),
         corpus.cache_note(),
         ctx.waived_note(waived)
@@ -1178,6 +1268,85 @@ mod tests {
             cl[0].score()
         );
         assert!(cl[0].score() >= DEFAULT_MIN_SCORE, "…but stays readable");
+    }
+
+    /// The check-on-check loop this closes. `metrics` gates a god function and
+    /// the prescribed repair is one function per case behind a uniform
+    /// interface — which is precisely what `signature` clusters on. Splitting
+    /// three functions in a real session cleared six `metrics` findings and
+    /// raised five `concepts` ones, all noise, all waived.
+    #[test]
+    fn a_private_single_module_dispatch_family_is_demoted() {
+        // Bodies differ on purpose: identical ones belong to `clones`, which
+        // takes them out of this view before it runs.
+        let c = corpus_of(&[(
+            "src/render/graph.rs",
+            "pub struct Svg; pub struct Plot;
+             fn draw_guides(s: &mut Svg, p: &Plot) { let _ = (s, p); println!(\"g\"); }
+             fn draw_curves(s: &mut Svg, p: &Plot) { if true { let _ = (s, p); } }
+             fn draw_geometry(s: &mut Svg, p: &Plot) { let _ = s; let _ = p; }",
+        )]);
+        let cl = signature_clusters(&c);
+        assert_eq!(cl.len(), 1, "still one cluster, just not a finding");
+        assert!(cl[0].dispatch_family(), "private, one module, `draw_*`");
+        assert!(cl[0].taxonomy(), "so it must not gate");
+        assert!(
+            cl[0].score() < DEFAULT_MIN_SCORE,
+            "score {:.2} should fall out of the default listing",
+            cl[0].score()
+        );
+    }
+
+    /// Each condition carries its own weight, so each is asserted alone. The
+    /// cross-module case is the one that matters most: it is the shape of the
+    /// single real finding that session had — two cognate `px` methods in two
+    /// widgets, a genuine question about whether one scale type serves both.
+    #[test]
+    fn the_dispatch_family_rule_holds_its_three_conditions() {
+        // Public: a duplicated exported interface is the expensive case.
+        let public = corpus_of(&[(
+            "src/render/graph.rs",
+            "pub struct Svg; pub struct Plot;
+             pub fn draw_guides(s: &mut Svg, p: &Plot) { let _ = (s, p); println!(\"g\"); }
+             pub fn draw_curves(s: &mut Svg, p: &Plot) { if true { let _ = (s, p); } }
+             pub fn draw_geometry(s: &mut Svg, p: &Plot) { let _ = s; let _ = p; }",
+        )]);
+        assert!(
+            !signature_clusters(&public)[0].dispatch_family(),
+            "exported siblings are not a private table"
+        );
+
+        // Two modules: they cannot see each other, which is the drift this
+        // check exists to catch.
+        let split = corpus_of(&[
+            (
+                "src/render/graph.rs",
+                "pub struct Svg; pub struct Plot;
+                 fn draw_guides(s: &mut Svg, p: &Plot) { let _ = (s, p); println!(\"g\"); }
+                 fn draw_curves(s: &mut Svg, p: &Plot) { if true { let _ = (s, p); } }",
+            ),
+            (
+                "src/render/number_line.rs",
+                "use crate::render::graph::{Svg, Plot};
+                 fn draw_axis(s: &mut Svg, p: &Plot) { let _ = s; let _ = p; }",
+            ),
+        ]);
+        assert!(
+            !signature_clusters(&split)[0].dispatch_family(),
+            "across modules it stays a finding"
+        );
+
+        // Two members: a pair is a lead, not yet a family.
+        let pair = corpus_of(&[(
+            "src/render/graph.rs",
+            "pub struct Svg; pub struct Plot;
+             fn draw_guides(s: &mut Svg, p: &Plot) { let _ = (s, p); println!(\"g\"); }
+             fn draw_curves(s: &mut Svg, p: &Plot) { if true { let _ = (s, p); } }",
+        )]);
+        assert!(
+            !signature_clusters(&pair)[0].dispatch_family(),
+            "two is not a table"
+        );
     }
 
     /// …while the shape the same run *did* act on — one parameter struct

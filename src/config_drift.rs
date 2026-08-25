@@ -402,9 +402,19 @@ pub fn run(
             .then_with(|| x.ty.cmp(&y.ty))
     });
 
-    let waived = ctx.retain_unsuppressed("config-drift", &mut drifts, |d| {
-        crate::suppress::Site::keyed(d.a.file.as_str(), d.a.line, d.ty.as_str())
-    });
+    // Multi-site: the finding is that these two sites configure one type
+    // differently, so either site can carry the waiver.
+    let waived = ctx.retain_unsuppressed_multi(
+        "config-drift",
+        &mut drifts,
+        |d| {
+            vec![
+                crate::suppress::Site::keyed(d.a.file.as_str(), d.a.line, d.ty.as_str()),
+                crate::suppress::Site::keyed(d.b.file.as_str(), d.b.line, d.ty.as_str()),
+            ]
+        },
+        |_| true,
+    );
 
     let found = drifts.len();
     if !ctx.summary {
@@ -423,7 +433,7 @@ pub fn run(
                 "vs_at" => site(&d.b.file, d.b.line),
                 "vs_in" => d.b.context.clone(),
             );
-            ctx.suggest("config-drift", Some(&d.ty), today);
+            ctx.suggest("config-drift", Some(&d.ty), today, (&d.a.file, d.a.line));
         }
     }
     ctx.out.summary(&format!(

@@ -1121,6 +1121,7 @@ fn coverage_one(
                     "enum-coverage",
                     Some(&format!("{}::{}", enum_name, v)),
                     today,
+                    (&r.site.file, r.site.line),
                 );
             }
         }

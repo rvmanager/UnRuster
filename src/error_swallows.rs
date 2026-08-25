@@ -985,7 +985,7 @@ pub fn run_counted(
                 "in_fn" => h.context.clone(),
                 "at" => site(&h.file, h.line),
             );
-            ctx.suggest("error-swallows", Some(h.kind), today);
+            ctx.suggest("error-swallows", Some(h.kind), today, (&h.file, h.line));
         }
     }
     let substituting = all.iter().filter(|h| h.substitutes && h.benign.is_none()).count();

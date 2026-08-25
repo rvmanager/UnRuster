@@ -439,7 +439,7 @@ pub fn run(
                     "via" => format!("transitive after {}", blocker),
                 ),
             }
-            ctx.suggest("dead-code", Some(&d.name), today);
+            ctx.suggest("dead-code", Some(&d.name), today, (&d.file, d.line));
         }
     }
     // Named where the deletion is about to happen. This check's call set is

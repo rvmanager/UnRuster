@@ -321,10 +321,16 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
     // suppressed row must not be counted at all. Telling the ledger which side
     // of it each hit falls on is what makes `hits` mean "suppressed something
     // the audit battery would have gated on", which is what the column claims.
-    let waived = ctx.retain_unsuppressed_tiered(
+    // Multi-site: the finding is the pair, so either half can carry it.
+    let waived = ctx.retain_unsuppressed_multi(
         "near-clones",
         &mut pairs,
-        |p| crate::suppress::Site::keyed(p.a.file.as_str(), p.a.line, &p.label),
+        |p| {
+            vec![
+                crate::suppress::Site::keyed(p.a.file.as_str(), p.a.line, &p.label),
+                crate::suppress::Site::keyed(p.b.file.as_str(), p.b.line, &p.label),
+            ]
+        },
         |p| {
             p.score(opts.max_diff) >= opts.min_score && p.score(opts.max_diff) >= GATING_SCORE
         },
@@ -364,7 +370,7 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
                 // scores what it does — `trait-impl` is the demoted class.
                 "via" => if p.dictated { "trait-impl" } else { "free" },
             );
-            ctx.suggest("near-clones", Some(&p.label), today);
+            ctx.suggest("near-clones", Some(&p.label), today, (&p.a.file, p.a.line));
         }
     }
 

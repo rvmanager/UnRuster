@@ -141,9 +141,18 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
     // one waiver above `impl From<A> for B` retires the pair. A gating check
     // whose commonest true verdict is "one of these types is foreign, so they
     // cannot be merged" needs a way to record that verdict.
-    let waived = ctx.retain_unsuppressed("conversion-pairs", &mut pairs, |p| {
-        crate::suppress::Site::keyed(p.0.file.as_str(), p.0.line, p.2.as_str())
-    });
+    // Multi-site: a bidirectional pair is both impls; either can carry it.
+    let waived = ctx.retain_unsuppressed_multi(
+        "conversion-pairs",
+        &mut pairs,
+        |p| {
+            vec![
+                crate::suppress::Site::keyed(p.0.file.as_str(), p.0.line, p.2.as_str()),
+                crate::suppress::Site::keyed(p.1.file.as_str(), p.1.line, p.2.as_str()),
+            ]
+        },
+        |_| true,
+    );
 
     if !summary {
         let today = crate::suppress::Date::today();
@@ -155,7 +164,7 @@ pub fn run(ctx: &AnalysisCtx) -> anyhow::Result<usize> {
                 "at" => site(&forward.file, forward.line),
                 "reverse_at" => site(&reverse.file, reverse.line),
             );
-            ctx.suggest("conversion-pairs", Some(key), today);
+            ctx.suggest("conversion-pairs", Some(key), today, (&forward.file, forward.line));
         }
     }
     ctx.out.summary(&format!(

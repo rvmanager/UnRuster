@@ -265,7 +265,7 @@ pub fn run(ctx: &AnalysisCtx, min_score: f64) -> anyhow::Result<usize> {
                 "vs" => f.witness.spelling.clone(),
                 "vs_at" => site(&f.witness.file, f.witness.line),
             );
-            ctx.suggest("arith-drift", Some(f.raw.op), today);
+            ctx.suggest("arith-drift", Some(f.raw.op), today, (&f.raw.file, f.raw.line));
         }
     }
     ctx.out.summary(&format!(

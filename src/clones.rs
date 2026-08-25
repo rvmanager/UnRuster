@@ -200,10 +200,16 @@ pub fn run_counted(
     // suppressed row must not be counted at all. Telling the ledger which side
     // of it each hit falls on is what makes `hits` mean "suppressed something
     // the audit battery would have gated on", which is what the column claims.
-    let waived = ctx.retain_unsuppressed_tiered(
+    // Multi-site: every copy is equally the finding.
+    let waived = ctx.retain_unsuppressed_multi(
         "clones",
         &mut groups,
-        |g| crate::suppress::Site::keyed(g.members[0].file.as_str(), g.members[0].line, &g.label),
+        |g| {
+            g.members
+                .iter()
+                .map(|m| crate::suppress::Site::keyed(m.file.as_str(), m.line, &g.label))
+                .collect()
+        },
         |g| g.score() >= min_score && g.score() >= GATING_SCORE,
     );
 
@@ -249,7 +255,7 @@ pub fn run_counted(
                     .collect::<Vec<_>>()
                     .join("  "),
             );
-            ctx.suggest("clones", Some(label), today);
+            ctx.suggest("clones", Some(label), today, (&first.file, first.line));
         }
     }
 

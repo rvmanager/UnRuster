@@ -265,9 +265,18 @@ pub fn run(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| x.group.cmp(&y.group))
     });
-    let waived = ctx.retain_unsuppressed("builder-drift", &mut drifts, |d| {
-        crate::suppress::Site::keyed(d.b.file.as_str(), d.b.line, d.group.as_str())
-    });
+    // Multi-site: the finding is the disagreement between the two builders.
+    let waived = ctx.retain_unsuppressed_multi(
+        "builder-drift",
+        &mut drifts,
+        |d| {
+            vec![
+                crate::suppress::Site::keyed(d.b.file.as_str(), d.b.line, d.group.as_str()),
+                crate::suppress::Site::keyed(d.a.file.as_str(), d.a.line, d.group.as_str()),
+            ]
+        },
+        |_| true,
+    );
 
     let found = drifts.len();
     if !ctx.summary {
@@ -284,7 +293,7 @@ pub fn run(
                 "in" => d.b.context.clone(),
                 "vs_richest" => site(&d.a.file, d.a.line),
             );
-            ctx.suggest("builder-drift", Some(&d.group), today);
+            ctx.suggest("builder-drift", Some(&d.group), today, (&d.b.file, d.b.line));
         }
     }
     ctx.out.summary(&format!(

@@ -168,6 +168,46 @@ impl AnalysisCtx<'_> {
         before - items.len()
     }
 
+    /// As [`Self::retain_unsuppressed_tiered`], for a finding that *is* several
+    /// sites: a waiver at any one of them retires it.
+    ///
+    /// The one-site form silently misfiles these. A `concepts` cluster, a
+    /// `clones` group, a `near-clones` or `conversion-pairs` pair — the finding
+    /// is the relationship between the members, and no member is more the
+    /// finding than another. Keying on one of them anyway (whichever sorted
+    /// first) meant a waiver written above either of two cognate `px` methods
+    /// worked or did nothing depending on a sort order the reader never saw. It
+    /// parsed, it read correctly, the row came back, and the ledger showed it
+    /// earning zero — so the reader's next guess was that the key was wrong.
+    ///
+    /// Every candidate site is probed, with no short-circuit on the first
+    /// match, so two members waived independently each get credit in `hits`.
+    /// Stopping early would leave the second looking dead and invite someone to
+    /// delete a waiver that is doing exactly what it says.
+    pub fn retain_unsuppressed_multi<T>(
+        &self,
+        check: &str,
+        items: &mut Vec<T>,
+        sites_of: impl Fn(&T) -> Vec<crate::suppress::Site<'_>>,
+        gating_of: impl Fn(&T) -> bool,
+    ) -> usize {
+        if self.suppressions.is_empty() {
+            return 0;
+        }
+        let before = items.len();
+        items.retain(|it| {
+            let gating = gating_of(it);
+            let mut waived = false;
+            for site in sites_of(it) {
+                if self.suppressions.matches_tiered(check, site, gating) {
+                    waived = true;
+                }
+            }
+            !waived
+        });
+        before - items.len()
+    }
+
     /// `; N waived` for a summary line, or empty when nothing was waived. Every
     /// check that filters appends this — a suppression that hides its own
     /// volume reads as a clean codebase.
@@ -180,10 +220,29 @@ impl AnalysisCtx<'_> {
     }
 
     /// With `--suggest-waivers`, print the exact comment that would retire the
-    /// row just emitted — correct check, correct key, today's date filled in.
-    /// This is the only place the waiver grammar is spelled out at the point of
-    /// use, so nobody has to go find it in the help.
-    pub fn suggest(&self, check: &str, key: Option<&str>, today: crate::suppress::Date) {
+    /// row just emitted — correct check, correct key, today's date filled in —
+    /// and the `file:line` it has to be attached to. This is the only place the
+    /// waiver grammar is spelled out at the point of use, so nobody has to go
+    /// find it in the help.
+    ///
+    /// `at` is not optional and not decoration. Several checks match a waiver
+    /// against one *designated* site of a multi-site finding — `concepts` keys
+    /// on the cluster's lead member, `near-clones` on the first of the pair —
+    /// so a waiver written above any of the other members parses fine, reads
+    /// fine, and suppresses nothing. That is a silent failure: the finding
+    /// comes back, the ledger shows a waiver earning zero, and the reader
+    /// concludes the key was wrong. One session lost three edits to it,
+    /// grepping the suggestions out of a run that had no way to say which of a
+    /// cluster's two `px` methods was the one that counted. Taking the anchor
+    /// by value means a check cannot add a suggestion without answering the
+    /// question.
+    pub fn suggest(
+        &self,
+        check: &str,
+        key: Option<&str>,
+        today: crate::suppress::Date,
+        at: (&str, usize),
+    ) {
         if !self.suggest_waivers {
             return;
         }
@@ -192,6 +251,13 @@ impl AnalysisCtx<'_> {
             None => check.to_string(),
         };
         let line = format!("  // unruster: ok({}) {} — WHY?", spec, today);
+        // Anchor first, comment second, two lines. Appending the location to
+        // the comment instead would have kept it to one line and broken it: the
+        // whole thing is a `//` comment, so a trailing `[at foo.rs:30]` lands
+        // inside the reason field and the parser reads it back as prose. The
+        // pasteable line has to stay exactly, and only, what gets pasted.
+        self.out
+            .hint(&format!("  ↳ attach above {}:{} —", at.0, at.1));
         self.out.hint(&line);
         // Structured, alongside the prose, so `--json` output is a `jq` away
         // from `waivers --apply`. Without it the suggestion carried no
@@ -201,6 +267,8 @@ impl AnalysisCtx<'_> {
         self.out.tag_last_row(&[
             ("waiver_check", check.to_string()),
             ("waiver_key", key.unwrap_or_default().to_string()),
+            ("waiver_file", at.0.to_string()),
+            ("waiver_line", at.1.to_string()),
         ]);
         // A `near-clones` key concatenates two function names, and the line it
         // produces can outrun a formatter's width. The parser now reads a date

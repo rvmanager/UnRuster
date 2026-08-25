@@ -216,7 +216,7 @@ pub fn run(
                         "in_fn" => h.context.clone(),
                         "at" => site(&h.file, h.line),
                     );
-                    ctx.suggest("stringly", Some(&h.literal), today);
+                    ctx.suggest("stringly", Some(&h.literal), today, (&h.file, h.line));
                 }
             }
         }

@@ -558,11 +558,28 @@ structs should split, or duplicate concepts should merge.
   What is deliberately not reported: methods inside a trait impl (the
   signature was the trait's decision), and `signature` clusters whose only
   shared word is Rust API vocabulary (`as_str`, `run`, `build`).
+  Two shapes are *demoted* rather than reported, and the `via` column says
+  which fired, so you do not have to waive what the tool already accepted:
+    via taxonomy  six or more members. Past that, more copies is evidence
+                  of a family — a variant per constraint kind, a fixture
+                  per test — not of a duplication. Collapsing it would
+                  delete the distinctions the family exists to draw.
+    via family    a `signature` cluster of three or more *private*
+                  functions in *one* module sharing a positional name word
+                  (`nl_point`/`nl_interval`/`nl_ray`). That is a dispatch
+                  table, and it is what splitting a god function produces —
+                  so without this, repairing a `metrics` finding raises a
+                  `concepts` one. All three conditions matter: exported
+                  siblings, siblings across modules, and pairs all stay
+                  reported.
+  A demoted cluster usually falls under `--min-score` too; the summary
+  line counts it, and `--min-score 0` lists it. There is no flag to tune
+  either rule — a family the tool has not recognised is a waiver.
   Signals: `n` ≥ 3 across modules, all `pub` = one canonical declaration
   is missing; a cognate pair in one module = a lead, not a gate.
   Repair: pick one declaration, make it the canonical home, convert the
   others to it or to aliases of it. Waive with `ok(concepts/<key>)` —
-  `--suggest-waivers` prints the exact key.
+  `--suggest-waivers` prints the exact key and the site to attach it to.
 
 ◇ PRE-WRITE GATE (ask before the duplicate is written)
   unruster gate UserId --kind struct               # is this name taken?

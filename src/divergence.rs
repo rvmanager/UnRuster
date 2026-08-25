@@ -427,6 +427,7 @@ pub fn run(
                 "divergence",
                 Some(&format!("{}::{}", p.enum_name, v)),
                 today,
+                (&p.lean.file, p.lean.line),
             );
         }
     }
@@ -835,6 +836,7 @@ pub fn run_handling(ctx: &AnalysisCtx, min_care_gap: u8) -> anyhow::Result<usize
             "divergence-handling",
             Some(&p.careless.callee),
             crate::suppress::Date::today(),
+            (&p.careless.file, p.careless.line),
         );
     }
     ctx.out.summary(&format!(

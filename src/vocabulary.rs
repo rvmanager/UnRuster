@@ -296,7 +296,7 @@ pub fn run_counted(ctx: &AnalysisCtx, corpus: &Corpus, opts: &Opts) -> anyhow::R
                     }
                 ));
             }
-            ctx.suggest("vocabulary", Some(&f.concept), today);
+            ctx.suggest("vocabulary", Some(&f.concept), today, (&f.item.file, f.item.line));
         }
     }
 

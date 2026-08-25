@@ -5273,28 +5273,86 @@ fn one_enum_named_waiver_covers_every_missing_variant() {
     assert_eq!(cols[6], "4", "one comment, four variants: {row}");
 }
 
+/// The false alarm this split exists to end: `audit` used to lump every
+/// zero-hit waiver under "suppressing nothing", including ones suppressing
+/// real rows that merely score below the gate. It could not do better, because
+/// the battery it runs only counts gating hits — the permissive pass that
+/// tells the two apart was something only `waivers` ran.
+#[test]
+fn audit_separates_dead_waivers_from_merely_below_threshold_ones() {
+    let audit = ur_stdout_allow_findings(&["--root", WV, "--all-stdout", "audit"]);
+    let a = String::from_utf8_lossy(&audit);
+    let line = a
+        .lines()
+        .find(|l| l.starts_with("(audit:"))
+        .unwrap_or_else(|| panic!("no audit summary line:\n{a}"));
+    assert!(
+        line.contains("2 of them suppressing nothing"),
+        "the genuinely dead ones, named as such:\n{line}"
+    );
+    assert!(
+        line.contains("1 suppressing only below audit's thresholds"),
+        "and the working one, not accused:\n{line}"
+    );
+    // The same two numbers `waivers` reports, from a run that costs one extra
+    // pass instead of a second command.
+    let w = ur_stdout(&["--root", WV, "--all-stdout", "waivers", "--today", TODAY]);
+    let w = String::from_utf8_lossy(&w);
+    assert!(
+        w.contains("2 waiver(s) suppress nothing at all"),
+        "waivers must still agree:\n{w}"
+    );
+    assert!(
+        w.contains("1 waiver(s) suppress only findings below audit's thresholds"),
+        "waivers must still agree:\n{w}"
+    );
+}
+
 #[test]
 fn orphan_detection_agrees_with_the_audit_line() {
     // These two used to contradict each other in the same run: `audit` counted
     // hits under its own (strict) config while `waivers` counted them wide
     // open, so a ledger could report "0 orphaned" next to an audit line saying
     // several suppressed nothing.
+    //
+    // The audit line now splits that set in two, because calling all of it
+    // "suppressing nothing" cried wolf at waivers that suppress real
+    // below-threshold rows. `--orphaned` deliberately keeps selecting the
+    // whole `hits() == 0` set — for a *listing* the useful question is "what
+    // is not holding the gate open" — so the invariant is that the two audit
+    // numbers partition exactly what `--orphaned` lists. A drift either way
+    // means one surface has changed its mind about what a dead waiver is.
     // `--all-stdout`: the audit summary rides stderr by default.
     let audit = ur_stdout_allow_findings(&["--root", WV, "--all-stdout", "audit"]);
     let a = String::from_utf8_lossy(&audit);
-    let audit_dead: usize = a
+    let line = a
         .lines()
-        .find(|l| l.contains("suppressing nothing"))
-        .and_then(|l| l.split(", ").find_map(|p| p.trim().split(' ').next()?.parse().ok()))
-        .unwrap_or(0);
+        .find(|l| l.starts_with("(audit:"))
+        .unwrap_or_else(|| panic!("no audit summary line:\n{a}"));
+    let count_before = |needle: &str| -> usize {
+        line.split(", ")
+            .find(|p| p.contains(needle))
+            .and_then(|p| p.trim().split(' ').next()?.parse().ok())
+            .unwrap_or(0)
+    };
+    let dead = count_before("suppressing nothing");
+    let below_only = count_before("suppressing only below audit's thresholds");
     let orphaned = rows_of(&ur_stdout(&["--root", WV, "waivers", "--orphaned", "--today", TODAY]));
     assert_eq!(
-        audit_dead,
+        dead + below_only,
         orphaned.len(),
-        "audit and `waivers --orphaned` must count the same set:\naudit said {audit_dead}, \
-         waivers listed {}",
+        "audit's two zero-hit counts must partition `waivers --orphaned`:\naudit said \
+         {dead} dead + {below_only} below-threshold, waivers listed {}\n{line}",
         orphaned.len()
     );
+    // And the alarming half must not be the whole half: the call to action is
+    // only earned when a comment genuinely describes nothing.
+    if dead == 0 {
+        assert!(
+            !line.contains("`unruster waivers` to review"),
+            "nothing is dead, so nothing to review:\n{line}"
+        );
+    }
 }
 
 #[test]
@@ -8365,6 +8423,75 @@ fn run_in(dir: &std::path::Path, cache: &std::path::Path, args: &[&str]) -> Stri
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// A `concepts` cluster is its members, so a waiver above *any* of them
+/// retires it. Keying on whichever member sorted first meant the same waiver,
+/// written above the other one, parsed correctly and suppressed nothing — a
+/// silent failure that cost a real session three edits to diagnose.
+#[test]
+fn a_concepts_waiver_counts_from_any_member_of_the_cluster() {
+    // The cluster's lead is whichever member sorts first; waive the *other*
+    // one, which is the case that used to do nothing.
+    let (dir, cache) = scratch_cached("concepts-waiver-any-member");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod user { pub struct UserId(u64); }
+pub mod order { pub struct OrderId(u64); }
+pub mod owner {
+    // unruster: ok(concepts/newtype:id:u64) 2026-08-24 — deliberate, one per crate.
+    pub struct OwnerId(u64);
+}
+"#,
+    )
+    .unwrap();
+    let text = run_in(&dir, &cache, &["concepts", "--kind", "newtype"]);
+    assert!(
+        !text.lines().any(|l| l.starts_with("newtype\t")),
+        "the waiver on a non-lead member should have retired the cluster:\n{text}"
+    );
+    assert!(text.contains("1 waived"), "and be counted as waived:\n{text}");
+}
+
+/// The suggestion has to name the site it must be attached to. Without it a
+/// reader greps the `ok(...)` lines out of a run and has nothing saying which
+/// of a cluster's members is the one the key was computed from.
+#[test]
+fn suggest_waivers_names_the_site_to_attach_the_waiver_to() {
+    let (dir, cache) = scratch_cached("concepts-suggest-site");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod user { pub struct UserId(u64); }
+pub mod order { pub struct OrderId(u64); }
+pub mod owner { pub struct OwnerId(u64); }
+"#,
+    )
+    .unwrap();
+    let text = run_in(
+        &dir,
+        &cache,
+        &["concepts", "--kind", "newtype", "--suggest-waivers"],
+    );
+    assert!(
+        text.contains("// unruster: ok(concepts/newtype:id:u64)"),
+        "still prints the pasteable comment:\n{text}"
+    );
+    assert!(
+        text.contains("attach above") && text.contains("src/lib.rs:2 —"),
+        "and now says where it goes:\n{text}"
+    );
+    // The pasteable line stays exactly pasteable: the location must not have
+    // been appended into the comment, where the parser reads it as the reason.
+    let comment = text
+        .lines()
+        .find(|l| l.contains("// unruster: ok("))
+        .unwrap_or_else(|| panic!("no suggestion:\n{text}"));
+    assert!(
+        comment.trim_end().ends_with("— WHY?"),
+        "location leaked into the reason field: {comment}"
+    );
 }
 
 /// The finding the whole noun axis exists for: one concept, three names.

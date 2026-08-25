@@ -91,6 +91,63 @@ const STOP_WORDS: &[&str] = &[
 // Dates
 // ---------------------------------------------------------------------------
 
+/// Seconds to add to a UTC timestamp to get local wall-clock time, resolved
+/// once per process.
+///
+/// Hand-rolled for the same reason [`Date`] is: the whole need is one integer,
+/// and neither `chrono` nor a hand-declared `libc::localtime_r` is worth a
+/// dependency or this crate's first `unsafe` block to get it. `date +%z` is
+/// POSIX, prints exactly `±HHMM`, and is asked once.
+///
+/// `/bin/date` by absolute path rather than `date` off `PATH`: this is a
+/// developer tool that runs in whatever environment a repo checkout brings
+/// with it, and a `PATH` lookup would let that environment choose the binary.
+///
+/// Anything unexpected — no such binary (Windows), a non-zero exit, output
+/// that is not `±HHMM` — yields `0`, which is the UTC reading this function
+/// replaced. The failure mode is the old behaviour, never a wrong offset.
+fn local_utc_offset_secs() -> i64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        if !cfg!(unix) {
+            return 0;
+        }
+        let out = match std::process::Command::new("/bin/date").arg("+%z").output() {
+            Ok(o) if o.status.success() => o.stdout,
+            _ => return 0,
+        };
+        parse_utc_offset(String::from_utf8_lossy(&out).trim())
+    })
+}
+
+/// `±HHMM` (the `date +%z` / RFC 822 spelling) as a count of seconds, or `0`
+/// for anything that is not that shape.
+///
+/// Split out from [`local_utc_offset_secs`] so the parse is testable without a
+/// clock or a subprocess: the offsets that break naive implementations are real
+/// zones, not hypotheticals — `+0545` (Kathmandu) is not a whole hour, `-0330`
+/// (Newfoundland) is a negative half hour whose minutes must be subtracted
+/// rather than added, and `+1400` (Kiritimati) is past the ±12 many parsers
+/// assume.
+fn parse_utc_offset(s: &str) -> i64 {
+    let b = s.as_bytes();
+    if b.len() != 5 || !b[1..].iter().all(u8::is_ascii_digit) {
+        return 0;
+    }
+    let sign: i64 = match b[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return 0,
+    };
+    let (h, m) = match (s[1..3].parse::<i64>(), s[3..5].parse::<i64>()) {
+        (Ok(h), Ok(m)) if h <= 14 && m < 60 => (h, m),
+        _ => return 0,
+    };
+    // The sign covers the whole offset, not just the hours: `-0330` is minus
+    // three and a half hours, not minus three hours plus thirty minutes.
+    sign * (h * 3600 + m * 60)
+}
+
 /// A calendar date, to the day. Hand-rolled rather than pulling in `chrono`:
 /// the only operations needed are parse, render, and "how many days ago",
 /// which is one well-known algorithm each.
@@ -133,15 +190,23 @@ impl Date {
         Some(Date { y, m, d })
     }
 
-    /// Today, from the system clock. The only non-deterministic input in the
-    /// tool, which is why every command that consumes it also accepts
-    /// `--today` (the test suite would otherwise drift).
+    /// Today in the *local* zone, from the system clock. The only
+    /// non-deterministic input in the tool, which is why every command that
+    /// consumes it also accepts `--today` (the test suite would otherwise
+    /// drift).
+    ///
+    /// The local offset matters because this date is what `--suggest-waivers`
+    /// stamps onto a line a human is about to paste. Reading the clock as UTC
+    /// put a CDT session's suggestions a day in the future — the agent noticed,
+    /// hand-corrected all fourteen of them, and in doing so did the one thing
+    /// the waiver docs tell people never to do. A stamp nobody trusts is worse
+    /// than no stamp, because `--stale` is measured against it.
     pub fn today() -> Date {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        Date::from_days(secs.div_euclid(86_400))
+        Date::from_days((secs + local_utc_offset_secs()).div_euclid(86_400))
     }
 
     /// Days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
@@ -1667,6 +1732,45 @@ mod tests {
         assert!(s.matches("error-swallows", Site::new("f.rs", 2)));
         assert_eq!(s.all()[0].hits(), 2);
         assert_eq!(s.all()[0].hit_checks(), vec!["error-swallows".to_string()]);
+    }
+
+    /// The offsets that break naive `±HHMM` parsing are all real zones, and
+    /// getting any of them wrong moves the date `--suggest-waivers` stamps.
+    #[test]
+    fn utc_offsets_parse_including_the_awkward_real_ones() {
+        assert_eq!(parse_utc_offset("+0000"), 0);
+        assert_eq!(parse_utc_offset("-0500"), -5 * 3600); // CDT, the reported case
+        assert_eq!(parse_utc_offset("+0200"), 2 * 3600);
+        // Not a whole hour (Kathmandu), and the minutes carry the sign too.
+        assert_eq!(parse_utc_offset("+0545"), 5 * 3600 + 45 * 60);
+        // Negative half hour (Newfoundland): minus three and a half, not minus
+        // three plus thirty.
+        assert_eq!(parse_utc_offset("-0330"), -(3 * 3600 + 30 * 60));
+        // Past the ±12 a lot of parsers assume (Kiritimati).
+        assert_eq!(parse_utc_offset("+1400"), 14 * 3600);
+    }
+
+    /// Every rejection falls back to `0`, which is the UTC reading this
+    /// replaced — a malformed `date` is never allowed to invent an offset.
+    #[test]
+    fn unparseable_utc_offsets_fall_back_to_utc() {
+        for bad in ["", "0500", "+05:00", "+05000", "+0560", "+1500", "z0500", "+05a0"] {
+            assert_eq!(parse_utc_offset(bad), 0, "{bad} should have been rejected");
+        }
+    }
+
+    /// The bug this fixes: west of UTC, late in the day, the UTC calendar has
+    /// already rolled over and the local one has not. Asserted through the same
+    /// arithmetic `today()` uses, so it holds without depending on the clock.
+    #[test]
+    fn local_offset_moves_the_date_back_across_the_utc_rollover() {
+        // 2026-08-25 01:58 UTC — the exact moment from the reported session.
+        let utc_secs = Date::parse("2026-08-25").unwrap().to_days() * 86_400 + 3600 + 58 * 60;
+        let as_utc = Date::from_days(utc_secs.div_euclid(86_400));
+        assert_eq!(as_utc.to_string(), "2026-08-25");
+        let cdt = parse_utc_offset("-0500");
+        let as_local = Date::from_days((utc_secs + cdt).div_euclid(86_400));
+        assert_eq!(as_local.to_string(), "2026-08-24", "CDT was still the 24th");
     }
 
     #[test]

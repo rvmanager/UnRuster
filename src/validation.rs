@@ -494,7 +494,7 @@ pub fn run_drift_counted(ctx: &AnalysisCtx, min_score: f64) -> anyhow::Result<Co
                 "fn" => d.owner.clone(),
                 "checked_siblings" => d.checked.join("  "),
             );
-            ctx.suggest("validation-drift", Some(&d.name), today);
+            ctx.suggest("validation-drift", Some(&d.name), today, (&d.file, d.line));
         }
     }
 

@@ -573,7 +573,7 @@ pub fn run_counted(ctx: &AnalysisCtx, opts: PanicOpts) -> anyhow::Result<Counts>
                 "in_fn" => h.context.clone(),
                 "at" => site(&h.file, h.line),
             );
-            ctx.suggest("panics", Some(h.kind), today);
+            ctx.suggest("panics", Some(h.kind), today, (&h.file, h.line));
         }
     }
     ctx.out.summary(&format!(
