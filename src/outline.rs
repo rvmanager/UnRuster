@@ -39,6 +39,31 @@ pub struct OutlineOpts<'a> {
     pub docs: bool,
     /// Flatten the nesting indent (nicer for `awk`, worse for reading).
     pub flat: bool,
+    /// Print each item's signature under its row: a fn's through the return
+    /// type, anything else's declaration line. The question an outline is
+    /// usually run for is "what is in this file and what do these take", and
+    /// the second half used to cost a `sed -n` per range — 62 outlines in one
+    /// project's sessions were followed by range reads of the same file.
+    pub sig: bool,
+}
+
+/// Signature lines a row wants — the `--sig` column's worth, capped so a
+/// forty-parameter fn does not turn an outline into a listing.
+const SIG_LINES_MAX: usize = 12;
+
+/// The lines of `d`'s signature, read from the file: a fn's declaration
+/// through `sig_end`, anything else's declaration line alone.
+fn signature_lines<'a>(d: &Defn, lines: &'a [String]) -> Vec<&'a str> {
+    let end = match d.kind {
+        "fn" | "impl-fn" | "trait-fn" => d.sig_end.max(d.line),
+        _ => d.line,
+    };
+    let lo = d.line.saturating_sub(1);
+    let hi = end.min(lines.len());
+    if lo >= hi {
+        return Vec::new();
+    }
+    lines[lo..hi].iter().map(|l| l.trim_end()).collect()
 }
 
 /// Does `d` belong to the file the user asked about?
@@ -102,6 +127,8 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
         }),
     }
 
+    // One read per file, for `--sig`.
+    let mut sources: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
     if !ctx.summary {
         for d in &items {
             // Indented: the short name, because the indent says whose it is.
@@ -130,7 +157,32 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
             if opts.docs {
                 cells.push(("doc", Val::from(d.doc.clone().unwrap_or_else(|| "—".into()))));
             }
+            let sig: Vec<String> = if opts.sig {
+                let src = sources.entry(d.file.as_str()).or_insert_with(|| {
+                    std::fs::read_to_string(&d.file)
+                        .map(|s| s.lines().map(str::to_string).collect())
+                        .unwrap_or_default()
+                });
+                let all = signature_lines(d, src);
+                let mut v: Vec<String> = all.iter().take(SIG_LINES_MAX).map(|l| l.to_string()).collect();
+                if all.len() > SIG_LINES_MAX {
+                    v.push(format!("… {} more signature line(s)", all.len() - SIG_LINES_MAX));
+                }
+                v
+            } else {
+                Vec::new()
+            };
+            // JSON carries the signature on the row; TSV prints it beneath,
+            // indented past any column, so the rows themselves keep their shape.
+            if opts.sig && ctx.out.format == crate::emit::Format::Json {
+                cells.push(("sig", Val::List(sig.clone())));
+            }
             ctx.out.row(cells);
+            if ctx.out.format != crate::emit::Format::Json {
+                for l in &sig {
+                    ctx.out.line(&format!("        {}", l.trim_start()));
+                }
+            }
         }
     }
     // The reverse lookup, named where the forward one just happened. A file

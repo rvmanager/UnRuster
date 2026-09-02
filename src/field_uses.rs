@@ -432,23 +432,42 @@ pub fn run(
     });
 
     let (reads, writes, inits, ti_count, q_count) = tally_and_print(ctx, &all);
-    ctx.out.summary(&format!(
-        "({} reads, {} writes, {} inits; via: {} type-inferred, {} unknown receiver; strict={})",
-        reads, writes, inits, ti_count, q_count, opts.strict
-    ));
-    note_write_only(ctx, ty, field, reads, writes, inits, &opts);
-
+    // Strict found nothing but the wider net would: print the candidates now,
+    // under a line that says what they are, rather than a hint that costs the
+    // rerun it describes. The hint was followed on the next call every time it
+    // was seen; the rerun was the only thing it bought.
+    let mut candidates = 0usize;
     if opts.strict && all.is_empty() && opts.via_receiver.is_none() && opts.kinds.is_empty() {
-        let cand = collect(files, ty, field, false, fn_sigs, false);
+        let mut cand = collect(files, ty, field, false, fn_sigs, ctx.spans);
+        ctx.retain_changed(&mut cand, |h| &h.file);
         if !cand.is_empty() {
-            ctx.out.note(&format!(
-                "hint: strict matched 0; --candidates would report {} hit(s) (mostly unknown receivers). \
-                 Try `--candidates` or `--candidates --via-receiver <substring>`.",
-                cand.len()
+            candidates = cand.len();
+            ctx.out.row_note(&format!(
+                "(note: strict matched 0 — the {} row(s) below are candidates, receivers not \
+                 verified as `{}`; `--candidates --via-receiver <substring>` narrows them)",
+                cand.len(),
+                ty
             ));
+            cand.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+            tally_and_print(ctx, &cand);
         }
     }
-    if !known && all.is_empty() {
+    ctx.out.summary(&format!(
+        "({} reads, {} writes, {} inits; via: {} type-inferred, {} unknown receiver; strict={}{})",
+        reads,
+        writes,
+        inits,
+        ti_count,
+        q_count,
+        opts.strict,
+        if candidates > 0 {
+            format!("; {} unverified candidate(s) listed", candidates)
+        } else {
+            String::new()
+        }
+    ));
+    note_write_only(ctx, ty, field, reads, writes, inits, &opts);
+    if !known && all.is_empty() && candidates == 0 {
         return Err(TargetNotFound::err("type", ty));
     }
     Ok(all.len())

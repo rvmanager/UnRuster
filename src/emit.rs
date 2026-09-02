@@ -318,6 +318,49 @@ pub struct Out {
     hold_summary: Cell<bool>,
     held_summary: RefCell<Option<String>>,
     state: RefCell<State>,
+    /// While `Some`, every TSV stdout line lands here instead of being
+    /// printed, so `audit` can put its `## gating` digest *first* — ahead of
+    /// rows that were emitted before the last gating row was known. Taken back
+    /// with [`Out::take_buffered`]. `None` streams, which is every other run.
+    buffer: RefCell<Option<Vec<String>>>,
+    /// `audit` only: prefix every TSV row with a gate column (`!` when the row
+    /// holds the exit code open, empty otherwise) and carry `"gating"` in JSON.
+    /// A reader grepping for the rows that matter had no handle on them: the
+    /// gating tier was a threshold in a section header, and one session ran
+    /// the battery eight times to find the single row that gated.
+    mark_gating: Cell<bool>,
+    /// Every gating row this run emitted, for the `## gating` digest and for
+    /// the summary line that names which checks hold the gate.
+    gating_rows: RefCell<Vec<GatingRow>>,
+    /// Print `hint` lines beside their row. `audit` turns this off unless
+    /// `--suggest-waivers` was named, and prints the hints it collected under
+    /// the gating rows alone — the rows a reader is about to decide about.
+    hints_inline: Cell<bool>,
+    /// Whether the most recent rendered row gated, so a following `hint`
+    /// knows whether it belongs in the digest.
+    last_row_gating: Cell<bool>,
+    /// Under `--changed-since`, says whether a row's line sits in a changed
+    /// hunk (`changed`) or merely in a changed file (`pre-existing`). Takes the
+    /// check name because an `item` row's line is where the item *starts*, so
+    /// its verdict is about the whole extent. Set by `audit`.
+    change_of: RefCell<Option<ChangeOf>>,
+}
+
+/// `(check, file, line) -> "changed" | "pre-existing" | ""`. See [`Out::change_of`].
+pub type ChangeOf = Box<dyn Fn(&str, &str, usize) -> &'static str>;
+
+/// One row that gates, kept for the digest that opens `audit`'s report.
+#[derive(Debug, Clone)]
+pub struct GatingRow {
+    pub check: String,
+    /// The TSV cells, tab-joined, without the gate column.
+    pub tsv: String,
+    pub file: Option<String>,
+    pub line: usize,
+    /// `--suggest-waivers` lines attached to this row.
+    pub hints: Vec<String>,
+    /// `changed` / `pre-existing` under `--changed-since`, else empty.
+    pub change: &'static str,
 }
 
 /// One emitted finding, reduced to what a cross-run comparison needs.
@@ -355,6 +398,12 @@ impl Out {
             hold_summary: Cell::new(false),
             held_summary: RefCell::new(None),
             state: RefCell::new(State::default()),
+            buffer: RefCell::new(None),
+            mark_gating: Cell::new(false),
+            gating_rows: RefCell::new(Vec::new()),
+            hints_inline: Cell::new(true),
+            last_row_gating: Cell::new(false),
+            change_of: RefCell::new(None),
         }
     }
 
@@ -382,6 +431,12 @@ impl Out {
             hold_summary: Cell::new(false),
             held_summary: RefCell::new(None),
             state: RefCell::new(State::default()),
+            buffer: RefCell::new(None),
+            mark_gating: Cell::new(false),
+            gating_rows: RefCell::new(Vec::new()),
+            hints_inline: Cell::new(true),
+            last_row_gating: Cell::new(false),
+            change_of: RefCell::new(None),
         }
     }
 
@@ -462,6 +517,78 @@ impl Out {
         self.format == Format::Json
     }
 
+    /// One stdout line: printed, or held while [`Out::start_buffering`] is on.
+    fn put(&self, text: &str) {
+        if let Some(buf) = self.buffer.borrow_mut().as_mut() {
+            buf.push(text.to_string());
+            return;
+        }
+        println!("{}", text);
+    }
+
+    /// Hold every stdout line from here on. See [`Out::buffer`].
+    pub fn start_buffering(&self) {
+        *self.buffer.borrow_mut() = Some(Vec::new());
+    }
+
+    /// Stop holding and hand back what was held, in order.
+    pub fn take_buffered(&self) -> Vec<String> {
+        self.buffer.borrow_mut().take().unwrap_or_default()
+    }
+
+    /// Whether this sink swallows everything (the waiver-probe battery).
+    pub fn is_silent(&self) -> bool {
+        self.silent
+    }
+
+    /// Print a line now, bypassing the buffer — for the digest that has to
+    /// precede everything the buffer holds.
+    pub fn print_now(&self, text: &str) {
+        println!("{}", text);
+    }
+
+    /// Turn the gate column on (see [`Out::mark_gating`]).
+    pub fn set_mark_gating(&self, on: bool) {
+        self.mark_gating.set(on);
+    }
+
+    /// Whether `hint` prints beside its row. Returns the previous setting.
+    pub fn set_hints_inline(&self, on: bool) -> bool {
+        self.hints_inline.replace(on)
+    }
+
+    /// Install the `--changed-since` classifier. See [`Out::change_of`].
+    pub fn set_change_of(&self, f: Option<ChangeOf>) {
+        *self.change_of.borrow_mut() = f;
+    }
+
+    /// The gating rows emitted so far, oldest first.
+    pub fn gating_rows(&self) -> Vec<GatingRow> {
+        self.gating_rows.borrow().clone()
+    }
+
+    /// Does this row hold the exit code open, under the section's gate?
+    ///
+    /// `None` floor: an advisory section, or a single-command run — nothing
+    /// gates. A `-inf` floor: every row gates, `score` cell or not. Any other
+    /// floor: the row's `score` has to clear it. The old test required a
+    /// `score` cell even under `-inf`, so a `divergence` row past the section's
+    /// cap — a check with no score column — was dropped while the note above
+    /// it promised the cap never hides a gating row.
+    fn gates(&self, cells: &[(&'static str, Val)]) -> bool {
+        let Some(floor) = self.row_budget_floor.get() else {
+            return false;
+        };
+        if floor == f64::NEG_INFINITY {
+            return true;
+        }
+        cells
+            .iter()
+            .find(|(k, _)| *k == "score")
+            .and_then(|(_, v)| v.tsv().parse::<f64>().ok())
+            .is_some_and(|s| s >= floor)
+    }
+
     /// Open a named section. In TSV this prints the `## title` header — and it
     /// must be called *before* the section's rows, which is exactly the bug
     /// `audit` had when it passed an eagerly-evaluated count as an argument.
@@ -479,21 +606,6 @@ impl Out {
     pub fn set_row_budget_keeping(&self, n: Option<usize>, floor: Option<f64>) {
         self.set_row_budget(n);
         self.row_budget_floor.set(floor);
-    }
-
-    /// Does this row's `score` cell clear [`Self::row_budget_floor`]?
-    ///
-    /// A row with no `score` cell never does: the exemption is for the tier a
-    /// check ranks, and a check that does not rank cannot have one.
-    fn above_floor(&self, cells: &[(&'static str, Val)]) -> bool {
-        let Some(floor) = self.row_budget_floor.get() else {
-            return false;
-        };
-        cells
-            .iter()
-            .find(|(k, _)| *k == "score")
-            .and_then(|(_, v)| v.tsv().parse::<f64>().ok())
-            .is_some_and(|s| s >= floor)
     }
 
     /// The `--top` note for the rows since the budget was last set, or `None`
@@ -560,7 +672,7 @@ impl Out {
     /// Print the deferred `## title`, if one is waiting.
     fn flush_section(&self) {
         if let Some(t) = self.pending_section.borrow_mut().take() {
-            println!("## {}", t);
+            self.put(&format!("## {}", t));
         }
     }
 
@@ -589,7 +701,7 @@ impl Out {
         }
         if !self.json() && !self.summary_only {
             self.flush_section();
-            println!();
+            self.put("");
         }
     }
 
@@ -606,7 +718,33 @@ impl Out {
         if let (Some(f), Some(list)) = (&finding, self.recorded.borrow_mut().as_mut()) {
             list.push(f.clone());
         }
-        if self.silent || self.summary_only {
+        if self.silent {
+            self.last_row_emitted.set(false);
+            return;
+        }
+        // Decided before the cap and before `--summary`'s early return: a
+        // gating row is recorded whether or not it is rendered, so the digest
+        // and the summary line name every one of them.
+        let gating = self.gates(&cells);
+        let change = self.change_of.borrow().as_ref().map(|f| {
+            let check = self.current_check.borrow().clone();
+            cells
+                .iter()
+                .find_map(|(_, v)| v.as_site())
+                .map_or("", |(file, line)| f(&check, file, line))
+        });
+        if gating {
+            let site = cells.iter().find_map(|(_, v)| v.as_site());
+            self.gating_rows.borrow_mut().push(GatingRow {
+                check: self.current_check.borrow().clone(),
+                tsv: cells.iter().map(|(_, v)| v.tsv()).collect::<Vec<_>>().join("\t"),
+                file: site.map(|(f, _)| f.to_string()),
+                line: site.map_or(0, |(_, l)| l),
+                hints: Vec::new(),
+                change: change.unwrap_or(""),
+            });
+        }
+        if self.summary_only {
             self.last_row_emitted.set(false);
             return;
         }
@@ -614,7 +752,7 @@ impl Out {
         // baselines still see every finding, and before rendering so the cap
         // only bounds the listing.
         match self.row_budget.get() {
-            Some(0) if self.above_floor(&cells) => {
+            Some(0) if gating => {
                 self.kept_over_budget.set(self.kept_over_budget.get() + 1);
             }
             Some(0) => {
@@ -627,11 +765,18 @@ impl Out {
         }
         self.emitted.set(self.emitted.get() + 1);
         self.last_row_emitted.set(true);
+        self.last_row_gating.set(gating);
         let context = self.context_for(&cells);
         if self.json() {
             let mut cells = cells;
             if let Some(f) = &finding {
                 cells.push(("fp", Val::Str(f.fp.clone())));
+            }
+            if self.mark_gating.get() {
+                cells.push(("gating", Val::Bool(gating)));
+            }
+            if let Some(c) = change.filter(|c| !c.is_empty()) {
+                cells.push(("change", Val::Str(c.to_string())));
             }
             let check = self.current_check.borrow().clone();
             let mut st = self.state.borrow_mut();
@@ -648,10 +793,14 @@ impl Out {
                 line.push(f.fp.clone());
             }
         }
+        // The gate column leads, so `grep '^!'` is the whole filter.
+        if self.mark_gating.get() {
+            line.insert(0, if gating { "!" } else { "" }.to_string());
+        }
         self.flush_section();
-        println!("{}", line.join("\t"));
+        self.put(&line.join("\t"));
         for l in context {
-            println!("{}", l);
+            self.put(&l);
         }
     }
 
@@ -689,7 +838,7 @@ impl Out {
             return;
         }
         self.flush_section();
-        println!("{}", text);
+        self.put(text);
     }
 
     /// An advisory line attached to the row just emitted — currently the
@@ -706,6 +855,13 @@ impl Out {
         if !self.last_row_emitted.get() {
             return;
         }
+        // A hint about a gating row travels with it into the digest, where the
+        // reader is deciding what to do about exactly that row.
+        if self.last_row_gating.get() {
+            if let Some(g) = self.gating_rows.borrow_mut().last_mut() {
+                g.hints.push(text.to_string());
+            }
+        }
         if self.json() {
             let mut st = self.state.borrow_mut();
             if let Some(r) = st.current().rows.last_mut() {
@@ -713,7 +869,9 @@ impl Out {
             }
             return;
         }
-        println!("{}", text);
+        if self.hints_inline.get() {
+            self.put(text);
+        }
     }
 
     /// The trailing `(N finding(s); …)` line. Goes to stderr by default so
@@ -738,13 +896,13 @@ impl Out {
         if self.summary_inline.get() {
             if !self.summary_only {
                 self.flush_section();
-                println!("{}", text);
+                self.put(text);
             }
             return;
         }
         if self.all_stdout {
             self.flush_section();
-            println!("{}", text);
+            self.put(text);
         } else {
             to_stderr(text);
         }
@@ -773,7 +931,7 @@ impl Out {
             self.state.borrow_mut().notes.push(text.to_string());
             return;
         }
-        println!("{}", text);
+        self.put(text);
     }
 
     /// A note about the **rows themselves** — that they were cut short. Goes to
@@ -805,7 +963,7 @@ impl Out {
             to_stderr(text);
         } else {
             self.flush_section();
-            println!("{}", text);
+            self.put(text);
         }
     }
 
@@ -825,12 +983,12 @@ impl Out {
         }
         if self.summary_inline.get() {
             if !self.summary_only {
-                println!("{}", text);
+                self.put(text);
             }
             return;
         }
         if self.all_stdout {
-            println!("{}", text);
+            self.put(text);
         } else {
             to_stderr(text);
         }
@@ -866,7 +1024,7 @@ impl Out {
             return;
         }
         for l in lines {
-            println!("{}", l);
+            self.put(&l);
         }
     }
 

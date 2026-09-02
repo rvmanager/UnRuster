@@ -177,6 +177,15 @@ fn at(d: &Defn, range: Option<(usize, usize)>) -> Val {
 /// source — no comments, no formatting, no `#[rustfmt::skip]` block as written.
 fn print_source(ctx: &AnalysisCtx, file: &str, start: usize, end: usize, opts: &ShowOpts) {
     print_range(ctx, file, start, end, opts.max_lines, opts.number, None);
+    if ctx.out.format == Format::Json {
+        return;
+    }
+    if let Some(budget) = cut_budget(opts.max_lines) {
+        let cut_at = start + budget;
+        if cut_at <= end {
+            sketch_tail(ctx, file, cut_at, end);
+        }
+    }
 }
 
 /// [`print_source`] with the two extras a non-`show` caller needs: an explicit
@@ -442,9 +451,69 @@ fn resolve(ctx: &AnalysisCtx, query: &str, opts: &ShowOpts) -> anyhow::Result<Ve
             hits = named;
         }
     }
+    // A type and its own `impl` blocks answer to one name, and that is not an
+    // ambiguity either: the reader asked for `Aabb` and there is one `Aabb`.
+    // Twelve `show <Type>` calls in four days of one project's sessions got a
+    // two-row list instead of the struct, and each cost a second call or a
+    // `sed -n` on the range the list had just printed. The impls are still
+    // named — under the type, where the reader is about to want them.
+    if hits.len() > 1 && opts.kind.is_none() && !opts.all {
+        let types: Vec<&Defn> = hits.iter().filter(|d| is_type(d.kind)).collect();
+        if let [t] = types[..] {
+            let own = t.name.clone();
+            if hits
+                .iter()
+                .all(|d| is_type(d.kind) || (d.kind == "impl" && d.owner.as_deref() == Some(own.as_str())))
+            {
+                hits.retain(|d| is_type(d.kind));
+            }
+        }
+    }
     hits.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
     hits.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.kind == b.kind);
     Ok(hits)
+}
+
+/// The kinds an `impl` block can belong to.
+fn is_type(kind: &str) -> bool {
+    matches!(kind, "struct" | "enum" | "trait" | "type")
+}
+
+/// After printing a type, name its `impl` blocks: where they are, how many fns
+/// each holds, and the two commands that print them. Under `--all` they were
+/// printed already.
+fn note_impl_blocks(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
+    if !is_type(d.kind) || opts.all {
+        return;
+    }
+    let impls: Vec<&Defn> = ctx
+        .idx
+        .iter()
+        .filter(|i| i.kind == "impl" && i.owner.as_deref() == Some(d.name.as_str()))
+        .collect();
+    if impls.is_empty() {
+        return;
+    }
+    let described: Vec<String> = impls
+        .iter()
+        .map(|i| {
+            let fns = ctx
+                .idx
+                .iter()
+                .filter(|m| m.kind == "impl-fn" && m.file == i.file && i.line <= m.line && m.line <= i.end)
+                .count();
+            format!("{} {}:{}-{} ({} fn(s))", i.qpath, i.file, i.line, i.end, fns)
+        })
+        .collect();
+    ctx.out.note(&format!(
+        "note: {} impl block(s) for `{}` — {}. `show {} --kind impl` prints them; `outline {}` \
+         lists their members.",
+        impls.len(),
+        d.name,
+        described.join(", "),
+        d.name,
+        d.file
+    ));
 }
 
 /// Say when a qualified query resolved past same-named items elsewhere.
@@ -509,6 +578,7 @@ fn show_one(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
     }
     note_container_sig(ctx, d, opts);
     note_field_route(ctx, d);
+    note_impl_blocks(ctx, d, opts);
 }
 
 /// Say how much source is coming, *before* it comes — and for an enum, name the
@@ -540,19 +610,96 @@ fn note_size_and_route(ctx: &AnalysisCtx, d: &Defn, range: Option<(usize, usize)
     // For an enum the compact route is not "read less of this", it is a
     // different command with a complete answer: one row per variant, plus the
     // ctor and match sites, immune to any `head`.
-    let route = if d.kind == "enum" {
-        format!(
-            " — `variants {}` lists them one per line, with their construction and match sites",
-            d.qpath
-        )
-    } else {
-        String::new()
-    };
+    if d.kind == "enum" {
+        ctx.out.note(&format!(
+            "note: {} line(s) of source follow — `variants {}` lists them one per line, \
+             with their construction and match sites.",
+            lines, d.qpath
+        ));
+        return;
+    }
+    // Only when this print is actually going to stop short. The old note fired
+    // on every item over forty lines — under `--max-lines 0` included, where
+    // nothing was bounded — and read as "the tool is cutting me": one project's
+    // sessions answered it with `--max-lines 0 | head -80` twenty-six times,
+    // lifting the cap and then cutting by hand. A reader who wanted less of a
+    // long fn is offered less; one who wanted all of it is not warned about a
+    // cut that will not happen.
+    let Some(budget) = cut_budget(opts.max_lines) else { return };
+    if lines <= budget {
+        return;
+    }
     ctx.out.note(&format!(
-        "note: {} line(s) of source follow{}. This command bounds itself; piping it to \
-         `head` cuts mid-item and says nothing.",
-        lines, route
+        "note: {} line(s) — printing the first {}, then a sketch of the rest. `--max-lines 0` \
+         prints all of it, `--max-lines 60` less, `--part sig` the signature alone.",
+        lines, budget
     ));
+}
+
+/// The per-item line budget `max_lines` means: `None` for "all of it".
+fn cut_budget(max_lines: Option<usize>) -> Option<usize> {
+    match max_lines {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(DEFAULT_MAX_LINES),
+    }
+}
+
+/// Lines of the dropped tail the sketch will list before saying how many more.
+const SKETCH_LINES: usize = 30;
+
+/// After a cut, the shape of what was dropped: the comments and control-flow
+/// lines at the body's top level, numbered. It is what a reader builds by
+/// hand when the cut lands — one session wrote a 500-line fn to a temp file
+/// with `--max-lines 0` and grepped it for `^    // \|^    if \|^    for ` to
+/// get exactly this.
+fn sketch_tail(ctx: &AnalysisCtx, file: &str, cut_from: usize, end: usize) {
+    let Ok(src) = std::fs::read_to_string(file) else { return };
+    let lines: Vec<&str> = src.lines().collect();
+    if cut_from == 0 || cut_from > end || end > lines.len() {
+        return;
+    }
+    let tail = &lines[cut_from - 1..end];
+    // The body's own indent: the shallowest non-blank line in the tail that is
+    // not the closing brace. Anything deeper is inside a nested block.
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let body_indent = tail
+        .iter()
+        .filter(|l| !l.trim().is_empty() && l.trim() != "}")
+        .map(|l| indent_of(l))
+        .min()
+        .unwrap_or(0);
+    let is_landmark = |t: &str| {
+        t.starts_with("//")
+            || t.starts_with("if ")
+            || t.starts_with("} else")
+            || t.starts_with("else")
+            || t.starts_with("for ")
+            || t.starts_with("while ")
+            || t.starts_with("loop")
+            || t.starts_with("match ")
+            || t.starts_with("return")
+            || t.starts_with("let ") && (t.contains("= match") || t.contains("= if"))
+    };
+    let picked: Vec<(usize, &str)> = tail
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| indent_of(l) == body_indent && is_landmark(l.trim()))
+        .map(|(i, l)| (cut_from + i, l.trim_end()))
+        .collect();
+    if picked.is_empty() {
+        return;
+    }
+    ctx.out.line(&format!(
+        "(sketch of lines {}-{}: comments and control flow at the body's top level)",
+        cut_from, end
+    ));
+    for (n, l) in picked.iter().take(SKETCH_LINES) {
+        ctx.out.line(&format!("  {:>5}| {}", n, l));
+    }
+    if picked.len() > SKETCH_LINES {
+        ctx.out.line(&format!("  … {} more landmark(s)", picked.len() - SKETCH_LINES));
+    }
 }
 
 /// After printing a struct, name the two commands that answer the question a
@@ -672,6 +819,10 @@ pub fn run(ctx: &AnalysisCtx, queries: &[String], opts: &ShowOpts) -> anyhow::Re
     // whether it was asked for one name or a hundred.
     if missed == queries.len() {
         return Err(TargetNotFound::err("item", &queries.join(", ")));
+    }
+    // One name, one item, nothing missed: the header row said it all.
+    if single && shown == 1 && missed == 0 {
+        return Ok(shown);
     }
     ctx.out.summary(&format!(
         "({} item(s) from {} name(s){})",

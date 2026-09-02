@@ -581,6 +581,11 @@ pub const WAIVABLE_CHECKS: &[&str] = &[
     "doc-drift",
     "enum-coverage",
     "error-swallows",
+    // Advisory in `audit`, but its two sections are printed under the name
+    // `metrics`, and that is the name a reader writes: a real ledger carried
+    // `ok(metrics)` above a 7-parameter fn for a day before `waivers` reported
+    // it as "a check this tool does not have".
+    "metrics",
     "near-clones",
     "panics",
     "pass-through",
@@ -598,6 +603,14 @@ pub fn known_check_names() -> Vec<&'static str> {
     v.sort_unstable();
     v.dedup();
     v
+}
+
+/// Does a waiver written for `waiver` (a check, a group, or `None` for the
+/// legacy form) apply to `check`? The public face of [`check_matches`], for
+/// `audit`'s ledger tally under `--only`/`--skip`: a waiver whose check did not
+/// run this pass has not "suppressed nothing", it has not been asked.
+pub fn waiver_covers(waiver: Option<&str>, check: &str) -> bool {
+    check_matches(waiver, check)
 }
 
 /// An unqualified waiver matches every check — that is the legacy contract and

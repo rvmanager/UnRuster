@@ -1,7 +1,7 @@
 Query a Rust codebase via syntactic (syn) analysis. Finds candidates; you judge them.
 
 AGENT QUICKSTART
-  unruster audit --findings-only --top 10  ranked battery, bounded; exit 1 on gating (never pipe it)
+  unruster audit                     ranked battery: `## gating` first, `!` marks gating rows; exit 1 on gating
   unruster audit --changed-since HEAD~1    same, scoped to your last commit — highest yield
   unruster divergence                sibling paths that disagree — highest yield, start here
   unruster clones                    the same body written out more than once
@@ -15,8 +15,8 @@ AGENT QUICKSTART
   unruster contract-drift <fn>       its callers, body withheld; `--reveal` after you judge
   unruster explain <topic>           one repair recipe (cheap); `playbook` for all
   unruster module-uses <mod>         what the rest of the tree takes from a module (removals)
-  unruster outline <f>  at <f>:<n>   a file's items with spans; which item owns a line
-  unruster show <name>               one item's exact source; bounds itself, never pipe to head
+  unruster outline <f> [--sig]  at <f>:<n>   a file's items (+signatures); which item owns a line
+  unruster show <name>               one item's exact source; a type prints over its own impls
   --json                             every command; named keys (TSV has no header row)
 
 HIGHEST-SIGNAL FIRST
@@ -62,7 +62,7 @@ WAIVERS — record a verified false positive (`unruster explain waivers`)
   Never hand-written: `--suggest-waivers` prints the exact line. Above an item
   it waives that whole item (the `#[allow]` model). A bare enum name as the key
   covers all its variants; a group name (`partial-enumeration`) covers every
-  check asking the same question. `unruster waivers [--orphaned]` audits them.
+  check asking the same question. `unruster waivers --orphaned` lists the dead ones.
 
 IN-SOURCE MARKERS (declarations live in `///`, waivers in `//`)
   /// unruster: sealed        on an enum: partial dispatch is tagged SEALED

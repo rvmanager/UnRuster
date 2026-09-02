@@ -108,6 +108,7 @@ fn populate_hits(ctx: &AnalysisCtx, call_source: &[ParsedFile]) {
         out: &quiet,
         suppressions: ctx.suppressions,
         suggest_waivers: false,
+        suggest_waivers_named: false,
     };
 
     // Two passes over the same waivers. Pass 1 is configured exactly as
@@ -139,7 +140,13 @@ fn selected(w: &Waiver, opts: &WaiverOpts) -> bool {
     if opts.legacy_only && !w.is_legacy() {
         return false;
     }
-    if opts.orphaned && w.hits() > 0 {
+    // `--orphaned` used to list the whole zero-hit set, including waivers
+    // that still suppress a row below audit's thresholds — and then told the
+    // reader, in a note, that those were fine and `--remove` would skip them.
+    // On one ledger that was 52 of 77 waivers printed on every one of 43 runs,
+    // with zero real orphans among them. The listing now agrees with the
+    // deletion: dead by default, `--include-below-audit` widens both.
+    if opts.orphaned && (w.hits() > 0 || (!opts.include_below_audit && w.below_audit() > 0)) {
         return false;
     }
     if opts.undated && w.date.is_some() {
@@ -403,12 +410,19 @@ fn list(ctx: &AnalysisCtx, chosen: &[&Waiver], opts: &WaiverOpts) {
             dead
         ));
     }
-    if sub_threshold > 0 {
+    if sub_threshold > 0 && opts.orphaned && !opts.include_below_audit {
+        ctx.out.note(&format!(
+            "(note: {} waiver(s) suppress only findings below audit's thresholds and are \
+             not listed — the reason still holds and `--remove` skips them. \
+             `--include-below-audit` lists them too)",
+            sub_threshold
+        ));
+    } else if sub_threshold > 0 {
         ctx.out.note(&format!(
             "(note: {} waiver(s) suppress only findings below audit's thresholds. The \
-             reason still holds and `--remove` will not touch them — they are listed \
-             because they are not holding the gating loop open, not because they are \
-             wrong. Check one with `<check> --no-suppress` before deciding)",
+             reason still holds and `--remove` will not touch them — they are not \
+             holding the gating loop open. Check one with `<check> --no-suppress` \
+             before deciding)",
             sub_threshold
         ));
     }
@@ -510,6 +524,25 @@ fn mutate(
         by_file.entry(w.file.as_str()).or_default().push(w);
     }
 
+    // `--orphaned` no longer selects the waivers whose finding merely scores
+    // under the gate, so `--remove` never sees them — but a reader clearing a
+    // ledger still has to be told they exist and how to reach them, or the
+    // count above reads as the whole story.
+    if what == Mutation::Remove && opts.orphaned && !opts.include_below_audit {
+        let held = ctx
+            .suppressions
+            .all()
+            .iter()
+            .filter(|w| w.hits() == 0 && w.below_audit() > 0)
+            .count();
+        if held > 0 {
+            skipped.push(format!(
+                "{} waiver(s) still suppressing findings below audit's thresholds were left \
+                 alone — the reason still holds; `--include-below-audit` removes these too",
+                held
+            ));
+        }
+    }
     let mut touched = 0usize;
     for (file, ws) in &by_file {
         let Ok(src) = std::fs::read_to_string(file) else {

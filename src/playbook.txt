@@ -89,12 +89,17 @@ audit found. One session paid for three full batteries on an 856-fn tree —
 `| head -50`, then `| sed -n '50,140p'`, then a third run for the exit code
 the first two had thrown away. Bound it instead:
 
-  unruster audit --changed-since HEAD --findings-only --top 10
+  unruster audit --changed-since HEAD
 
-`--findings-only` drops the sections that found nothing (the closing line
-says how many), `--top` caps each section's rows and every cut announces
-itself on stdout. On that same tree it is 70 lines against 156, complete,
-with the exit status stated in the closing line.
+The report opens with `## gating` — every row that holds the exit code
+open, each prefixed with its check and carrying its waiver line — and the
+sections below mark those same rows with a leading `!`. Clean sections are
+dropped and advisory rows are capped at five per section (`--full` for
+everything, `--top 0` to lift the caps); every cut announces itself on
+stdout. The closing line names the checks holding the gate and one site
+each, so `| tail -2` is a complete answer. Under `--changed-since` it also
+splits the gate into rows in changed lines and rows pre-existing in changed
+files, and `--fail-on-new` gates on the first kind alone.
 `unruster explain <topic>` prints one repair recipe instead of this whole
 text.
 
@@ -225,11 +230,13 @@ WHAT TO RUN INSTEAD
                                 number the lines you are about to edit against,
                                 `--max-lines N` for a tighter look, `0` for
                                 all of it. Output is bounded at 240 lines per
-                                item by default and the cut names what it
-                                dropped, so **do not pipe this through
-                                `head`**: that cut is silent, lands
-                                mid-expression, and is what sent one session
-                                back to `sed -n 'A,Bp'` for the rest of a body
+                                item by default; the cut names what it
+                                dropped and sketches the dropped tail (its
+                                top-level comments and control flow, numbered),
+                                so **do not pipe this through `head`**: that
+                                cut is silent, lands mid-expression, and is
+                                what sent one session back to `sed -n 'A,Bp'`
+                                for the rest of a body
                                 this command had already located exactly.
 
   NAME SEVERAL AT ONCE
@@ -381,7 +388,9 @@ levels, and all three have produced confirmed defects:
        line it prints, so the next run doesn't re-litigate it. Put it above
        the enclosing impl when the whole sibling family shares one rationale
     5. `unruster waivers --orphaned` periodically: a waiver that suppresses
-       nothing describes a finding that no longer exists
+       nothing describes a finding that no longer exists. It lists only
+       those; `--include-below-audit` adds the ones still working below
+       audit's thresholds
 
 ──── 1. TYPE & DATA DESIGN ──────────────────────────────────────────
 When concrete types should become traits, primitives become newtypes,
@@ -1144,15 +1153,15 @@ today's date already filled in.
   go to be forgotten, and the output then reads as clean.
     unruster waivers              age, scope, and how many findings each
                                   one actually suppresses
-    unruster waivers --orphaned   earns nothing in `audit`. Two columns
-                                  tell the sub-cases apart: `suppresses`
-                                  counts findings the gating battery
-                                  would have reported, `below_audit`
-                                  counts ones only a permissive config
-                                  surfaces. 0/0 means the comment lies;
-                                  0/N means it is hiding rows the audit
-                                  filters out anyway. Both are dead
-                                  weight in the loop that gates.
+    unruster waivers --orphaned   suppresses nothing at all — the comment
+                                  lies. Two columns tell the sub-cases
+                                  apart: `suppresses` counts findings the
+                                  gating battery would have reported,
+                                  `below_audit` counts ones only a
+                                  permissive config surfaces. 0/0 is what
+                                  this lists; 0/N is a working waiver the
+                                  gate never sees, reached with
+                                  `--include-below-audit`.
                                   Mechanical, unlike age
     unruster waivers --stale 365  older than N days; a proxy that asks a
                                   human to re-read, nothing more

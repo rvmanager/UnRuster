@@ -104,6 +104,12 @@ struct Cli {
 
     /// Test-code scope: production (default), tests, or all.
     /// Aliases: `prod` = production, `test` = tests.
+    ///
+    /// The usage queries — `callers`, `callees`, `co-call`, `field-uses`,
+    /// `type-refs`, `takes-mut`, `module-uses`, `variants` — default to `all`
+    /// instead: "who uses this" asked before a signature changes wants the
+    /// tests in the answer, and the note that used to say so was followed by
+    /// a `--scope all` rerun nearly every time it appeared.
     #[arg(long, global = true, value_enum, default_value = "production")]
     scope: Scope,
 
@@ -543,12 +549,13 @@ struct WaiversArgs {
     #[arg(long)]
     write: bool,
 
-    /// Let `--remove` take the waivers it otherwise holds back: the ones whose
-    /// finding still exists but scores below audit's gating tier. Those record
-    /// a judgment that is still true, so removing them re-exposes a real site
-    /// the moment a threshold moves — which is why it takes saying so. Use it
-    /// when clearing a ledger wholesale rather than pruning dead entries.
-    #[arg(long, requires = "remove")]
+    /// Widen `--orphaned` (and `--remove`) to the waivers they otherwise leave
+    /// alone: the ones whose finding still exists but scores below audit's
+    /// gating tier. Those record a judgment that is still true, so removing
+    /// them re-exposes a real site the moment a threshold moves — which is why
+    /// it takes saying so. Use it when clearing a ledger wholesale rather than
+    /// pruning dead entries.
+    #[arg(long)]
     include_below_audit: bool,
 
     /// Exit 1 if any waiver is undated or at least N days old. For CI, in the
@@ -624,6 +631,62 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
 }
 
 impl Cmd {
+    /// Commands whose unnamed `--scope` means `all`: the usage queries, where
+    /// a production-only answer to "who uses this" is confidently incomplete.
+    /// Exhaustive so a new command decides.
+    fn defaults_to_scope_all(&self) -> bool {
+        match self {
+            Cmd::Callers(_)
+            | Cmd::Callees(_)
+            | Cmd::CoCall(_)
+            | Cmd::FieldUses(_)
+            | Cmd::TypeRefs(_)
+            | Cmd::TakesMut(_)
+            | Cmd::ModuleUses(_)
+            | Cmd::Variants(_) => true,
+            Cmd::Audit(_)
+            | Cmd::SelfCheck(_)
+            | Cmd::BuilderDrift(_)
+            | Cmd::ConfigDrift(_)
+            | Cmd::Clones(_)
+            | Cmd::Concepts(_)
+            | Cmd::NearClones(_)
+            | Cmd::Vocabulary(_)
+            | Cmd::DocDrift(_)
+            | Cmd::Asserts(_)
+            | Cmd::ValidationDrift(_)
+            | Cmd::Gate(_)
+            | Cmd::Cache(_)
+            | Cmd::BlindSpots
+            | Cmd::Inventory(_)
+            | Cmd::Show(_)
+            | Cmd::Outline(_)
+            | Cmd::At(_)
+            | Cmd::Fields(_)
+            | Cmd::Impls(_)
+            | Cmd::Metrics(_)
+            | Cmd::DeadCode(_)
+            | Cmd::CatchAllArms(_)
+            | Cmd::ParallelMatches(_)
+            | Cmd::EnumCoverage(_)
+            | Cmd::CohortCallees(_)
+            | Cmd::Divergence(_)
+            | Cmd::ContractDrift(_)
+            | Cmd::Playbook
+            | Cmd::ErrorSwallows(_)
+            | Cmd::Panics(_)
+            | Cmd::ArithDrift(_)
+            | Cmd::PassThrough(_)
+            | Cmd::Explain(_)
+            | Cmd::Casts(_)
+            | Cmd::Conversions(_)
+            | Cmd::ConversionPairs
+            | Cmd::Stringly(_)
+            | Cmd::Tests(_)
+            | Cmd::Waivers(_) => false,
+        }
+    }
+
     /// Commands that imply `--fail-on-findings`. Exhaustive (no `_`) so a new
     /// command must declare its agent-loop semantics — `unruster enum-coverage
     /// Cmd` flagged the previous `matches!(…, Cmd::Audit(_))` shortcut.
@@ -722,17 +785,20 @@ struct AuditArgs {
     #[arg(long)]
     strict: bool,
 
-    /// Omit sections that found nothing. Every check still runs and still
-    /// counts — the closing line reports how many sections were hidden — this
-    /// only stops a mostly-clean battery from spending two thirds of its
-    /// output saying so.
-    ///
-    /// On a healthy tree that is eight of thirteen sections, three lines each,
-    /// which is what pushed one session's real findings past its own
-    /// `| head -60` and made it run the whole battery a second time with
-    /// `| tail -40` to read the rest.
-    #[arg(long)]
+    /// Now the default: sections that found nothing are omitted, and the
+    /// closing line reports how many. Kept so scripts that pass it keep
+    /// working; `--full` is the way to see the clean sections.
+    #[arg(long, hide = true)]
     findings_only: bool,
+
+    /// The long form: clean sections shown, and each section lists its own
+    /// full row budget (40 for `divergence`, 20 for the ranked checks, …)
+    /// instead of the default five. The default exists because the digest was
+    /// consumed by its exit code alone — 52 of 181 audit calls in one
+    /// project's sessions piped it to `tail -2` or `/dev/null`, and a 350-line
+    /// report with one gating row in it was rerun eight times to find that row.
+    #[arg(long, conflicts_with = "findings_only")]
+    full: bool,
 
     /// Run only these checks (repeatable, or comma-separated). Names are the
     /// ones in each section's `"check"` field: `divergence`,
@@ -1069,6 +1135,13 @@ struct OutlineArgs {
     /// Append each item's doc-comment first line as a final column.
     #[arg(long, alias = "docs")]
     include_docs: bool,
+
+    /// Print each item's signature under its row — a fn's through the return
+    /// type, anything else's declaration line. Answers "what is in this file
+    /// and what do these take" in one call instead of an outline and a
+    /// `sed -n` per range.
+    #[arg(long)]
+    sig: bool,
 
     /// Row order: by source position (an outline) or by kind (a census). The
     /// same flag `inventory` carries; only the default differs.
@@ -1852,30 +1925,27 @@ fn report_scope_gap(out: &emit::Out, scope: Scope, traits: CmdTraits) {
     let in_test_crates = parse::scope_skipped_test_crates();
     let named = parse::test_support_crates();
     out.note(&format!(
-        "(scope: {} test file(s) were not scanned{} — this answer covers production code \
-         only. `--scope all` includes tests, which is usually what you want before \
-         changing a signature or a type's shape.)",
+        "(scope: production — `--scope all` adds {} test file(s){})",
         skipped,
         if in_test_crates == 0 {
             String::new()
         } else if named.is_empty() {
             // The graph had no opinion and the crate's *name* is what removed
             // it. Say so, because that rule is a convention and can be wrong.
-            format!(
-                ", {} of them in crates whose name says test support (no manifest \
-                 dev-depends on them in this tree, so the dependency graph could \
-                 not confirm it)",
-                in_test_crates
-            )
+            format!(", {} in crates named as test support", in_test_crates)
         } else {
-            format!(
-                ", {} of them in test-support crates ({} — production code reaches \
-                 them only through a `[dev-dependencies]` edge)",
-                in_test_crates,
-                named.join(", ")
-            )
+            format!(", {} in test-support crates: {}", in_test_crates, named.join(", "))
         }
     ));
+}
+
+/// Say that a usage query was answered under `--scope all` because nobody
+/// named a scope — the default that the old note asked for on every run.
+fn report_scope_default(out: &emit::Out, traits: CmdTraits) {
+    if !traits.usage_query {
+        return;
+    }
+    out.note("(scope: all — tests included by default for a usage query; `--scope production` narrows it)");
 }
 
 /// Would a waiver change what this command prints?
@@ -1939,9 +2009,7 @@ fn report_blind_spots(out: &emit::Out) {
     let blind = macro_scan::blind_spots();
     if blind > 0 {
         out.note(&format!(
-            "(blind spots: {} macro body(ies) in the scanned tree could not be parsed as \
-             expressions — code inside them was not analyzed by any check; \
-             `unruster blind-spots` lists them)",
+            "(blind spots: {} macro body(ies) not analyzed — `unruster blind-spots` lists them)",
             blind
         ));
     }
@@ -1967,11 +2035,30 @@ fn dispatch(
             let all_files = full_tree_if_needed(root, scope, cfg, exclude)?;
             let call_source = all_files.as_deref().unwrap_or(files);
             let sel = audit::Selection::new(&a.only, &a.skip)?;
-            let comparing = a.since.is_some() || a.baseline.is_some();
+            // `--fail-on-new` with `--changed-since <ref>` and no `--since`:
+            // the ref is the baseline. Asking for it twice is why the flag went
+            // unused — 91 scoped audits in one project's sessions, none of them
+            // with the gate they actually wanted.
+            let since = a.since.clone().or_else(|| {
+                (a.fail_on_new && a.baseline.is_none())
+                    .then(|| ctx.changed.as_ref().map(|c| c.git_ref.clone()))
+                    .flatten()
+            });
+            let comparing = since.is_some() || a.baseline.is_some();
             if comparing || a.write_baseline.is_some() {
                 ctx.out.start_recording();
             }
-            let gating = audit::run(ctx, call_source, top, a.strict, a.findings_only, &sel)?;
+            let gating = audit::run(
+                ctx,
+                call_source,
+                &audit::Opts {
+                    top,
+                    strict: a.strict,
+                    full: a.full,
+                    suggest_inline: ctx.suggest_waivers_named,
+                    sel: &sel,
+                },
+            )?;
             let current = ctx.out.take_recording();
 
             if let Some(p) = a.write_baseline.as_deref() {
@@ -1985,7 +2072,7 @@ fn dispatch(
                 ));
             }
 
-            let Some((label, base)) = (match (&a.since, &a.baseline) {
+            let Some((label, base)) = (match (&since, &a.baseline) {
                 (Some(r), _) => Some((
                     r.clone(),
                     battery_at_ref(r, root, scope, cfg, exclude, &sel)?,
@@ -2098,6 +2185,7 @@ fn dispatch(
                 sort: a.sort,
                 docs: a.include_docs,
                 flat: a.flat,
+                sig: a.sig,
             },
         ),
         Cmd::At(a) => outline::run_at(ctx, &a.target, root),
@@ -2337,6 +2425,7 @@ fn battery_at_ref(
         out: &out,
         suppressions: &sup,
         suggest_waivers: false,
+        suggest_waivers_named: false,
     };
     audit::run_silent_battery(&sctx, &files, audit::BatteryConfig::gating(), sel);
     // Rewrite the temp-dir paths back to how the caller spells them, so a
@@ -2376,13 +2465,9 @@ fn report_new_blind_spots(
     cfg: &[String],
     exclude: &[String],
     files: &[parse::ParsedFile],
-    changed: &std::collections::HashSet<std::path::PathBuf>,
+    changed: &context::Changed,
 ) {
-    let in_diff = |display: &str| {
-        std::fs::canonicalize(display)
-            .map(|p| changed.contains(&p))
-            .unwrap_or(false)
-    };
+    let in_diff = |display: &str| changed.contains_file(display);
     let now = macro_scan::count_in(files, in_diff);
     if now == 0 {
         return;
@@ -2699,6 +2784,10 @@ fn main() -> Result<()> {
         let cache = open_cache(cli.no_cache, &cli.root);
         return run_gate(&out, &cli.root, &cli.exclude, cache.as_ref(), a, cli.summary);
     }
+    let scope_was_named = !matches!(
+        matches.value_source("scope"),
+        Some(clap::parser::ValueSource::DefaultValue) | None
+    );
     let Cli {
         root,
         scope,
@@ -2715,6 +2804,14 @@ fn main() -> Result<()> {
         cmd,
         ..
     } = cli;
+    // A usage query nobody scoped is answered over the whole tree. See
+    // `Cmd::defaults_to_scope_all`.
+    let scope_defaulted_to_all = !scope_was_named && cmd.defaults_to_scope_all();
+    let scope = if scope_defaulted_to_all {
+        Scope::All
+    } else {
+        scope
+    };
     // Exit-code contract: any setup error (bad glob, bad git ref, IO) is 2.
     let scan_of = |r: &std::path::Path| match parse::parse_dir(r, scope, &cfg, &exclude) {
         Ok(f) => f,
@@ -2819,7 +2916,7 @@ fn main() -> Result<()> {
     // pipelines that are doing nothing wrong. The disclosure is the part that
     // costs nobody anything.
     if let Some(set) = &changed {
-        if set.is_empty() {
+        if set.files.is_empty() {
             out.note(&format!(
                 "(note: 0 files changed vs {}, so nothing was scanned — this is an empty \
                  scope, not a clean result.)",
@@ -2848,7 +2945,12 @@ fn main() -> Result<()> {
         changed,
         out: &out,
         suppressions: &suppressions,
-        suggest_waivers,
+        // `audit` always generates the waiver lines: its gating digest prints
+        // them under the rows a reader is deciding about, which is where a
+        // hand-written `ok(metrics)` came from when nothing offered the exact
+        // spelling. Inline under every section only when asked.
+        suggest_waivers: suggest_waivers || matches!(cmd, Cmd::Audit(_)),
+        suggest_waivers_named: suggest_waivers,
     };
     // Silence here is worse than absence: an agent that runs
     // `--suggest-waivers` on an unsupported check gets no line, no error, and
@@ -2875,6 +2977,9 @@ fn main() -> Result<()> {
         out.row_note(&note);
     }
     report_scope_gap(&out, scope, traits);
+    if scope_defaulted_to_all {
+        report_scope_default(&out, traits);
+    }
     if traits.analyses_code {
         report_blind_spots(&out);
     }

@@ -470,6 +470,13 @@ pub fn run(
     if let Some(t) = threshold {
         apply_threshold(&mut fns, sort, t);
     }
+    // After the threshold, so a waiver over a fn that no longer trips it is
+    // not credited with a hit. Keyed by the fn's short name, so
+    // `ok(metrics/evaluate)` reads as it is meant and bare `ok(metrics)`
+    // covers the item.
+    let waived = ctx.retain_unsuppressed("metrics", &mut fns, |m| {
+        crate::suppress::Site::keyed(m.file.as_str(), m.line, crate::ast::last_segment(&m.qpath))
+    });
     sort_fns(&mut fns, sort);
     structs.sort_by_key(|s| std::cmp::Reverse(s.fields));
     enums.sort_by_key(|e| std::cmp::Reverse(e.variants));
@@ -520,7 +527,7 @@ pub fn run(
         ));
     }
     ctx.out.summary(&format!(
-        "({} fns, {} structs, {} enums; sort={}{})",
+        "({} fns, {} structs, {} enums; sort={}{}{})",
         fns.len(),
         structs.len(),
         enums.len(),
@@ -529,7 +536,12 @@ pub fn run(
             .map(|t| format!("; threshold={}", t))
             // unruster: ok(error-swallows/.unwrap_or_default) 2026-08-06 — `threshold` is an
             // Option<usize> flag; an absent flag renders as the empty string by design.
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        if waived > 0 {
+            format!("; {} waived", waived)
+        } else {
+            String::new()
+        }
     ));
     // With --threshold the fn table is the findings set; otherwise everything shown counts.
     Ok(if threshold.is_some() || fns_only {

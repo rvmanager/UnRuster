@@ -718,6 +718,7 @@ fn check_type_query_forms(ctx: &AnalysisCtx, budget: usize, out: &mut Vec<Violat
         out: &quiet,
         suppressions: ctx.suppressions,
         suggest_waivers: false,
+        suggest_waivers_named: false,
     };
     let mut pairs = 0;
     for d in type_probe_set(ctx, budget) {

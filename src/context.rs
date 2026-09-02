@@ -30,10 +30,12 @@ pub struct AnalysisCtx<'a> {
     pub summary: bool,
     /// Render enclosing-fn labels as `name@start-end` (the `--spans` flag).
     pub spans: bool,
-    /// With `--changed-since <ref>`: canonical paths of files changed vs that
-    /// git ref. Site-listing commands drop rows outside this set, so an agent
-    /// can verify exactly its own edit. `None` = no filter.
-    pub changed: Option<std::collections::HashSet<std::path::PathBuf>>,
+    /// With `--changed-since <ref>`: the files changed vs that git ref, and
+    /// the line ranges within them. Site-listing commands drop rows outside
+    /// the file set, so an agent can verify exactly its own edit; the ranges
+    /// say whether a kept row is in the edit or merely near it. `None` = no
+    /// filter.
+    pub changed: Option<Changed>,
     /// Where rows, section headers, and summary lines go. Every command emits
     /// through this so `--json` needs no per-command support.
     pub out: &'a Out,
@@ -42,7 +44,11 @@ pub struct AnalysisCtx<'a> {
     /// same set and then read back each waiver's hit count.
     pub suppressions: &'a crate::suppress::Suppressions,
     /// With `--suggest-waivers`, print the exact waiver comment under each row.
+    /// `audit` turns this on for itself so its gating digest can carry the
+    /// lines; `suggest_waivers_named` says whether the reader asked.
     pub suggest_waivers: bool,
+    /// `--suggest-waivers` was actually on the command line.
+    pub suggest_waivers_named: bool,
 }
 
 /// A check's findings, split by whether they clear that check's gating
@@ -517,9 +523,7 @@ impl AnalysisCtx<'_> {
     pub fn in_scope(&self, file: &str) -> bool {
         match &self.changed {
             None => true,
-            Some(set) => std::fs::canonicalize(file)
-                .map(|p| set.contains(&p))
-                .unwrap_or(false),
+            Some(c) => c.contains_file(file),
         }
     }
 
@@ -532,10 +536,107 @@ impl AnalysisCtx<'_> {
     }
 }
 
-/// Canonical paths of files changed vs `git_ref`: `git diff --name-only
-/// <ref>` (tracked changes, staged or not) plus untracked files. Paths are
-/// resolved against the repo top-level, so this works from any CWD. Git is
-/// the only state consulted — there is no tracking file.
+/// What `--changed-since <ref>` selected: the changed files, and for each
+/// tracked one the line ranges `git diff -U0` reports as added or modified.
+///
+/// The ranges exist because a *file* filter gates on everything a touched file
+/// ever accumulated. A 17-file refactor on one real tree surfaced a
+/// `partial_cmp … unwrap_or` that no hunk in the diff came near, and the agent
+/// had to run `git diff | grep -c partial_cmp` by hand to learn it was
+/// pre-existing. The filter stays file-granular — nothing gets quieter — but
+/// every kept row can now say which of the two it is.
+#[derive(Clone, Debug)]
+pub struct Changed {
+    /// The ref the diff was taken against, so `audit --fail-on-new` can reuse
+    /// it as its baseline without being told twice.
+    pub git_ref: String,
+    pub files: std::collections::HashSet<std::path::PathBuf>,
+    /// Inclusive 1-based line ranges per canonical path. A file in `files`
+    /// with no entry here is untracked — new in its entirety.
+    pub hunks: std::collections::HashMap<std::path::PathBuf, Vec<(usize, usize)>>,
+}
+
+/// Which side of the diff a kept row is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    /// The row's lines intersect a changed hunk (or the file is untracked).
+    Changed,
+    /// The row is in a changed file, outside every changed hunk.
+    PreExisting,
+}
+
+impl ChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeKind::Changed => "changed",
+            ChangeKind::PreExisting => "pre-existing",
+        }
+    }
+}
+
+impl Changed {
+    pub fn contains_file(&self, file: &str) -> bool {
+        std::fs::canonicalize(file)
+            .map(|p| self.files.contains(&p))
+            .unwrap_or(false)
+    }
+
+    /// Classify the line range `start..=end` of `file`. `None` when the file
+    /// is not in the changed set at all — a row the filter should already have
+    /// dropped.
+    pub fn classify(&self, file: &str, start: usize, end: usize) -> Option<ChangeKind> {
+        let p = std::fs::canonicalize(file).ok()?;
+        if !self.files.contains(&p) {
+            return None;
+        }
+        let Some(ranges) = self.hunks.get(&p) else {
+            return Some(ChangeKind::Changed);
+        };
+        let hit = ranges.iter().any(|&(a, b)| a <= end && start <= b);
+        Some(if hit {
+            ChangeKind::Changed
+        } else {
+            ChangeKind::PreExisting
+        })
+    }
+}
+
+/// Parse `git diff -U0` output into `path -> [(start, end)]` of the new-side
+/// line ranges. A pure-deletion hunk (`+N,0`) is recorded as `(N, N)`: the
+/// lines around the deletion are where the change is.
+fn parse_hunks(diff: &str) -> std::collections::HashMap<String, Vec<(usize, usize)>> {
+    let mut out: std::collections::HashMap<String, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    let mut current: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            let path = path.strip_prefix("b/").unwrap_or(path);
+            current = (path != "/dev/null").then(|| path.to_string());
+            continue;
+        }
+        if !line.starts_with("@@") {
+            continue;
+        }
+        let Some(cur) = &current else { continue };
+        // `@@ -a,b +c,d @@` — take the `+c,d` half.
+        let Some(plus) = line.split_whitespace().find(|w| w.starts_with('+')) else {
+            continue;
+        };
+        let mut it = plus[1..].split(',');
+        let Some(start) = it.next().and_then(|n| n.parse::<usize>().ok()) else {
+            continue;
+        };
+        let len = it.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1);
+        let end = if len == 0 { start } else { start + len - 1 };
+        out.entry(cur.clone()).or_default().push((start.max(1), end.max(1)));
+    }
+    out
+}
+
+/// Files changed vs `git_ref`: `git diff --name-only <ref>` (tracked changes,
+/// staged or not) plus untracked files, with the changed line ranges of the
+/// tracked ones. Paths are resolved against the repo top-level, so this works
+/// from any CWD. Git is the only state consulted — there is no tracking file.
 ///
 /// Asked of `root`'s repository, not the process's. Reading the CWD's repo
 /// instead is the same failure the empty-`files` guard in `main` exists to
@@ -546,10 +647,7 @@ impl AnalysisCtx<'_> {
 // unruster: ok(error-swallows/if-let-ok) 2026-08-06 — a path that will not
 // canonicalize is not in the working tree, which is precisely the reason to
 // leave it out of the changed set.
-pub fn changed_set(
-    git_ref: &str,
-    root: &std::path::Path,
-) -> anyhow::Result<std::collections::HashSet<std::path::PathBuf>> {
+pub fn changed_set(git_ref: &str, root: &std::path::Path) -> anyhow::Result<Changed> {
     use std::process::Command;
     // `--root` may name a file; git wants a directory.
     let at = match root.is_dir() {
@@ -584,7 +682,17 @@ pub fn changed_set(
             }
         }
     }
-    Ok(set)
+    let mut hunks = std::collections::HashMap::new();
+    for (path, ranges) in parse_hunks(&git(&["diff", "-U0", git_ref])?) {
+        if let Ok(p) = std::fs::canonicalize(top.join(&path)) {
+            hunks.insert(p, ranges);
+        }
+    }
+    Ok(Changed {
+        git_ref: git_ref.to_string(),
+        files: set,
+        hunks,
+    })
 }
 
 /// How strongly a row's match is grounded. Ordered weakest-first so

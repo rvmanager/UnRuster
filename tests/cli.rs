@@ -741,8 +741,8 @@ fn an_ambiguity_listing_reports_each_items_real_extent() {
     // it was taking the `--part` range, collapsing every non-fn row to its
     // declaration line. On one real tree a 351-line `impl PathData` was
     // catalogued as `51-51`, and the reader needed a second command to find out.
-    let full = ur_stdout(&["--root", FIXTURE, "show", "Document", "--part", "span"]);
-    let sig = ur_stdout(&["--root", FIXTURE, "show", "Document", "--part", "sig"]);
+    let full = ur_stdout(&["--root", FIXTURE, "show", "Document", "--kind", "impl", "--part", "span"]);
+    let sig = ur_stdout(&["--root", FIXTURE, "show", "Document", "--kind", "impl", "--part", "sig"]);
     let spans = |o: &[u8]| -> Vec<String> {
         rows_of(o)
             .iter()
@@ -761,7 +761,9 @@ fn an_ambiguity_listing_reports_each_items_real_extent() {
 fn a_listed_impl_block_is_not_reported_as_one_line() {
     // The concrete shape of the bug: an impl block's `sig_end` is its
     // declaration line, so under `--part sig` it collapsed to `N-N`.
-    let out = ur_stdout(&["--root", FIXTURE, "show", "Document", "--part", "sig"]);
+    // `--kind impl`: `Document` alone now resolves to the struct, and its three
+    // impl blocks are what still make a listing.
+    let out = ur_stdout(&["--root", FIXTURE, "show", "Document", "--kind", "impl", "--part", "sig"]);
     let impl_row = rows_of(&out)
         .into_iter()
         .find(|l| l.starts_with("impl\t"))
@@ -1585,16 +1587,25 @@ fn field_uses_hint_when_strict_empty_but_candidates_match() {
     // No `impl NoSuchType { self.transform = ... }` exists, but many other
     // `self.transform` accesses do — strict matches 0, candidates would match
     // many. Exercises the hint code in field.rs.
+    // The hint used to name `--candidates` and cost the rerun it described;
+    // the candidates now print under a note that says what they are.
     let out = ur()
         .args(["--root", FIXTURE, "field-uses", "NoSuchType", "transform"])
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stderr.contains("hint:"),
-        "expected hint about candidates, got stderr:\n{}",
-        stderr
+        stdout.contains("strict matched 0") && stdout.contains("candidates"),
+        "expected the candidate note on stdout:\n{}",
+        stdout
     );
+    assert!(
+        rows_of(&out.stdout).iter().any(|l| l.contains("transform") || l.contains(".rs:")),
+        "expected candidate rows:\n{}",
+        stdout
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unverified candidate(s) listed"), "{stderr}");
 }
 
 #[test]
@@ -2697,7 +2708,7 @@ pub fn settle(db: &Db, id: u64) {
         "a discarded DELETE must hold the loop open: {text}"
     );
     assert!(
-        text.contains("exit 1 while gating findings remain"),
+        text.contains("exit 1: error-swallows"),
         "summary should say the gate is held: {text}"
     );
     // The section *header* also names the threshold, so match the summary's
@@ -4169,16 +4180,27 @@ fn a_usage_question_says_when_the_default_scope_walked_past_the_tests() {
         full.extend(args);
         String::from_utf8_lossy(&ur().args(&full).output().unwrap().stderr).into_owned()
     };
-    let usage = err(&["type-refs", "Cfg"]);
+    // A usage query nobody scoped is answered over the whole tree, and says so
+    // in one line.
+    let default = err(&["type-refs", "Cfg"]);
     assert!(
-        usage.contains("test file(s) were not scanned") && usage.contains("--scope all"),
+        default.contains("tests included by default") && !default.contains("--scope all` adds"),
+        "the default should be `all`, said once:\n{}",
+        default
+    );
+    // Narrowed on purpose: the gap is reported, briefly.
+    let usage = err(&["type-refs", "Cfg", "--scope", "production"]);
+    assert!(
+        usage.contains("test file(s)") && usage.contains("--scope all"),
         "a usage question answered production-only in silence:\n{}",
         usage
     );
-    // Asking for the wider scope is not then told it is missing something.
+    // Asking for the wider scope by name is not then told anything about it.
+    let named = err(&["type-refs", "Cfg", "--scope", "all"]);
     assert!(
-        !err(&["type-refs", "Cfg", "--scope", "all"]).contains("were not scanned"),
-        "nagged a caller who had already widened"
+        !named.contains("were not scanned") && !named.contains("by default"),
+        "nagged a caller who had already widened:\n{}",
+        named
     );
     // A catalogue is not a usage question: `--scope` narrowing the catalogue is
     // the flag doing its job, and saying so on every listing is the noise that
@@ -4451,8 +4473,9 @@ fn audit_findings_only_drops_clean_sections_and_says_how_many() {
     // `| head -60` and made it run the whole battery again with `| tail -40`.
     // Hiding them must never hide a finding, so the count and the closing
     // tallies have to be identical either way.
-    let full = ur_stdout_allow_findings(&["--root", FIXTURE, "audit"]);
-    let lean = ur_stdout_allow_findings(&["--root", FIXTURE, "audit", "--findings-only"]);
+    // Lean is now the default; `--full` is the long form.
+    let full = ur_stdout_allow_findings(&["--root", FIXTURE, "audit", "--full"]);
+    let lean = ur_stdout_allow_findings(&["--root", FIXTURE, "audit"]);
     let headers = |o: &[u8]| -> Vec<String> {
         rows_of(o).into_iter().filter(|l| l.starts_with("## ")).collect()
     };
@@ -4605,7 +4628,7 @@ fn the_playbook_names_the_habits_that_cost_real_sessions() {
         ("-A45", "the grep -A<N> form `show` replaces"),
         // Three full batteries: two to page the report, one for the exit code
         // the pipes had thrown away.
-        ("--findings-only --top 10", "the bounded audit invocation"),
+        ("unruster audit --changed-since HEAD\n", "the bounded audit invocation"),
         ("$?` is the *last* command's status", "the piped-exit-code trap"),
         // A prose sweep stopped at a waiver, unsure what was load-bearing.
         ("The reason is prose and nothing keys off it", "the waiver contract"),
@@ -5339,11 +5362,19 @@ fn orphan_detection_agrees_with_the_audit_line() {
     let below_only = count_before("suppressing only below audit's thresholds");
     let orphaned = rows_of(&ur_stdout(&["--root", WV, "waivers", "--orphaned", "--today", TODAY]));
     assert_eq!(
-        dead + below_only,
+        dead,
         orphaned.len(),
-        "audit's two zero-hit counts must partition `waivers --orphaned`:\naudit said \
+        "audit's dead count must be what `waivers --orphaned` lists:\naudit said \
          {dead} dead + {below_only} below-threshold, waivers listed {}\n{line}",
         orphaned.len()
+    );
+    let widened = rows_of(&ur_stdout(&[
+        "--root", WV, "waivers", "--orphaned", "--include-below-audit", "--today", TODAY,
+    ]));
+    assert_eq!(
+        dead + below_only,
+        widened.len(),
+        "and the two counts together must be the widened listing:\n{line}"
     );
     // And the alarming half must not be the whole half: the call to action is
     // only earned when a comment genuinely describes nothing.
@@ -5534,13 +5565,21 @@ fn waivers_listing_reports_scope_key_and_suppression_count() {
 
 #[test]
 fn orphaned_finds_waivers_that_suppress_nothing() {
+    // Dead by default: the ones whose comment now lies. The below-threshold
+    // one is a working waiver and is reached only by name.
     let out = ur_stdout(&["--root", WV, "waivers", "--orphaned", "--today", TODAY]);
     let rows = rows_of(&out);
-    assert_eq!(rows.len(), 3, "two dead + one below-audit:\n{:?}", rows);
+    assert_eq!(rows.len(), 2, "two dead:\n{:?}", rows);
     for r in &rows {
         let cols: Vec<&str> = r.split('\t').collect();
         assert_eq!(cols[5], "0", "orphaned rows earn nothing in audit: {}", r);
+        assert_eq!(cols[6], "0", "a below-audit waiver is not an orphan: {}", r);
     }
+    let out = ur_stdout(&[
+        "--root", WV, "waivers", "--orphaned", "--include-below-audit", "--today", TODAY,
+    ]);
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 3, "two dead + one below-audit:\n{:?}", rows);
     // The two sub-cases must be distinguishable, or "delete it" and "it is
     // below your thresholds" collapse into one unactionable bucket.
     let below: Vec<&String> = rows.iter().filter(|r| r.split('\t').nth(6) != Some("0")).collect();
@@ -6709,10 +6748,10 @@ fn the_scope_note_names_the_crates_it_removed_and_why() {
     // `crates/foo-test/src/lib.rs`. Naming the crates also makes the verdict
     // falsifiable: a crate listed here that the reader knows is production is
     // a bug report, where a bare count is not.
-    let err = ur_stderr(&["--root", TEST_CRATE_FIXTURE, "callers", "load"]);
+    let err = ur_stderr(&["--root", TEST_CRATE_FIXTURE, "--scope", "production", "callers", "load"]);
     assert!(err.contains("sample-test-utils"), "{err}");
     assert!(err.contains("sample-fixtures"), "{err}");
-    assert!(err.contains("[dev-dependencies]"), "{err}");
+    assert!(err.contains("test-support crates"), "{err}");
     // The one it kept must not be named as removed.
     assert!(!err.contains("sample-tests"), "{err}");
 }
@@ -6753,12 +6792,12 @@ fn the_note_does_not_claim_a_dependency_edge_it_never_saw() {
     std::fs::write(dir.join("harness/src/lib.rs"), "pub fn rig() {}\n").unwrap();
 
     let out = ur()
-        .args(["--root", dir.to_str().unwrap(), "callers", "ship"])
+        .args(["--root", dir.to_str().unwrap(), "--scope", "production", "callers", "ship"])
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("name says test support"),
+        err.contains("named as test support"),
         "expected the name-rule wording:\n{err}"
     );
     assert!(
@@ -7628,7 +7667,7 @@ fn contract_drift_reports_the_scope_gap() {
     .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("test file(s) were not scanned"),
+        err.contains("`--scope all` adds") && err.contains("test file(s)"),
         "the scope gap must be reported here of all places:\n{err}"
     );
 }
@@ -9005,7 +9044,7 @@ pub mod c { pub struct OwnerId(u64); }
 "#,
     )
     .unwrap();
-    let text = run_in(&dir, &cache, &["audit"]);
+    let text = run_in(&dir, &cache, &["audit", "--full"]);
     assert!(text.contains("## [high] concepts"), "{text}");
     assert!(text.contains("## [high] near-clones"), "{text}");
     assert!(text.contains("UserId"), "the cluster must be reported: {text}");
@@ -10588,12 +10627,13 @@ fn the_audit_row_cap_never_hides_a_gating_row() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
+    // The marked rows in the section — the digest repeats them above.
     let gating = text
         .lines()
-        .filter(|l| l.contains('\t'))
+        .filter(|l| l.starts_with("!\t"))
         .filter(|l| {
             l.split('\t')
-                .nth(1)
+                .nth(2)
                 .and_then(|s| s.parse::<f64>().ok())
                 .is_some_and(|s| s >= 0.55)
         })
@@ -10627,7 +10667,7 @@ fn audit_says_how_it_is_bounded_before_the_first_section() {
         .unwrap_or(usize::MAX);
     let budget_note = text
         .lines()
-        .position(|l| l.contains("complete about what holds the exit code open"))
+        .position(|l| l.contains("gating rows lead under"))
         .unwrap_or_else(|| panic!("no budget note:\n{text}"));
     assert!(
         budget_note < first_section,
@@ -10907,4 +10947,263 @@ fn remove_can_be_told_to_take_the_below_audit_waivers_too() {
     let after = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
     assert!(!after.contains("unruster: ok"), "the waiver survived:\n{after}");
     assert!(after.contains("a as u64"), "the code must survive:\n{after}");
+}
+
+// ── field findings, September 2026: the gate is the first thing on screen ──
+
+/// One gating row in a 353-line digest cost eight reruns to locate. The rows
+/// that gate now lead the report, are marked in their sections, and the
+/// closing line names the checks holding the gate with one site each.
+#[test]
+fn audit_leads_with_the_gating_rows_and_names_them_in_the_summary() {
+    let out = ur().args(["--root", WV, "audit"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "fixture should gate");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].starts_with("## gating — ") && lines[0].contains("hold the exit code open"),
+        "the digest must be the first line:\n{text}"
+    );
+    // Each digest row leads with its check name; the same rows are marked `!`
+    // in their own sections below, so `grep '^!'` finds them there.
+    let digest_rows: Vec<&str> = lines
+        .iter()
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .filter(|l| !l.starts_with("  ") && !l.starts_with('('))
+        .copied()
+        .collect();
+    assert!(!digest_rows.is_empty(), "no digest rows:\n{text}");
+    assert!(
+        digest_rows.iter().all(|r| r.starts_with("dead-code\t") || r.starts_with("enum-coverage\t") || r.starts_with("error-swallows\t")),
+        "digest rows must lead with their check:\n{text}"
+    );
+    let marked = lines.iter().filter(|l| l.starts_with("!\t")).count();
+    assert_eq!(marked, digest_rows.len(), "every digest row is marked in its section:\n{text}");
+    // A waiver line rides under each digest row, without `--suggest-waivers`.
+    assert!(
+        lines[1..].iter().take(6).any(|l| l.contains("// unruster: ok(")),
+        "the digest should carry the waiver spelling:\n{text}"
+    );
+    // The summary names the holders and one site each.
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let summary = err.lines().find(|l| l.starts_with("(audit:")).expect("summary");
+    assert!(
+        summary.contains("exit 1: ") && summary.contains("dead-code ×") && summary.contains(".rs:"),
+        "the summary must name the gate:\n{summary}"
+    );
+    // And a tree that gates on nothing says so in one line, first.
+    let clean = ur_stdout(&["audit"]);
+    assert!(
+        String::from_utf8_lossy(&clean).starts_with("## gating — no rows hold the exit code open"),
+        "a clean tree should open with the empty digest"
+    );
+}
+
+/// The default digest caps advisory rows and drops clean sections; `--full`
+/// is the old long form. Gating rows are never capped either way.
+#[test]
+fn audit_default_is_short_and_full_is_the_long_form() {
+    let lean = ur_stdout_allow_findings(&["--root", FIXTURE, "audit"]);
+    let full = ur_stdout_allow_findings(&["--root", FIXTURE, "audit", "--full"]);
+    assert!(lean.len() < full.len(), "the default should be the shorter report");
+    let lean = String::from_utf8_lossy(&lean).to_string();
+    assert!(
+        lean.contains("showing 5 of"),
+        "advisory sections cap at five by default and say so:\n{lean}"
+    );
+    // The digest counts every gating row, capped section or not.
+    let n: usize = lean
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("## gating — "))
+        .and_then(|l| l.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("digest count");
+    let marked = lean.lines().filter(|l| l.starts_with("!\t")).count();
+    assert_eq!(n, marked, "every gating row survives the default caps:\n{lean}");
+}
+
+/// A waiver for a check `--only` did not run has not "suppressed nothing".
+#[test]
+fn audit_only_does_not_accuse_waivers_for_checks_it_did_not_run() {
+    let err = ur_stderr(&["--root", WV, "audit", "--only", "casts", "--summary"]);
+    let summary = err.lines().find(|l| l.starts_with("(audit:")).expect("summary");
+    assert!(
+        summary.contains("waiver(s) for checks not run this pass"),
+        "the unasked waivers must be accounted for, not accused:\n{summary}"
+    );
+    assert!(
+        !summary.contains("9 of them suppressing nothing"),
+        "waivers for unrun checks were called dead:\n{summary}"
+    );
+}
+
+/// `ok(metrics)` is the name the audit's own section header teaches.
+#[test]
+fn a_metrics_waiver_is_honoured_and_not_reported_as_unknown() {
+    let dir = scratch("metrics-waiver");
+    let mut src = String::from(
+        "// unruster: ok(metrics) 2026-09-02 — one problem statement, unpacked immediately\n\
+         pub fn wide(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8) -> u8 { a + b + c + d + e + f + g + h }\n",
+    );
+    src.push_str("pub fn also_wide(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8) -> u8 { a * b * c * d * e * f * g * h }\n");
+    std::fs::write(dir.join("src/lib.rs"), src).unwrap();
+    let root = dir.to_str().unwrap();
+    let out = ur().args(["--root", root, "metrics", "--sort", "params", "--threshold", "7"]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("also_wide"), "the unwaived fn must still list:\n{text}");
+    assert!(!text.contains("\twide\t") && !text.contains("::wide\t"), "the waived fn listed anyway:\n{text}");
+    assert!(text.contains("1 waived"), "the summary must count the waiver:\n{text}");
+    assert!(!text.contains("does not have"), "metrics is a known check now:\n{text}");
+}
+
+/// Under `--changed-since`, a gating row in a touched file but outside every
+/// changed hunk is pre-existing, and `--fail-on-new` needs no second flag.
+#[test]
+fn changed_since_tells_pre_existing_rows_from_the_edit_and_fail_on_new_reuses_the_ref() {
+    let dir = scratch("changed-lines");
+    // A dead fn that has always been there, plus a line the edit will touch far
+    // below it.
+    let before = "pub fn old_dead() -> u8 { 1 }\n\n\n\n\n\n\n\n\n\npub const TAIL: u8 = 1;\n";
+    std::fs::write(dir.join("src/lib.rs"), before).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    std::fs::write(dir.join("src/lib.rs"), before.replace("TAIL: u8 = 1", "TAIL: u8 = 2")).unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur()
+        .args(["--root", root, "--changed-since", "HEAD", "audit"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "file-granular: the old row still gates");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let digest_row = text
+        .lines()
+        .find(|l| l.starts_with("dead-code\t") && l.contains("old_dead"))
+        .unwrap_or_else(|| panic!("no digest row for old_dead:\n{text}"));
+    assert!(digest_row.ends_with("\tpre-existing"), "the row must say it predates the edit:\n{digest_row}");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("(0 in changed lines, 1 pre-existing in changed files)"),
+        "the summary must split the gate:\n{err}"
+    );
+
+    // `--fail-on-new` with only `--changed-since`: the ref is the baseline.
+    let out = ur()
+        .args(["--root", root, "--changed-since", "HEAD", "audit", "--fail-on-new"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "nothing new was introduced:\n{}", String::from_utf8_lossy(&out.stdout));
+
+    // A dead fn added inside the edit flips both verdicts.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        before.replace("TAIL: u8 = 1", "TAIL: u8 = 2;\npub fn new_dead() -> u8 { 3 }\npub const T2: u8 = 1"),
+    )
+    .unwrap();
+    let out = ur()
+        .args(["--root", root, "--changed-since", "HEAD", "audit", "--fail-on-new"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "a new dead fn must fail --fail-on-new");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.lines().any(|l| l.contains("new_dead") && l.ends_with("\tchanged")),
+        "the new row must be tagged changed:\n{text}"
+    );
+}
+
+/// A type and its own `impl` blocks are one name, not an ambiguity.
+#[test]
+fn show_of_a_type_prints_the_type_and_points_at_its_impl_blocks() {
+    let out = ur().args(["--root", FIXTURE, "show", "Document"]).output().unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("pub struct Document {"), "the struct should print:\n{s}");
+    assert!(!s.contains("names 4 items"), "listed instead of printing:\n{s}");
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        e.contains("3 impl block(s) for `Document`") && e.contains("impl Document") && e.contains("--kind impl"),
+        "the impls must be named under the type:\n{e}"
+    );
+    // A genuine collision still lists.
+    let out = ur().args(["--root", FIXTURE, "show", "render"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("names 2 items"));
+    // And a single item prints no `(1 item(s) from 1 name(s))` trailer.
+    let e = ur_stderr(&["--root", FIXTURE, "show", "Document::new"]);
+    assert!(!e.contains("item(s) from"), "needless trailer:\n{e}");
+}
+
+/// The size note fires only when a cut is coming — never under `--max-lines 0`
+/// — and the cut is followed by a sketch of what was dropped.
+#[test]
+fn show_announces_a_cut_only_when_it_will_cut_and_sketches_the_tail() {
+    let dir = scratch("show-sketch");
+    let mut body = String::new();
+    for i in 0..300 {
+        if i % 50 == 0 {
+            body.push_str(&format!("    // ---- stage {}\n", i / 50));
+            body.push_str(&format!("    if x > {} {{\n        x -= 1;\n    }}\n", i));
+        }
+        body.push_str(&format!("    let _v{} = x + {};\n", i, i));
+    }
+    std::fs::write(dir.join("src/lib.rs"), format!("pub fn big(mut x: u32) -> u32 {{\n{}    x\n}}\n", body)).unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur().args(["--root", root, "show", "big"]).output().unwrap();
+    let e = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(e.contains("printing the first 240"), "no honest pre-announcement:\n{e}");
+    assert!(!e.contains("bounds itself"), "the old wording is back:\n{e}");
+    assert!(s.contains("(sketch of lines"), "no sketch after the cut:\n{s}");
+    assert!(s.contains("// ---- stage 5"), "the sketch should carry the dropped landmarks:\n{s}");
+
+    let out = ur().args(["--root", root, "show", "big", "--max-lines", "0"]).output().unwrap();
+    let e = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!e.contains("line(s) —") && !e.contains("bounds itself"), "warned about a cut that will not happen:\n{e}");
+    assert!(!s.contains("(sketch of lines"), "sketched an uncut body:\n{s}");
+}
+
+/// `outline --sig` answers "what is in this file and what do these take" in
+/// one call.
+#[test]
+fn outline_sig_prints_each_items_signature_under_its_row() {
+    let out = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--sig"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("pub fn new(name: String) -> Self {"), "fn signatures missing:\n{s}");
+    assert!(s.contains("pub struct Document {"), "declaration lines missing:\n{s}");
+    // The rows keep their shape: signature lines are indented past any column.
+    for l in s.lines().filter(|l| !l.starts_with(' ') && !l.starts_with('(')) {
+        assert_eq!(l.split('\t').count(), 5, "row shape changed: {l:?}");
+    }
+    let json = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--sig", "--json"]);
+    assert!(String::from_utf8_lossy(&json).contains("\"sig\": ["), "JSON should carry it on the row");
+}
+
+/// The usage queries default to `--scope all` and say so once.
+#[test]
+fn usage_queries_default_to_the_whole_tree() {
+    let dir = scratch("usage-scope-default");
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn target() -> u8 { 1 }\npub fn a() -> u8 { target() }\n").unwrap();
+    std::fs::write(dir.join("tests/it.rs"), "#[test]\nfn t() { assert_eq!(demo::target(), 1); }\n").unwrap();
+    let root = dir.to_str().unwrap();
+    let out = ur().args(["--root", root, "callers", "target"]).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(s.contains("tests/it.rs"), "the test caller must be in the default answer:\n{s}");
+    assert!(e.contains("tests included by default"), "the default should be said once:\n{e}");
+    // A check keeps the production default.
+    let out = ur().args(["--root", root, "dead-code"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("by default"));
 }

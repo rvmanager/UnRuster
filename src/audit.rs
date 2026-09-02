@@ -498,11 +498,18 @@ pub const ARITH_DRIFT_MIN_SCORE: f64 = 0.6;
 pub fn run(
     ctx: &AnalysisCtx,
     dead_call_source: &[ParsedFile],
-    top: Option<usize>,
-    strict: bool,
-    findings_only: bool,
-    sel: &Selection,
+    opts: &Opts,
 ) -> anyhow::Result<usize> {
+    let Opts {
+        top,
+        strict,
+        full,
+        suggest_inline,
+        sel,
+    } = *opts;
+    // Clean sections are dropped unless `--full` asked for them: on a healthy
+    // tree they were two thirds of the report.
+    let findings_only = !full;
     let mut gating = 0usize;
     let mut advisory = 0usize;
     let mut checks = 0usize;
@@ -514,23 +521,36 @@ pub fn run(
     // much is coming, *before* it comes.
     if !ctx.summary {
         ctx.out.note(&format!(
-            "(note: {} check(s){}; each section caps its advisory rows{} and names the \
-             command that lists the rest. Every gating row is shown whatever the cap, so \
-             this digest is complete about what holds the exit code open — read it whole \
-             rather than piping it to `head`.)",
+            "(note: {} check(s){}; gating rows lead under `## gating`, are marked `!` in \
+             their sections, and are never capped. Advisory rows are capped at {} per \
+             section{} — `--full` prints everything, `--top 0` lifts the caps.)",
             CHECKS.len(),
             if findings_only {
                 ", clean ones dropped"
             } else {
                 ""
             },
+            ADVISORY_TOP,
             match top {
                 Some(0) => " (uncapped by --top 0)".to_string(),
-                Some(n) => format!(" at --top {}", n),
+                Some(n) => format!(", --top {} here", n),
                 None => String::new(),
             }
         ));
     }
+    // Everything from here to the summary is held, so the gating digest —
+    // which is only complete once the last section has run — can be printed
+    // *first*. A reader who pipes to `head` sees the rows that gate; one who
+    // pipes to `tail` sees the summary that names them. Eight reruns of one
+    // battery, each with a different `grep`/`awk` slice, were spent finding a
+    // single gating row that sat at line 6 of a 353-line digest.
+    let held = !ctx.out.is_silent() && !ctx.summary && ctx.out.format != crate::emit::Format::Json;
+    if held {
+        ctx.out.start_buffering();
+    }
+    ctx.out.set_mark_gating(true);
+    let prev_hints = ctx.out.set_hints_inline(suggest_inline);
+    install_change_classifier(ctx);
     // Each check's own summary line belongs with its rows, on one stream.
     // Splitting them cost a full round-trip of "re-run with 2> redirected"
     // every time someone read this output for the first time.
@@ -584,6 +604,14 @@ pub fn run(
         // anonymous object.
         let prev = ctx.out.set_check(check);
         ctx.out.section(title);
+        // The advisory budget: `--top` wins, then `--full` keeps each section's
+        // own cap, and the default shrinks every cap to `ADVISORY_TOP`. Gating
+        // rows are exempt through the floor, whatever the budget.
+        let cap = if full {
+            cap
+        } else {
+            Some(cap.map_or(ADVISORY_TOP, |c| c.min(ADVISORY_TOP)))
+        };
         ctx.out
             .set_row_budget_keeping(top.or(cap), floor_of(gate, check));
         // A check announces its own `(0 …)` line before anyone can know the
@@ -638,21 +666,21 @@ pub fn run(
     // large codebase, sibling-disagreement rows converted to real defects at a
     // far higher rate than any volume check below.
     section(
-        "[high] divergence — sibling paths that disagree (explain: partial-enumeration)",
+        "[high] divergence — sibling paths that disagree; gating: every row (explain: partial-enumeration)",
         "divergence",
         Gate::Gating,
         Some(40),
         &mut || Ok(Counts::flat(divergence::run(ctx, None, DIVERGENCE_MIN_SCORE)?)),
     )?;
     section(
-        "[high] divergence --handling — one callee, different care (explain: silent-fallbacks)",
+        "[high] divergence --handling — one callee, different care; gating: every row (explain: silent-fallbacks)",
         "divergence-handling",
         Gate::Gating,
         None,
         &mut || Ok(Counts::flat(divergence::run_handling(ctx, HANDLING_MIN_CARE_GAP)?)),
     )?;
     section(
-        "[high] enum-coverage --all — partial enum dispatch (explain: partial-enumeration)",
+        "[high] enum-coverage --all — partial enum dispatch; gating: every row (explain: partial-enumeration)",
         "enum-coverage",
         Gate::Gating,
         None,
@@ -665,14 +693,14 @@ pub fn run(
         },
     )?;
     section(
-        "[high] dead-code — fns with no observed caller",
+        "[high] dead-code — fns with no observed caller; gating: every row",
         "dead-code",
         Gate::Gating,
         None,
         &mut || Ok(Counts::flat(dead_code::run(ctx, dead_call_source, None, false, false)?)),
     )?;
     section(
-        "[high] conversion-pairs — one concept in two shapes (explain: replication)",
+        "[high] conversion-pairs — one concept in two shapes; gating: every row (explain: replication)",
         "conversion-pairs",
         Gate::Gating,
         None,
@@ -901,7 +929,7 @@ pub fn run(
     )?;
     section(
         &format!(
-            "[medium] metrics — fns with cyclo >= {} (explain: god-function)",
+            "[medium] metrics — fns with cyclo >= {}; advisory, waivable as `ok(metrics)` (explain: god-function)",
             CYCLO_THRESHOLD
         ),
         "metrics",
@@ -911,7 +939,7 @@ pub fn run(
     )?;
     section(
         &format!(
-            "[low] metrics — fns with params >= {} (explain: god-function)",
+            "[low] metrics — fns with params >= {}; advisory, waivable as `ok(metrics)` (explain: god-function)",
             PARAMS_THRESHOLD
         ),
         "metrics-params",
@@ -938,6 +966,15 @@ pub fn run(
     // The battery-wide line goes back to the normal stream: it is the one an
     // `until unruster audit` loop greps for, and callers already redirect for it.
     ctx.out.set_summary_inline(prev_inline);
+    ctx.out.set_hints_inline(prev_hints);
+    ctx.out.set_mark_gating(false);
+    let gating_rows = ctx.out.gating_rows();
+    if held {
+        print_gating_digest(ctx, &gating_rows);
+        for l in ctx.out.take_buffered() {
+            ctx.out.print_now(&l);
+        }
+    }
     // Both numbers, not just the waiver count: two item-scoped waivers hiding
     // seven findings reported as "2 site(s) waived" understates the reach by
     // 3.5x, which is the exact failure this line exists to prevent.
@@ -951,12 +988,27 @@ pub fn run(
     // that reads as a demand to delete two dozen live waivers. `hits` was
     // already scoped (it is counted during the run); this puts the count that
     // divides it on the same footing.
-    let ledger: Vec<&crate::suppress::Waiver> = ctx
+    //
+    // And under `--only`/`--skip`, only the waivers whose check ran: a waiver
+    // for a check this pass never asked has not "suppressed nothing", and one
+    // scoped run reported six live waivers that way with a pointer to go and
+    // review them.
+    let in_scope: Vec<&crate::suppress::Waiver> = ctx
         .suppressions
         .all()
         .iter()
         .filter(|w| ctx.in_scope(&w.file))
         .collect();
+    let ledger: Vec<&crate::suppress::Waiver> = in_scope
+        .iter()
+        .copied()
+        .filter(|w| {
+            CHECKS
+                .iter()
+                .any(|c| sel.wants(c) && crate::suppress::waiver_covers(w.check.as_deref(), c))
+        })
+        .collect();
+    let not_run = in_scope.len() - ledger.len();
     let waivers = ledger.len();
     let hidden: usize = ledger.iter().map(|w| w.hits()).sum();
 
@@ -988,6 +1040,7 @@ pub fn run(
             out: &quiet,
             suppressions: ctx.suppressions,
             suggest_waivers: false,
+            suggest_waivers_named: false,
         };
         let prev = ctx
             .suppressions
@@ -996,9 +1049,46 @@ pub fn run(
         ctx.suppressions.set_hit_mode(prev);
     }
 
+    // Which checks hold the gate, with one site each: the sentence a `tail -2`
+    // reader needs, and the one the old line withheld ("exit 1 while gating
+    // findings remain" said only that the digest above was worth rereading).
+    let holders = {
+        let mut by_check: Vec<(String, usize, String)> = Vec::new();
+        for g in &gating_rows {
+            match by_check.iter_mut().find(|(c, _, _)| *c == g.check) {
+                Some((_, n, _)) => *n += 1,
+                None => by_check.push((
+                    g.check.clone(),
+                    1,
+                    g.file
+                        .as_ref()
+                        .map_or(String::new(), |f| format!(" ({}:{})", f, g.line)),
+                )),
+            }
+        }
+        by_check
+            .iter()
+            .map(|(c, n, at)| format!("{} ×{}{}", c, n, at))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // Under `--changed-since`, split the gate between the edit and what the
+    // edit merely touched. The count stays whole — nothing gets quieter — but
+    // the reader no longer needs `git diff | grep` to learn which is which.
+    let change_split = if ctx.changed.is_some() && gating > 0 {
+        let changed = gating_rows.iter().filter(|g| g.change == "changed").count();
+        format!(
+            " ({} in changed lines, {} pre-existing in changed files)",
+            changed,
+            gating_rows.len().saturating_sub(changed)
+        )
+    } else {
+        String::new()
+    };
     ctx.out.summary(&format!(
-        "(audit: {} gating + {} advisory finding(s) across {} check(s){}{}; {}{}{})",
+        "(audit: {} gating{} + {} advisory finding(s) across {} check(s){}{}; {}{}{}{})",
         gating,
+        change_split,
         advisory,
         checks,
         // A selected run reports what it did not look at. Without this the
@@ -1035,10 +1125,16 @@ pub fn run(
         // `unruster audit … | tail -40; echo "EXIT=$?"` and read back `EXIT=0`,
         // which was `tail`'s. It happened to be clean that time.
         if gating > 0 {
-            "exit 1 while gating findings remain (the process's status — after a \
-             pipe `$?` is the pipe's)"
+            format!(
+                "exit 1: {} (the process's status — after a pipe `$?` is the pipe's)",
+                if holders.is_empty() {
+                    "gating findings remain".to_string()
+                } else {
+                    holders
+                }
+            )
         } else {
-            "clean: no gating findings, exit 0"
+            "clean: no gating findings, exit 0".to_string()
         },
         if strict { "; --strict: all gate" } else { "" },
         if waivers > 0 {
@@ -1102,7 +1198,7 @@ pub fn run(
                     ""
                 }
             )
-        } else if !ctx.suppressions.is_empty() {
+        } else if !ctx.suppressions.is_empty() && not_run == 0 {
             // Scoped past every waiver there is. Silence here reads as "this
             // tree has no waivers", which is the opposite of true.
             format!(
@@ -1111,10 +1207,116 @@ pub fn run(
             )
         } else {
             String::new()
+        },
+        if not_run > 0 {
+            format!("; {} waiver(s) for checks not run this pass", not_run)
+        } else {
+            String::new()
         }
     ));
     Ok(gating)
 }
+
+/// The rows that hold the exit code open, printed before everything else.
+///
+/// Each row leads with its check name — the sections below have their own
+/// column shapes, so the check is what makes a row readable out of context —
+/// and carries any `--suggest-waivers` lines the check attached. Under
+/// `--changed-since` a last column says `changed` or `pre-existing`.
+fn print_gating_digest(ctx: &AnalysisCtx, rows: &[crate::emit::GatingRow]) {
+    if rows.is_empty() {
+        ctx.out.print_now("## gating — no rows hold the exit code open");
+        ctx.out.print_now("");
+        return;
+    }
+    ctx.out.print_now(&format!(
+        "## gating — {} row(s) hold the exit code open; each is marked `!` in its section \
+         below{}",
+        rows.len(),
+        if ctx.changed.is_some() {
+            "; last column: changed lines vs pre-existing in a changed file"
+        } else {
+            ""
+        }
+    ));
+    // The waiver lines triple a digest's height. On the handful of rows a
+    // tuned tree gates on that is the point; on a tree gating on ninety, the
+    // digest has to stay a digest.
+    let with_hints = rows.len() <= DIGEST_HINTS_UP_TO;
+    for g in rows {
+        let mut line = format!("{}\t{}", g.check, g.tsv);
+        if !g.change.is_empty() {
+            line.push('\t');
+            line.push_str(g.change);
+        }
+        ctx.out.print_now(&line);
+        if with_hints {
+            for h in &g.hints {
+                ctx.out.print_now(h);
+            }
+        }
+    }
+    if !with_hints && rows.iter().any(|g| !g.hints.is_empty()) {
+        ctx.out.print_now(
+            "(note: waiver lines omitted above this many rows — `--suggest-waivers` prints \
+             them under every row)",
+        );
+    }
+    ctx.out.print_now("");
+}
+
+/// Gating rows up to which the digest carries each row's waiver line.
+const DIGEST_HINTS_UP_TO: usize = 25;
+
+/// Under `--changed-since`, teach the emitter to say which side of the diff a
+/// row is on. An `item` row's line is where the item starts, so its verdict
+/// covers the item's whole extent; a `site` or `pair` row is judged at its line.
+fn install_change_classifier(ctx: &AnalysisCtx) {
+    let Some(changed) = ctx.changed.clone() else {
+        ctx.out.set_change_of(None);
+        return;
+    };
+    // `(file, doc_start, end)` of every indexed item, for the extent lookup.
+    let extents: Vec<(String, usize, usize)> = ctx
+        .idx
+        .iter()
+        .map(|d| (d.file.clone(), d.doc_start, d.end))
+        .collect();
+    ctx.out.set_change_of(Some(Box::new(move |check, file, line| {
+        let (start, end) = if crate::emit::kind_of_check(check) == "item" {
+            extents
+                .iter()
+                .filter(|(f, s, e)| f == file && *s <= line && line <= *e)
+                .min_by_key(|(_, s, e)| e - s)
+                .map_or((line, line), |(_, s, e)| (*s, *e))
+        } else {
+            (line, line)
+        };
+        changed
+            .classify(file, start, end)
+            .map_or("", crate::context::ChangeKind::as_str)
+    })));
+}
+
+/// How `audit` runs, gathered so the signature stops growing a flag at a time.
+#[derive(Clone, Copy)]
+pub struct Opts<'a> {
+    /// `--top N`: rows per section. `None` takes the defaults.
+    pub top: Option<usize>,
+    /// `--strict`: advisory rows gate too.
+    pub strict: bool,
+    /// `--full`: clean sections shown, each section's own cap kept.
+    pub full: bool,
+    /// `--suggest-waivers` was named, so hints print beside their rows as well
+    /// as under the gating digest.
+    pub suggest_inline: bool,
+    pub sel: &'a Selection,
+}
+
+/// Advisory rows a section lists by default. The rest is one `--top 0` away
+/// and the cap note says so; what the default optimises for is a report that
+/// fits one screen with its gating rows on it.
+pub const ADVISORY_TOP: usize = 5;
 
 /// Render a cross-run comparison as its own section.
 ///
