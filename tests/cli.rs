@@ -4343,7 +4343,7 @@ fn waivers_honours_changed_since_on_its_rows_but_not_on_orphanhood() {
         err
     );
     assert!(
-        err.contains("0 earning nothing in `audit`"),
+        err.contains("0 orphaned — earning nothing in `audit`"),
         "a live waiver outside the diff was scored as orphaned:\n{}",
         err
     );

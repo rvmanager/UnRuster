@@ -97,7 +97,13 @@ sections below mark those same rows with a leading `!`. Clean sections are
 dropped and advisory rows are capped at five per section (`--full` for
 everything, `--top 0` to lift the caps); every cut announces itself on
 stdout. The closing line names the checks holding the gate and one site
-each, so `| tail -2` is a complete answer. Under `--changed-since` it also
+each, and states the verdict in words — `clean: no gating findings, exit 0`
+or `exit 1 while gating findings remain` — so `| tail -2` is a complete
+answer to both *what* and *whether*. Do not run the battery a second time
+behind `>/dev/null` just to read `$?`: in one two-day sample 13 of 119
+audit calls did, at five seconds each. A script that needs the code after
+a pipe reads `$pipestatus[1]` (zsh) or `${PIPESTATUS[0]}` (bash), or uses
+`--summary`, which prints only the closing line. Under `--changed-since` it also
 splits the gate into rows in changed lines and rows pre-existing in changed
 files, and `--fail-on-new` gates on the first kind alone.
 `unruster explain <topic>` prints one repair recipe instead of this whole

@@ -382,8 +382,8 @@ fn list(ctx: &AnalysisCtx, chosen: &[&Waiver], opts: &WaiverOpts) {
     }
     let breakdown: Vec<String> = by_check.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     ctx.out.summary(&format!(
-        "({} of {} waiver(s) shown; {}; {} item-scoped; {} earning nothing in `audit` \
-         ({} suppress nothing at all, {} only below audit thresholds); {} legacy; \
+        "({} of {} waiver(s) shown; {}; {} item-scoped; {} orphaned — earning nothing in \
+         `audit` ({} suppress nothing at all, {} only below audit thresholds); {} legacy; \
          {} undated; widest suppresses {} finding(s))",
         chosen.len(),
         all.len(),
