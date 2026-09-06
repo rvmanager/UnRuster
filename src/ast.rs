@@ -1009,6 +1009,68 @@ macro_rules! scope_visits {
 
 pub(crate) use scope_visits;
 
+/// The local-binding walk, for a visitor whose `self.scopes` is a
+/// [`crate::callers::LocalScopes`]: which bare names are a parameter, a
+/// `let`, a closure head, a `match` arm, a `for` pattern or an `if let` at the
+/// point the walk has reached, so a call written `dir(…)` under a `let dir`
+/// is known to be the local and not the item.
+///
+/// One copy, used by `callers` and `dead-code`, because the two answer the
+/// same question from opposite ends — "who calls this" and "does anyone" —
+/// and a binding one of them tracked and the other did not was exactly the
+/// disagreement that let a `pub fn dir` stay off the dead list for as long
+/// as any test kept a local of the same name. `contract-drift` interleaves
+/// its own claims into these visits and keeps a hand-written copy.
+///
+/// The ordering rules are the compiler's: a `let`'s initializer is walked
+/// before its pattern binds (`let grow = |x| grow(x)` calls the item); a
+/// `for` head's iterated expression is outside the binding and only the body
+/// sees it; an `if let` pattern is pended after its scrutinee and claimed by
+/// the block that opens next.
+macro_rules! local_scope_visits {
+    () => {
+        fn visit_signature(&mut self, s: &'ast syn::Signature) {
+            self.scopes.pend_signature(s);
+            syn::visit::visit_signature(self, s);
+        }
+
+        fn visit_block(&mut self, b: &'ast syn::Block) {
+            self.scopes.open_block();
+            syn::visit::visit_block(self, b);
+            self.scopes.close();
+        }
+
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            syn::visit::visit_local(self, l);
+            self.scopes.bind(&l.pat);
+        }
+
+        fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+            self.scopes.open_patterns(c.inputs.iter());
+            syn::visit::visit_expr_closure(self, c);
+            self.scopes.close();
+        }
+
+        fn visit_arm(&mut self, a: &'ast syn::Arm) {
+            self.scopes.open_patterns(std::iter::once(&a.pat));
+            syn::visit::visit_arm(self, a);
+            self.scopes.close();
+        }
+
+        fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
+            self.visit_expr(&e.expr);
+            self.scopes.pend_pattern(&e.pat);
+            self.visit_block(&e.body);
+        }
+
+        fn visit_expr_let(&mut self, e: &'ast syn::ExprLet) {
+            syn::visit::visit_expr_let(self, e);
+            self.scopes.pend_pattern(&e.pat);
+        }
+    };
+}
+pub(crate) use local_scope_visits;
+
 // ---------------------------------------------------------------------------
 // Shared syntax predicates
 //

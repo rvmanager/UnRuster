@@ -233,8 +233,8 @@ pub struct Out {
     pub format: Format,
     /// `--summary`: suppress per-row output, keep the summary line.
     pub summary_only: bool,
-    /// `--all-stdout`: route summary/note lines to stdout instead of stderr,
-    /// so one redirect captures the whole run.
+    /// `--all-stdout`: route the summary line to stdout too, so one redirect
+    /// captures the whole run. Notes already live there.
     pub all_stdout: bool,
     /// `--context N`: source lines to gather around each row's site.
     /// A `Cell` because `audit` raises it for the sections whose output is
@@ -875,7 +875,8 @@ impl Out {
     }
 
     /// The trailing `(N finding(s); …)` line. Goes to stderr by default so
-    /// stdout stays pipe-clean; `--all-stdout` moves it, and `audit` also
+    /// stdout stays pipe-clean — it is a count, and a reader who dropped it
+    /// still holds a correct answer; `--all-stdout` moves it, and `audit` also
     /// echoes each section's line into the section body.
     pub fn summary(&self, text: &str) {
         if self.silent {
@@ -912,14 +913,14 @@ impl Out {
     /// for a lookup that found nothing, and anything else a caller would be
     /// wrong to discard.
     ///
-    /// Always stdout. `note` goes to stderr so that a piped run stays clean,
-    /// which is right for "blind spots" and "showing 20 of 87" and exactly
-    /// wrong here: agents suppress stderr routinely, and one session ran
+    /// Always stdout, even under `--summary`. This was the first line to move
+    /// off stderr: agents suppress stderr routinely, and one session ran
     /// `show <name> 2>/dev/null | head -30 || <fallback>` four times. Each got
     /// total silence — the suggestion erased by the redirect, the `||` never
     /// firing because a pipeline exits with `head`'s status — and each time the
     /// reader concluded the tool had nothing and went back to `grep`. A failed
     /// lookup's explanation is the answer to the question that was asked.
+    /// [`note`](Self::note) has since followed it for the same reason.
     ///
     /// JSON keeps it in `notes` alongside [`Out::note`], so a document consumer
     /// reads both from one place.
@@ -935,19 +936,18 @@ impl Out {
     }
 
     /// A note about the **rows themselves** — that they were cut short. Goes to
-    /// stdout, beside the rows it qualifies, where [`note`](Self::note) goes to
-    /// stderr.
+    /// stdout, beside the rows it qualifies.
     ///
-    /// The rule that decides which: everything on stderr is commentary a caller
-    /// can discard and still hold a correct answer. A truncation is not that.
-    /// `2>/dev/null` is what a caller writes to silence the near-name
-    /// suggestions and the blind-spot paragraph, and in one real session it was
-    /// paired with `| head -N` on five of seven invocations — so the
-    /// `(showing 3 of 36 row(s))` line, the only thing saying the answer was
-    /// partial, was the first casualty, and three rows read as "that is all
-    /// there is". A cut this tool performed has to survive the redirect the
-    /// caller reaches for. Under `--summary` there are no rows on stdout to sit
-    /// beside, so it rejoins the summary on stderr.
+    /// The rule that decides the channel: everything on stderr is commentary a
+    /// caller can discard and still hold a correct answer. A truncation is not
+    /// that. `2>/dev/null` is what a caller writes to silence the blind-spot
+    /// paragraph, and in one real session it was paired with `| head -N` on
+    /// five of seven invocations — so the `(showing 3 of 36 row(s))` line, the
+    /// only thing saying the answer was partial, was the first casualty, and
+    /// three rows read as "that is all there is". A cut this tool performed
+    /// has to survive the redirect the caller reaches for. Under `--summary`
+    /// there are no rows on stdout to sit beside, so it rejoins the summary on
+    /// stderr. Said once: a section that cuts twice reports it once.
     pub fn row_note(&self, text: &str) {
         if self.silent {
             return;
@@ -967,9 +967,22 @@ impl Out {
         }
     }
 
-    /// A warning / note not tied to a row (unknown target, macro blind spots).
-    /// Follows `summary_inline`: inside an `audit` section a note is only
-    /// useful next to the rows it qualifies.
+    /// A note not tied to a row: what the answer leaves out, or what to run
+    /// next — "`dir` names 3 items, qualify it or `--all`", "2 of these sites
+    /// are a local binding", "0 files changed, so this is an empty scope",
+    /// the macro blind spots. Follows `summary_inline`: inside an `audit`
+    /// section a note is only useful next to the rows it qualifies.
+    ///
+    /// **Stdout**, with the rows. It went to stderr for a long time so a piped
+    /// run stayed clean, and every reader who mattered redirected stderr away:
+    /// in one seven-hour session 61 of 76 invocations carried `2>/dev/null`,
+    /// so four ambiguous `show`s answered with a bare header list and the
+    /// reader fell back to `sed`, a `callers` on a common name showed fourteen
+    /// heuristic rows with the "these are locals" note erased, and a `show`
+    /// cut at its line budget lost the line saying so. A note is written
+    /// because the rows alone mislead; a channel the reader has closed does not
+    /// deliver it. Under `--summary` there are no rows on stdout, so it rejoins
+    /// the summary on stderr, and JSON keeps it in `notes` either way.
     pub fn note(&self, text: &str) {
         if self.silent {
             return;
@@ -981,17 +994,14 @@ impl Out {
             self.state.borrow_mut().notes.push(text.to_string());
             return;
         }
-        if self.summary_inline.get() {
-            if !self.summary_only {
-                self.put(text);
+        if self.summary_only {
+            if !self.summary_inline.get() {
+                to_stderr(text);
             }
             return;
         }
-        if self.all_stdout {
-            self.put(text);
-        } else {
-            to_stderr(text);
-        }
+        self.flush_section();
+        self.put(text);
     }
 
     /// `--context N` lines around a row's site, `>`-marking the site line.

@@ -159,8 +159,9 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "format")]
     json: bool,
 
-    /// Send summary and note lines to stdout instead of stderr, so one
-    /// redirect captures the whole run.
+    /// Send the summary line to stdout instead of stderr, so one redirect
+    /// captures the whole run. Notes are on stdout already — they say what
+    /// the rows leave out, and `2>/dev/null` used to erase them.
     #[arg(long, global = true)]
     all_stdout: bool,
 
@@ -2885,14 +2886,7 @@ fn main() -> Result<()> {
         suppress::scan(&files)
     };
     let traits = traits_of(&cmd);
-    // Waiver hygiene is advice about waivers, so it goes to the commands that
-    // read waivers. It used to print on every invocation of everything: on a
-    // `show` whose answer is 49 bytes the preamble was 558 — eleven times the
-    // output, on every call, about a subsystem the command does not touch. An
-    // agent making fifteen navigation calls paid for it fifteen times.
-    if traits.waiver_aware {
-        report_waiver_hygiene(&out, &suppressions, matches!(cmd, Cmd::Waivers(_)));
-    }
+    let is_waivers_cmd = matches!(cmd, Cmd::Waivers(_));
     let changed = match changed_since.as_deref() {
         Some(r) => match context::changed_set(r, &root) {
             Ok(set) => Some(set),
@@ -2979,6 +2973,18 @@ fn main() -> Result<()> {
     report_scope_gap(&out, scope, traits);
     if scope_defaulted_to_all {
         report_scope_default(&out, traits);
+    }
+    // Waiver hygiene is advice about waivers, so it goes to the commands that
+    // read waivers. It used to print on every invocation of everything: on a
+    // `show` whose answer is 49 bytes the preamble was 558 — eleven times the
+    // output, on every call, about a subsystem the command does not touch. An
+    // agent making fifteen navigation calls paid for it fifteen times.
+    //
+    // After the command, with the other run-level notes: now that notes ride
+    // stdout, one printed before the rows would sit above `audit`'s digest,
+    // and the digest is line one.
+    if traits.waiver_aware {
+        report_waiver_hygiene(&out, &suppressions, is_waivers_cmd);
     }
     if traits.analyses_code {
         report_blind_spots(&out);

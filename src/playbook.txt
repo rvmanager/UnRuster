@@ -160,7 +160,8 @@ In-source markers (no config file — the marker lives with the code):
 
 Output for machines: `--json` on any command keeps `file`/`line` and the
 numeric columns as real fields, so ranking and filtering across rows need
-no `awk`. `--all-stdout` puts summary/note lines on stdout too.
+no `awk`. Notes are on stdout with the rows; `--all-stdout` puts the
+summary line there too.
 
 ◇ READING CODE (locate an item before editing it — `outline`, `show`, `--spans`)
 The idiom this replaces, taken verbatim from an agent transcript:
@@ -300,12 +301,16 @@ and prefix-weighted — `nwe` finds `new`, `contour_of` finds
 `contour_points` — because those are the two ways a name is actually
 mis-recalled.
 
-That explanation goes to **stdout**, not stderr, because it is the answer
-to the question you asked. It used to go to stderr, and a session running
+That explanation goes to **stdout**, because it is the answer to the
+question you asked. It used to go to stderr, and a session running
 `show <name> 2>/dev/null | head -30 || <fallback>` got silence four times
 over: the note erased by the redirect, and the `||` never firing because a
-pipeline exits with `head`'s status. Suppress stderr freely — the summary
-and the blind-spot count live there, and losing them costs nothing.
+pipeline exits with `head`'s status. Every note has since followed it
+there — "`dir` names 3 items", "2 of these sites are a local binding",
+"0 files changed, so this is an empty scope", the blind-spot count — for
+the same reason: a note is written because the rows alone mislead. Only
+the `(N finding(s); …)` summary line stays on stderr, so `2>/dev/null`
+costs you a count and nothing else.
 
 WHAT THIS IS NOT
 

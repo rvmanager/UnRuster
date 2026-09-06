@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use syn::visit::{self, Visit};
 
-use crate::ast::{line_of, path_to_string, print_grouped_counts, scope_visits, ScopeTracker};
+use crate::ast::{local_scope_visits, line_of, path_to_string, print_grouped_counts, scope_visits, ScopeTracker};
 use crate::context::{warn_unknown_target, AnalysisCtx, Confidence, GroupBy, TargetNotFound};
 
 use crate::index::NameIndex;
@@ -262,52 +262,9 @@ impl<'ast, 'a> Visit<'ast> for CallVisitor<'a> {
         }
     }
 
-    fn visit_signature(&mut self, s: &'ast syn::Signature) {
-        self.scopes.pend_signature(s);
-        visit::visit_signature(self, s);
-    }
-
-    fn visit_block(&mut self, b: &'ast syn::Block) {
-        self.scopes.open_block();
-        visit::visit_block(self, b);
-        self.scopes.close();
-    }
-
-    fn visit_local(&mut self, l: &'ast syn::Local) {
-        // Initializer first: in `let grow = |x| grow(x)` the body's call
-        // still names the outer item, exactly as the compiler resolves it.
-        visit::visit_local(self, l);
-        self.scopes.bind(&l.pat);
-    }
-
-    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
-        self.scopes.open_patterns(c.inputs.iter());
-        visit::visit_expr_closure(self, c);
-        self.scopes.close();
-    }
-
-    fn visit_arm(&mut self, a: &'ast syn::Arm) {
-        self.scopes.open_patterns(std::iter::once(&a.pat));
-        visit::visit_arm(self, a);
-        self.scopes.close();
-    }
-
-    fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
-        // The iterated expression is outside the binding: `for path in
-        // paths()` calls the item, and only the body sees the local.
-        self.visit_expr(&e.expr);
-        self.scopes.pend_pattern(&e.pat);
-        self.visit_block(&e.body);
-    }
-
-    fn visit_expr_let(&mut self, e: &'ast syn::ExprLet) {
-        // Pended *after* the scrutinee is walked, so a closure inside it
-        // cannot claim the binding, and picked up by the `then` block or loop
-        // body that opens next — which is exactly where an `if let` binding is
-        // in scope.
-        visit::visit_expr_let(self, e);
-        self.scopes.pend_pattern(&e.pat);
-    }
+    // The binding walk — `let`, closure heads, arms, `for` and `if let`
+    // patterns — shared with `dead-code`, see the macro.
+    local_scope_visits!();
 }
 
 pub(crate) fn collect_sites(

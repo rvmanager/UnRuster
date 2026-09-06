@@ -514,11 +514,22 @@ pub fn run(
     let mut advisory = 0usize;
     let mut checks = 0usize;
     let mut skipped_clean = 0usize;
-    // Line one, before any section, so it survives the `head` it is warning
-    // about. Every session's first `audit` was piped and cut; one of them cost
-    // three recovery commands (`| head -200`, then `cat` the tool-results file,
-    // then `sed -n '199,500p'`). The same mechanism that fixed `show` — say how
-    // much is coming, *before* it comes.
+    // Everything from here to the summary is held, so the gating digest —
+    // which is only complete once the last section has run — can be printed
+    // *first*. A reader who pipes to `head` sees the rows that gate; one who
+    // pipes to `tail` sees the summary that names them. Eight reruns of one
+    // battery, each with a different `grep`/`awk` slice, were spent finding a
+    // single gating row that sat at line 6 of a 353-line digest.
+    let held = !ctx.out.is_silent() && !ctx.summary && ctx.out.format != crate::emit::Format::Json;
+    if held {
+        ctx.out.start_buffering();
+    }
+    // Before any section, so it survives the `head` it is warning about. Every
+    // session's first `audit` was piped and cut; one of them cost three
+    // recovery commands (`| head -200`, then `cat` the tool-results file, then
+    // `sed -n '199,500p'`). The same mechanism that fixed `show` — say how much
+    // is coming, *before* it comes. Emitted into the held buffer, so it lands
+    // right under the digest rather than above it: the digest is line one.
     if !ctx.summary {
         ctx.out.note(&format!(
             "(note: {} check(s){}; gating rows lead under `## gating`, are marked `!` in \
@@ -537,16 +548,6 @@ pub fn run(
                 None => String::new(),
             }
         ));
-    }
-    // Everything from here to the summary is held, so the gating digest —
-    // which is only complete once the last section has run — can be printed
-    // *first*. A reader who pipes to `head` sees the rows that gate; one who
-    // pipes to `tail` sees the summary that names them. Eight reruns of one
-    // battery, each with a different `grep`/`awk` slice, were spent finding a
-    // single gating row that sat at line 6 of a 353-line digest.
-    let held = !ctx.out.is_silent() && !ctx.summary && ctx.out.format != crate::emit::Format::Json;
-    if held {
-        ctx.out.start_buffering();
     }
     ctx.out.set_mark_gating(true);
     let prev_hints = ctx.out.set_hints_inline(suggest_inline);

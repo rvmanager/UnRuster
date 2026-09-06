@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
-use crate::ast::{fn_visits, path_to_string, scope_visits, ScopeTracker};
+use crate::ast::{fn_visits, local_scope_visits, path_to_string, scope_visits, ScopeTracker};
+use crate::callers::LocalScopes;
 use crate::context::AnalysisCtx;
 use crate::parse::ParsedFile;
 use crate::emit::row;
@@ -25,6 +26,14 @@ struct CallSink {
     /// Qualified path of the fn currently being walked, innermost last.
     stack: Vec<String>,
     scope: ScopeTracker,
+    /// The bare names bound locally where the walk currently is. A `let dir`,
+    /// a closure named `dir`, a `for dir in …` — every later `dir` in that
+    /// scope names the binding, not `geom::dir`, and must not count as a call
+    /// of it. Without this, one real project's `pub fn dir` stayed off the
+    /// list for as long as any test kept a local of the same name, and the
+    /// reader had to prove it dead with `grep`. Same tracker `callers` uses,
+    /// so the two checks agree on what a local is.
+    scopes: LocalScopes,
 }
 
 impl CallSink {
@@ -34,6 +43,7 @@ impl CallSink {
             per_item: std::collections::BTreeMap::new(),
             stack: Vec::new(),
             scope: ScopeTracker::new(""),
+            scopes: LocalScopes::default(),
         }
     }
 
@@ -64,6 +74,17 @@ impl CallSink {
         self.called_without(&BTreeSet::new())
     }
 
+    /// A written-as-called path, unless a local binding captures it. A bare
+    /// `dir` under a `let dir` is that local; `geom::dir`, `Self::dir` and
+    /// `.dir()` always name the item, however many locals share the name.
+    fn saw_path(&mut self, path: &str) {
+        if self.scopes.shadows_path(path) {
+            return;
+        }
+        let last = crate::ast::last_segment(path).to_string();
+        self.saw(last);
+    }
+
     /// Open a fn: everything walked from here belongs to it until [`Self::leave_fn`].
     /// Shared by every fn-shaped visit method — see [`fn_visits`].
     fn enter_fn(&mut self, sig: &syn::Signature, _block: Option<&syn::Block>) {
@@ -86,9 +107,7 @@ impl<'ast> Visit<'ast> for CallSink {
 
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*e.func {
-            let s = path_to_string(&p.path);
-            let last = crate::ast::last_segment(&s).to_string();
-            self.saw(last);
+            self.saw_path(&path_to_string(&p.path));
         }
         visit::visit_expr_call(self, e);
     }
@@ -100,11 +119,14 @@ impl<'ast> Visit<'ast> for CallSink {
 
     fn visit_expr_path(&mut self, e: &'ast syn::ExprPath) {
         // Track fn-references-as-values (`let f = some_fn; f();`) too.
-        let s = path_to_string(&e.path);
-        let last = crate::ast::last_segment(&s).to_string();
-        self.saw(last);
+        self.saw_path(&path_to_string(&e.path));
         visit::visit_expr_path(self, e);
     }
+
+    // The binding walk — `let`, closure heads, arms, `for` and `if let`
+    // patterns — shared with `callers`, so both checks draw the same line
+    // between a local and an item. See the macro.
+    local_scope_visits!();
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         if let Some(last) = m.path.segments.last() {
@@ -268,7 +290,9 @@ fn collect_idents(ts: &TokenStream, out: &mut BTreeSet<String>) {
 /// `call_source` is the FULL tree so production items called only from tests
 /// aren't false-flagged as dead.
 /// Every name `dead-code` believes is called, by its own independent
-/// mechanism: raw identifier collection rather than call-site matching.
+/// mechanism: raw identifier collection rather than call-site matching —
+/// less the bare names a local binding has captured at the point of use,
+/// which is the one thing both mechanisms agree is not a call.
 ///
 /// Exposed so `self-check` can hold it against the AST call-site path. That
 /// disagreement is not academic — it is what exposed a fn used only as

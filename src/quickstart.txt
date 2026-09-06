@@ -38,7 +38,7 @@ GLOBAL FLAGS
   --context N            print ±N source lines under each row
   --spans                fn labels `name@start-end`; item rows' `at` gains an end
   --summary              drop rows, keep the summary line
-  --all-stdout           summaries/notes to stdout too (a --top cut is always there)
+  --all-stdout           the summary line to stdout too (notes and a --top cut always are)
   --exclude GLOB         drop matching files (repeatable)
   --cfg KEY[=VALUE]      strip items whose cfg is definitively false
   --fail-on-findings     exit 1 on any finding (0 = clean, 2 = error)

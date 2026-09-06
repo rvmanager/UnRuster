@@ -1033,8 +1033,10 @@ pub fn run(ctx: &AnalysisCtx, query: &str, opts: &ContractOpts) -> anyhow::Resul
     }
 
     // Through `answer`, not `note`: this is the instruction the whole command
-    // exists to deliver, and `note` goes to stderr, which agents routinely
-    // discard. A blindfold that lands on a suppressed channel is not applied.
+    // exists to deliver, and `answer` reaches stdout even under `--summary`,
+    // where a `note` rejoins the summary on stderr — the channel agents
+    // routinely discard. A blindfold that lands on a suppressed channel is
+    // not applied.
     // Naming the bypasses, because withholding the body here does not make it
     // unreadable anywhere else. One session ran `contract-drift <fn>` and
     // `unruster show <fn>` as two halves of a single shell command, labelled

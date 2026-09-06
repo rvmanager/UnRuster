@@ -16,17 +16,23 @@ fn ur() -> Command {
 
 /// Non-blank data lines of `out`.
 ///
-/// `(note: …)` lines are dropped: the `--top` truncation note is emitted on
-/// *stdout* on purpose (a caller who writes `2>/dev/null` must still learn the
-/// answer was cut), but it is commentary about the rows and not one of them.
-/// No TSV row can collide with the prefix — a row's first cell is a kind, a
-/// visibility or a name.
+/// Note lines are dropped: notes are emitted on *stdout* on purpose (a caller
+/// who writes `2>/dev/null` must still learn the answer was cut, or that the
+/// name was ambiguous, or that half the rows are locals), but they are
+/// commentary about the rows and not one of them. A note starts with `(` or
+/// `note:`, and no TSV row can collide with either — a row's first cell is a
+/// kind, a visibility or a name.
 fn rows_of(out: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(out)
         .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with("(note:"))
+        .filter(|l| !l.trim().is_empty() && !is_note(l))
         .map(str::to_string)
         .collect()
+}
+
+/// The stdout lines that are commentary rather than rows.
+fn is_note(l: &str) -> bool {
+    l.starts_with('(') || l.starts_with("note:")
 }
 
 /// Every row must split into exactly `expected` tab-separated columns.
@@ -81,6 +87,22 @@ fn ur_stdout_allow_findings(args: &[&str]) -> Vec<u8> {
         args
     );
     out.stdout
+}
+
+/// Stdout and stderr together. Notes ride stdout with the rows they qualify
+/// and the summary line stays on stderr, so a test that asserts on both — or
+/// that one of them is *absent* — reads the pair.
+fn all_output(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// [`all_output`] of a run, whatever its exit code.
+fn ur_all(args: &[&str]) -> String {
+    all_output(&ur().args(args).output().unwrap())
 }
 
 /// Run and assert success; return raw stdout bytes.
@@ -185,7 +207,7 @@ fn inventory_name_takes_a_glob_and_says_when_it_matches_nothing() {
         .unwrap();
     assert!(out.status.success());
     assert!(rows_of(&out.stdout).is_empty());
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = all_output(&out);
     assert!(err.contains("--name Documnet"), "the filter is unnamed:\n{}", err);
     assert!(err.contains("nothing matches `Documnet`"), "{}", err);
 }
@@ -314,10 +336,7 @@ fn waiver_hygiene_notes_stay_off_commands_waivers_cannot_affect() {
 
 #[test]
 fn waiver_hygiene_notes_survive_where_a_waiver_changes_the_answer() {
-    let e = String::from_utf8_lossy(
-        &ur().args(["--root", WV, "dead-code"]).output().unwrap().stderr,
-    )
-    .to_string();
+    let e = ur_all(&["--root", WV, "dead-code"]);
     assert!(e.contains("waiver(s)"), "expected waiver advice on a waiver-aware check:\n{}", e);
 }
 
@@ -731,7 +750,7 @@ fn show_lists_rather_than_concatenating_when_a_name_is_ambiguous() {
     assert!(out.status.success());
     assert_tsv_cols(&out.stdout, 4);
     assert!(rows_of(&out.stdout).len() > 1);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("names"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("names"));
 }
 
 #[test]
@@ -839,7 +858,7 @@ fn sig_of_a_container_says_which_command_lists_its_members() {
         "{:?}",
         out
     );
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stdout);
     assert!(err.contains("outline "), "no route to the members:\n{}", err);
     assert!(err.contains("impls --of Document"), "{}", err);
 }
@@ -943,7 +962,7 @@ fn show_of_a_struct_names_the_commands_that_answer_the_next_question() {
         .args(["--root", FIXTURE, "show", "Document", "--kind", "struct"])
         .output()
         .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stdout);
     assert!(err.contains("fields "), "no route to the fields:\n{}", err);
     assert!(err.contains("field-uses "), "{}", err);
     // A fn has no fields to ask about.
@@ -952,7 +971,7 @@ fn show_of_a_struct_names_the_commands_that_answer_the_next_question() {
         .output()
         .unwrap();
     assert!(
-        !String::from_utf8_lossy(&fun.stderr).contains("field-uses"),
+        !all_output(&fun).contains("field-uses"),
         "nagged about fields on a fn"
     );
 }
@@ -971,8 +990,8 @@ fn show_says_which_kinds_exist_when_kind_filters_everything_out() {
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("exists but not as a `enum`"))
-        .stderr(contains("struct"));
+        .stdout(contains("exists but not as a `enum`"))
+        .stdout(contains("struct"));
 }
 
 #[test]
@@ -1146,6 +1165,56 @@ fn a_single_crate_scan_still_drops_its_leading_src() {
 }
 
 #[test]
+fn a_note_survives_the_stderr_redirect_a_reader_writes() {
+    // In one seven-hour session 61 of 76 invocations carried `2>/dev/null`.
+    // Each note below changes what the reader should do next, and each was
+    // erased: the ambiguous `show` answered with a header list and no body
+    // (the reader fell back to `sed`), `callers` on a common name showed its
+    // heuristic rows without the line saying they were locals, and an audit
+    // over zero changed files read as clean. A note is written because the
+    // rows alone mislead; it has to reach the reader through the redirect.
+    let dir = scratch("note-channel");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn grow(x: u8) -> u8 { x + 1 }
+pub struct Hull;
+impl Hull {
+    pub fn grow(&self, x: u8) -> u8 { x }
+}
+pub fn walk() -> u8 {
+    let grow = |x: u8| x;
+    grow(1)
+}
+"#,
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    for (args, expect) in [
+        (vec!["show", "grow"], "names 2 items"),
+        (vec!["callers", "grow"], "*local* binding"),
+        (vec!["dead-code"], "tests --mentions"),
+    ] {
+        let mut full = vec!["--root", root];
+        full.extend(args.iter());
+        let out = ur().args(&full).output().unwrap();
+        let so = String::from_utf8_lossy(&out.stdout);
+        let se = String::from_utf8_lossy(&out.stderr);
+        assert!(so.contains(expect), "{:?}: note not on stdout:\n{so}\n--- stderr:\n{se}", args);
+        assert!(!se.contains(expect), "{:?}: note duplicated on stderr:\n{se}", args);
+    }
+    // `--summary` has no rows on stdout for a note to sit beside; it rejoins
+    // the summary on stderr and stdout stays silent.
+    let out = ur().args(["--root", root, "callers", "grow", "--summary"]).output().unwrap();
+    assert!(out.stdout.is_empty(), "stdout under --summary:\n{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("*local* binding"),
+        "note lost under --summary:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn show_of_a_qualified_name_says_how_many_siblings_it_passed_over() {
     // `clones` reports a duplicated fn by its qualified path, so the obvious
     // next command is `show <that path>` — which returns one copy and used to
@@ -1153,8 +1222,8 @@ fn show_of_a_qualified_name_says_how_many_siblings_it_passed_over() {
     ur().args(["--root", FIXTURE, "show", "Document::render"])
         .assert()
         .success()
-        .stderr(contains("also named `render`"))
-        .stderr(contains("--all"));
+        .stdout(contains("also named `render`"))
+        .stdout(contains("--all"));
 }
 
 #[test]
@@ -1183,7 +1252,7 @@ fn navigation_commands_do_not_print_the_macro_blind_spot_note() {
 fn an_analysis_command_still_reports_blind_spots() {
     let out = ur().args(["--root", FIXTURE, "inventory"]).output().unwrap();
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("blind spots"),
+        String::from_utf8_lossy(&out.stdout).contains("blind spots"),
         "the note must survive where it is load-bearing"
     );
 }
@@ -1343,7 +1412,7 @@ fn outline_of_an_unscanned_file_says_why_rather_than_listing_nothing() {
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("--scope all"));
+        .stdout(contains("--scope all"));
 }
 
 #[test]
@@ -1352,7 +1421,7 @@ fn outline_of_a_nonexistent_file_says_that_instead() {
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("no such path exists"));
+        .stdout(contains("no such path exists"));
 }
 
 #[test]
@@ -1769,7 +1838,7 @@ fn an_unfiltered_impls_listing_names_the_commands_that_narrow_it() {
     // `Mask`, not its members. Observed verbatim in a real session, followed by
     // `outline src/mask.rs`, which is what actually answered.
     let big = ur().args(["--root", FIXTURE, "impls"]).output().unwrap();
-    let err = String::from_utf8_lossy(&big.stderr);
+    let err = String::from_utf8_lossy(&big.stdout);
     assert!(err.contains("impls --of <Type>"), "no route offered:\n{}", err);
     assert!(err.contains("outline <file>"), "{}", err);
     // A caller who already narrowed does not need telling.
@@ -1778,7 +1847,7 @@ fn an_unfiltered_impls_listing_names_the_commands_that_narrow_it() {
         .output()
         .unwrap();
     assert!(
-        !String::from_utf8_lossy(&narrowed.stderr).contains("unfiltered"),
+        !all_output(&narrowed).contains("unfiltered"),
         "nagged a caller who had already filtered"
     );
 }
@@ -2038,6 +2107,62 @@ fn dead_code_sees_calls_inside_unparseable_macro_arms() {
         "age_label is called inside a `=>` macro arm — not dead:\n{}",
         s
     );
+}
+
+#[test]
+fn dead_code_is_not_fooled_by_a_local_of_the_same_name() {
+    // One real project's `pub fn dir(angle)` lost its last caller and stayed
+    // off this list for as long as any test kept a `let dir = …` or a closure
+    // named `dir`: the identifier sink counted every bare `dir` as a call,
+    // while `callers` on the same name already knew those sites were locals.
+    // The reader had to prove it dead with `grep`. Both checks now draw the
+    // same line.
+    let dir = scratch("dead-shadowed");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn dir(angle_deg: f64) -> (f64, f64) {
+    let a = angle_deg.to_radians();
+    (a.sin(), -a.cos())
+}
+
+pub fn render() -> f64 {
+    let dir = 3.0;
+    dir * 2.0
+}
+
+pub fn build() -> f64 {
+    let dir = |x: f64| x + 1.0;
+    dir(2.0)
+}
+
+pub fn walk(dirs: &[f64]) -> f64 {
+    let mut t = 0.0;
+    for dir in dirs {
+        t += dir;
+    }
+    match dirs.first() {
+        Some(dir) => t + dir,
+        None => t,
+    }
+}
+
+/// Still live: called through a path, and a bare call before any shadow.
+pub fn live(x: f64) -> f64 { x }
+
+pub fn uses_live() -> f64 {
+    let a = live(1.0);
+    let live = 2.0;
+    let b = crate::live(live);
+    a + b
+}
+"#,
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let s = String::from_utf8_lossy(&ur_stdout(&["--root", root, "dead-code"])).to_string();
+    assert!(s.contains("\tdir\t"), "`dir` has only locals of its name, so it is dead:\n{s}");
+    assert!(!s.contains("\tlive\t"), "`live` is called before its shadow and by path:\n{s}");
 }
 
 #[test]
@@ -2567,7 +2692,7 @@ fn blind_spots_can_be_located_not_just_counted() {
     }
     // And the count matches what every other command reports in its note.
     let note = String::from_utf8_lossy(
-        &ur().args(["--root", FIXTURE, "inventory"]).output().unwrap().stderr,
+        &ur().args(["--root", FIXTURE, "inventory"]).output().unwrap().stdout,
     )
     .to_string();
     let n = note
@@ -3840,8 +3965,8 @@ fn tests_subcommand_typo_suggests_the_real_one() {
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("Did you mean"))
-        .stderr(contains("impls"));
+        .stdout(contains("Did you mean"))
+        .stdout(contains("impls"));
 }
 
 #[test]
@@ -3852,7 +3977,7 @@ fn tests_subcommand_with_no_coverage_lists_what_is_covered() {
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("Subcommands with tests:"));
+        .stdout(contains("Subcommands with tests:"));
 }
 
 #[test]
@@ -4078,11 +4203,12 @@ fn audit_summary_mode_silent_stdout() {
 #[test]
 fn callers_rows_carry_confidence_column() {
     let out = ur_stdout(&["--root", FIXTURE, "callers", "mark_pending"]);
-    let s = String::from_utf8_lossy(&out);
+    let rows = rows_of(&out);
+    assert!(!rows.is_empty());
     assert!(
-        s.lines().all(|l| l.contains("\tresolved\t") || l.contains("\theuristic\t")),
-        "every callers row should carry a confidence column:\n{}",
-        s
+        rows.iter().all(|l| l.contains("\tresolved\t") || l.contains("\theuristic\t")),
+        "every callers row should carry a confidence column:\n{:?}",
+        rows
     );
 }
 
@@ -4178,7 +4304,7 @@ fn a_usage_question_says_when_the_default_scope_walked_past_the_tests() {
     let err = |args: &[&str]| -> String {
         let mut full = vec!["--root", root];
         full.extend(args);
-        String::from_utf8_lossy(&ur().args(&full).output().unwrap().stderr).into_owned()
+        all_output(&ur().args(&full).output().unwrap())
     };
     // A usage query nobody scoped is answered over the whole tree, and says so
     // in one line.
@@ -4331,7 +4457,7 @@ fn waivers_honours_changed_since_on_its_rows_but_not_on_orphanhood() {
         ])
         .output()
         .unwrap();
-    let (rows, err) = (rows_of(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let (rows, err) = (rows_of(&out.stdout), all_output(&out));
     assert_eq!(rows.len(), 1, "expected only the changed file's waiver:\n{:?}", rows);
     assert!(rows[0].contains("touched.rs"), "{:?}", rows);
     assert!(err.contains("held back 1 waiver(s)"), "the drop was silent:\n{}", err);
@@ -4361,13 +4487,14 @@ fn context_flag_prints_snippets() {
 }
 
 #[test]
-fn blind_spots_reported_on_stderr() {
+fn blind_spots_reported_with_the_rows() {
     // The fixture contains a macro whose tokens don't parse as expressions.
+    // The count rides stdout with the rows: it says what the rows leave out.
     let out = ur()
         .args(["--root", FIXTURE, "callers", "println"])
         .output()
         .unwrap();
-    let e = String::from_utf8_lossy(&out.stderr);
+    let e = String::from_utf8_lossy(&out.stdout);
     assert!(e.contains("blind spots:"), "expected blind-spot count:\n{}", e);
 }
 
@@ -5259,7 +5386,7 @@ fn suggest_waivers_says_so_when_a_check_cannot_use_them() {
     // honours the key `--suggest-waivers` prints, so the note was false and the
     // test was pinning the falsehood. `conversions` neither suggests nor filters.
     let out = ur().args(["--root", WV, "--suggest-waivers", "conversions"]).output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = all_output(&out);
     assert!(
         err.contains("does not support waivers"),
         "expected a note, got:\n{}",
@@ -5268,7 +5395,7 @@ fn suggest_waivers_says_so_when_a_check_cannot_use_them() {
     // And it must not cry wolf on a check that does support them.
     let ok = ur().args(["--root", WV, "--suggest-waivers", "dead-code"]).output().unwrap();
     assert!(
-        !String::from_utf8_lossy(&ok.stderr).contains("does not support waivers"),
+        !all_output(&ok).contains("does not support waivers"),
         "dead-code supports waivers now"
     );
 }
@@ -5963,7 +6090,7 @@ fn outline_names_every_file_an_ambiguous_suffix_matches() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stdout);
     assert!(err.contains("matches 2 files"), "expected ambiguity note, got: {err}");
     // Both files are outlined rather than one silently winning.
     let rows = rows_of(&out.stdout);
@@ -6147,7 +6274,7 @@ fn a_ledger_dated_in_one_session_gets_the_herd_note() {
         })
         .collect();
     std::fs::write(src.join("lib.rs"), body).unwrap();
-    let err = ur_stderr(&["--root", root.to_str().unwrap(), "waivers", "--today", TODAY]);
+    let err = ur_all(&["--root", root.to_str().unwrap(), "waivers", "--today", TODAY]);
     assert!(err.contains("dated waiver(s) carry"), "{err}");
 }
 
@@ -6170,7 +6297,7 @@ fn waivers_note_the_pair_a_group_key_would_retire() {
          }\n",
     )
     .unwrap();
-    let err = ur_stderr(&["--root", root.to_str().unwrap(), "waivers", "--today", TODAY]);
+    let err = ur_all(&["--root", root.to_str().unwrap(), "waivers", "--today", TODAY]);
     assert!(
         err.contains("single group key") && err.contains("ok(partial-enumeration/Node::C)"),
         "{err}"
@@ -6205,7 +6332,7 @@ fn upgrade_leaves_an_unhit_legacy_waiver_alone_and_says_why() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = all_output(&out);
     // Zero hits means no check can be named — the waiver must survive, and
     // the run must say so rather than silently skipping it.
     assert!(err.contains("not upgraded"), "{err}");
@@ -6307,9 +6434,11 @@ fn callers_demotes_calls_to_a_shadowing_local_binding() {
             "{caller} must keep a resolved site:\n{rows:?}"
         );
     }
-    // The demotion announces itself rather than silently reshuffling a column.
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("local"), "expected the local-binding note, got: {err}");
+    // The demotion announces itself rather than silently reshuffling a column,
+    // and it does so beside the rows: a reader who wrote `2>/dev/null` is the
+    // reader who most needs to hear it.
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("*local* binding"), "expected the local-binding note, got: {said}");
 }
 
 #[test]
@@ -6748,7 +6877,7 @@ fn the_scope_note_names_the_crates_it_removed_and_why() {
     // `crates/foo-test/src/lib.rs`. Naming the crates also makes the verdict
     // falsifiable: a crate listed here that the reader knows is production is
     // a bug report, where a bare count is not.
-    let err = ur_stderr(&["--root", TEST_CRATE_FIXTURE, "--scope", "production", "callers", "load"]);
+    let err = ur_all(&["--root", TEST_CRATE_FIXTURE, "--scope", "production", "callers", "load"]);
     assert!(err.contains("sample-test-utils"), "{err}");
     assert!(err.contains("sample-fixtures"), "{err}");
     assert!(err.contains("test-support crates"), "{err}");
@@ -6795,7 +6924,7 @@ fn the_note_does_not_claim_a_dependency_edge_it_never_saw() {
         .args(["--root", dir.to_str().unwrap(), "--scope", "production", "callers", "ship"])
         .output()
         .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = all_output(&out);
     assert!(
         err.contains("named as test support"),
         "expected the name-rule wording:\n{err}"
@@ -7665,7 +7794,7 @@ fn contract_drift_reports_the_scope_gap() {
     ])
     .output()
     .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = all_output(&out);
     assert!(
         err.contains("`--scope all` adds") && err.contains("test file(s)"),
         "the scope gap must be reported here of all places:\n{err}"
@@ -7706,7 +7835,7 @@ fn the_waiver_aware_list_matches_what_the_commands_actually_do() {
         .args(["--root", FIXTURE, "--suggest-waivers", "inventory"])
         .output()
         .unwrap();
-    let all = String::from_utf8_lossy(&out.stderr);
+    let all = all_output(&out);
     assert!(
         all.contains("does not support waivers"),
         "a non-waiver command must disclaim, not go quiet:\n{all}"
@@ -9694,7 +9823,7 @@ fn show_announces_a_long_print_before_printing_it() {
     let body: String = (0..60).map(|i| format!("    V{i},\n")).collect();
     std::fs::write(dir.join("src/lib.rs"), format!("pub enum Big {{\n{body}}}\n")).unwrap();
     let out = ur().args(["--root", dir.to_str().unwrap(), "show", "Big"]).output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stdout);
     assert!(err.contains("line(s) of source follow"), "{err}");
     // And for an enum, the compact command that cannot be truncated at all.
     assert!(err.contains("variants Big"), "no route offered: {err}");
@@ -9802,7 +9931,7 @@ fn a_field_that_is_built_and_never_read_says_so() {
     let err = |args: &[&str]| {
         let mut full = vec!["--root", root];
         full.extend(args);
-        String::from_utf8_lossy(&ur().args(&full).output().unwrap().stderr).to_string()
+        all_output(&ur().args(&full).output().unwrap())
     };
     let one = err(&["field-uses", "Built", "radius"]);
     assert!(one.contains("never used"), "{one}");
@@ -9847,7 +9976,7 @@ pub fn go() -> u32 { crate::a::helpers::one() + crate::b::helpers::two() }
     )
     .unwrap();
     let out = ur().args(["--root", dir.to_str().unwrap(), "module-uses", "helpers"]).output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = all_output(&out);
     let summary = err
         .lines()
         .find(|l| l.starts_with("(") && l.contains("site(s) outside"))
@@ -9860,10 +9989,7 @@ pub fn go() -> u32 { crate::a::helpers::one() + crate::b::helpers::two() }
     // The note still names every one — the list is not lost, only moved.
     assert!(err.contains("a::helpers") && err.contains("b::helpers"), "{err}");
     // And a single match still prints its own path, not "(1 modules)".
-    let one = String::from_utf8_lossy(
-        &ur().args(["--root", dir.to_str().unwrap(), "module-uses", "a::helpers"]).output().unwrap().stderr,
-    )
-    .to_string();
+    let one = ur_all(&["--root", dir.to_str().unwrap(), "module-uses", "a::helpers"]);
     assert!(one.contains("outside `a::helpers`"), "{one}");
 }
 
@@ -9967,10 +10093,7 @@ fn remove_leaves_a_waiver_that_still_suppresses_something() {
     let root = dir.to_str().unwrap();
 
     // The ledger sees both kinds, and says so.
-    let ledger = String::from_utf8_lossy(
-        &ur().args(["--root", root, "waivers"]).output().unwrap().stderr,
-    )
-    .to_string();
+    let ledger = ur_all(&["--root", root, "waivers"]);
     assert!(
         ledger.contains("(1 suppress nothing at all, 1 only below audit thresholds)"),
         "fixture did not produce one of each kind:\n{ledger}"
@@ -10661,9 +10784,11 @@ fn audit_says_how_it_is_bounded_before_the_first_section() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
+    // The gating digest is line one; the first *section* is the first
+    // `## [severity]` header, and the note has to come before that.
     let first_section = text
         .lines()
-        .position(|l| l.starts_with("##"))
+        .position(|l| l.starts_with("## ["))
         .unwrap_or(usize::MAX);
     let budget_note = text
         .lines()
@@ -10672,6 +10797,10 @@ fn audit_says_how_it_is_bounded_before_the_first_section() {
     assert!(
         budget_note < first_section,
         "the note must survive `head`:\n{text}"
+    );
+    assert!(
+        text.starts_with("## gating"),
+        "the digest stays line one:\n{text}"
     );
 }
 
@@ -11130,16 +11259,15 @@ fn show_of_a_type_prints_the_type_and_points_at_its_impl_blocks() {
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("pub struct Document {"), "the struct should print:\n{s}");
     assert!(!s.contains("names 4 items"), "listed instead of printing:\n{s}");
-    let e = String::from_utf8_lossy(&out.stderr);
     assert!(
-        e.contains("3 impl block(s) for `Document`") && e.contains("impl Document") && e.contains("--kind impl"),
-        "the impls must be named under the type:\n{e}"
+        s.contains("3 impl block(s) for `Document`") && s.contains("impl Document") && s.contains("--kind impl"),
+        "the impls must be named under the type:\n{s}"
     );
     // A genuine collision still lists.
     let out = ur().args(["--root", FIXTURE, "show", "render"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stderr).contains("names 2 items"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("names 2 items"));
     // And a single item prints no `(1 item(s) from 1 name(s))` trailer.
-    let e = ur_stderr(&["--root", FIXTURE, "show", "Document::new"]);
+    let e = ur_all(&["--root", FIXTURE, "show", "Document::new"]);
     assert!(!e.contains("item(s) from"), "needless trailer:\n{e}");
 }
 
@@ -11160,15 +11288,14 @@ fn show_announces_a_cut_only_when_it_will_cut_and_sketches_the_tail() {
     let root = dir.to_str().unwrap();
 
     let out = ur().args(["--root", root, "show", "big"]).output().unwrap();
-    let e = String::from_utf8_lossy(&out.stderr);
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(e.contains("printing the first 240"), "no honest pre-announcement:\n{e}");
-    assert!(!e.contains("bounds itself"), "the old wording is back:\n{e}");
+    assert!(s.contains("printing the first 240"), "no honest pre-announcement:\n{s}");
+    assert!(!s.contains("bounds itself"), "the old wording is back:\n{s}");
     assert!(s.contains("(sketch of lines"), "no sketch after the cut:\n{s}");
     assert!(s.contains("// ---- stage 5"), "the sketch should carry the dropped landmarks:\n{s}");
 
     let out = ur().args(["--root", root, "show", "big", "--max-lines", "0"]).output().unwrap();
-    let e = String::from_utf8_lossy(&out.stderr);
+    let e = all_output(&out);
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(!e.contains("line(s) —") && !e.contains("bounds itself"), "warned about a cut that will not happen:\n{e}");
     assert!(!s.contains("(sketch of lines"), "sketched an uncut body:\n{s}");
@@ -11200,10 +11327,9 @@ fn usage_queries_default_to_the_whole_tree() {
     let root = dir.to_str().unwrap();
     let out = ur().args(["--root", root, "callers", "target"]).output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
-    let e = String::from_utf8_lossy(&out.stderr);
     assert!(s.contains("tests/it.rs"), "the test caller must be in the default answer:\n{s}");
-    assert!(e.contains("tests included by default"), "the default should be said once:\n{e}");
+    assert!(s.contains("tests included by default"), "the default should be said once:\n{s}");
     // A check keeps the production default.
     let out = ur().args(["--root", root, "dead-code"]).output().unwrap();
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("by default"));
+    assert!(!all_output(&out).contains("by default"));
 }
