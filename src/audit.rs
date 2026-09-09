@@ -547,7 +547,7 @@ pub fn run_silent_battery(
             stringly::run(ctx, false, false, None)
         }),
         ("metrics", &|| {
-            metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true, crate::context::GroupBy::Fn)
+            metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true, crate::context::GroupBy::Fn, None)
         }),
         ("pass-through", &|| pass_through::run(ctx, 1)),
     ];
@@ -596,6 +596,7 @@ pub fn run(
         full,
         suggest_inline,
         sel,
+        gate_deferred,
     } = *opts;
     // Clean sections are dropped unless `--full` asked for them: on a healthy
     // tree they were two thirds of the report.
@@ -1030,7 +1031,7 @@ pub fn run(
         "metrics",
         Gate::Advisory,
         Some(DEFAULT_METRICS_TOP),
-        &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true, crate::context::GroupBy::Fn)?)),
+        &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true, crate::context::GroupBy::Fn, None)?)),
     )?;
     section(
         &format!(
@@ -1047,6 +1048,9 @@ pub fn run(
                 Some(PARAMS_THRESHOLD),
                 true,
                 crate::context::GroupBy::Fn,
+                // The battery has its own `--since`, which compares whole
+                // findings sets rather than one ranking's numbers.
+                None,
             )?))
         },
     )?;
@@ -1065,7 +1069,7 @@ pub fn run(
     ctx.out.set_mark_gating(false);
     let gating_rows = ctx.out.gating_rows();
     if held {
-        print_gating_digest(ctx, &gating_rows);
+        print_gating_digest(ctx, &gating_rows, gate_deferred);
         for l in ctx.out.take_buffered() {
             ctx.out.print_now(&l);
         }
@@ -1318,21 +1322,58 @@ pub fn run(
 /// column shapes, so the check is what makes a row readable out of context —
 /// and carries any `--suggest-waivers` lines the check attached. Under
 /// `--changed-since` a last column says `changed` or `pre-existing`.
-fn print_gating_digest(ctx: &AnalysisCtx, rows: &[crate::emit::GatingRow]) {
+///
+/// **The header carries the verdict, the changed/pre-existing split, and the
+/// `$?` caveat, because it is the one line a truncating reader is certain to
+/// get.** All three were already in the report and all three were already being
+/// missed. One session opened with
+/// `unruster audit 2>&1 | head -3; echo "EXIT=$?"` and read `EXIT=0` off a run
+/// whose own line 1 said three rows held the exit code open — `$?` was `head`'s.
+/// The same session then wrote `| grep -cE '\tchanged$'` eight times to count
+/// the changed-line rows the closing line already counts in words, and paid for
+/// a second full battery in one call to list what the first had counted. A
+/// number that costs a minute to compute and sits behind a pipe the reader has
+/// already installed is a number nobody reads.
+fn print_gating_digest(ctx: &AnalysisCtx, rows: &[crate::emit::GatingRow], deferred: bool) {
+    // The verdict in the header. Under `--fail-on-new` the exit code belongs to
+    // the comparison that runs after this battery, so the digest says who
+    // decides rather than guessing — a wrong verdict on line 1 is worse than
+    // none.
+    let verdict = |gating: bool| -> String {
+        match (deferred, gating) {
+            (true, _) => "; the exit code is `--fail-on-new`'s, from the comparison below".into(),
+            (false, true) => {
+                "; exit 1 — but after a pipe `$?` is the pipe's status, not this run's".into()
+            }
+            (false, false) => "; exit 0".into(),
+        }
+    };
     if rows.is_empty() {
-        ctx.out.print_now("## gating — no rows hold the exit code open");
+        ctx.out.print_now(&format!(
+            "## gating — no rows hold the exit code open{}",
+            verdict(false)
+        ));
         ctx.out.print_now("");
         return;
     }
+    // The split the closing line reports in words, on line 1 as well: this is
+    // the "did *I* break it" number, and it is why the run was scoped at all.
+    let changed = rows.iter().filter(|g| g.change == "changed").count();
+    let pre = rows.iter().filter(|g| g.change == "pre-existing").count();
     ctx.out.print_now(&format!(
-        "## gating — {} row(s) hold the exit code open; each is marked `!` in its section \
-         below{}",
+        "## gating — {} row(s) hold the exit code open{}{}; each is marked `!` in its \
+         section below",
         rows.len(),
         if ctx.changed.is_some() {
-            "; last column: changed lines vs pre-existing in a changed file"
+            format!(
+                ", {} in changed lines and {} pre-existing in a changed file (last column \
+                 says which)",
+                changed, pre
+            )
         } else {
-            ""
-        }
+            String::new()
+        },
+        verdict(true)
     ));
     // The waiver lines triple a digest's height. On the handful of rows a
     // tuned tree gates on that is the point; on a tree gating on ninety, the
@@ -1406,6 +1447,9 @@ pub struct Opts<'a> {
     /// as under the gating digest.
     pub suggest_inline: bool,
     pub sel: &'a Selection,
+    /// `--fail-on-new`: the exit code is the *comparison's*, decided after this
+    /// battery returns, so the gating digest must not claim one.
+    pub gate_deferred: bool,
 }
 
 /// Advisory rows a section lists by default. The rest is one `--top 0` away

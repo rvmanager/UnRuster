@@ -1313,6 +1313,22 @@ struct MetricsArgs {
     /// effect on the other two.
     #[arg(long, value_enum, default_value = "fn")]
     by: context::GroupBy,
+
+    /// Compare against the tree as it was at this git ref (`HEAD`, `HEAD~1`,
+    /// `main`): each row gains a trailing `was:N` cell with the same metric's
+    /// value there, and the summary counts how many got worse, better or
+    /// stayed. The ref is materialized with `git archive` and scanned in a
+    /// temp dir, so nothing is written and a dirty working tree is fine.
+    ///
+    /// With `--threshold`, a fn that was above the bar is kept whatever it
+    /// reads now — otherwise the fn you just cut from 60 to 19 is exactly the
+    /// row the threshold hides, and "did it improve" answers with an empty
+    /// table.
+    ///
+    /// Matching is by qualified path, so a fn that moves within its module
+    /// still lines up; a rename reads as one `gone` and one `was:new`.
+    #[arg(long, value_name = "GIT_REF", conflicts_with = "by")]
+    since: Option<String>,
 }
 
 #[derive(Args)]
@@ -2074,6 +2090,10 @@ fn dispatch(
                     full: a.full,
                     suggest_inline: ctx.suggest_waivers_named,
                     sel: &sel,
+                    // The digest prints before the comparison runs, so it can
+                    // only name the exit code when nothing downstream replaces
+                    // it. `--fail-on-new` does.
+                    gate_deferred: a.fail_on_new,
                 },
             )?;
             let current = ctx.out.take_recording();
@@ -2251,7 +2271,14 @@ fn dispatch(
             Some(ty) => takes_mut::run(ctx, ty),
             None => takes_mut::run_candidates(ctx),
         },
-        Cmd::Metrics(a) => metrics::run(ctx, a.sort, a.threshold, false, a.by),
+        Cmd::Metrics(a) => {
+            let base = a
+                .since
+                .as_deref()
+                .map(|r| metrics_at_ref(r, root, scope, cfg, exclude, a.sort))
+                .transpose()?;
+            metrics::run(ctx, a.sort, a.threshold, false, a.by, base.as_ref())
+        }
         Cmd::DeadCode(a) => {
             // Build the call-set from the FULL tree so production items called
             // only from tests aren't false-flagged as dead.
@@ -2401,6 +2428,25 @@ fn dispatch(
             )
         }
     }
+}
+
+/// Rank every fn over `root` as it existed at `git_ref` — `metrics --since`'s
+/// baseline.
+///
+/// `battery_at_ref`'s snapshot, without the battery: this needs one walk and no
+/// name index, no semantic pass and no corpus, because a metric is a property
+/// of a fn body and of nothing else.
+fn metrics_at_ref(
+    git_ref: &str,
+    root: &std::path::Path,
+    scope: Scope,
+    cfg: &[String],
+    exclude: &[String],
+    sort: metrics::SortKey,
+) -> Result<metrics::Baseline> {
+    let snap = baseline::snapshot(git_ref, root)?;
+    let files = parse::parse_dir(&snap.scan_root, scope, cfg, exclude)?;
+    Ok(metrics::baseline_of(&files, sort, git_ref))
 }
 
 /// Run the gating battery over `root` as it existed at `git_ref`, and return

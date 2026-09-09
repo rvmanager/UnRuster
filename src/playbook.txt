@@ -91,9 +91,13 @@ the first two had thrown away. Bound it instead:
 
   unruster audit --changed-since HEAD
 
-The report opens with `## gating` — every row that holds the exit code
-open, each prefixed with its check and carrying its waiver line — and the
-sections below mark those same rows with a leading `!`. Clean sections are
+The report opens with `## gating`, and that first line is the whole
+verdict: how many rows hold the exit code open, what the exit code is,
+and — under `--changed-since` — how many of those rows are in lines you
+changed against how many predate the edit. Read it with `head -1` rather
+than counting rows with `grep -c`; the rows below it are prefixed with
+their check and carry their waiver lines, and the sections below mark
+those same rows with a leading `!`. Clean sections are
 dropped and advisory rows are capped at five per section (`--full` for
 everything, `--top 0` to lift the caps); every cut announces itself on
 stdout, naming the command that gives that section's tail — with the
@@ -894,11 +898,22 @@ dispatch, oversized functions that should split.
   unruster metrics --sort nesting --top 20        # by max nesting depth
   unruster metrics --sort cyclo --threshold 15    # above-threshold
   unruster metrics --sort nesting --threshold 4   # deeply-indented
+  unruster metrics --sort cyclo --threshold 15 --since HEAD
+                                                  # ...and did the split work?
   unruster callees <Type>::<fn>                   # helper-call clustering
   Signals: high LOC + low cyclo → extract named sections, not split;
   high cyclo (≥15) → split decision logic into focused helpers, or
   trait-dispatch (theme 3); high nesting (≥4) → flatten with early
   returns / guard clauses; all three high → genuine god fn, split first.
+
+  `--since <ref>` is how you check the split landed: each row gains a
+  trailing `was:N`, and the summary counts worse / better / unchanged /
+  new / gone. Do not build the baseline by hand — one session spent
+  seven `git archive`/`git show`-into-a-scratch-dir rounds on this, three
+  of them just getting the first one to run. With `--threshold`, a fn
+  that *was* above the bar stays on the page whatever it reads now:
+  otherwise the fn you just cut from 60 to 19 is the one row the
+  threshold hides, and "did it improve" answers with an empty table.
 
 ──── 4. CORRECTNESS & SAFETY ────────────────────────────────────────
 Runtime risks hidden in the code: silent error-swallowing, silent data

@@ -11227,6 +11227,163 @@ fn audit_default_is_short_and_full_is_the_long_form() {
     assert_eq!(n, marked, "every gating row survives the default caps:\n{lean}");
 }
 
+/// The digest's first line carries the verdict, the changed split, and the
+/// `$?` caveat — because line 1 is what a truncating reader gets.
+///
+/// From a session that opened with `unruster audit 2>&1 | head -3; echo
+/// "EXIT=$?"` and read `EXIT=0` off a run whose own line 1 said three rows held
+/// the exit code open. The same session then wrote eight `grep -c` counts of a
+/// number the closing line already reports, and ran a second full battery in
+/// one call to list what the first had counted.
+#[test]
+fn the_gating_digest_states_the_verdict_on_its_first_line() {
+    let dir = scratch("digest-verdict");
+    let kept = "pub fn kept() -> u8 { 1 }\n";
+    std::fs::write(dir.join("src/lib.rs"), kept).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    // One gating row that predates the edit...
+    std::fs::write(dir.join("src/lib.rs"), format!("pub fn old_dead() -> u8 {{ 2 }}\n{kept}")).unwrap();
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "two"]);
+    // ...and one the edit introduces.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        format!("pub fn old_dead() -> u8 {{ 2 }}\npub fn new_dead() -> u8 {{ 3 }}\n{kept}"),
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let line1 = |args: &[&str]| -> String {
+        let out = ur().args(args).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or_default().to_string()
+    };
+
+    // Plain: the verdict, and the caveat that makes `EXIT=$?` after a pipe a lie.
+    let plain = line1(&["--root", root, "audit"]);
+    assert!(plain.starts_with("## gating —"), "{plain}");
+    assert!(plain.contains("exit 1"), "line 1 must name the exit code:\n{plain}");
+    assert!(
+        plain.contains("after a pipe `$?` is the pipe's"),
+        "line 1 must warn that a pipe replaces the status:\n{plain}"
+    );
+
+    // Scoped: the changed/pre-existing split, which a `grep -c` was reinventing.
+    let scoped = line1(&["--root", root, "--changed-since", "HEAD", "audit"]);
+    assert!(
+        // Three dead fns: `new_dead` sits in a changed line, `old_dead` and
+        // `kept` predate the edit in the same changed file.
+        scoped.contains("1 in changed lines and 2 pre-existing in a changed file"),
+        "line 1 must carry the split:\n{scoped}"
+    );
+
+    // A clean tree says so on line 1 too, so `head -1` is a whole verdict either way.
+    let clean = ur().args(["--root", FIXTURE, "audit"]).output().unwrap();
+    let clean1 = String::from_utf8_lossy(&clean.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if clean1.contains("no rows hold") {
+        assert!(clean1.contains("exit 0"), "{clean1}");
+    }
+
+    // `--fail-on-new` decides the code after the digest prints, so the digest
+    // must not claim one — a wrong verdict on line 1 is worse than none.
+    let deferred = line1(&["--root", root, "--changed-since", "HEAD", "audit", "--fail-on-new"]);
+    assert!(
+        deferred.contains("--fail-on-new") && !deferred.contains("exit 1"),
+        "under --fail-on-new the digest must defer, not guess:\n{deferred}"
+    );
+}
+
+/// `metrics --since <ref>` answers "is it worse than it was" in one run.
+///
+/// The question a ranked metric is read for, and the one the tool had no answer
+/// to: one session built the baseline by hand seven times with `git archive` /
+/// `git show` into a scratch directory. The threshold case is the point — a fn
+/// cut from above the bar to below it must stay on the page, or "did it
+/// improve" comes back as an empty table, which reads the same as "it never
+/// tripped the threshold at all".
+#[test]
+fn metrics_since_carries_the_previous_value_and_keeps_the_fn_that_improved() {
+    let dir = scratch("metrics-since");
+    let branchy = |n: usize| {
+        let mut b = String::from("pub fn hot(x: u8) -> u8 {\n    let mut t = 0;\n");
+        for i in 0..n {
+            b.push_str(&format!("    if x == {i} {{ t += {i}; }}\n"));
+        }
+        b.push_str("    t\n}\n");
+        b
+    };
+    let steady = "pub fn steady(x: u8) -> u8 { if x > 1 { 1 } else { 0 } }\n";
+    std::fs::write(dir.join("src/lib.rs"), format!("mod other;\n{}{steady}", branchy(24))).unwrap();
+    // A second file the edit never touches, so `--changed-since` has something
+    // to hold out of frame.
+    std::fs::write(dir.join("src/other.rs"), branchy(30).replace("hot", "cold")).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    // Cut it to well under the threshold — the improvement under test.
+    std::fs::write(dir.join("src/lib.rs"), format!("mod other;\n{}{steady}", branchy(2))).unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur()
+        .args(["--root", root, "metrics", "--since", "HEAD", "--sort", "cyclo", "--threshold", "20"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{:?}", String::from_utf8_lossy(&out.stderr));
+    let rows = rows_of(&out.stdout);
+    let hot = rows
+        .iter()
+        .find(|l| l.contains("\thot\t"))
+        .unwrap_or_else(|| panic!("the improved fn must stay on the page:\n{rows:?}"));
+    assert!(hot.ends_with("\twas:25"), "the row must carry its previous value:\n{hot}");
+    assert!(hot.contains("cyclo:3\t"), "and its current one:\n{hot}");
+    // `steady` trips the threshold at neither end, so the flag does not turn
+    // the ranking into a whole-tree dump.
+    assert!(!rows.iter().any(|l| l.contains("\tsteady\t")), "{rows:?}");
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        // `hot` improved; `cold`, in the file the edit never touched, is
+        // unchanged and still over the bar.
+        err.contains("vs HEAD: 0 worse, 1 better, 1 unchanged, 0 new, 0 gone"),
+        "the summary must say which way it moved:\n{err}"
+    );
+
+    // Scoped to the edit: the baseline is a whole tree while the rows are
+    // filtered to the changed files, so the `gone` set has to be filtered the
+    // same way. It counted every fn in every untouched file as gone.
+    let scoped = ur_stderr(&[
+        "--root", root, "--changed-since", "HEAD", "metrics", "--since", "HEAD", "--sort",
+        "cyclo", "--threshold", "20",
+    ]);
+    assert!(
+        scoped.contains("0 gone"),
+        "a baseline fn in an unchanged file is out of frame, not gone:\n{scoped}"
+    );
+
+    // Without the flag, the same query keeps exactly the shape it always had.
+    let plain = ur_stdout(&["--root", root, "metrics", "--sort", "cyclo", "--threshold", "20"]);
+    let plain_rows = rows_of(&plain);
+    assert!(
+        !plain_rows.iter().any(|l| l.contains("\thot\t")),
+        "no baseline, no reason to keep a row under the bar:\n{plain_rows:?}"
+    );
+    assert!(
+        plain_rows.iter().all(|l| !l.contains("was:")),
+        "the `was` cell appears only under --since:\n{plain_rows:?}"
+    );
+}
+
 /// A waiver for a check `--only` did not run has not "suppressed nothing".
 #[test]
 fn audit_only_does_not_accuse_waivers_for_checks_it_did_not_run() {

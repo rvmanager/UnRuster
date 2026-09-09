@@ -277,14 +277,93 @@ impl SortKey {
     }
 }
 
-/// Drop fns whose sort metric is below the threshold.
-fn apply_threshold(fns: &mut Vec<FnMetric>, sort: SortKey, t: usize) {
-    match sort {
-        SortKey::Loc => fns.retain(|m| m.loc >= t),
-        SortKey::Params => fns.retain(|m| m.params >= t),
-        SortKey::Cyclo => fns.retain(|m| m.cyclo >= t),
-        SortKey::Nesting => fns.retain(|m| m.nesting >= t),
+impl FnMetric {
+    /// This fn's value for the metric being ranked.
+    fn key(&self, sort: SortKey) -> usize {
+        match sort {
+            SortKey::Loc => self.loc,
+            SortKey::Params => self.params,
+            SortKey::Cyclo => self.cyclo,
+            SortKey::Nesting => self.nesting,
+        }
     }
+}
+
+/// The same ranking taken over the tree as it was at a git ref — what
+/// `--since` compares against.
+///
+/// **Why the command needs one.** The question a ranked metric is read for is
+/// almost never "how complex is this fn"; it is "is it worse than it was", and
+/// the tool had no answer. One session asked it seven times and built the
+/// baseline by hand every time: `git archive HEAD | tar -x` into a scratch
+/// directory, then `unruster -r <scratch> metrics` — three tries to get the
+/// first one working (a `git archive` from the wrong directory, then a denied
+/// `rm -rf`), settling on `git show HEAD:<file> > base.rs` and a per-file run
+/// that can only see one file's fns. `audit --since` already materialises a ref
+/// this way; this is the same mechanism where the ranking lives.
+///
+/// Keyed by qualified path, so a fn that moves within its module still matches.
+/// A rename reads as one `gone` and one `new`, which is the honest answer — the
+/// tool cannot know they are the same fn.
+pub struct Baseline {
+    /// The ref as the caller spelled it, for the summary line.
+    pub git_ref: String,
+    /// Qualified path → that fn's value for the ranked metric at the ref, and
+    /// the file it lived in.
+    ///
+    /// The file is carried for `--changed-since`: the baseline is a whole tree
+    /// while the current rows are filtered to the changed files, so without it
+    /// every fn in an untouched file counts as `gone`. It read `42 gone` on a
+    /// two-file edit.
+    pub by_qpath: std::collections::HashMap<String, (usize, String)>,
+}
+
+/// Collect the ranked metric for every fn in an already-parsed tree.
+///
+/// Takes the parse rather than a root: the caller has already materialised the
+/// snapshot and parsed it, and re-walking from a path here would be a second
+/// parse of the same files.
+pub fn baseline_of(
+    files: &[crate::parse::ParsedFile],
+    sort: SortKey,
+    git_ref: &str,
+) -> Baseline {
+    let mut fns: Vec<FnMetric> = Vec::new();
+    let mut structs: Vec<StructMetric> = Vec::new();
+    let mut enums: Vec<EnumMetric> = Vec::new();
+    for f in files {
+        let mut v = MetricsVisitor {
+            file: &display_path(&f.path),
+            scope: ScopeTracker::new(f.module.as_str()),
+            fns: &mut fns,
+            structs: &mut structs,
+            enums: &mut enums,
+        };
+        v.visit_file(&f.ast);
+    }
+    Baseline {
+        git_ref: git_ref.to_string(),
+        by_qpath: fns
+            .into_iter()
+            .map(|m| (m.qpath.clone(), (m.key(sort), m.file.clone())))
+            .collect(),
+    }
+}
+
+/// Drop fns whose sort metric is below the threshold.
+///
+/// With a `--since` baseline, a fn that *was* above it is kept whatever it
+/// reads now. Otherwise the one row a reader ran the command to see — the fn
+/// they just cut from 60 to 19 — is the row the threshold hides, and "did it
+/// improve" comes back as an empty table, which is the same output as "it never
+/// tripped the threshold at all".
+fn apply_threshold(fns: &mut Vec<FnMetric>, sort: SortKey, t: usize, base: Option<&Baseline>) {
+    fns.retain(|m| {
+        m.key(sort) >= t
+            || base
+                .and_then(|b| b.by_qpath.get(&m.qpath))
+                .is_some_and(|(was, _)| *was >= t)
+    });
 }
 
 /// Sort the fn table by the key, descending, with stable tie-breakers.
@@ -443,6 +522,7 @@ pub fn run(
     threshold: Option<usize>,
     fns_only: bool,
     by: crate::context::GroupBy,
+    base: Option<&Baseline>,
 ) -> anyhow::Result<usize> {
     if by != crate::context::GroupBy::Fn {
         return run_bulk(ctx, by == crate::context::GroupBy::Module, threshold);
@@ -468,7 +548,7 @@ pub fn run(
     ctx.retain_changed(&mut enums, |m| &m.file);
 
     if let Some(t) = threshold {
-        apply_threshold(&mut fns, sort, t);
+        apply_threshold(&mut fns, sort, t, base);
     }
     // After the threshold, so a waiver over a fn that no longer trips it is
     // not credited with a hit. Keyed by the fn's short name, so
@@ -483,16 +563,25 @@ pub fn run(
 
     if !summary {
         for m in fns.iter() {
-            row!(
-                ctx.out,
-                "kind" => "fn",
-                "loc" => format!("loc:{}", m.loc),
-                "params" => format!("params:{}", m.params),
-                "cyclo" => format!("cyclo:{}", m.cyclo),
-                "nesting" => format!("nesting:{}", m.nesting),
-                "qpath" => m.qpath.clone(),
-                "at" => ctx.at(&m.file, m.line, m.end),
-            );
+            // Under `--since` one extra trailing cell, never a reshuffle: the
+            // five leading cells stay where every existing reader expects them.
+            let was = base.map(|b| match b.by_qpath.get(&m.qpath) {
+                Some((w, _)) => format!("was:{}", w),
+                None => "was:new".to_string(),
+            });
+            let mut cells = vec![
+                ("kind", crate::emit::Val::from("fn")),
+                ("loc", crate::emit::Val::from(format!("loc:{}", m.loc))),
+                ("params", crate::emit::Val::from(format!("params:{}", m.params))),
+                ("cyclo", crate::emit::Val::from(format!("cyclo:{}", m.cyclo))),
+                ("nesting", crate::emit::Val::from(format!("nesting:{}", m.nesting))),
+                ("qpath", crate::emit::Val::from(m.qpath.clone())),
+                ("at", ctx.at(&m.file, m.line, m.end)),
+            ];
+            if let Some(w) = was {
+                cells.push(("was", crate::emit::Val::from(w)));
+            }
+            ctx.out.row(cells);
         }
         for m in structs.iter().take(if fns_only { 0 } else { usize::MAX }) {
             row!(
@@ -526,8 +615,64 @@ pub fn run(
             fns.len()
         ));
     }
+    // The comparison, in words. `--since` is asked to answer "did the row I
+    // just worked on improve"; a reader should not have to diff two columns by
+    // eye to find out, and a `| grep` that keeps the rows drops the summary.
+    let since_note = base.map(|b| {
+        let (mut worse, mut better, mut same, mut fresh) = (0, 0, 0, 0);
+        for m in fns.iter() {
+            match b.by_qpath.get(&m.qpath) {
+                None => fresh += 1,
+                Some((w, _)) => match m.key(sort).cmp(w) {
+                    std::cmp::Ordering::Greater => worse += 1,
+                    std::cmp::Ordering::Less => better += 1,
+                    std::cmp::Ordering::Equal => same += 1,
+                },
+            }
+        }
+        // Fns that were in the ranking at the ref and are not in it now. A
+        // deletion and a rename both land here, and so does a fn that fell
+        // below a threshold it no longer needs to pass — but that last one is
+        // kept as a row by `apply_threshold`, so what is left really is gone.
+        let here: std::collections::HashSet<&str> =
+            fns.iter().map(|m| m.qpath.as_str()).collect();
+        let gone: Vec<&str> = b
+            .by_qpath
+            .iter()
+            .filter(|(q, _)| !here.contains(q.as_str()))
+            // Same scope as the rows it is compared against: under
+            // `--changed-since` the current side sees only the changed files,
+            // so a baseline fn in an untouched file is not gone, it is out of
+            // frame.
+            .filter(|(_, (_, file))| ctx.in_scope(file))
+            .filter(|(_, (was, _))| threshold.is_none_or(|t| *was >= t))
+            .map(|(q, _)| q.as_str())
+            .collect();
+        (
+            format!(
+                "; vs {}: {} worse, {} better, {} unchanged, {} new, {} gone",
+                b.git_ref,
+                worse,
+                better,
+                same,
+                fresh,
+                gone.len()
+            ),
+            gone.len(),
+        )
+    });
+    if let Some((_, n)) = &since_note {
+        if *n > 0 {
+            ctx.out.note(&format!(
+                "(note: {} fn(s) were in this ranking at the ref and are not now — renamed, \
+                 moved to another module, or deleted; a rename reads as one `gone` and one \
+                 `was:new`)",
+                n
+            ));
+        }
+    }
     ctx.out.summary(&format!(
-        "({} fns, {} structs, {} enums; sort={}{}{})",
+        "({} fns, {} structs, {} enums; sort={}{}{}{})",
         fns.len(),
         structs.len(),
         enums.len(),
@@ -541,7 +686,8 @@ pub fn run(
             format!("; {} waived", waived)
         } else {
             String::new()
-        }
+        },
+        since_note.map(|(t, _)| t).unwrap_or_default()
     ));
     // With --threshold the fn table is the findings set; otherwise everything shown counts.
     Ok(if threshold.is_some() || fns_only {
