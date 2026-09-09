@@ -146,13 +146,26 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
                 ("vis", Val::from(d.vis)),
                 ("loc", Val::from(d.end.saturating_sub(d.line) + 1)),
                 ("name", Val::from(name)),
-                // Through `ctx.at`, like every other item-listing command:
-                // `file:line` by default, `file:start-end` under `--spans`.
-                // This alone rendered an unconditional range, so `--spans` was
-                // a no-op here and the same item read two ways depending only
-                // on which command you asked. The extent is still in the row —
-                // `loc` carries it as a number.
-                ("at", ctx.at(&d.file, d.line, d.end)),
+                // Always the span, never the bare declaration line — `at`'s
+                // rule (`--spans` must not be the difference between an answer
+                // and half of one), and this command has the stronger claim to
+                // it: an outline is a table of contents *to read from*, and
+                // "where does this item end" is the question it is opened to
+                // answer. It went through `ctx.at` for a while, for consistency
+                // with the other item listings, and the consistency was bought
+                // at the reader's expense: with only start lines on the page
+                // the follow-up read is a `sed` over the gap to the *next*
+                // item's start, which overshoots by every doc comment and blank
+                // line between them. Measured on one session that outlined four
+                // files and then read them: four ranges, over by 37, 66, 24 and
+                // 5 lines, one of them 247 lines covering four separate items.
+                // `loc` carrying the extent as a number did not help — nobody
+                // does the arithmetic.
+                //
+                // `--spans` stays accepted and is a no-op here. `inventory`
+                // still honours it: a whole-tree census is scanned, not read
+                // from, and there the flag is the reader asking to widen it.
+                ("at", crate::emit::span_site(&d.file, d.line, d.end.max(d.line))),
             ];
             if opts.docs {
                 cells.push(("doc", Val::from(d.doc.clone().unwrap_or_else(|| "—".into()))));

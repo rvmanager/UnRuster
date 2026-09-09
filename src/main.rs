@@ -130,6 +130,10 @@ struct Cli {
 
     /// Render each row's enclosing-fn label as `name@start-end` source lines,
     /// so the relevant body can be read directly (`sed -n 'start,endp'`).
+    ///
+    /// `outline` and `at` print spans with or without it: those two are read
+    /// *from* rather than scanned, and an entry without its end line sends the
+    /// reader back to guessing the range.
     #[arg(long, global = true)]
     spans: bool,
 
@@ -315,8 +319,10 @@ enum Cmd {
     /// three separate calls parse it three times.
     /// Prints from the doc comment through the closing brace — no `+N` line
     /// budget to guess, no `^fn` anchor to miss an indented method. `--part
-    /// sig` for the signature alone, `--part span` for just `file:start-end`.
-    /// A name that doesn't resolve answers with the near names, not silence.
+    /// sig` drops the body, `--hide-doc` drops the doc comment, `--part sig
+    /// --hide-doc` is the signature alone, and `--part span` is just
+    /// `file:start-end`. A name that doesn't resolve answers with the near
+    /// names, not silence.
     Show(ShowArgs),
     /// AST table of contents for one file: every item with `file:start-end`,
     /// indented by scope. `outline src/trace.rs`. Complete where a
@@ -801,12 +807,22 @@ struct AuditArgs {
     #[arg(long, conflicts_with = "findings_only")]
     full: bool,
 
+    /// Print the battery: every check's name and the standalone command that
+    /// reproduces its section, with the arguments `audit` runs it under. Runs
+    /// no check and reads no code.
+    ///
+    /// The names are what `--only` / `--skip` take and what `--json` carries as
+    /// `"check"`. This exists because the alternative — a list written out in
+    /// this help text — had drifted: it named fifteen of the twenty-one checks,
+    /// and the six it omitted (`near-clones`, `concepts`, `vocabulary`,
+    /// `doc-drift`, `validation-drift`, `metrics-params`) were accepted by
+    /// `--only` all along.
+    #[arg(long)]
+    list_checks: bool,
+
     /// Run only these checks (repeatable, or comma-separated). Names are the
-    /// ones in each section's `"check"` field: `divergence`,
-    /// `divergence-handling`, `enum-coverage`, `dead-code`,
-    /// `conversion-pairs`, `error-swallows`, `panics`, `clones`,
-    /// `config-drift`, `builder-drift`, `arith-drift`, `casts`, `stringly`,
-    /// `metrics`, `pass-through`.
+    /// ones in each section's `"check"` field — `--list-checks` prints all of
+    /// them, with the command each section is running.
     #[arg(long, value_name = "CHECK", value_delimiter = ',')]
     only: Vec<String>,
 
@@ -2528,6 +2544,31 @@ fn open_cache(no_cache: bool, root: &std::path::Path) -> Option<cache::Cache> {
     cache::Cache::open(root)
 }
 
+/// `audit --list-checks`: the battery, one row per section.
+///
+/// Two questions in one listing, both of which used to be answered by reading
+/// source. Which names `--only` and `--skip` take — the help text's own list
+/// had drifted six names short of [`audit::CHECKS`]. And what each section is
+/// actually running, which is the same string the cap note offers as "for the
+/// rest": a reader who wants one section's full output should not have to
+/// reconstruct the thresholds `audit` chose for it.
+fn run_list_checks(out: &emit::Out) -> Result<()> {
+    for check in audit::CHECKS {
+        row!(
+            out,
+            "check" => *check,
+            "command" => format!("unruster {}", audit::rerun_cmd(check)),
+        );
+    }
+    out.summary(&format!(
+        "({} check(s); `--only` / `--skip` take these names, and each command \
+         reproduces that section on its own)",
+        audit::CHECKS.len()
+    ));
+    out.finish("audit");
+    Ok(())
+}
+
 fn run_cache(out: &emit::Out, root: &std::path::Path, a: &CacheArgs) -> Result<()> {
     let Some(c) = cache::Cache::open(root) else {
         out.note("note: no cache directory (set $UNRUSTER_CACHE_DIR or $HOME)");
@@ -2784,6 +2825,14 @@ fn main() -> Result<()> {
     if let Cmd::Gate(a) = &cli.cmd {
         let cache = open_cache(cli.no_cache, &cli.root);
         return run_gate(&out, &cli.root, &cli.exclude, cache.as_ref(), a, cli.summary);
+    }
+    // Same placement, same reason: the battery's shape is a compile-time fact,
+    // so answering "what does audit run, and how do I re-run one section of it"
+    // must not cost a tree scan.
+    if let Cmd::Audit(a) = &cli.cmd {
+        if a.list_checks {
+            return run_list_checks(&out);
+        }
     }
     let scope_was_named = !matches!(
         matches.value_source("scope"),

@@ -305,6 +305,17 @@ pub struct Out {
     /// single-command run sets it once. Part of every fingerprint, so two
     /// checks reporting the same line stay distinguishable.
     current_check: RefCell<String>,
+    /// The standalone command that reproduces the current section, when the
+    /// check's name alone does not spell it.
+    ///
+    /// `cap_note` used to build "for the rest, run …" out of `current_check`,
+    /// which is a *fingerprint identity*, not a command line. Two ways that
+    /// lied: `audit`'s params ranking is registered as `metrics-params`, which
+    /// is not a subcommand at all, and every section that runs its check with
+    /// a non-default threshold (`divergence` at 0.45, `metrics` at
+    /// `--sort cyclo`) named a command that answers a different question. A
+    /// hint a reader pastes has to be the command, so the section states it.
+    current_rerun: RefCell<Option<String>>,
     /// Every row emitted this run, for `--since` / `--baseline` comparison.
     /// `None` unless someone asked.
     recorded: RefCell<Option<Vec<Finding>>>,
@@ -392,6 +403,7 @@ impl Out {
             last_row_emitted: Cell::new(false),
             said: RefCell::new(std::collections::HashSet::new()),
             current_check: RefCell::new(String::new()),
+            current_rerun: RefCell::new(None),
             recorded: RefCell::new(None),
             line_cache: RefCell::new(std::collections::HashMap::new()),
             pending_section: RefCell::new(None),
@@ -425,6 +437,7 @@ impl Out {
             last_row_emitted: Cell::new(false),
             said: RefCell::new(std::collections::HashSet::new()),
             current_check: RefCell::new(String::new()),
+            current_rerun: RefCell::new(None),
             recorded: RefCell::new(None),
             line_cache: RefCell::new(std::collections::HashMap::new()),
             pending_section: RefCell::new(None),
@@ -443,6 +456,16 @@ impl Out {
     /// Name the check producing subsequent rows. Returns the previous name.
     pub fn set_check(&self, name: &str) -> String {
         self.current_check.replace(name.to_string())
+    }
+
+    /// State the command that reproduces the rows about to be emitted — the
+    /// arguments included, not just the subcommand. Returns the previous one.
+    ///
+    /// `None` means "`unruster <check>` is exact", which is true of a
+    /// single-command run and of every `audit` section that runs its check on
+    /// the defaults. See [`Out::current_rerun`].
+    pub fn set_rerun(&self, cmd: Option<String>) -> Option<String> {
+        self.current_rerun.replace(cmd)
     }
 
     /// Start recording every row's fingerprint for a cross-run comparison.
@@ -616,7 +639,13 @@ impl Out {
             return None;
         }
         let kept = self.kept_over_budget.get();
-        let check = self.current_check.borrow().clone();
+        // The section's own command when it stated one, else the check name:
+        // see [`Out::current_rerun`] for why the name alone is not a command.
+        let check = self
+            .current_rerun
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.current_check.borrow().clone());
         Some(format!(
             "(note: showing {} of {} row(s){} — {} for the rest)",
             self.emitted.get(),

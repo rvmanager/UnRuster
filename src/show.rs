@@ -33,6 +33,10 @@ pub enum Part {
     /// Docs and the signature, no body. For "what does this take and return"
     /// without paying for a 200-line body. Only a fn has a body to drop, so on
     /// a struct/enum/const this is the whole declaration — see [`sig_shape`].
+    ///
+    /// The docs stay because they are usually the answer; where they are the
+    /// bulk instead, `--hide-doc` drops them and `--part sig --hide-doc` is the
+    /// signature line by itself.
     Sig,
     /// The doc comment alone.
     Doc,

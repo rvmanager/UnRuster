@@ -96,7 +96,10 @@ open, each prefixed with its check and carrying its waiver line — and the
 sections below mark those same rows with a leading `!`. Clean sections are
 dropped and advisory rows are capped at five per section (`--full` for
 everything, `--top 0` to lift the caps); every cut announces itself on
-stdout. The closing line names the checks holding the gate and one site
+stdout, naming the command that gives that section's tail — with the
+arguments `audit` ran the check under, which are rarely the standalone
+defaults. `audit --list-checks` prints all of them, and the names are what
+`--only` and `--skip` take. The closing line names the checks holding the gate and one site
 each, and states the verdict in words — `clean: no gating findings, exit 0`
 or `exit 1 while gating findings remain` — so `| tail -2` is a complete
 answer to both *what* and *whether*. Do not run the battery a second time
@@ -200,10 +203,13 @@ you are already grepping.
 WHAT TO RUN INSTEAD
 
   unruster outline <file>       every item in the file, indented by scope,
-                                with a `loc` column giving each item's length —
-                                so the end line is `at + loc - 1` and no `+70`
-                                guess is needed. `--spans` renders `at` as
-                                `file:start-end` directly. `--include-docs` adds
+                                with `at` as `file:start-end` — the end line is
+                                on the row, so no `+70` guess is needed and no
+                                arithmetic either. (It was `file:line` plus a
+                                `loc` column to add for a while. Nobody added:
+                                one session outlined four files and then `sed`ed
+                                the gap to the *next* item's start, overshooting
+                                by 37, 66, 24 and 5 lines.) `--include-docs` adds
                                 each doc comment's first line; `--pub-only`
                                 narrows to the file's external surface;
                                 `--kind fn` filters; `--sort kind` gives the
@@ -270,6 +276,9 @@ WHAT TO RUN INSTEAD
   --spans                       on the commands that list *items* — inventory,
                                 dead-code, metrics, impls — upgrades the `at`
                                 column from `file:line` to `file:start-end`.
+                                `outline` and `at` are already there without it:
+                                those two are read *from*, and half a span sends
+                                the reader back to guessing the range.
                                 Same column count, so existing `awk` still
                                 works; on site-listing commands it instead
                                 appends `@start-end` to the enclosing fn, since

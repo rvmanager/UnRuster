@@ -137,6 +137,96 @@ pub const CHECKS: &[&str] = &[
     "pass-through",
 ];
 
+/// The standalone command that reproduces one section of the battery, without
+/// the leading `unruster`.
+///
+/// **A section's check name is not a command line.** It is a fingerprint
+/// identity, and two of them (`divergence-handling`, `metrics-params`) name no
+/// subcommand at all — `unruster metrics-params --top 0`, printed by the cap
+/// note under the params ranking, answered `unrecognized subcommand`. Worse
+/// than the outright miss were the near-misses: eleven sections run their check
+/// with a threshold the standalone default does not share, so `unruster
+/// metrics --top 0` offered as the tail of *fns with cyclo >= 15* ranks by LOC
+/// with no threshold and disagrees from its third row down.
+///
+/// Every argument here is interpolated from the constant the section itself
+/// passes, so a threshold that moves cannot leave the hint behind. What is
+/// deliberately *not* carried across is the caller's own environment —
+/// `--root`, `--scope`, `--changed-since`, `--exclude`, `--cfg`: those narrow
+/// every section alike and belong to the invocation, not to this one section's
+/// question. `self_check` asserts that each of these parses.
+pub fn rerun_cmd(check: &str) -> String {
+    match check {
+        "divergence" => format!("divergence --min-score {}", DIVERGENCE_MIN_SCORE),
+        "divergence-handling" => format!(
+            "divergence --handling --min-care-gap {}",
+            HANDLING_MIN_CARE_GAP
+        ),
+        // `coverage_opts()`, spelled out: the sweep, its variant floor, the
+        // one-short window, and the trait-routed catch-alls it hides.
+        "enum-coverage" => {
+            let o = coverage_opts();
+            format!(
+                "enum-coverage --all --min-variants {} --max-missing {}{}",
+                o.min_variants,
+                o.max_missing.unwrap_or(0),
+                if o.hide_trait_routed {
+                    " --hide-trait-routed"
+                } else {
+                    ""
+                }
+            )
+        }
+        // `swallow_opts()` / `panic_opts()`: `audit` hides the idiomatic
+        // families the dedicated commands show by default.
+        "error-swallows" => {
+            let o = swallow_opts();
+            let mut c = String::from("error-swallows");
+            if !o.include_infallible {
+                c.push_str(" --hide-infallible");
+            }
+            if !o.include_logged {
+                c.push_str(" --hide-logged");
+            }
+            if o.include_unwrap_or {
+                c.push_str(" --include-unwrap-or");
+            }
+            c
+        }
+        "panics" => {
+            let mut c = String::from("panics");
+            if !panic_opts().include_idiomatic {
+                c.push_str(" --hide-idiomatic");
+            }
+            c
+        }
+        "validation-drift" => format!("validation-drift --min-score {}", VALIDATION_DRIFT_MIN_SCORE),
+        "config-drift" => format!("config-drift --min-score {}", CONFIG_DRIFT_MIN_SCORE),
+        "builder-drift" => format!("builder-drift --min-score {}", BUILDER_DRIFT_MIN_SCORE),
+        "arith-drift" => format!("arith-drift --min-score {}", ARITH_DRIFT_MIN_SCORE),
+        "casts" => format!(
+            "casts --class {}",
+            CAST_CLASSES
+                .iter()
+                // clap's own kebab-casing, so the filter list and the parser
+                // that will read it back cannot spell a class differently.
+                .filter_map(|c| {
+                    <CastClass as clap::ValueEnum>::to_possible_value(c)
+                        .map(|v| v.get_name().to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        "metrics" => format!("metrics --sort cyclo --threshold {}", CYCLO_THRESHOLD),
+        "metrics-params" => format!("metrics --sort params --threshold {}", PARAMS_THRESHOLD),
+        // The rest run their check on its own defaults, so the bare command is
+        // exact. Listed by omission rather than by name: a new section that
+        // forgets to appear here gets the honest bare form, and `self_check`
+        // fails it only if the name is not a subcommand.
+        other => other.to_string(),
+    }
+}
+
 /// The score at which a `Tiered` check's rows start gating.
 ///
 /// The one place the mapping from a section's check name to its own
@@ -604,6 +694,9 @@ pub fn run(
         // — otherwise a clean `metrics` and a clean `dead-code` are the same
         // anonymous object.
         let prev = ctx.out.set_check(check);
+        // What a reader pastes to see the rest of this section — the check's
+        // own arguments included. See [`rerun_cmd`].
+        let prev_rerun = ctx.out.set_rerun(Some(rerun_cmd(check)));
         ctx.out.section(title);
         // The advisory budget: `--top` wins, then `--full` keeps each section's
         // own cap, and the default shrinks every cap to `ADVISORY_TOP`. Gating
@@ -629,6 +722,7 @@ pub fn run(
         // command that gives the rest, and `set_check` below restores `audit`.
         let cap_note = ctx.out.cap_note();
         ctx.out.set_check(&prev);
+        ctx.out.set_rerun(prev_rerun);
         // `--strict` promotes every advisory row, so it wants the total, not
         // the tier: the flag means "nothing at all", not "nothing important".
         let g = if strict {

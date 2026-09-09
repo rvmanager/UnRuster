@@ -1342,6 +1342,28 @@ fn outline_lists_a_files_items_with_end_lines() {
     assert!(s.contains("Token"), "{}", s);
     // Private items too — the `^pub fn` anchor cannot see these.
     assert!(s.contains("inner"), "{}", s);
+    // The end line, on every row and without `--spans`. What this test is
+    // named for went unasserted while the `at` cell was a bare `file:line`,
+    // and both the command's own help ("every item with `file:start-end`")
+    // and its summary line ("`at` is file:decl-end") described the span all
+    // along. A reader with only start lines reconstructs each range from the
+    // next item's start and overshoots by whatever sits between them.
+    for row in rows_of(&out.stdout) {
+        let at = row.split('\t').nth(4).expect("an `at` cell");
+        let (_, span) = at.rsplit_once(':').expect("file:span");
+        let (start, end) = span.split_once('-').unwrap_or_else(|| {
+            panic!("`{at}` carries no end line — outline spans are unconditional")
+        });
+        let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse().unwrap());
+        assert!(end >= start, "{at}: end before start");
+    }
+    // `--spans` is the same request, so it changes nothing here.
+    let spanned = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--spans"]);
+    assert_eq!(
+        rows_of(&out.stdout),
+        rows_of(&spanned),
+        "`--spans` must be a no-op on outline"
+    );
 }
 
 #[test]
@@ -10769,9 +10791,14 @@ fn the_audit_row_cap_never_hides_a_gating_row() {
         text.contains("the cap never hides one"),
         "and the note says the cap did not apply to them:\n{text}"
     );
+    // The pointer names the check, not the battery — and names it as `audit`
+    // runs it: this section hides the infallible and already-logged families,
+    // so the bare command would offer a longer list than the one it is the
+    // tail of. `every_check_listed_by_audit_names_a_command_that_runs` holds
+    // the general property; this pins the one section whose cap is under test.
     assert!(
-        text.contains("`unruster error-swallows --top 0` for the rest"),
-        "the pointer names the check, not the battery:\n{text}"
+        text.contains("`unruster error-swallows --hide-infallible --hide-logged --top 0` for the rest"),
+        "the pointer names the check with the arguments audit ran it under:\n{text}"
     );
 }
 
@@ -11007,6 +11034,53 @@ fn the_test_dir_rule_is_relative_to_the_scan_root() {
 /// findings. Every gating row used to come from the deliberately-defective
 /// fixtures, so `unruster audit` on this checkout exited 1 forever and the
 /// advertised `until unruster audit; do fix; done` loop could never close here.
+/// Every command `audit --list-checks` offers must be a command.
+///
+/// The cap note under a truncated section used to build its "for the rest" hint
+/// out of the section's *check name*, which is a fingerprint identity and not a
+/// command line. `unruster metrics-params --top 0` was printed on every audit
+/// of a tree with more than five wide-signature fns, and answers `unrecognized
+/// subcommand`. This runs all twenty-one against the fixture and fails on a
+/// usage error, so a section whose thresholds move without its hint moving is
+/// caught here rather than by whoever pastes it.
+///
+/// Row equality with the audit section is deliberately *not* asserted: the two
+/// runs differ in row budget and in nothing else that matters, and pinning the
+/// counts would make this test a copy of the battery's output. What it asserts
+/// is the property the hint claims — that it parses and runs.
+#[test]
+fn every_check_listed_by_audit_names_a_command_that_runs() {
+    let listed = ur().args(["audit", "--list-checks"]).output().unwrap();
+    assert_eq!(listed.status.code(), Some(0), "--list-checks must succeed");
+    let rows = rows_of(&listed.stdout);
+    assert!(
+        rows.len() >= 20,
+        "expected the whole battery, got {} row(s)",
+        rows.len()
+    );
+    for row in &rows {
+        let (check, cmd) = row.split_once('\t').expect("check\tcommand");
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        assert_eq!(args.first(), Some(&"unruster"), "{check}: {cmd}");
+        let out = ur()
+            .args(&args[1..])
+            .args(["--root", FIXTURE, "--summary"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.contains("unrecognized subcommand")
+                && !err.contains("unexpected argument")
+                && !err.contains("invalid value"),
+            "`{cmd}` (for section `{check}`) is not a usable command:\n{err}"
+        );
+        assert!(
+            out.status.code() != Some(2),
+            "`{cmd}` (for section `{check}`) exited with a usage error:\n{err}"
+        );
+    }
+}
+
 #[test]
 fn the_battery_on_this_repo_gates_on_nothing() {
     let out = ur().args(["audit", "--findings-only"]).output().unwrap();
