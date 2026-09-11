@@ -1145,6 +1145,16 @@ struct OutlineArgs {
     #[arg(long, value_enum)]
     vis: Option<inventory::VisFilter>,
 
+    /// Keep only items whose name matches this glob — the same flag, matcher
+    /// and notes as `inventory --name`, so `--name 'EditOpState::*'` lists one
+    /// type's members inside this file.
+    ///
+    /// It was the one filter the two listings did not share, and the shape
+    /// that filled the gap was `outline <file> | grep -iE '<type>|<method>'`,
+    /// which drops every member whose name the filter does not happen to name.
+    #[arg(long, value_name = "GLOB")]
+    name: Option<String>,
+
     /// Shorthand for `--vis pub`: the file's external surface.
     #[arg(long, conflicts_with = "vis")]
     pub_only: bool,
@@ -2038,6 +2048,57 @@ fn report_waiver_hygiene(
     }
 }
 
+/// `p` as the reader would type it: relative to the working directory when it
+/// lies under it, `.` for the working directory itself, absolute otherwise.
+fn from_cwd(p: &std::path::Path) -> String {
+    let Ok(cwd) = std::env::current_dir().and_then(std::fs::canonicalize) else {
+        return p.display().to_string();
+    };
+    match p.strip_prefix(&cwd) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => p.display().to_string(),
+    }
+}
+
+/// Say when the scan root sits inside a Cargo workspace and leaves member
+/// crates out of it.
+///
+/// A narrow root shrinks every answer this tool gives, silently and in the one
+/// direction that reads as good news: fewer callers, no such item, a clean
+/// audit. After a crate split moved half a project into `core/`, its
+/// `justfile` kept running `unruster -r src audit` — which from then on covered
+/// the shell and not the model, io or render layers, and said so nowhere. The
+/// session that found it spent a call on
+/// `inventory --kind struct | wc -l` under two roots to compare the counts.
+///
+/// Silent in the ordinary case, like [`report_scope_gap`]: a run from the
+/// workspace directory leaves nothing out, and a crate that is not in a
+/// workspace has nothing to leave out. It fires only where the answer is
+/// already narrower than the reader probably thinks.
+fn report_root_gap(out: &emit::Out, root: &std::path::Path, excludes: &[String]) {
+    let Some(ws) = workspace::enclosing_workspace(root, CRATE_WALK_LEVELS) else {
+        return;
+    };
+    let missed = workspace::Workspace::discover(&ws, excludes).packages_outside(root);
+    if missed.is_empty() {
+        return;
+    }
+    // Spelled from where the reader is standing. An absolute path is correct
+    // and unusable: the point of the line is the `-r` they should have typed,
+    // and `-r .` is what that usually is.
+    let ws_shown = from_cwd(&ws);
+    out.note(&format!(
+        "(root: `{}` is inside the Cargo workspace at `{}`, and this scan leaves out {} \
+         member crate(s): {}. `-r {}` covers the whole workspace.)",
+        root.display(),
+        ws_shown,
+        missed.len(),
+        missed.join(", "),
+        ws_shown
+    ));
+}
+
 fn report_blind_spots(out: &emit::Out) {
     let blind = macro_scan::blind_spots();
     if blind > 0 {
@@ -2219,6 +2280,7 @@ fn dispatch(
                 kind: a.kind.map(inventory::ItemKind::as_str),
                 // `--pub-only` is `--vis pub`; clap has already rejected both.
                 vis: a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
+                name: a.name.as_deref(),
                 sort: a.sort,
                 docs: a.include_docs,
                 flat: a.flat,
@@ -3082,7 +3144,33 @@ fn main() -> Result<()> {
         report_waiver_hygiene(&out, &suppressions, is_waivers_cmd);
     }
     if traits.analyses_code {
+        report_root_gap(&out, &root, &exclude);
         report_blind_spots(&out);
+    }
+    // The exit code, said out loud, from the one place that knows the run is
+    // about to use it.
+    //
+    // 2 is also the code for a broken run — a bad flag, an unreadable file —
+    // and the two are indistinguishable to a caller reading `$?`. In a shell
+    // line of several invocations the last one's status becomes the whole
+    // command's, so a session that asked for one good name and one stale one
+    // saw its only `unruster` call reported as failed, with the near-name list
+    // sitting unread above it, and went back to `grep`. The suggestions are
+    // the answer; the code is not a crash.
+    //
+    // Here rather than in `unknown_target`, because twenty-one sites build a
+    // `TargetNotFound` and only some of them route through that one. Before
+    // `finish`, because `finish` serializes the JSON document this line
+    // belongs inside.
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.downcast_ref::<context::TargetNotFound>().is_some())
+    {
+        out.answer(
+            "(this run exits 2 because the target did not resolve — the scan itself \
+             succeeded. The lines above are the answer.)",
+        );
     }
     out.finish(command_name);
     let findings = match result {

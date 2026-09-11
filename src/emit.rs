@@ -27,6 +27,35 @@ fn to_stderr(text: &str) {
     eprintln!("{}", text);
 }
 
+/// Write one line to stdout, and stop the run quietly when the reader has
+/// closed the pipe.
+///
+/// Rust ignores `SIGPIPE`, so a `println!` into a closed pipe does not kill the
+/// process — it panics. `unruster show <big fn> | head -45` therefore exits
+/// 101 with `failed printing to stdout: Broken pipe` on stderr, and has since
+/// the tool existed. It goes unseen because the pipeline reports `head`'s
+/// status and agents redirect stderr: in one seven-hour session 57 of 66
+/// invocations were piped into `head`, every one of them ending in a panic
+/// nobody could see. Under `set -o pipefail`, or read through
+/// `${pipestatus[1]}`, it surfaces as a tool that crashes on ordinary use.
+///
+/// Exit 0, not 141: `head -45` closing the pipe is the reader getting what
+/// they asked for, not a failure, and this tool's own notes already warn that
+/// `$?` after a pipe belongs to the pipe. Failing the pipeline under
+/// `pipefail` would make the documented idiom look broken.
+///
+/// Here rather than at `main`, because this module is the only thing in the
+/// tool that writes to stdout — three call sites, all below.
+fn to_stdout(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if writeln!(out, "{}", text).is_err() {
+        // Flushing would fail the same way. Nothing left to say and no one
+        // listening: leave before the next line panics.
+        std::process::exit(0);
+    }
+}
+
 /// How rows are rendered. `Tsv` writes as it goes; `Json` buffers the whole
 /// run and emits one document at the end (a valid document can't be streamed
 /// section-by-section).
@@ -546,7 +575,7 @@ impl Out {
             buf.push(text.to_string());
             return;
         }
-        println!("{}", text);
+        to_stdout(text);
     }
 
     /// Hold every stdout line from here on. See [`Out::buffer`].
@@ -567,7 +596,7 @@ impl Out {
     /// Print a line now, bypassing the buffer — for the digest that has to
     /// precede everything the buffer holds.
     pub fn print_now(&self, text: &str) {
-        println!("{}", text);
+        to_stdout(text);
     }
 
     /// Turn the gate column on (see [`Out::mark_gating`]).
@@ -1145,7 +1174,7 @@ impl Out {
             s.push_str("\n  ]");
         }
         s.push_str("\n}");
-        println!("{}", s);
+        to_stdout(&s);
     }
 }
 

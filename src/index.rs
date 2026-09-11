@@ -115,6 +115,71 @@ impl NameIndex {
         self.by_last.contains_key(last)
     }
 
+    /// The members declared under type or trait `decl`, best match for `want`
+    /// first, with the total they were drawn from — the answer to a
+    /// `Type::method` query where the type is real and the method name is not.
+    ///
+    /// [`similar_ranked`](Self::similar_ranked) cannot answer that question. It
+    /// scores the last segment alone and breaks ties on shared *module* prefix,
+    /// and a method's module is the file it lives in, never the type that owns
+    /// it — so the type half of the query is invisible to it. A session asking
+    /// for `FrameSelectionCtx::compute` (the name a stale doc comment gave;
+    /// the real one was `refresh`) was answered with `CircularArray::compute`,
+    /// `Affine2D::compose` and four more, not one of them a member of the type
+    /// it had named. Six suggestions, zero candidates. The reader dropped the
+    /// tool and grepped the file.
+    ///
+    /// Ranked rather than filtered: `refresh` scores ~0 against `compute`, so a
+    /// similarity floor would return nothing on the very case this exists for.
+    /// Being a member of the named type is the evidence; similarity only
+    /// decides the order. One row per distinct name, source order within a tie.
+    ///
+    /// Takes the declaration rather than the bare name because the bare name is
+    /// not a type. This tree has two enums called `Scope`, and matching on
+    /// `owner == "Scope"` credited `parse::Scope` with `suppress::Scope::as_str`
+    /// — a wrong answer of exactly the kind this exists to stop. Where the name
+    /// is unique the bare match stands, since an `impl` block may sit in a
+    /// different module from its type; where it is not, only members under this
+    /// declaration's own path count, and a member impl'd elsewhere is dropped
+    /// rather than risk crediting it to the wrong type.
+    pub fn members_of(&self, decl: &Defn, want: &str, limit: usize) -> (Vec<&Defn>, usize) {
+        let owner = decl.name.as_str();
+        let unique = self
+            .lookup(owner)
+            .iter()
+            .filter(|d| matches!(d.kind, "struct" | "enum" | "trait" | "type"))
+            .count()
+            <= 1;
+        let under = format!("{}::", decl.qpath);
+        let want = want.to_lowercase();
+        let mut seen: Vec<&str> = Vec::new();
+        let mut scored: Vec<(f64, &Defn)> = Vec::new();
+        for d in &self.defns {
+            if !matches!(d.kind, "impl-fn" | "trait-fn") || d.owner.as_deref() != Some(owner) {
+                continue;
+            }
+            if !unique && !d.qpath.starts_with(&under) {
+                continue;
+            }
+            if seen.contains(&d.name.as_str()) {
+                continue;
+            }
+            seen.push(&d.name);
+            // Below the correction threshold every score is noise, and letting
+            // noise sort the list hands the reader eight members in an order
+            // that looks meaningful and is not. Flattened to zero, the stable
+            // sort leaves them in source order — the order the type is read in.
+            let sim = similarity(&d.name.to_lowercase(), &want);
+            scored.push((if sim >= SIMILAR_ENOUGH { sim } else { 0.0 }, d));
+        }
+        // The total is counted here, from the same filter, so the "8 of 10
+        // shown" line cannot disagree with the rows above it.
+        let total = scored.len();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(limit);
+        (scored.into_iter().map(|(_, d)| d).collect(), total)
+    }
+
     /// Definitions whose name is *close to* `query` — the answer to a lookup
     /// that found nothing.
     ///

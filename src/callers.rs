@@ -677,6 +677,9 @@ pub fn run_callers(
         ));
         note_imports(ctx, &imports, with_imports, query);
         note_module_route(ctx, &direct, query);
+        if direct.is_empty() {
+            note_wrong_kind(ctx, index, query);
+        }
         if !known && direct.is_empty() && !(with_imports && !imports.is_empty()) {
             return Err(TargetNotFound::err("fn, method, or macro matching", query));
         }
@@ -700,10 +703,86 @@ pub fn run_callers(
             .map(|d| d.to_string())
             .unwrap_or_else(|| "∞".to_string())
     ));
+    if direct.is_empty() && rows.is_empty() {
+        note_wrong_kind(ctx, index, query);
+    }
     if !known && direct.is_empty() && rows.is_empty() {
         return Err(TargetNotFound::err("fn, method, or macro matching", query));
     }
     Ok(direct.len() + rows.len())
+}
+
+/// The query names a real item of a kind that has no call sites. Say which
+/// kind, and which command does answer the question.
+///
+/// This is the worst zero the tool can print, because it is the one a reader
+/// acts on. [`query_known`] returns true for *any* indexed name, so a const or
+/// a struct takes the quiet path: `(0 call site(s) across 0 caller(s))`, exit
+/// 0, no note. In a visibility-narrowing pass — the exact job `callers` is for
+/// — that reads as "nothing uses this, safe to narrow or delete".
+///
+/// One session ran `callers` over eight names during a `pub` → `pub(crate)`
+/// sweep. Six were consts and types. All six answered zero, all six were in
+/// use, and the reader's conclusion was that the command "doesn't track
+/// const/type references" — correct, and knowable only by inferring it from
+/// six wrong-looking answers. It left the tool there and finished the job with
+/// `grep` and a recompile-per-item loop that ran for hours.
+///
+/// The index already holds the kind. Nothing had to be computed to say this;
+/// it only had to be said.
+fn note_wrong_kind(ctx: &AnalysisCtx, index: &NameIndex, query: &str) {
+    // Macros are not indexed, so a lookup miss proves nothing about them.
+    if query.ends_with('!') {
+        return;
+    }
+    let found = index.lookup(query);
+    if found.is_empty() {
+        return;
+    }
+    // One callable definition anywhere in the set and the zero is a real
+    // answer about a fn — which is the case this must not talk over.
+    if found
+        .iter()
+        .any(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn"))
+    {
+        return;
+    }
+    let mut kinds: Vec<&str> = found.iter().map(|d| d.kind).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    // An `impl` header answers to its self-type's name, so a struct query
+    // returns `["impl", "struct"]` and naming the first would call `NameIndex`
+    // an impl. The declaration is what the reader named; the block is not.
+    let kind = kinds
+        .iter()
+        .copied()
+        .find(|k| matches!(*k, "struct" | "enum" | "trait" | "type"))
+        .unwrap_or(kinds[0]);
+    let last = crate::ast::last_segment(query);
+    let route = match kind {
+        "struct" | "enum" | "trait" | "type" | "impl" => format!(
+            "`type-refs {}` lists every site that names it — a `{}::new()` call is a call \
+             site and answers to *that* name, not this one.",
+            last, last
+        ),
+        "const" | "static" => format!(
+            "No usage query here tracks a {} — `type-refs` reads type positions and finds \
+             none either, so a text search is the right tool for `{}`.",
+            kind, last
+        ),
+        "mod" => format!("`module-uses {}` lists what imports it and reaches into it.", last),
+        _ => format!("No usage query in this tool covers {} items.", kind),
+    };
+    ctx.out.answer(&format!(
+        "note: `{}` is {} {}, not a fn — `callers` counts call sites and {} {} is never \
+         called, so the zero above says nothing about whether it is used. {}",
+        query,
+        crate::context::article(kind),
+        kind,
+        crate::context::article(kind),
+        kind,
+        route
+    ));
 }
 
 /// A qualified query matched fewer sites than its bare name would. Say so.

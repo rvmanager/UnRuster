@@ -15,7 +15,7 @@ AGENT QUICKSTART
   unruster contract-drift <fn>       its callers, body withheld; `--reveal` after you judge
   unruster explain <topic>           one repair recipe (cheap); `playbook` for all
   unruster module-uses <mod>         what the rest of the tree takes from a module (removals)
-  unruster outline <f> [--sig]  at <f>:<n>   a file's items (+signatures); which item owns a line
+  unruster outline <f> [--sig] [--name 'T::*']  at <f>:<n>   a file's items, or one type's; which owns a line
   unruster show <name>               one item's exact source; a type prints over its own impls
   --json                             every command; named keys (TSV has no header row)
 

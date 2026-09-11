@@ -33,6 +33,18 @@ pub struct OutlineOpts<'a> {
     /// `--vis pub`; the long form exists so this command and `inventory` filter
     /// the same way with the same word.
     pub vis: Option<crate::inventory::VisFilter>,
+    /// Keep only items whose name matches this glob — the same flag,
+    /// the same matcher and the same notes as `inventory --name`.
+    ///
+    /// The one filter the two listings did not share, and the gap showed:
+    /// asked for one type's members inside a long file, a session wrote
+    /// `outline app_state.rs | grep -iE 'editopstate|take_drag|cancel'`, which
+    /// dropped every member whose name did not match the filter, then retried
+    /// with `sed -n '/impl EditOpState/,/^impl /p'` — whose `^impl ` never
+    /// matches the tab-separated `impl` row, so the range ran on into three
+    /// unrelated types. Two calls and a wrong answer for
+    /// `--name 'EditOpState::*'`.
+    pub name: Option<&'a str>,
     /// Row order. Shared with `inventory`; the two differ only in the default.
     pub sort: crate::inventory::ItemSort,
     /// Append the first line of each item's doc comment.
@@ -112,6 +124,9 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
     }
     if let Some(v) = opts.vis {
         items.retain(|d| d.vis == v.as_str());
+    }
+    if let Some(pat) = opts.name {
+        items.retain(|d| crate::inventory::name_matches(pat, &d.qpath));
     }
     // Source order by default: an outline read out of order is a list, not an
     // outline. `--sort kind` gives `inventory`'s census ordering on one file.
@@ -215,6 +230,7 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
     // names and is about to read several of them. Told only in `--help`, the
     // batch form goes unused: one session made 34 `show` calls of which 23 sat
     // in groups of two to four on a single shell line, each re-parsing the tree.
+    crate::inventory::note_name_filter(ctx, opts.name, items.len(), true);
     ctx.out.summary(&format!(
         "({} item(s) in {}; `at` is file:decl-end — `show <name>` prints one \
          with its docs, `show <a> <b> <c>` several in one pass)",

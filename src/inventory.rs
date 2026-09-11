@@ -84,7 +84,7 @@ pub enum ItemSort {
 /// `show Document::new` means there. Without the qualified form the only way to
 /// list one type's methods was `inventory --kind impl-fn | grep 'Document::'`,
 /// which this command's own playbook was recommending.
-fn name_matches(pat: &str, qpath: &str) -> bool {
+pub(crate) fn name_matches(pat: &str, qpath: &str) -> bool {
     use crate::ast::{glob_match_smart, last_segment};
     if !pat.contains("::") {
         return glob_match_smart(pat, last_segment(qpath));
@@ -178,14 +178,32 @@ pub fn run(
     // written by a reader who never opened the help — and a grep matches the
     // file path and the doc column as readily as the name, takes this count
     // down with the stderr it redirects, and hides the `--top` cut.
-    if name_filter.is_none() && !tree && all.len() > 40 {
+    note_name_filter(ctx, name_filter, all.len(), !tree);
+    Ok(all.len())
+}
+
+/// What `--name` has to say about this listing: that it exists, or that it
+/// matched nothing.
+///
+/// Shared with `outline`, which grew the flag for the same reason and would
+/// otherwise have grown a second, drifting copy of these sentences — the
+/// failure `--vis` and `--pub-only` already had across the three commands that
+/// filter by visibility.
+///
+/// `offer` is false where the pointer would be wrong: `--tree` is already a
+/// narrowing view, so suggesting a narrower one is noise.
+pub(crate) fn note_name_filter(ctx: &AnalysisCtx, pat: Option<&str>, shown: usize, offer: bool) {
+    // A listing long enough to scroll is where the reader reaches for `grep`
+    // — which also matches the path and the doc column, and discards the
+    // count and the `--top` cut along with the stderr it redirects.
+    if pat.is_none() && offer && shown > 40 {
         ctx.out.note(
             "note: `--name <glob>` narrows by name — `*` the only metacharacter, smartcase, \
              and `Type::*` for one type's members. Prefer it to `| grep`, which also matches \
              the path and the doc column and discards the count above.",
         );
     }
-    if let Some(pat) = name_filter.filter(|_| all.is_empty()) {
+    if let Some(pat) = pat.filter(|_| shown == 0) {
         ctx.out.note(&format!(
             "note: nothing matches `{}` — `*` is the only metacharacter, the match is on the \
              last `::` segment (a pattern with `::` matches any qualified suffix), and an \
@@ -195,7 +213,6 @@ pub fn run(
             pat.trim_matches('*')
         ));
     }
-    Ok(all.len())
 }
 
 fn print_tree(ctx: &AnalysisCtx, items: &[&Defn]) {

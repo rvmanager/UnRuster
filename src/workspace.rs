@@ -122,6 +122,29 @@ impl Workspace {
         }
     }
 
+    /// The packages under this graph whose directory the scan root does not
+    /// cover — what a narrower `--root` is leaving out.
+    ///
+    /// Names rather than paths: a package name is what the reader recognises
+    /// and what `cargo` answers to, and the path is already implied by the
+    /// workspace directory the note prints alongside.
+    pub fn packages_outside(&self, root: &Path) -> Vec<String> {
+        let Ok(root) = std::fs::canonicalize(root) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = self
+            .by_dir
+            .iter()
+            .filter(|(dir, _)| {
+                std::fs::canonicalize(dir).is_ok_and(|d| !d.starts_with(&root))
+            })
+            .map(|(_, name)| name.clone())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Read every `Cargo.toml` under `root` and classify.
     ///
     /// Walker errors and unparseable manifests are skipped rather than fatal:
@@ -256,6 +279,49 @@ impl Workspace {
 /// must not answer it a second, differing way.
 pub fn package_name_of(manifest: &str) -> Option<String> {
     Manifest::parse(manifest)?.name
+}
+
+/// The nearest `Cargo.toml` at or above `start` that declares a `[workspace]`,
+/// within `levels` steps.
+///
+/// `start` itself counts: a scan rooted at the workspace directory has nothing
+/// outside it, and the caller finds that out from an empty
+/// [`Workspace::packages_outside`] rather than from a special case here.
+///
+/// Bounded for the reason [`crate::main`]'s crate walk is bounded — an
+/// unbounded walk from a directory under `~/` finds a workspace nobody was
+/// asking about.
+pub fn enclosing_workspace(start: &Path, levels: usize) -> Option<PathBuf> {
+    let abs = std::fs::canonicalize(start).ok()?;
+    // A `--root` pointing at a file asks about the directory holding it.
+    let mut cur = Some(if abs.is_file() {
+        abs.parent()?.to_path_buf()
+    } else {
+        abs
+    });
+    for _ in 0..=levels {
+        let dir = cur.take()?;
+        if declares_workspace(&dir.join("Cargo.toml")) {
+            return Some(dir);
+        }
+        cur = dir.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+/// Does this manifest declare a `[workspace]`?
+///
+/// A directory with no manifest, and one whose manifest will not parse, are
+/// both simply not a workspace root — the walk goes past each without an
+/// opinion, the same way [`Workspace::discover`] skips an unreadable manifest
+/// rather than failing the scan over it.
+fn declares_workspace(manifest: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(manifest) else {
+        return false;
+    };
+    toml_edit::Document::parse(&text)
+        .ok()
+        .is_some_and(|d| d.get("workspace").is_some())
 }
 
 /// The three things this module needs out of a manifest.

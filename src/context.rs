@@ -307,6 +307,9 @@ impl AnalysisCtx<'_> {
     /// across all of them: an unanswerable query is 2, not a clean 0. A command
     /// where any name could plausibly match (`callers`, `type-refs`) must NOT
     /// use this for a zero-hit result — there, zero is a real answer.
+    ///
+    /// `main` adds the line that says what the 2 means, for every path that
+    /// ends in a [`TargetNotFound`] rather than only the ones through here.
     pub fn unknown_target(&self, what: &str, name: &str) -> anyhow::Error {
         self.say_unknown(what, name);
         TargetNotFound::err_owned(what, name)
@@ -421,6 +424,96 @@ impl AnalysisCtx<'_> {
             ));
             return;
         }
+        // `Type::method` where the type is real and the method name is not.
+        // Asked before the fuzzy list because the type half of the query is
+        // evidence and the fuzzy list throws it away: it ranks on the last
+        // segment and tie-breaks on shared *module* prefix, which a method
+        // never shares with its own type. `show FrameSelectionCtx::compute`
+        // (the name a stale doc comment gave; the real one was `refresh`) drew
+        // `CircularArray::compute`, `Affine2D::compose` and four more — six
+        // rows, none of them a member of the named type, while
+        // `inventory --name 'FrameSelectionCtx::*'` had the answer in one call.
+        // The reader read the list as "not here" and grepped the file instead.
+        if name.contains("::") {
+            if let Some((ty, decl, copies)) = self.owner_type_of(name) {
+                let (members, total) =
+                    self.idx.members_of(decl, crate::ast::last_segment(name), 8);
+                // Naming one of several same-named types without saying so is
+                // how the wrong one gets read as the only one.
+                let chosen = if copies > 1 {
+                    format!(
+                        " ({} types in this tree are named `{}`; spell the module to pick another)",
+                        copies, ty
+                    )
+                } else {
+                    String::new()
+                };
+                // A variant is not an item and is not indexed, so an enum
+                // qualifier's suggestions are its *methods* — an answer to a
+                // question the reader may not have asked unless it says where
+                // the variants are.
+                let variants_note = if decl.kind == "enum" {
+                    format!(
+                        "  (note: `{}` is an enum — its variants are not items and are not \
+                         listed above. `variants {}` names them.)",
+                        ty, ty
+                    )
+                } else {
+                    String::new()
+                };
+                if members.is_empty() {
+                    self.out.answer(&format!(
+                        "note: no {} `{}` — `{}` is {} {} at {}:{}{}, but it declares no \
+                         member named `{}`, or any other.",
+                        what,
+                        name,
+                        ty,
+                        article(decl.kind),
+                        decl.kind,
+                        decl.file,
+                        decl.line,
+                        chosen,
+                        crate::ast::last_segment(name)
+                    ));
+                    if !variants_note.is_empty() {
+                        self.out.answer(&variants_note);
+                        return;
+                    }
+                    // A type with no members and no variants has nothing more
+                    // to offer, so the fuzzy list below still gets its turn.
+                } else {
+                    self.out.answer(&format!(
+                        "note: no {} `{}` — but `{}` is {} {} at {}:{}{}, and it has {} member(s). \
+                         Did you mean:",
+                        what,
+                        name,
+                        ty,
+                        article(decl.kind),
+                        decl.kind,
+                        decl.file,
+                        decl.line,
+                        chosen,
+                        total
+                    ));
+                    for d in &members {
+                        self.out
+                            .answer(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));
+                    }
+                    if total > members.len() {
+                        self.out.answer(&format!(
+                            "  (note: {} of {} shown — `inventory --name '{}::*'` lists every member)",
+                            members.len(),
+                            total,
+                            ty
+                        ));
+                    }
+                    if !variants_note.is_empty() {
+                        self.out.answer(&variants_note);
+                    }
+                    return;
+                }
+            }
+        }
         let near = self.idx.similar_to_query(name, 6);
         if near.is_empty() {
             self.out.answer(&format!(
@@ -454,6 +547,38 @@ impl AnalysisCtx<'_> {
                 hidden
             ));
         }
+    }
+
+    /// The type a `Type::method` query names, when the tree has one — with how
+    /// many types share that bare name, so a note built on it can say when it
+    /// had to choose.
+    ///
+    /// The whole qualifier is tried before its last segment, because the last
+    /// segment is not a type: this tree has `parse::Scope` and
+    /// `suppress::Scope`, and matching on `Scope` alone answered
+    /// `show suppress::Scope::Nope` by citing the enum in `parse.rs`. A reader
+    /// who spelled the path out gets the one they spelled.
+    ///
+    /// Returns an `impl` header only when nothing declares the type in this
+    /// tree, which is how `impl u8` and other foreign-type impls appear.
+    fn owner_type_of(&self, query: &str) -> Option<(String, &crate::index::Defn, usize)> {
+        let qualifier = crate::ast::module_of_path(query);
+        if qualifier.is_empty() {
+            return None;
+        }
+        let ty = crate::ast::last_segment(qualifier);
+        let bare = self.idx.lookup(ty);
+        let copies = bare
+            .iter()
+            .filter(|d| matches!(d.kind, "struct" | "enum" | "trait" | "type"))
+            .count();
+        let spelled = if qualifier == ty {
+            Vec::new()
+        } else {
+            self.idx.lookup(qualifier)
+        };
+        let decl = pick_type_decl(&spelled).or_else(|| pick_type_decl(&bare))?;
+        Some((ty.to_string(), decl, copies))
     }
 
     /// The item `mod::name` names when `mod` reaches `name` through a glob.
@@ -765,10 +890,21 @@ impl TargetNotFound {
     }
 }
 
+/// The declaration among `found` that a `Type::…` qualifier names: a real type
+/// declaration for preference, an `impl` header only when the tree declares the
+/// type nowhere (`impl u8`, and every other impl on a foreign type).
+fn pick_type_decl<'a>(found: &[&'a crate::index::Defn]) -> Option<&'a crate::index::Defn> {
+    found
+        .iter()
+        .find(|d| matches!(d.kind, "struct" | "enum" | "trait" | "type"))
+        .or_else(|| found.iter().find(|d| d.kind == "impl"))
+        .copied()
+}
+
 /// `a` or `an` for a target kind. The kinds are a fixed, tiny vocabulary
 /// (`enum`, `impl`, `struct with named fields`, …), so the vowel test is exact
 /// here rather than the usual approximation.
-fn article(what: &str) -> &'static str {
+pub(crate) fn article(what: &str) -> &'static str {
     match what.chars().next() {
         Some('a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U') => "an",
         _ => "a",

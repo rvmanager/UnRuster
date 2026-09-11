@@ -1007,6 +1007,88 @@ fn show_suggests_near_names_instead_of_printing_nothing() {
 }
 
 #[test]
+fn a_type_qualified_miss_suggests_that_type_s_own_members() {
+    // The near-name list ranks on the last segment and tie-breaks on shared
+    // *module* prefix, which a method never shares with its own type — so the
+    // type half of `Type::method` was thrown away. A session asking for
+    // `FrameSelectionCtx::compute` (a stale doc comment's name; the real one
+    // was `refresh`) got six suggestions from six unrelated types, read the
+    // list as "not here", and grepped the file.
+    //
+    // `compute` is close to nothing on `Document`, which is the point: being a
+    // member of the named type is the evidence, not the spelling.
+    let out = ur()
+        .args(["--root", FIXTURE, "show", "Document::compute"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{}", s);
+    assert!(s.contains("`Document` is a struct"), "{}", s);
+    for member in ["Document::render", "Document::new", "Document::classify_token"] {
+        assert!(s.contains(member), "expected {} in:\n{}", member, s);
+    }
+}
+
+#[test]
+fn a_type_qualified_miss_does_not_credit_a_same_named_type_elsewhere() {
+    // Two `Scope` enums live in this crate. Matching members on the bare owner
+    // name credited `parse::Scope` with `suppress::Scope::as_str` — the same
+    // class of wrong answer the suggestion list exists to prevent. The spelled
+    // qualifier picks its own type, and the bare one says it had to choose.
+    let out = ur().args(["show", "suppress::Scope::nope"]).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{}", s);
+    assert!(s.contains("src/suppress.rs"), "{}", s);
+    assert!(!s.contains("src/parse.rs"), "picked the wrong Scope:\n{}", s);
+
+    let out = ur().args(["show", "Scope::nope"]).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("types in this tree are named `Scope`"), "{}", s);
+}
+
+#[test]
+fn an_enum_qualifier_says_where_its_variants_are() {
+    // A variant is not an item and is not indexed, so an enum qualifier's
+    // suggestions are its methods — and `Token` has none. Without this line
+    // the answer is "no member of any kind", which is true and useless to a
+    // reader who wanted a variant.
+    ur().args(["--root", FIXTURE, "show", "Token::Nope"])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(contains("`Token` is an enum"))
+        .stdout(contains("variants Token"));
+}
+
+#[test]
+fn an_unresolved_name_says_what_its_exit_2_means() {
+    // 2 is also the code for a broken run, and in a shell line of several
+    // invocations the last one's status becomes the whole command's. One
+    // session's only `unruster` call was reported as failed with the near-name
+    // list sitting unread above it, and the reader moved on to `grep`.
+    ur().args(["--root", FIXTURE, "show", "zzzqqqwwwyyy"])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(contains("exits 2 because the target did not resolve"))
+        .stdout(contains("the scan itself succeeded"));
+
+    // Every path that ends in a `TargetNotFound` gets it, not only the ones
+    // routed through `unknown_target` — `callers` and `outline` build theirs
+    // directly, and `callers` is where the cost was paid.
+    ur().args(["--root", FIXTURE, "callers", "zzzqqqwwwyyy"])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(contains("exits 2 because the target did not resolve"));
+    ur().args(["--root", FIXTURE, "outline", "zzzqqqwwwyyy.rs"])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(contains("exits 2 because the target did not resolve"));
+}
+
+#[test]
 fn show_unknown_name_with_nothing_close_says_so_plainly() {
     ur().args(["--root", FIXTURE, "show", "zzzqqqwwwyyy"])
         .assert()
@@ -1475,6 +1557,53 @@ fn callers_macro_only_with_bang() {
         .assert()
         .success()
         .stdout(contains("println!"));
+}
+
+#[test]
+fn callers_on_a_const_says_the_zero_is_not_an_answer_about_use() {
+    // The worst zero the tool can print, because it is the one a reader acts
+    // on. `query_known` returns true for any indexed name, so a const took the
+    // quiet path: `(0 call site(s) …)`, exit 0, no note — which in a
+    // visibility-narrowing pass reads as "nothing uses this".
+    //
+    // One session ran `callers` over eight names during a `pub` ->
+    // `pub(crate)` sweep. Six were consts and types, all six answered zero,
+    // all six were in use, and the reader finished the job with `grep` and a
+    // recompile-per-item loop.
+    let out = ur()
+        .args(["--root", FIXTURE, "callers", "SAMPLE_TOKEN"])
+        .output()
+        .unwrap();
+    let s = all_output(&out);
+    assert!(out.status.success(), "a real zero is still exit 0:\n{}", s);
+    assert!(s.contains("is a const, not a fn"), "{}", s);
+    assert!(s.contains("says nothing about whether it is used"), "{}", s);
+    assert!(s.contains("text search"), "{}", s);
+}
+
+#[test]
+fn callers_on_a_type_routes_to_type_refs() {
+    let out = ur()
+        .args(["--root", FIXTURE, "callers", "Document"])
+        .output()
+        .unwrap();
+    let s = all_output(&out);
+    assert!(s.contains("is a struct, not a fn"), "{}", s);
+    assert!(s.contains("type-refs Document"), "{}", s);
+}
+
+#[test]
+fn callers_on_a_fn_with_no_call_sites_keeps_its_bare_zero() {
+    // The note must not talk over the case it was built to leave alone: a fn
+    // nobody calls really does have zero callers, and a paragraph explaining
+    // that zero would bury the answer.
+    let out = ur()
+        .args(["--root", FIXTURE, "callers", "item_allow_dead"])
+        .output()
+        .unwrap();
+    let s = all_output(&out);
+    assert!(s.contains("0 call site(s)"), "{}", s);
+    assert!(!s.contains("not a fn"), "{}", s);
 }
 
 #[test]
@@ -6082,6 +6211,49 @@ fn outline_kind_filter_keeps_only_that_kind() {
 }
 
 #[test]
+fn outline_name_filter_lists_one_types_members_in_a_file() {
+    // The one filter `inventory` had and `outline` did not. Asked for a type's
+    // members inside a long file, a session wrote
+    // `outline app_state.rs | grep -iE 'editopstate|take_drag|cancel'`, which
+    // dropped every member the filter did not happen to name, then retried
+    // with `sed -n '/impl EditOpState/,/^impl /p'` — whose `^impl ` never
+    // matches the tab-separated `impl` row, so the range ran into three
+    // unrelated types. Two calls and a wrong answer.
+    let out = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--name", "Document::*"]);
+    let rows = rows_of(&out);
+    assert!(!rows.is_empty(), "Document has members in the fixture");
+    for r in &rows {
+        assert!(r.starts_with("impl-fn"), "not a member of Document: {r}");
+    }
+    assert!(rows.iter().any(|r| r.contains("classify_token")), "{rows:?}");
+}
+
+#[test]
+fn outline_and_inventory_agree_on_what_name_selects() {
+    // The two listings are meant to differ in their defaults, not in what they
+    // can show — the invariant `--vis`/`--pub-only` already state. A second,
+    // drifting copy of the matcher is how that stops being true.
+    let by_outline = rows_of(&ur_stdout(&[
+        "--root", FIXTURE, "outline", "src/main.rs", "--name", "Document::*",
+    ]))
+    .len();
+    let by_inventory = rows_of(&ur_stdout(&[
+        "--root", FIXTURE, "inventory", "--name", "Document::*",
+    ]))
+    .len();
+    assert_eq!(by_outline, by_inventory, "the same glob selected different sets");
+}
+
+#[test]
+fn outline_name_that_matches_nothing_says_why() {
+    ur().args(["--root", FIXTURE, "outline", "src/main.rs", "--name", "Nope::*"])
+        .assert()
+        .success()
+        .stdout(contains("nothing matches `Nope::*`"))
+        .stdout(contains("`*` is the only metacharacter"));
+}
+
+#[test]
 fn outline_sort_kind_groups_rows_into_a_census() {
     let out = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--sort", "kind"]);
     let kinds: Vec<String> = rows_of(&out)
@@ -6905,6 +7077,74 @@ fn the_scope_note_names_the_crates_it_removed_and_why() {
     assert!(err.contains("test-support crates"), "{err}");
     // The one it kept must not be named as removed.
     assert!(!err.contains("sample-tests"), "{err}");
+}
+
+#[test]
+fn a_reader_that_closes_the_pipe_does_not_crash_the_run() {
+    // Rust ignores SIGPIPE, so a `println!` into a closed pipe panics rather
+    // than ending the process: `unruster show <big fn> | head -45` exited 101
+    // with `failed printing to stdout: Broken pipe` on stderr, and had since
+    // the tool existed. It went unseen because a pipeline reports the last
+    // command's status and agents redirect stderr — in one seven-hour session
+    // 57 of 66 invocations were piped into `head`, every one of them ending in
+    // a panic nobody could see.
+    //
+    // Driven through a real pipe, because the pipe is the whole condition: the
+    // harness captures stdout into a buffer that never closes early. The
+    // output is far larger than a pipe buffer, so the child is still writing
+    // when the reader goes away.
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("unruster"))
+        .args(["--scope", "all", "inventory"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut head = [0u8; 1024];
+    let read = child.stdout.as_mut().unwrap().read(&mut head).unwrap();
+    assert!(read > 0, "expected rows before closing the pipe");
+    // The reader goes away, as `head -n` does once it has its lines.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "panicked on a closed pipe:\n{err}");
+    assert!(!err.contains("Broken pipe"), "leaked the pipe error:\n{err}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a reader taking the first lines is not a failure; stderr:\n{err}"
+    );
+}
+
+#[test]
+fn a_root_inside_a_workspace_names_the_crates_it_leaves_out() {
+    // A narrow root shrinks every answer, silently and in the direction that
+    // reads as good news: fewer callers, no such item, a clean audit. After a
+    // crate split moved half a project into `core/`, its justfile kept running
+    // `unruster -r src audit`, which from then on covered one of two crates
+    // and said so nowhere. The session that found it spent a call comparing
+    // `inventory --kind struct | wc -l` under two roots.
+    let root = format!("{TEST_CRATE_FIXTURE}/prod");
+    let out = ur_all(&["--root", &root, "--scope", "all", "inventory"]);
+    assert!(out.contains("inside the Cargo workspace"), "{out}");
+    for missed in ["sample-fixtures", "sample-test-utils", "sample-tests"] {
+        assert!(out.contains(missed), "expected {missed} named as left out:\n{out}");
+    }
+    // The line exists to hand over the `-r` the reader should have typed, so
+    // it has to be a path they could paste.
+    assert!(out.contains("covers the whole workspace"), "{out}");
+}
+
+#[test]
+fn a_root_that_leaves_nothing_out_says_nothing() {
+    // The ordinary case is silence. A note that fires on every run in every
+    // workspace is the preamble this tool already removed once.
+    let whole = ur_all(&["--root", TEST_CRATE_FIXTURE, "--scope", "all", "inventory"]);
+    assert!(!whole.contains("inside the Cargo workspace"), "{whole}");
+    // Nor does a crate that is in no workspace at all.
+    let plain = ur_all(&["--root", FIXTURE, "inventory"]);
+    assert!(!plain.contains("inside the Cargo workspace"), "{plain}");
 }
 
 #[test]
@@ -11541,7 +11781,7 @@ fn outline_sig_prints_each_items_signature_under_its_row() {
     assert!(s.contains("pub fn new(name: String) -> Self {"), "fn signatures missing:\n{s}");
     assert!(s.contains("pub struct Document {"), "declaration lines missing:\n{s}");
     // The rows keep their shape: signature lines are indented past any column.
-    for l in s.lines().filter(|l| !l.starts_with(' ') && !l.starts_with('(')) {
+    for l in s.lines().filter(|l| !l.starts_with(' ') && !is_note(l)) {
         assert_eq!(l.split('\t').count(), 5, "row shape changed: {l:?}");
     }
     let json = ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs", "--sig", "--json"]);
