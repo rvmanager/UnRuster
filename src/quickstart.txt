@@ -1,8 +1,8 @@
 Query a Rust codebase via syntactic (syn) analysis. Finds candidates; you judge them.
 
 AGENT QUICKSTART
-  unruster audit                     ranked battery: `## gating` first, `!` marks gating rows; exit 1 on gating
-  unruster audit --changed-since HEAD~1    same, scoped to your last commit — highest yield
+  unruster audit                     ranked battery: `## gating` first, `!` marks gating rows; exit 1 on gating; `--gating-only` = that digest plus the verdict, nothing else
+  unruster audit --changed-since HEAD~1    scoped to your last commit — highest yield; only rows in changed *lines* gate
   unruster divergence                sibling paths that disagree — highest yield, start here
   unruster clones                    the same body written out more than once
   unruster near-clones               ...and the copies that have already drifted apart
@@ -38,7 +38,7 @@ GLOBAL FLAGS
   --context N            print ±N source lines under each row
   --spans                fn labels `name@start-end`; item rows' `at` gains an end
   --summary              drop rows, keep the summary line
-  --all-stdout           the summary line to stdout too (notes and a --top cut always are)
+  --all-stdout           the summary line to stdout too (notes, a --top cut and `audit`'s own closing line always are)
   --exclude GLOB         drop matching files (repeatable)
   --cfg KEY[=VALUE]      strip items whose cfg is definitively false
   --fail-on-findings     exit 1 on any finding (0 = clean, 2 = error)

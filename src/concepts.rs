@@ -684,6 +684,37 @@ fn signature_rarity(population: usize) -> f64 {
     (1.0 / (population as f64 - 1.0).max(1.0)).clamp(0.0, 1.0)
 }
 
+/// The scalar return types an accessor hands back.
+///
+/// Deliberately closed and deliberately small: a nullary method returning a
+/// *domain* type (`-> Aabb`, `-> Result<Scene>`) is an interface somebody
+/// designed, and stays clustered. These are the types Rust gives you.
+const SCALAR_RETURNS: &[&str] = &[
+    "bool", "char", "usize", "isize", "String", "&str", "&String", "f32", "f64", "u8", "u16",
+    "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128",
+];
+
+/// Is `(params) -> ret` an accessor shape — a method that takes nothing but
+/// `self` and hands back a scalar?
+///
+/// The three shapes the check's own [`signature_rarity`] doc names as its
+/// measured false positives are all of exactly this form: `() -> bool` with
+/// the word *active*, `() -> usize` with *count*, `() -> &str` with *label*.
+/// Sharing one says only that Rust has integers.
+///
+/// `signature_rarity` was the first attempt at demoting them and could not
+/// reach: it enters the score as `0.15 * agreement` where `agreement` is
+/// already `0.4 * rarity`, so its entire authority is 0.06 of a score whose
+/// floor is 0.28 — while *spread*, which idiomatic accessors on unrelated
+/// types maximise by construction, adds 0.16. On a 23-crate workspace three
+/// such clusters scored 0.83, 0.76 and 0.76 against a 0.70 gate and cost three
+/// hand-written waivers; the reader's verdict was "a correct observation and a
+/// wrong concern". Skipping the shape is the honest version of what the
+/// rarity term was trying to say.
+fn is_accessor_shape(params: &[String], ret: &str) -> bool {
+    params.is_empty() && SCALAR_RETURNS.contains(&ret)
+}
+
 /// The same operation, written twice, over the same types.
 ///
 /// This is the shape `clones` cannot see. `clones` groups on the body, and two
@@ -723,6 +754,10 @@ fn signature_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
         // A no-argument fn returning unit is a shape shared by every `main`,
         // every `drop` and every test; it discriminates nothing.
         if params.is_empty() && ret == "()" {
+            continue;
+        }
+        // Nor does any other nullary accessor. See [`is_accessor_shape`].
+        if is_accessor_shape(params, ret) {
             continue;
         }
         if exact_cloned.contains(&(i.file.as_str(), i.line)) {

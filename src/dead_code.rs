@@ -356,6 +356,15 @@ pub fn run(
         if d.allow_dead {
             return false;
         }
+        // An ABI export has no in-tree caller by construction — that is what
+        // publishing a symbol means. Reporting one is a finding no edit can
+        // clear, on the check whose every row holds the exit code open: a
+        // macOS shell talking to its Rust core over a hand-written C API put
+        // 30 such rows in one audit's 77-row gating tier, and the loop they
+        // gated could never converge. See `ast::is_abi_export`.
+        if d.is_exported {
+            return false;
+        }
         // The harness calls a `#[test]` fn, and the harness is in no call site.
         // Without this, `--scope all` — the scope every command's own note
         // recommends — answered with 600 rows of which every single one was a
@@ -364,6 +373,18 @@ pub fn run(
     };
 
     let called = sink.called();
+    // What the export rule above removed, so the footer can say so. A silent
+    // filter on a gating check reads as "your FFI surface is reachable", which
+    // is the opposite of true.
+    let exported = index
+        .iter()
+        .filter(|d| {
+            d.is_exported
+                && matches!(d.kind, "fn" | "impl-fn")
+                && !d.is_test
+                && !called.contains(&d.name)
+        })
+        .count();
     // `(kind, defn, what would have to go first)`. `None` means nothing:
     // the item is dead as the tree stands.
     let mut hits: Vec<(&str, &crate::index::Defn, Option<String>)> = index
@@ -480,7 +501,7 @@ pub fn run(
         ));
     }
     ctx.out.summary(&format!(
-        "({} candidate dead fn(s){}; vis={}; include_trait_impls={}{}; heuristic — call-set \
+        "({} candidate dead fn(s){}; vis={}; include_trait_impls={}{}{}; heuristic — call-set \
          built from full tree incl. tests; `#[allow(dead_code)]` skipped; pub items may still \
          have external callers we can\'t see.{})",
         total,
@@ -491,6 +512,15 @@ pub fn run(
         },
         vis.map_or("any", crate::inventory::VisFilter::as_str),
         include_trait_impls,
+        if exported > 0 {
+            format!(
+                "; {} ABI export(s) skipped (#[no_mangle] / pub extern \"C\" — the caller is \
+                 outside the tree, so no edit here could ever clear them)",
+                exported
+            )
+        } else {
+            String::new()
+        },
         ctx.waived_note(waived),
         if transitive {
             ""

@@ -665,6 +665,69 @@ pub fn has_allow_dead_code(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+/// Is this body nothing but `todo!()` / `unimplemented!()` — a stub rather
+/// than a reachable branch?
+///
+/// The distinction `panics` needs. `todo!()` on one arm of a working `match` is
+/// a crash somebody can reach, which is what that check is for; `todo!()` as
+/// the *whole* body of a function is the author saying "not written yet" to a
+/// compiler that already knows. Scaffolding a 23-crate workspace put 22 of one
+/// audit's 77 gating rows in that second class, every one of them describing
+/// work the author was in the middle of.
+///
+/// Only a bare, sole statement counts. A body that does anything before it
+/// panics — a log, a validation, a `let` — is doing work, and is reported.
+pub fn body_is_stub(block: &syn::Block) -> bool {
+    let [stmt] = &block.stmts[..] else {
+        return false;
+    };
+    let e = match stmt {
+        syn::Stmt::Expr(e, _) => e,
+        syn::Stmt::Macro(m) => {
+            return macro_is_unwritten(&m.mac);
+        }
+        _ => return false,
+    };
+    matches!(peel_grouping(e), syn::Expr::Macro(m) if macro_is_unwritten(&m.mac))
+}
+
+/// `todo!` or `unimplemented!` — the two macros that mean "not written yet".
+fn macro_is_unwritten(m: &syn::Macro) -> bool {
+    m.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "todo" || s.ident == "unimplemented")
+}
+
+/// Is this function an ABI export — a symbol something outside the tree links
+/// against?
+///
+/// `#[no_mangle]` (and its `#[unsafe(no_mangle)]` 2024-edition spelling) and
+/// `#[export_name]` exist for exactly one purpose: to publish a stable symbol
+/// for a caller that is not Rust and is not here. An `extern "C"` ABI on a
+/// `pub` fn says the same thing a little less loudly.
+///
+/// `dead-code` needs this because such a function *cannot* have an in-tree
+/// caller by construction, so it is a permanent finding no edit can clear. On
+/// a project whose macOS shell talks to the core over a hand-written C API,
+/// that was the whole FFI crate — 30 of one audit's 77 gating rows, none of
+/// them actionable, on the check whose every row is gating.
+pub fn is_abi_export(attrs: &[syn::Attribute], sig: &syn::Signature, vis: &syn::Visibility) -> bool {
+    let named = |a: &syn::Attribute| {
+        let p = a.path();
+        if p.is_ident("no_mangle") || p.is_ident("export_name") {
+            return true;
+        }
+        // `#[unsafe(no_mangle)]`: the attribute is `unsafe` and the real name
+        // sits in its token list.
+        p.is_ident("unsafe")
+            && matches!(&a.meta, syn::Meta::List(ml)
+                if ml.tokens.clone().into_iter().any(|tt|
+                    matches!(tt, TokenTree::Ident(id) if id == "no_mangle" || id == "export_name")))
+    };
+    attrs.iter().any(named) || (sig.abi.is_some() && matches!(vis, syn::Visibility::Public(_)))
+}
+
 /// The string value of a `#[doc = "..."]` attribute (one doc-comment line).
 pub fn doc_text(attr: &syn::Attribute) -> Option<String> {
     if !attr.path().is_ident("doc") {
@@ -975,6 +1038,48 @@ macro_rules! scope_visits {
                 .enter_fn(i.sig.ident.to_string(), $crate::ast::trait_fn_span(i));
             syn::visit::visit_trait_item_fn(self, i);
             self.scope.leave_fn();
+        }
+    };
+    // As the three above, but also maintains `self.in_stub_body` — whether the
+    // fn currently being walked has a body that is nothing but `todo!()` /
+    // `unimplemented!()`. Requires `self.in_stub_body: bool`. Nesting is
+    // honoured by save-and-restore, so a closure inside a stub is not a stub.
+    //
+    // One rule per fn kind rather than three hand-written visits: the three
+    // differ only in the `syn` type and the span helper, and `near-clones`
+    // scored the first two copies at 0.60 the moment they were written.
+    (@emit item_fn_stubs) => {
+        scope_visits!(@emit_stub visit_item_fn, syn::ItemFn, fn_span);
+    };
+    (@emit impl_item_fn_stubs) => {
+        scope_visits!(@emit_stub visit_impl_item_fn, syn::ImplItemFn, fn_span);
+    };
+    (@emit_stub $visit:ident, $ty:path, fn_span) => {
+        fn $visit(&mut self, i: &'ast $ty) {
+            let was = ::std::mem::replace(
+                &mut self.in_stub_body,
+                $crate::ast::body_is_stub(&i.block),
+            );
+            self.scope.enter_fn(
+                i.sig.ident.to_string(),
+                $crate::ast::fn_span(&i.sig, &i.block),
+            );
+            syn::visit::$visit(self, i);
+            self.scope.leave_fn();
+            self.in_stub_body = was;
+        }
+    };
+    (@emit trait_item_fn_stubs) => {
+        fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+            let was = ::std::mem::replace(
+                &mut self.in_stub_body,
+                i.default.as_ref().is_some_and($crate::ast::body_is_stub),
+            );
+            self.scope
+                .enter_fn(i.sig.ident.to_string(), $crate::ast::trait_fn_span(i));
+            syn::visit::visit_trait_item_fn(self, i);
+            self.scope.leave_fn();
+            self.in_stub_body = was;
         }
     };
     // As above, but also maintains `self.fn_types_stack` — the local-type

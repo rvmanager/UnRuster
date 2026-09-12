@@ -597,10 +597,50 @@ pub fn run(
         suggest_inline,
         sel,
         gate_deferred,
+        gating_only,
+        gate_pre_existing,
     } = *opts;
+    // Under `--summary` the battery still runs *dense*.
+    //
+    // `Out` already records a gating row before it declines to render one, so
+    // the digest and the closing line can name every gate whatever the output
+    // shape — but each check guards its own row loop with `if !ctx.summary`,
+    // so under `--summary` no row was ever offered and `gating_rows` came back
+    // empty. The closing line then said "(0 in changed lines, 0 pre-existing in
+    // changed files)" beside a gating count of two, and once the exit code was
+    // derived from that split, `audit --changed-since HEAD --summary` and
+    // `audit --changed-since HEAD` disagreed about whether the run passed.
+    //
+    // Flipping the flag for the battery alone costs nothing: `Out` is still
+    // `summary_only`, so the rows it is now offered are recorded and dropped.
+    // The reader's own `--summary`, kept because the rebind below hides it:
+    // the battery runs dense, but the *rendering* is still summary-only.
+    let summary_mode = ctx.summary;
+    let dense;
+    let ctx = if ctx.summary {
+        dense = AnalysisCtx {
+            files: ctx.files,
+            idx: ctx.idx,
+            sem: ctx.sem,
+            corpus: ctx.corpus,
+            summary: false,
+            spans: ctx.spans,
+            changed: ctx.changed.clone(),
+            out: ctx.out,
+            suppressions: ctx.suppressions,
+            suggest_waivers: ctx.suggest_waivers,
+            suggest_waivers_named: ctx.suggest_waivers_named,
+        };
+        &dense
+    } else {
+        ctx
+    };
     // Clean sections are dropped unless `--full` asked for them: on a healthy
     // tree they were two thirds of the report.
     let findings_only = !full;
+    // This battery's closing line is a verdict, not a count, so it goes where
+    // a pipe can reach it. See `Out::summary_stdout`.
+    let prev_summary_stream = ctx.out.set_summary_stdout(true);
     let mut gating = 0usize;
     let mut advisory = 0usize;
     let mut checks = 0usize;
@@ -611,7 +651,8 @@ pub fn run(
     // pipes to `tail` sees the summary that names them. Eight reruns of one
     // battery, each with a different `grep`/`awk` slice, were spent finding a
     // single gating row that sat at line 6 of a 353-line digest.
-    let held = !ctx.out.is_silent() && !ctx.summary && ctx.out.format != crate::emit::Format::Json;
+    let held =
+        !ctx.out.is_silent() && !summary_mode && ctx.out.format != crate::emit::Format::Json;
     if held {
         ctx.out.start_buffering();
     }
@@ -621,7 +662,7 @@ pub fn run(
     // `sed -n '199,500p'`). The same mechanism that fixed `show` — say how much
     // is coming, *before* it comes. Emitted into the held buffer, so it lands
     // right under the digest rather than above it: the digest is line one.
-    if !ctx.summary {
+    if !summary_mode {
         ctx.out.note(&format!(
             "(note: {} check(s){}; gating rows lead under `## gating`, are marked `!` in \
              their sections, and are never capped. Advisory rows are capped at {} per \
@@ -1069,9 +1110,16 @@ pub fn run(
     ctx.out.set_mark_gating(false);
     let gating_rows = ctx.out.gating_rows();
     if held {
-        print_gating_digest(ctx, &gating_rows, gate_deferred);
-        for l in ctx.out.take_buffered() {
-            ctx.out.print_now(&l);
+        print_gating_digest(ctx, &gating_rows, gate_deferred, gate_pre_existing);
+        let body = ctx.out.take_buffered();
+        // `--gating-only` keeps the digest and drops the sections. The battery
+        // still ran whole — the counts, the waiver ledger and the `--since`
+        // baseline all need it — so this is a rendering choice, never a
+        // narrower analysis.
+        if !gating_only {
+            for l in body {
+                ctx.out.print_now(&l);
+            }
         }
     }
     // Both numbers, not just the waiver count: two item-scoped waivers hiding
@@ -1151,9 +1199,9 @@ pub fn run(
     // Which checks hold the gate, with one site each: the sentence a `tail -2`
     // reader needs, and the one the old line withheld ("exit 1 while gating
     // findings remain" said only that the digest above was worth rereading).
-    let holders = {
+    let holders_from = |rows: &[crate::emit::GatingRow]| {
         let mut by_check: Vec<(String, usize, String)> = Vec::new();
-        for g in &gating_rows {
+        for g in rows {
             match by_check.iter_mut().find(|(c, _, _)| *c == g.check) {
                 Some((_, n, _)) => *n += 1,
                 None => by_check.push((
@@ -1171,18 +1219,54 @@ pub fn run(
             .collect::<Vec<_>>()
             .join(", ")
     };
+
     // Under `--changed-since`, split the gate between the edit and what the
-    // edit merely touched. The count stays whole — nothing gets quieter — but
-    // the reader no longer needs `git diff | grep` to learn which is which.
+    // edit merely touched, and — unless `--gate-pre-existing` says otherwise —
+    // let only the edit decide the exit code.
+    //
+    // The rows stay: both halves print, both are marked `!`, both are counted
+    // here. What changes is which half holds an agent loop open. `did I make
+    // it worse` is the question this flag is asked, and a finding that was
+    // already there is not an answer to it.
+    let pre_existing = if ctx.changed.is_some() {
+        gating_rows.iter().filter(|g| g.change != "changed").count()
+    } else {
+        0
+    };
     let change_split = if ctx.changed.is_some() && gating > 0 {
         let changed = gating_rows.iter().filter(|g| g.change == "changed").count();
         format!(
-            " ({} in changed lines, {} pre-existing in changed files)",
+            " ({} in changed lines, {} pre-existing in changed files{})",
             changed,
-            gating_rows.len().saturating_sub(changed)
+            gating_rows.len().saturating_sub(changed),
+            if pre_existing > 0 && !gate_pre_existing {
+                " — pre-existing rows do not hold the exit code; `--gate-pre-existing` makes them"
+            } else {
+                ""
+            }
         )
     } else {
         String::new()
+    };
+    // The number the exit code is built from. Never larger than `gating`, and
+    // equal to it whenever `--changed-since` is absent or the flag is set.
+    let gate_count = if gate_pre_existing {
+        gating
+    } else {
+        gating.saturating_sub(pre_existing)
+    };
+    // Name only the rows that actually hold it. Listing a pre-existing row
+    // beside `exit 1` when it is not the reason would send the reader to fix
+    // the wrong thing.
+    let holders = if gate_pre_existing || ctx.changed.is_none() {
+        holders_from(&gating_rows)
+    } else {
+        let live: Vec<crate::emit::GatingRow> = gating_rows
+            .iter()
+            .filter(|g| g.change == "changed")
+            .cloned()
+            .collect();
+        holders_from(&live)
     };
     ctx.out.summary(&format!(
         "(audit: {} gating{} + {} advisory finding(s) across {} check(s){}{}; {}{}{}{})",
@@ -1203,13 +1287,18 @@ pub fn run(
                 sel.omitted().join(", ")
             )
         },
-        // `--findings-only` hides sections, never findings — but a report with
-        // eight of thirteen headers missing has to say which eight are missing
-        // and why, or the next reader counts the headers and believes the
-        // battery shrank.
+        // A report with eight of thirteen headers missing has to say which
+        // eight are missing and why, or the next reader counts the headers and
+        // believes the battery shrank.
+        //
+        // Named by the flag that *restores* them. This line used to credit the
+        // hiding to `--findings-only`, which is the default's own name and is
+        // `hide`den from `--help` — so the single most-printed sentence in the
+        // tool pointed at a flag no reader could look up. It appeared 49 times
+        // in one project's sessions and was followed up zero times.
         if skipped_clean > 0 {
             format!(
-                "; --findings-only hid {} clean section(s), all counted above",
+                "; {} clean section(s) not shown (`--full` shows them), all counted above",
                 skipped_clean
             )
         } else {
@@ -1223,7 +1312,7 @@ pub fn run(
         // habit that surrounds it is a pipe: one session ran
         // `unruster audit … | tail -40; echo "EXIT=$?"` and read back `EXIT=0`,
         // which was `tail`'s. It happened to be clean that time.
-        if gating > 0 {
+        if gate_count > 0 {
             format!(
                 "exit 1: {} (the process's status — after a pipe `$?` is the pipe's)",
                 if holders.is_empty() {
@@ -1231,6 +1320,14 @@ pub fn run(
                 } else {
                     holders
                 }
+            )
+        } else if gating > 0 {
+            // Gating rows exist and none of them is the edit's. Saying "clean"
+            // would be a lie by omission; saying "exit 1" would be wrong.
+            format!(
+                "exit 0: all {} gating row(s) pre-date this diff (`--gate-pre-existing` gates \
+                 on them, `audit` without `--changed-since` shows the whole tree)",
+                gating
             )
         } else {
             "clean: no gating findings, exit 0".to_string()
@@ -1313,7 +1410,8 @@ pub fn run(
             String::new()
         }
     ));
-    Ok(gating)
+    ctx.out.set_summary_stdout(prev_summary_stream);
+    Ok(gate_count)
 }
 
 /// The rows that hold the exit code open, printed before everything else.
@@ -1334,7 +1432,20 @@ pub fn run(
 /// a second full battery in one call to list what the first had counted. A
 /// number that costs a minute to compute and sits behind a pipe the reader has
 /// already installed is a number nobody reads.
-fn print_gating_digest(ctx: &AnalysisCtx, rows: &[crate::emit::GatingRow], deferred: bool) {
+fn print_gating_digest(
+    ctx: &AnalysisCtx,
+    rows: &[crate::emit::GatingRow],
+    deferred: bool,
+    gate_pre_existing: bool,
+) {
+    // Pre-existing rows print and are counted, but under `--changed-since`
+    // they no longer decide the exit code — so the verdict on line 1 counts
+    // only the half that does. See `Opts::gate_pre_existing`.
+    let holding = if gate_pre_existing || ctx.changed.is_none() {
+        rows.len()
+    } else {
+        rows.iter().filter(|g| g.change == "changed").count()
+    };
     // The verdict in the header. Under `--fail-on-new` the exit code belongs to
     // the comparison that runs after this battery, so the digest says who
     // decides rather than guessing — a wrong verdict on line 1 is worse than
@@ -1356,13 +1467,23 @@ fn print_gating_digest(ctx: &AnalysisCtx, rows: &[crate::emit::GatingRow], defer
         ctx.out.print_now("");
         return;
     }
+    if holding == 0 {
+        ctx.out.print_now(&format!(
+            "## gating — {} row(s) below, none of them in changed lines, so none holds the \
+             exit code open{} (`--gate-pre-existing` gates on them)",
+            rows.len(),
+            verdict(false)
+        ));
+    }
     // The split the closing line reports in words, on line 1 as well: this is
     // the "did *I* break it" number, and it is why the run was scoped at all.
     let changed = rows.iter().filter(|g| g.change == "changed").count();
     let pre = rows.iter().filter(|g| g.change == "pre-existing").count();
-    ctx.out.print_now(&format!(
-        "## gating — {} row(s) hold the exit code open{}{}; each is marked `!` in its \
+    if holding > 0 {
+        ctx.out.print_now(&format!(
+        "## gating — {} of {} row(s) hold the exit code open{}{}; each is marked `!` in its \
          section below",
+        holding,
         rows.len(),
         if ctx.changed.is_some() {
             format!(
@@ -1374,7 +1495,8 @@ fn print_gating_digest(ctx: &AnalysisCtx, rows: &[crate::emit::GatingRow], defer
             String::new()
         },
         verdict(true)
-    ));
+        ));
+    }
     // The waiver lines triple a digest's height. On the handful of rows a
     // tuned tree gates on that is the point; on a tree gating on ninety, the
     // digest has to stay a digest.
@@ -1450,6 +1572,27 @@ pub struct Opts<'a> {
     /// `--fail-on-new`: the exit code is the *comparison's*, decided after this
     /// battery returns, so the gating digest must not claim one.
     pub gate_deferred: bool,
+    /// `--gating-only`: print the `## gating` digest and the closing line, and
+    /// nothing else.
+    ///
+    /// Exists because readers built it themselves. Across one project's
+    /// sessions 8 of 71 audit runs were `audit … | grep -E "^!"` — the gate
+    /// column this tool prints for exactly this purpose, re-extracted by hand
+    /// because no flag asked for it — and 7 more ran the whole battery *twice*
+    /// in one command, once for the rows and once for the summary a pipe had
+    /// eaten.
+    pub gating_only: bool,
+    /// `--gate-pre-existing`: under `--changed-since`, let a finding the edit
+    /// merely *touched* hold the exit code open, as it used to.
+    ///
+    /// Off by default. `--changed-since HEAD` is asked as "did I make it
+    /// worse", and answering it with a finding that was already there inverts
+    /// the question: one session's loop was held open by a dead `pub fn` in a
+    /// file it had opened for an unrelated reason, and the reader's own note
+    /// was "pre-existing dead code, gating only because I touched the file".
+    /// The rows are still printed, still marked, and still counted in the
+    /// digest — they just do not decide the exit code.
+    pub gate_pre_existing: bool,
 }
 
 /// Advisory rows a section lists by default. The rest is one `--top 0` away

@@ -47,6 +47,11 @@ pub struct Defn {
     /// True if the item (or its enclosing impl block) carries `#[allow(dead_code)]`.
     /// `dead-code` skips these to respect the author's explicit opt-out.
     pub allow_dead: bool,
+    /// The fn publishes a symbol for a caller outside the tree —
+    /// `#[no_mangle]`, `#[export_name]`, or a `pub extern "C"` ABI. See
+    /// [`crate::ast::is_abi_export`]. `dead-code` skips these: an in-tree
+    /// caller is impossible by construction, so the row could never be cleared.
+    pub is_exported: bool,
     /// The item carries `#[test]`, `#[bench]`, `#[tokio::test]` or similar.
     ///
     /// Its caller is the test harness, which appears in no call site, so
@@ -254,6 +259,21 @@ impl NameIndex {
             };
             scored.push((sim, name.as_str(), &self.defns[best]));
         }
+        // The reader spelled a real identifier and got the module half wrong.
+        // Once that is known, every near-spelling is noise: `Index` somewhere
+        // else answers the question, `INDENT` and `inside` do not, and a
+        // suggestion list padded with them teaches the reader to stop reading
+        // suggestion lists. Measured on a 23-crate workspace, where
+        // `fab-vcs::diff::Index` was answered with the right `tree::Index`
+        // followed by `merge::insert`, `library::index`, `document::INDENT`
+        // and `tessellate::inside` — four rows, none of them an `Index`.
+        //
+        // Only when there *is* an exact match: a genuine typo (`contour_of`
+        // for `contour_points`) has none, and near-spellings are the whole
+        // answer there.
+        if scored.iter().any(|(_, name, _)| name.to_lowercase() == want) {
+            scored.retain(|(_, name, _)| name.to_lowercase() == want);
+        }
         // A candidate under the query's own qualifier outranks a closer spelling
         // somewhere else: `geom::dist` before `trace::seg_dist`, whatever the
         // edit distance says.
@@ -297,6 +317,7 @@ struct Spot {
     doc: Option<String>,
     allow_dead: bool,
     is_test: bool,
+    is_exported: bool,
 }
 
 impl Spot {
@@ -311,6 +332,7 @@ impl Spot {
             doc: None,
             allow_dead: false,
             is_test: false,
+            is_exported: false,
         }
     }
 
@@ -331,6 +353,11 @@ impl Spot {
 
     fn allow_dead(mut self, on: bool) -> Spot {
         self.allow_dead = on;
+        self
+    }
+
+    fn exported(mut self, on: bool) -> Spot {
+        self.is_exported = on;
         self
     }
 }
@@ -512,6 +539,7 @@ impl<'a> IndexVisitor<'a> {
             in_trait_impl: false,
             allow_dead: s.allow_dead,
             is_test: s.is_test,
+            is_exported: s.is_exported,
         }
     }
 
@@ -567,6 +595,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                 .doc(&i.attrs)
                 .sig(&i.sig)
                 .allow_dead(has_allow_dead_code(&i.attrs))
+                .exported(crate::ast::is_abi_export(&i.attrs, &i.sig, &i.vis))
                 .test_attr(crate::ast::has_test_attr(&i.attrs)),
         );
     }
@@ -621,6 +650,7 @@ impl<'ast, 'a> Visit<'ast> for IndexVisitor<'a> {
                     .doc(&f.attrs)
                     .sig(&f.sig)
                     .allow_dead(impl_block_allow || has_allow_dead_code(&f.attrs))
+                    .exported(crate::ast::is_abi_export(&f.attrs, &f.sig, &f.vis))
                     .test_attr(crate::ast::has_test_attr(&f.attrs));
                 let mut d = self.defn(spot);
                 d.owner = self.scope.impl_stack.last().cloned();

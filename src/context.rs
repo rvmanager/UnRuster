@@ -523,8 +523,20 @@ impl AnalysisCtx<'_> {
             ));
             return;
         }
-        self.out
-            .answer(&format!("note: no {} `{}`. Did you mean:", what, name));
+        // "Did you mean" is the wrong sentence when nothing was misspelled.
+        // A qualified query whose last segment names a real item got the module
+        // half wrong, and saying so names the repair — where "did you mean"
+        // invites the reader to re-check a spelling that was already right.
+        let exact = crate::ast::last_segment(name);
+        if near.iter().all(|d| d.name.eq_ignore_ascii_case(exact)) {
+            self.out.answer(&format!(
+                "note: no {} `{}` — `{}` is not in that module. It is declared here:",
+                what, name, exact
+            ));
+        } else {
+            self.out
+                .answer(&format!("note: no {} `{}`. Did you mean:", what, name));
+        }
         for d in &near {
             self.out
                 .answer(&format!("  {} {}\t{}:{}", d.kind, d.qpath, d.file, d.line));

@@ -794,9 +794,34 @@ struct AuditArgs {
 
     /// Now the default: sections that found nothing are omitted, and the
     /// closing line reports how many. Kept so scripts that pass it keep
-    /// working; `--full` is the way to see the clean sections.
+    /// working; `--full` is the way to see the clean sections. The closing
+    /// line no longer names it — a flag `--help` hides is a dead end for the
+    /// reader who follows it, and that sentence was printed 49 times in one
+    /// project's sessions and acted on none.
     #[arg(long, hide = true)]
     findings_only: bool,
+
+    /// Print the `## gating` digest and the closing line, and nothing else.
+    ///
+    /// The battery still runs whole — counts, waiver ledger and `--since`
+    /// baseline all need it — so this narrows the rendering and never the
+    /// analysis. It exists because readers built it themselves: across one
+    /// project's sessions 8 of 71 audit runs re-extracted the gate column with
+    /// `| grep -E "^!"`, and 7 more ran the whole battery twice in one command
+    /// to get the rows and the summary a pipe had eaten.
+    #[arg(long, conflicts_with = "full")]
+    gating_only: bool,
+
+    /// With `--changed-since`: let findings the edit merely *touched* hold the
+    /// exit code open too, as they used to.
+    ///
+    /// Off by default. `--changed-since HEAD` asks "did I make it worse", and
+    /// a finding that was already there is not an answer to it — one session's
+    /// loop was held open by a dead `pub fn` in a file it had opened for an
+    /// unrelated reason. Pre-existing rows still print, are still marked `!`
+    /// and are still counted in the digest; they just do not decide the exit.
+    #[arg(long)]
+    gate_pre_existing: bool,
 
     /// The long form: clean sections shown, and each section lists its own
     /// full row budget (40 for `divergence`, 20 for the ranked checks, …)
@@ -1007,6 +1032,12 @@ struct InventoryArgs {
     /// the only metacharacter). A bare pattern matches the last `::` segment;
     /// one containing `::` matches any qualified suffix, so
     /// `--name 'Document::*'` lists one type's members.
+    ///
+    /// **The whole path is one of those suffixes, so a leading glob narrows by
+    /// crate or module**: `--name 'crates::fab-vcs::*'`, `--name 'audit::*'`.
+    /// That is the workspace filter this listing looks like it lacks — on a
+    /// 23-crate tree 13 of one project's 14 `inventory` calls were
+    /// `inventory | grep <crate-name>` because nothing said so.
     ///
     /// Smartcase: an all-lowercase pattern matches case-insensitively, so
     /// `--name mask` finds `Mask`, `load_mask_for` and `MaskArgs` alike; any
@@ -2099,15 +2130,68 @@ fn report_root_gap(out: &emit::Out, root: &std::path::Path, excludes: &[String])
     ));
 }
 
+/// The caveat line: what this run could not read.
+///
+/// It names the macros and the files rather than a follow-up command. The line
+/// used to end with "`unruster blind-spots` lists them", and it is printed on
+/// every run that parses anything — so across one project's sessions it
+/// appeared 21 times and `blind-spots` was run zero. A caveat that costs a
+/// second command to act on is a caveat nobody acts on, and the whole payload
+/// here is a handful of macro names; most of the value fits on the line that
+/// was already going to be printed.
 fn report_blind_spots(out: &emit::Out) {
-    let blind = macro_scan::blind_spots();
-    if blind > 0 {
-        out.note(&format!(
-            "(blind spots: {} macro body(ies) not analyzed — `unruster blind-spots` lists them)",
-            blind
-        ));
+    let sites = macro_scan::blind_spot_sites();
+    if sites.is_empty() {
+        return;
     }
+    // `name ×n` for the macros, and the files they sit in — ranked, because
+    // a single `lazy_static!` behaves very differently from forty `kdl!`s.
+    let mut by_macro: Vec<(String, usize)> = Vec::new();
+    let mut files: Vec<&str> = Vec::new();
+    for (file, _, name) in &sites {
+        match by_macro.iter_mut().find(|(n, _)| n == name) {
+            Some((_, c)) => *c += 1,
+            None => by_macro.push((name.clone(), 1)),
+        }
+        if !files.contains(&file.as_str()) {
+            files.push(file);
+        }
+    }
+    by_macro.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let named: Vec<String> = by_macro
+        .iter()
+        .take(BLIND_SPOT_NAMES)
+        .map(|(n, c)| if *c > 1 { format!("{} ×{}", n, c) } else { n.clone() })
+        .collect();
+    out.note(&format!(
+        "(blind spots: {} macro body(ies) not analyzed — {}{}; in {}{}. \
+         `blind-spots` prints every site.)",
+        sites.len(),
+        named.join(", "),
+        if by_macro.len() > named.len() {
+            format!(" and {} more macro(s)", by_macro.len() - named.len())
+        } else {
+            String::new()
+        },
+        files
+            .iter()
+            .take(BLIND_SPOT_FILES)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", "),
+        if files.len() > BLIND_SPOT_FILES {
+            format!(" and {} more file(s)", files.len() - BLIND_SPOT_FILES)
+        } else {
+            String::new()
+        }
+    ));
 }
+
+/// Distinct macro names the blind-spot caveat names before summarising.
+const BLIND_SPOT_NAMES: usize = 4;
+
+/// Files the blind-spot caveat names before summarising.
+const BLIND_SPOT_FILES: usize = 3;
 
 /// Route one parsed subcommand to its implementation. Pure jump table —
 /// extracted so `main` itself stays small (its own `metrics --sort cyclo`
@@ -2155,6 +2239,8 @@ fn dispatch(
                     // only name the exit code when nothing downstream replaces
                     // it. `--fail-on-new` does.
                     gate_deferred: a.fail_on_new,
+                    gating_only: a.gating_only,
+                    gate_pre_existing: a.gate_pre_existing,
                 },
             )?;
             let current = ctx.out.take_recording();

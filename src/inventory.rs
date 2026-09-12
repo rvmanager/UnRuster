@@ -84,6 +84,13 @@ pub enum ItemSort {
 /// `show Document::new` means there. Without the qualified form the only way to
 /// list one type's methods was `inventory --kind impl-fn | grep 'Document::'`,
 /// which this command's own playbook was recommending.
+///
+/// The whole path is one of the suffixes tried, so a *leading* glob narrows by
+/// crate or module: `--name 'crates::fab-vcs::*'`. That has always worked and
+/// was never written down, so on a 23-crate workspace 13 of 14 `inventory`
+/// calls were `inventory | grep <crate-name>` — which matches the file path and
+/// the doc column as readily as the name, and discards the item count and the
+/// `--top` cut along with them.
 pub(crate) fn name_matches(pat: &str, qpath: &str) -> bool {
     use crate::ast::{glob_match_smart, last_segment};
     if !pat.contains("::") {
@@ -92,6 +99,25 @@ pub(crate) fn name_matches(pat: &str, qpath: &str) -> bool {
     std::iter::once(qpath)
         .chain(qpath.match_indices("::").map(|(i, _)| &qpath[i + 2..]))
         .any(|suffix| glob_match_smart(pat, suffix))
+}
+
+/// The path-shaped spelling of an item, for [`name_matches`].
+///
+/// An `impl` header's `qpath` is its rendered `impl Trait for Type` line, not a
+/// path — so a module- or crate-prefixed `--name` matched none of them and
+/// silently dropped every impl block in the crate it selected. On a 23-crate
+/// workspace `--name 'crates::fab-features::*'` returned 49 rows where
+/// `inventory | grep fab-features` returned 59, and all 10 of the difference
+/// were impl headers. A reader comparing the two concludes the flag is broken
+/// and goes back to the grep — which is the habit the flag exists to replace.
+///
+/// Its `module` is a real path, so that is what the pattern is offered.
+pub(crate) fn match_path(d: &Defn) -> String {
+    if d.kind == "impl" && !d.module.is_empty() {
+        format!("{}::{}", d.module, d.name)
+    } else {
+        d.qpath.clone()
+    }
 }
 
 pub fn run(
@@ -120,7 +146,7 @@ pub fn run(
     // Matching on the last segment keeps `--name Options` from being defeated
     // by every item's module prefix.
     if let Some(pat) = name_filter {
-        all.retain(|d| name_matches(pat, &d.qpath));
+        all.retain(|d| name_matches(pat, &match_path(d)));
     }
 
     if tree {
@@ -197,18 +223,23 @@ pub(crate) fn note_name_filter(ctx: &AnalysisCtx, pat: Option<&str>, shown: usiz
     // — which also matches the path and the doc column, and discards the
     // count and the `--top` cut along with the stderr it redirects.
     if pat.is_none() && offer && shown > 40 {
-        ctx.out.note(
+        // `advice`, not `note`: this sentence is aimed at the reader who is
+        // about to pipe the listing into `grep`, and on stdout their own grep
+        // is what deletes it. See `Out::advice`.
+        ctx.out.advice(
             "note: `--name <glob>` narrows by name — `*` the only metacharacter, smartcase, \
-             and `Type::*` for one type's members. Prefer it to `| grep`, which also matches \
+             `Type::*` for one type's members, and a leading glob for a crate or module \
+             (`--name 'crates::fab-vcs::*'`). Prefer it to `| grep`, which also matches \
              the path and the doc column and discards the count above.",
         );
     }
     if let Some(pat) = pat.filter(|_| shown == 0) {
         ctx.out.note(&format!(
             "note: nothing matches `{}` — `*` is the only metacharacter, the match is on the \
-             last `::` segment (a pattern with `::` matches any qualified suffix), and an \
-             all-lowercase pattern already matches case-insensitively. `show {}` answers \
-             with the near names if it is a typo.",
+             last `::` segment (a pattern with `::` matches any qualified suffix, the whole \
+             path included, so `'mod::*'` narrows by module), and an all-lowercase pattern \
+             already matches case-insensitively. `show {}` answers with the near names if \
+             it is a typo.",
             pat,
             pat.trim_matches('*')
         ));

@@ -378,6 +378,7 @@ fn variant_defns(ctx: &AnalysisCtx, query: &str) -> Vec<Defn> {
                     trait_name: None,
                     in_trait_impl: false,
                     allow_dead: false,
+                    is_exported: false,
                     is_test: false,
                 });
             }
@@ -417,6 +418,24 @@ fn resolve(ctx: &AnalysisCtx, query: &str, opts: &ShowOpts) -> anyhow::Result<Ve
         .map(|d| (*d).clone())
         .collect();
 
+    // `--kind impl` on a type name means "that type's impl blocks", and an
+    // `impl` header's `qpath` is the rendered `impl Trait for Type` line rather
+    // than a module path — so the index can never reach one through a
+    // *qualified* query, and the kind filter emptied a perfectly good hit.
+    //
+    // The trap this closes: every other note in this command tells the reader
+    // to re-run with the qualified name, and `note_impl_blocks` tells them
+    // `show <Type> --kind impl` prints the blocks. Following both at once —
+    // `show crates::features::dag::Dag --kind impl` — printed nothing at all,
+    // and the session that hit it fell back to `grep -n "fn order" | sed -n`,
+    // which is the one outcome this tool exists to prevent.
+    if hits.is_empty() && opts.kind == Some("impl") {
+        let blocks = impl_blocks_of(ctx, &found);
+        if !blocks.is_empty() {
+            hits = blocks;
+        }
+    }
+
     // The name resolved and `--kind` then emptied it. Saying "no item named X"
     // here would be a lie that sends the reader hunting for a typo they did not
     // make, so name the kinds that actually exist.
@@ -424,10 +443,12 @@ fn resolve(ctx: &AnalysisCtx, query: &str, opts: &ShowOpts) -> anyhow::Result<Ve
         let mut kinds: Vec<&str> = found.iter().map(|d| d.kind).collect();
         kinds.sort_unstable();
         kinds.dedup();
+        let want = opts.kind.unwrap_or("?");
         ctx.out.note(&format!(
-            "note: `{}` exists but not as a `{}` — it is: {}",
+            "note: `{}` exists but not as {} `{}` — it is: {}",
             query,
-            opts.kind.unwrap_or("?"),
+            crate::context::article(want),
+            want,
             kinds.join(", ")
         ));
         return Err(TargetNotFound::err("item", query));
@@ -483,6 +504,35 @@ fn is_type(kind: &str) -> bool {
     matches!(kind, "struct" | "enum" | "trait" | "type")
 }
 
+/// The `impl` blocks belonging to the type declarations in `found`.
+///
+/// Needed because an impl header is indexed under its rendered
+/// `impl Trait for Type` line, not under a module path: `lookup` finds it from
+/// a bare `Type` and never from `module::Type`. The owner name is the only
+/// link, so where that name is ambiguous tree-wide the search is confined to
+/// the declaration's own file and module — crediting `parse::Scope`'s impls to
+/// `suppress::Scope` would be a wrong answer of exactly the kind a qualified
+/// query was written to avoid.
+fn impl_blocks_of(ctx: &AnalysisCtx, found: &[&Defn]) -> Vec<Defn> {
+    let mut out: Vec<Defn> = Vec::new();
+    for decl in found.iter().filter(|d| is_type(d.kind)) {
+        let ambiguous = ctx
+            .idx
+            .iter()
+            .filter(|d| is_type(d.kind) && d.name == decl.name)
+            .count()
+            > 1;
+        out.extend(
+            ctx.idx
+                .iter()
+                .filter(|i| i.kind == "impl" && i.owner.as_deref() == Some(decl.name.as_str()))
+                .filter(|i| !ambiguous || i.file == decl.file || i.module == decl.module)
+                .cloned(),
+        );
+    }
+    out
+}
+
 /// After printing a type, name its `impl` blocks: where they are, how many fns
 /// each holds, and the two commands that print them. Under `--all` they were
 /// printed already.
@@ -498,6 +548,15 @@ fn note_impl_blocks(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
     if impls.is_empty() {
         return;
     }
+    // Spell the rerun with the path that resolves. Where the bare name is
+    // ambiguous the note's own command answered with every same-named type's
+    // blocks, and a reader who narrowed it themselves — the thing every other
+    // note here tells them to do — used to get nothing back.
+    let rerun = if ctx.idx.lookup(&d.name).iter().filter(|o| is_type(o.kind)).count() > 1 {
+        d.qpath.as_str()
+    } else {
+        d.name.as_str()
+    };
     let described: Vec<String> = impls
         .iter()
         .map(|i| {
@@ -515,7 +574,7 @@ fn note_impl_blocks(ctx: &AnalysisCtx, d: &Defn, opts: &ShowOpts) {
         impls.len(),
         d.name,
         described.join(", "),
-        d.name,
+        rerun,
         d.file
     ));
 }
@@ -724,11 +783,16 @@ fn note_field_route(ctx: &AnalysisCtx, d: &Defn) {
     if d.kind != "struct" {
         return;
     }
-    ctx.out.note(&format!(
-        "note: `fields {}` lists these with read/write/init counts, and \
-         `field-uses {} <field>` gives the sites — both take this qualified name.",
-        d.qpath, d.qpath
-    ));
+    // Once per run: the sentence names its subject, so the plain text-dedup
+    // never fires and a `show` over several structs printed one copy each.
+    ctx.out.note_once(
+        "field-route",
+        &format!(
+            "note: `fields {}` lists these with read/write/init counts, and \
+             `field-uses {} <field>` gives the sites — both take this qualified name.",
+            d.qpath, d.qpath
+        ),
+    );
 }
 
 /// `--part sig` on an `impl`/`trait`/`mod` prints its header line and stops.

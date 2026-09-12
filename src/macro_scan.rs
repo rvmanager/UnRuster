@@ -155,14 +155,6 @@ pub fn count_in(files: &[crate::parse::ParsedFile], keep: impl Fn(&str) -> bool)
     c.n
 }
 
-pub fn blind_spots() -> usize {
-    UNPARSED_MACRO_BODIES
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.len())
-        .unwrap_or(0)
-}
 
 /// Structured parse of a macro body, when we can recognize the shape.
 // `Body` is a transient per-macro return value, consumed immediately and never

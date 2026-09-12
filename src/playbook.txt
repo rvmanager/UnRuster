@@ -105,14 +105,28 @@ arguments `audit` ran the check under, which are rarely the standalone
 defaults. `audit --list-checks` prints all of them, and the names are what
 `--only` and `--skip` take. The closing line names the checks holding the gate and one site
 each, and states the verdict in words — `clean: no gating findings, exit 0`
-or `exit 1 while gating findings remain` — so `| tail -2` is a complete
-answer to both *what* and *whether*. Do not run the battery a second time
-behind `>/dev/null` just to read `$?`: in one two-day sample 13 of 119
-audit calls did, at five seconds each. A script that needs the code after
-a pipe reads `$pipestatus[1]` (zsh) or `${PIPESTATUS[0]}` (bash), or uses
-`--summary`, which prints only the closing line. Under `--changed-since` it also
-splits the gate into rows in changed lines and rows pre-existing in changed
-files, and `--fail-on-new` gates on the first kind alone.
+or `exit 1: <checks>` — so `| tail -2` is a complete
+answer to both *what* and *whether*. **That line is on stdout**, unlike
+every other command's summary: it is the verdict a pipe has to be able to
+reach, not a count a reader can afford to lose. Do not run the battery a
+second time behind `>/dev/null` just to read `$?`: in one two-day sample 13
+of 119 audit calls did, at five seconds each. A script that needs the code
+after a pipe reads `$pipestatus[1]` (zsh) or `${PIPESTATUS[0]}` (bash).
+
+Three flags shape the report, and each replaces a pipeline readers were
+writing by hand: `--summary` prints the closing line alone,
+`--gating-only` prints the `## gating` digest and that line and nothing
+else (this is `| grep -E "^!"`, but it keeps the verdict), and `--full`
+prints the clean sections and every section's own row budget.
+
+Under `--changed-since` the digest splits the gate into rows in changed
+lines and rows pre-existing in changed files, **and only the first kind
+holds the exit code open**. `--changed-since HEAD` is asked as "did I make
+it worse", and a finding that was already there is not an answer to it —
+one session's loop was held open by a dead `pub fn` in a file it had opened
+for an unrelated reason. Pre-existing rows still print, are still marked
+`!` and are still counted; `--gate-pre-existing` restores the old verdict,
+and `--fail-on-new` compares against the ref instead.
 `unruster explain <topic>` prints one repair recipe instead of this whole
 text.
 

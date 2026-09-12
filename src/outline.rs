@@ -126,7 +126,9 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
         items.retain(|d| d.vis == v.as_str());
     }
     if let Some(pat) = opts.name {
-        items.retain(|d| crate::inventory::name_matches(pat, &d.qpath));
+        items.retain(|d| {
+            crate::inventory::name_matches(pat, &crate::inventory::match_path(d))
+        });
     }
     // Source order by default: an outline read out of order is a list, not an
     // outline. `--sort kind` gives `inventory`'s census ordering on one file.

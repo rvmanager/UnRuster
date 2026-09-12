@@ -990,7 +990,7 @@ fn show_says_which_kinds_exist_when_kind_filters_everything_out() {
         .assert()
         .failure()
         .code(2)
-        .stdout(contains("exists but not as a `enum`"))
+        .stdout(contains("exists but not as an `enum`"))
         .stdout(contains("struct"));
 }
 
@@ -4337,18 +4337,50 @@ fn audit_runs_all_sections_and_exits_1_on_findings() {
     assert_eq!(out.status.code(), Some(1), "fixtures have findings → exit 1");
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("## [high]"), "expected severity section headers:\n{}", s);
-    let e = String::from_utf8_lossy(&out.stderr);
-    assert!(e.contains("(audit:"), "expected audit summary:\n{}", e);
+    // The digest rides *stdout*: it is the verdict a pipe has to be able to
+    // reach, not a count a reader can lose. See `Out::summary_stdout`.
+    assert!(s.contains("(audit:"), "expected audit summary on stdout:\n{}", s);
 }
 
+/// `--summary` drops the rows and keeps the verdict — on stdout, where a pipe
+/// can reach it.
+///
+/// It used to leave stdout completely empty, which made the flag useless in the
+/// shape everybody writes: `unruster audit --summary | grep …` printed nothing
+/// at all, silently, because the one line it produces went to stderr. Across
+/// one project's sessions 50 of 71 audit runs hand-rolled that line with
+/// `2>&1 | grep "audit:"` or `2>&1 | tail -2`, and `--summary` was used zero
+/// times.
 #[test]
-fn audit_summary_mode_silent_stdout() {
+fn audit_summary_mode_keeps_the_verdict_and_drops_the_rows() {
     let out = ur()
         .args(["--root", FIXTURE, "--summary", "audit"])
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "--summary is the verdict and nothing else:\n{}",
+        s
+    );
+    assert!(lines[0].starts_with("(audit:"), "and the verdict is the audit line:\n{}", s);
+}
+
+/// …but only `audit`'s. Every other command's summary is a *count*, and a
+/// reader who lost it to `2>/dev/null` still holds a correct answer — so it
+/// stays on stderr, where it has always been.
+#[test]
+fn summary_mode_still_silences_stdout_for_other_commands() {
+    let out = ur()
+        .args(["--root", FIXTURE, "--summary", "dead-code"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.trim().is_empty(), "expected --summary to silence stdout:\n{}", s);
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("candidate dead fn(s)"), "the count belongs on stderr:\n{}", e);
 }
 
 #[test]
@@ -4575,7 +4607,7 @@ fn a_scoped_audit_does_not_report_out_of_scope_waivers_as_dead() {
         .args(["--root", dir.to_str().unwrap(), "--changed-since", "HEAD", "audit"])
         .output()
         .unwrap();
-    let s = String::from_utf8_lossy(&out.stderr);
+    let s = String::from_utf8_lossy(&out.stdout);
     let line = s
         .lines()
         .find(|l| l.starts_with("(audit:"))
@@ -4681,7 +4713,7 @@ fn audit_strict_gates_advisory_findings() {
         .assert()
         .failure()
         .code(1)
-        .stderr(contains("--strict: all gate"));
+        .stdout(contains("--strict: all gate"));
 }
 
 #[test]
@@ -4771,11 +4803,23 @@ fn audit_findings_only_drops_clean_sections_and_says_how_many() {
     let err = |args: &[&str]| -> String {
         let mut full = vec!["--root", FIXTURE];
         full.extend(args);
-        String::from_utf8_lossy(&ur().args(&full).output().unwrap().stderr).into_owned()
+        String::from_utf8_lossy(&ur().args(&full).output().unwrap().stdout).into_owned()
     };
     let line = err(&["audit", "--findings-only"]);
     let summary = line.lines().find(|l| l.starts_with("(audit:")).unwrap();
-    assert!(summary.contains("hid"), "the omission is silent:\n{}", summary);
+    assert!(
+        summary.contains("clean section(s) not shown"),
+        "the omission is silent:\n{}",
+        summary
+    );
+    // …and it names the flag that restores them, not the hidden one that
+    // caused them. `--findings-only` is `hide = true` in the CLI, so a reader
+    // who followed the old sentence into `--help` found nothing.
+    assert!(
+        summary.contains("`--full` shows them") && !summary.contains("--findings-only"),
+        "the digest must point at a documented flag:\n{}",
+        summary
+    );
     // The finding counts and check count are the run's, not the listing's.
     let counts = |s: &str| s.split(';').next().unwrap().to_string();
     let plain = err(&["audit"]);
@@ -4793,7 +4837,7 @@ fn a_failing_audit_says_the_exit_code_is_the_process_s() {
     // and read back `EXIT=0`, which was tail's. It happened to be clean.
     let out = ur().args(["--root", FIXTURE, "audit"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1), "fixture should have gating findings");
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stdout);
     assert!(
         err.contains("after a pipe `$?` is the pipe's"),
         "the trap is unsaid:\n{}",
@@ -6817,7 +6861,10 @@ fn json_sections_name_their_check_and_its_finding_kind() {
 
 #[test]
 fn audit_can_skip_a_check_and_says_which() {
-    let out = ur_stderr(&["--root", FIXTURE, "audit", "--skip", "error-swallows,dead-code"]);
+    let out = String::from_utf8_lossy(&ur_stdout_allow_findings(&[
+        "--root", FIXTURE, "audit", "--skip", "error-swallows,dead-code",
+    ]))
+    .into_owned();
     assert!(
         out.contains("--only/--skip left out: dead-code, error-swallows"),
         "a shortened battery must name what it left out:\n{out}"
@@ -6949,9 +6996,36 @@ fn unwrapping_a_parse_of_external_input_outranks_an_in_process_expect() {
 fn a_shipped_todo_gates_on_its_own() {
     let out = ur_stdout(&["--root", ARITH_FIXTURE, "panics"]);
     let s = String::from_utf8_lossy(&out);
-    let row = s.lines().find(|l| l.starts_with("todo!")).expect("fixture has one");
+    let row = s
+        .lines()
+        .find(|l| l.starts_with("todo!") && l.contains("route"))
+        .expect("fixture has a reachable one");
     let score: f64 = row.split('\t').nth(1).unwrap().parse().unwrap();
     assert!(score >= 0.55, "a shipped todo! is a crash on a reachable path: {row}");
+}
+
+/// A `todo!()` that *is* the whole body is unwritten work, not a shipped
+/// crash — there is no path through a function with no code in it.
+///
+/// Scaffolding a 23-crate workspace otherwise put 22 such rows in one audit's
+/// 77-row gating tier, every one of them describing the task the author was in
+/// the middle of. The row still prints; it just does not hold the loop open.
+#[test]
+fn a_stub_body_is_listed_but_does_not_gate() {
+    let out = ur_stdout(&["--root", ARITH_FIXTURE, "panics", "--min-score", "0"]);
+    let s = String::from_utf8_lossy(&out);
+    let row = s
+        .lines()
+        .find(|l| l.starts_with("todo!") && l.contains("unfinished"))
+        .expect("the stub must still be listed");
+    let score: f64 = row.split('\t').nth(1).unwrap().parse().unwrap();
+    assert!(score < 0.55, "a stub body must not gate: {row}");
+    // And the distinction is the body, not the macro: the reachable arm in the
+    // same fixture keeps its score.
+    assert!(
+        s.lines().any(|l| l.starts_with("todo!") && l.contains("route")),
+        "the reachable todo! must survive the same run:\n{s}"
+    );
 }
 
 #[test]
@@ -11429,7 +11503,7 @@ fn audit_leads_with_the_gating_rows_and_names_them_in_the_summary() {
         "the digest should carry the waiver spelling:\n{text}"
     );
     // The summary names the holders and one site each.
-    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let err = String::from_utf8_lossy(&out.stdout).to_string();
     let summary = err.lines().find(|l| l.starts_with("(audit:")).expect("summary");
     assert!(
         summary.contains("exit 1: ") && summary.contains("dead-code ×") && summary.contains(".rs:"),
@@ -11627,7 +11701,10 @@ fn metrics_since_carries_the_previous_value_and_keeps_the_fn_that_improved() {
 /// A waiver for a check `--only` did not run has not "suppressed nothing".
 #[test]
 fn audit_only_does_not_accuse_waivers_for_checks_it_did_not_run() {
-    let err = ur_stderr(&["--root", WV, "audit", "--only", "casts", "--summary"]);
+    let err = String::from_utf8_lossy(&ur_stdout_allow_findings(&[
+        "--root", WV, "audit", "--only", "casts", "--summary",
+    ]))
+    .into_owned();
     let summary = err.lines().find(|l| l.starts_with("(audit:")).expect("summary");
     assert!(
         summary.contains("waiver(s) for checks not run this pass"),
@@ -11663,7 +11740,15 @@ fn a_metrics_waiver_is_honoured_and_not_reported_as_unknown() {
 }
 
 /// Under `--changed-since`, a gating row in a touched file but outside every
-/// changed hunk is pre-existing, and `--fail-on-new` needs no second flag.
+/// changed hunk is pre-existing — it prints, it is counted, and it does **not**
+/// hold the exit code open. `--fail-on-new` needs no second flag.
+///
+/// The default flipped because `--changed-since HEAD` is asked as "did I make
+/// it worse", and a finding that was already there is not an answer to it. One
+/// session's loop was held open by a dead `pub fn` in a file it had opened for
+/// an unrelated reason; the reader's own note was "pre-existing dead code,
+/// gating only because I touched the file". `--gate-pre-existing` restores the
+/// old verdict, and is asserted here too.
 #[test]
 fn changed_since_tells_pre_existing_rows_from_the_edit_and_fail_on_new_reuses_the_ref() {
     let dir = scratch("changed-lines");
@@ -11684,17 +11769,38 @@ fn changed_since_tells_pre_existing_rows_from_the_edit_and_fail_on_new_reuses_th
         .args(["--root", root, "--changed-since", "HEAD", "audit"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1), "file-granular: the old row still gates");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a finding the edit merely touched must not gate:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let digest_row = text
         .lines()
         .find(|l| l.starts_with("dead-code\t") && l.contains("old_dead"))
         .unwrap_or_else(|| panic!("no digest row for old_dead:\n{text}"));
     assert!(digest_row.ends_with("\tpre-existing"), "the row must say it predates the edit:\n{digest_row}");
-    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    // Counted and printed, not hidden: only the *verdict* changed.
     assert!(
-        err.contains("(0 in changed lines, 1 pre-existing in changed files)"),
-        "the summary must split the gate:\n{err}"
+        text.contains("0 in changed lines, 1 pre-existing in changed files"),
+        "the summary must still split and still count the gate:\n{text}"
+    );
+    assert!(
+        text.contains("pre-existing rows do not hold the exit code"),
+        "the summary must say why the exit is 0:\n{text}"
+    );
+
+    // The old verdict is one flag away.
+    let out_gated = ur()
+        .args(["--root", root, "--changed-since", "HEAD", "audit", "--gate-pre-existing"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_gated.status.code(),
+        Some(1),
+        "--gate-pre-existing must restore the file-granular gate:\n{}",
+        String::from_utf8_lossy(&out_gated.stdout)
     );
 
     // `--fail-on-new` with only `--changed-since`: the ref is the baseline.
@@ -11803,4 +11909,344 @@ fn usage_queries_default_to_the_whole_tree() {
     // A check keeps the production default.
     let out = ur().args(["--root", root, "dead-code"]).output().unwrap();
     assert!(!all_output(&out).contains("by default"));
+}
+
+// ── field findings: the 2026-09-12 sweep ──────────────────────────────────
+//
+// Each test below pins one behaviour that a 23-crate CAD workspace's sessions
+// showed to be wrong or unreachable. The comment on each says what it cost.
+
+/// `--kind impl` on a *qualified* type name prints that type's impl blocks.
+///
+/// An impl header is indexed under its rendered `impl Trait for Type` line,
+/// not under a module path, so the index could never reach one from
+/// `module::Type` and the kind filter emptied a perfectly good hit. Every
+/// other note in `show` tells the reader to re-run with the qualified name,
+/// and `note_impl_blocks` tells them `--kind impl` prints the blocks —
+/// following both at once printed nothing, and the session that hit it fell
+/// back to `grep -n "fn order" | sed -n`.
+#[test]
+fn kind_impl_on_a_qualified_type_prints_its_impl_blocks() {
+    let dir = scratch("kind-impl-qualified");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod dag {
+    pub struct Dag { pub n: usize }
+    impl Dag {
+        pub fn order(&self) -> usize { self.n }
+    }
+    impl std::fmt::Debug for Dag {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Dag") }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let out = ur_all(&["--root", root, "show", "dag::Dag", "--kind", "impl"]);
+    assert!(
+        out.contains("impl Dag") && out.contains("impl std::fmt::Debug for Dag"),
+        "both impl blocks must be reached by a qualified query:\n{out}"
+    );
+    assert!(
+        !out.contains("exists but not as"),
+        "the kind filter must not empty a real hit:\n{out}"
+    );
+    // The bare name has always worked and must keep working.
+    let bare = ur_all(&["--root", root, "show", "Dag", "--kind", "impl"]);
+    assert!(bare.contains("impl Dag"), "the bare form regressed:\n{bare}");
+}
+
+/// A miss whose last segment names a real item is a *module* mistake, and the
+/// answer is that item — not a list of near-spellings.
+///
+/// `crates::fab-vcs::diff::Index` used to be answered with the right
+/// `tree::Index` followed by `merge::insert`, `library::index`,
+/// `document::INDENT` and `tessellate::inside`: four rows, none of them an
+/// `Index`. A suggestion list padded with noise teaches the reader to stop
+/// reading suggestion lists.
+#[test]
+fn an_exact_name_elsewhere_beats_every_near_spelling() {
+    let dir = scratch("exact-name-wins");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub mod tree { pub struct Index { pub n: usize } }
+pub mod diff { pub fn build() -> usize { 0 } }
+pub mod merge { pub fn insert() {} }
+pub mod doc { pub const INDENT: usize = 2; }
+pub mod tess { pub fn inside() -> bool { true } }
+"#,
+    )
+    .unwrap();
+    let out = ur_all(&["--root", dir.to_str().unwrap(), "show", "diff::Index"]);
+    assert!(
+        out.contains("tree::Index"),
+        "the real Index must be offered:\n{out}"
+    );
+    for noise in ["insert", "INDENT", "inside"] {
+        assert!(
+            !out.contains(noise),
+            "a near-spelling crowded out the exact match ({noise}):\n{out}"
+        );
+    }
+    // And the sentence names the repair rather than inviting a spell-check.
+    assert!(
+        out.contains("is not in that module"),
+        "nothing was misspelled, so \"did you mean\" is the wrong sentence:\n{out}"
+    );
+    // A genuine typo still gets near-spellings: the rule only fires on an
+    // exact leaf-name match.
+    let typo = ur_all(&["--root", dir.to_str().unwrap(), "show", "insrt"]);
+    assert!(typo.contains("Did you mean"), "a real typo lost its list:\n{typo}");
+}
+
+/// An ABI export has no in-tree caller by construction, so `dead-code` must
+/// not report one.
+///
+/// A macOS shell talking to its Rust core over a hand-written C API put 30
+/// such rows in one audit's 77-row gating tier — on the check whose every row
+/// gates — and no edit in the tree could ever have cleared them.
+#[test]
+fn dead_code_skips_abi_exports_and_counts_them() {
+    let dir = scratch("dead-code-ffi");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+#[no_mangle]
+pub extern "C" fn fab_session_open() -> u32 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fab_session_close() {}
+
+pub extern "C" fn fab_hit_test() {}
+
+pub fn never_called_anywhere() {}
+"#,
+    )
+    .unwrap();
+    let out = ur_all(&["--root", dir.to_str().unwrap(), "dead-code"]);
+    for exported in ["fab_session_open", "fab_session_close", "fab_hit_test"] {
+        assert!(!out.contains(exported), "an ABI export was reported: {exported}\n{out}");
+    }
+    assert!(
+        out.contains("never_called_anywhere"),
+        "ordinary dead code must still be reported:\n{out}"
+    );
+    assert!(
+        out.contains("3 ABI export(s) skipped"),
+        "a silent filter on a gating check reads as \"your FFI surface is reachable\":\n{out}"
+    );
+}
+
+/// `concepts` must not cluster nullary accessors returning a scalar.
+///
+/// `() -> usize` named `*_count` on four unrelated types in four crates scored
+/// 0.83 against a 0.70 gate, because *spread* — which idiomatic accessors
+/// maximise by construction — adds more to the score than the rarity term that
+/// was supposed to demote them could ever subtract. The reader's verdict was
+/// "a correct observation and a wrong concern", and it cost three waivers.
+#[test]
+fn concepts_does_not_cluster_nullary_scalar_accessors() {
+    let dir = scratch("concepts-accessors");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub struct Scene { n: usize }
+pub struct Corpus { n: usize }
+pub struct Perturbations { n: usize }
+pub struct Constraint { n: usize }
+impl Scene { pub fn triangle_count(&self) -> usize { self.n } }
+impl Corpus { pub fn rebuild_count(&self) -> usize { self.n + 1 } }
+impl Perturbations { pub fn rebuild_count(&self) -> usize { self.n + 2 } }
+impl Constraint { pub fn residual_count(&self) -> usize { self.n + 3 } }
+
+pub struct Aabb; pub struct Rect; pub struct Pos;
+pub struct Picker; pub struct Hover; pub struct Drag;
+impl Picker { pub fn hit_target(&self, a: Aabb, b: Rect, c: Pos) -> bool { let _ = (a, b, c); true } }
+impl Hover { pub fn hit_target(&self, a: Aabb, b: Rect, c: Pos) -> bool { let _ = (a, b, c); false } }
+impl Drag { pub fn hit_target(&self, a: Aabb, b: Rect, c: Pos) -> bool { let _ = (b, c); let _ = a; true } }
+"#,
+    )
+    .unwrap();
+    let out = ur_all(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "concepts",
+        "--kind",
+        "signature",
+        "--min-score",
+        "0",
+    ]);
+    assert!(
+        !out.contains("() -> usize"),
+        "an accessor shape was clustered:\n{out}"
+    );
+    // The designed three-parameter interface — the shape this check exists for
+    // — must survive the same run.
+    assert!(
+        out.contains("(Aabb, Rect, Pos) -> bool"),
+        "the real finding was thrown out with the noise:\n{out}"
+    );
+}
+
+/// `--gating-only` prints the digest and the verdict, and nothing else.
+///
+/// Readers built it by hand: 8 of one project's 71 audit runs re-extracted the
+/// gate column with `| grep -E "^!"`, and 7 more ran the whole battery twice in
+/// one command to get the rows and the summary a pipe had eaten.
+#[test]
+fn audit_gating_only_prints_the_digest_and_the_verdict() {
+    let out = ur_stdout_allow_findings(&["--root", FIXTURE, "audit", "--gating-only"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("## gating"), "the digest must survive:\n{s}");
+    assert!(s.contains("(audit:"), "the verdict must survive:\n{s}");
+    assert!(
+        !s.contains("## [high]"),
+        "the sections must not:\n{s}"
+    );
+    // The counts are the whole battery's — the flag narrows the rendering, not
+    // the analysis.
+    let full = String::from_utf8_lossy(&ur_stdout_allow_findings(&["--root", FIXTURE, "audit"]))
+        .into_owned();
+    let counts = |t: &str| {
+        t.lines()
+            .find(|l| l.starts_with("(audit:"))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(counts(&s), counts(&full), "--gating-only changed what was counted");
+}
+
+/// The "use `--name` instead of `| grep`" advice goes to stderr, because on
+/// stdout the reader's own `grep` is what deletes it.
+///
+/// It was emitted on 13 of one project's 14 `inventory` calls and reached the
+/// reader on none of them: all 13 were the very pipe it was warning about.
+#[test]
+fn the_narrowing_advice_survives_the_pipe_it_warns_about() {
+    let out = ur().args(["--root", FIXTURE, "inventory"]).output().unwrap();
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        e.contains("`--name <glob>` narrows by name"),
+        "the advice must be on the one channel a pipe cannot eat:\n{e}"
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !s.contains("narrows by name"),
+        "coaching on stdout is coaching a grep will delete:\n{s}"
+    );
+    // And it names the form that answers "narrow this to one crate".
+    assert!(e.contains("leading glob for a crate or module"), "{e}");
+}
+
+/// A leading glob narrows `inventory` by crate or module. This has always
+/// worked and was never written down, so a 23-crate workspace's sessions wrote
+/// `inventory | grep <crate-name>` 13 times out of 14.
+#[test]
+fn inventory_name_glob_narrows_by_module_prefix() {
+    let rows = rows_of(&ur_stdout(&[
+        "--root", FIXTURE, "inventory", "--name", "inference::*",
+    ]));
+    assert!(!rows.is_empty(), "the module prefix matched nothing");
+    // Every row belongs to that module. Checked by file rather than by the
+    // `qpath` cell, because an `impl` header renders as `impl Trait for Type`
+    // and carries no path — which is exactly why it used to be dropped.
+    assert!(
+        rows.iter().all(|r| r.contains("/inference.rs:")),
+        "the prefix let something else through:\n{rows:?}"
+    );
+    // It is a prefix, not a substring: a module that merely *contains* the
+    // pattern later in its path is not selected by a leading glob.
+    let all = rows_of(&ur_stdout(&["--root", FIXTURE, "inventory"]));
+    assert!(all.len() > rows.len(), "the filter narrowed nothing:\n{rows:?}");
+    // And it reaches `impl` headers, whose qpath is the rendered
+    // `impl Trait for Type` line rather than a path. Without that they were
+    // dropped in silence: on a 23-crate workspace a crate-prefixed `--name`
+    // returned 49 rows where `inventory | grep <crate>` returned 59, and all
+    // ten of the difference were impl blocks — so the flag looked broken and
+    // the reader went back to the grep it exists to replace.
+    let mods = rows_of(&ur_stdout(&[
+        "--root", FIXTURE, "inventory", "--name", "inference::*",
+    ]));
+    assert!(
+        mods.iter().any(|r| r.starts_with("impl\t")),
+        "a module-prefixed --name dropped every impl block:\n{mods:?}"
+    );
+}
+
+/// The blind-spot caveat names the macros and files rather than a follow-up
+/// command. It prints on every run that parses anything — 21 times across one
+/// project's sessions — and `blind-spots` was run zero times.
+#[test]
+fn the_blind_spot_caveat_names_what_it_could_not_read() {
+    let out = ur().args(["--root", FIXTURE, "inventory"]).output().unwrap();
+    let s = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = s
+        .lines()
+        .find(|l| l.starts_with("(blind spots:"))
+        .unwrap_or_else(|| panic!("no blind-spot line:\n{s}"));
+    assert!(
+        line.contains("state_machine!"),
+        "the caveat must name the macro:\n{line}"
+    );
+    assert!(line.contains(".rs"), "and the file it sits in:\n{line}");
+}
+
+/// `--summary` must not change the verdict, only the rendering.
+///
+/// `Out` records a gating row before it declines to render one, but each check
+/// guards its own row loop with `if !ctx.summary` — so under `--summary` no row
+/// was ever offered, the changed/pre-existing split came back "(0, 0)" beside a
+/// gating count of two, and the exit code derived from that split disagreed
+/// with the full run's. The battery now runs dense under `--summary` and only
+/// the rendering is suppressed.
+#[test]
+fn summary_mode_agrees_with_the_full_run_on_the_verdict() {
+    let dir = scratch("summary-verdict");
+    let before = "pub fn old_dead() -> u8 { 1 }\n\n\n\n\n\n\n\n\n\npub const TAIL: u8 = 1;\n";
+    std::fs::write(dir.join("src/lib.rs"), before).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    std::fs::write(dir.join("src/lib.rs"), before.replace("TAIL: u8 = 1", "TAIL: u8 = 2")).unwrap();
+    let root = dir.to_str().unwrap();
+
+    let run = |extra: &[&str]| {
+        let mut args = vec!["--root", root];
+        args.extend(extra);
+        args.extend(["--changed-since", "HEAD", "audit"]);
+        ur().args(&args).output().unwrap()
+    };
+    let plain = run(&[]);
+    let summary = run(&["--summary"]);
+    assert_eq!(
+        plain.status.code(),
+        summary.status.code(),
+        "--summary changed the verdict:\nplain:\n{}\nsummary:\n{}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&summary.stdout)
+    );
+    let s = String::from_utf8_lossy(&summary.stdout);
+    assert_eq!(
+        s.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "--summary must still render one line:\n{s}"
+    );
+    // And that line carries the split the rows would have shown.
+    assert!(
+        s.contains("0 in changed lines, 1 pre-existing in changed files"),
+        "--summary lost the changed/pre-existing split:\n{s}"
+    );
 }

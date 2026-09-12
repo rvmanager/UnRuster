@@ -42,6 +42,9 @@ struct Hit {
     /// A flag rather than a drop, so the summary can say how many were filtered
     /// and `--include-idiomatic` can restore them.
     benign: Option<&'static str>,
+    /// The site is the *whole* body of its function: a `todo!()` stub, not a
+    /// reachable branch. See [`crate::ast::body_is_stub`].
+    stub: bool,
     /// What the asserted call was doing. `Unknown` for the bare macros, which
     /// have no receiver to classify.
     effect: Effect,
@@ -63,6 +66,12 @@ impl Hit {
     ///   and a review someone already did. A bare `.unwrap()` records nothing.
     fn score(&self) -> f64 {
         let kind = match self.kind {
+            // A body that is *only* `todo!()` is unwritten work, not a shipped
+            // crash: there is no path through it because there is no code in
+            // it, and the author is mid-task. Scored like `unreachable!` —
+            // still listed, never gating. Scaffolding a workspace otherwise
+            // fills the gating tier with the scaffold.
+            "todo!" | "unimplemented!" if self.stub => 0.15,
             // Ships as a crash on a path the author knows is reachable.
             "todo!" | "unimplemented!" => 0.60,
             // No message: the backtrace is the only thing the user gets.
@@ -229,6 +238,10 @@ struct PanicVisitor<'a> {
     /// One frame per lexical block: the names bound in it to a value the
     /// process computed.
     bounded: Vec<std::collections::BTreeSet<String>>,
+    /// The fn currently being walked has a stub body. Set by the three fn
+    /// visits below rather than by `scope_visits!`, which knows about scope
+    /// and not about bodies.
+    in_stub_body: bool,
 }
 
 impl PanicVisitor<'_> {
@@ -247,6 +260,7 @@ impl PanicVisitor<'_> {
             line,
             context,
             benign,
+            stub: self.in_stub_body,
             effect,
             provenance,
         });
@@ -357,9 +371,9 @@ impl<'ast> Visit<'ast> for PanicVisitor<'_> {
         item_mod,
         item_impl,
         item_trait,
-        item_fn,
-        impl_item_fn,
-        trait_item_fn
+        item_fn_stubs,
+        impl_item_fn_stubs,
+        trait_item_fn_stubs
     );
 
     /// One frame per block, so `let n = v.len();` reaches the `.unwrap()` three
@@ -498,6 +512,7 @@ pub fn run_counted(ctx: &AnalysisCtx, opts: PanicOpts) -> anyhow::Result<Counts>
             hits: Vec::new(),
             sigs: &ctx.sem.fn_sigs,
             bounded: vec![Default::default()],
+            in_stub_body: false,
         };
         v.visit_file(&f.ast);
         all.extend(v.hits);
@@ -639,6 +654,9 @@ mod tests {
             line: 1,
             context: "m::f".into(),
             benign,
+            // The hand-built `Hit`s test the score table, whose stub row has
+            // its own fixture below; a bare `hit()` is a site inside real code.
+            stub: false,
             effect,
             provenance: Provenance::Unknown,
         }
@@ -662,6 +680,7 @@ mod tests {
             hits: Vec::new(),
             sigs: &sigs,
             bounded: vec![Default::default()],
+            in_stub_body: false,
         };
         v.visit_file(&parsed[0].ast);
         v.hits

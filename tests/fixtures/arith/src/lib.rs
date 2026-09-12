@@ -56,7 +56,18 @@ pub fn idiomatic(state: &std::sync::Mutex<u32>) -> u32 {
     *guard + literal as u32
 }
 
-/// Ships as a crash on a path someone can reach.
+/// Scaffolding: the body *is* the macro, so there is no path through it and
+/// nothing here is reachable yet. Listed, never gating.
 pub fn unfinished(_kind: u8) -> u32 {
     todo!("variant routing")
+}
+
+/// Ships as a crash on a path someone can reach: the other arms work, and a
+/// caller passing anything else lands here.
+pub fn route(kind: u8) -> u32 {
+    match kind {
+        0 => 10,
+        1 => 20,
+        _ => todo!("the remaining variants"),
+    }
 }

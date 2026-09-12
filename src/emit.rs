@@ -274,6 +274,18 @@ pub struct Out {
     /// check's `(N finding(s); …)` line sits with the rows it counts, rather
     /// than being separated onto another stream and re-associated by hand.
     summary_inline: std::cell::Cell<bool>,
+    /// Force [`Out::summary`] onto stdout for this run, whatever `--all-stdout`
+    /// says, and print it even under `--summary`.
+    ///
+    /// `audit` sets it. Every other command's summary is a *count*, and a
+    /// reader who lost it to `2>/dev/null` still holds a correct answer — the
+    /// contract `summary` was written for. Audit's is the verdict: the gating
+    /// tally, which checks hold the gate, what the exit code means. Across one
+    /// project's sessions 50 of 71 audit runs existed only to recover that one
+    /// line, each spelling `2>&1 | grep "audit:"` or `2>&1 | tail -2`, and the
+    /// flag that would have done it — `--summary` — printed *nothing at all*
+    /// through a pipe, because it wrote to stderr and suppressed the rows.
+    summary_stdout: std::cell::Cell<bool>,
     /// Swallow every kind of output. `waivers` re-runs the check battery purely
     /// to populate per-waiver hit counts; the battery's own rows would drown
     /// the listing it is gathering data for.
@@ -422,6 +434,7 @@ impl Out {
             all_stdout,
             context_lines: std::cell::Cell::new(context_lines),
             summary_inline: std::cell::Cell::new(false),
+            summary_stdout: std::cell::Cell::new(false),
             silent: false,
             show_fingerprints: false,
             row_budget: Cell::new(None),
@@ -456,6 +469,7 @@ impl Out {
             all_stdout: false,
             context_lines: std::cell::Cell::new(None),
             summary_inline: std::cell::Cell::new(false),
+            summary_stdout: std::cell::Cell::new(false),
             silent: true,
             show_fingerprints: false,
             row_budget: Cell::new(None),
@@ -553,6 +567,11 @@ impl Out {
     /// Returns the previous setting so a caller can restore it.
     pub fn set_summary_inline(&self, on: bool) -> bool {
         self.summary_inline.replace(on)
+    }
+
+    /// Route [`Out::summary`] to stdout for this run. See `summary_stdout`.
+    pub fn set_summary_stdout(&self, on: bool) -> bool {
+        self.summary_stdout.replace(on)
     }
 
     /// Source-context width for the rows emitted next. Returns the previous
@@ -959,7 +978,7 @@ impl Out {
             }
             return;
         }
-        if self.all_stdout {
+        if self.all_stdout || self.summary_stdout.get() {
             self.flush_section();
             self.put(text);
         } else {
@@ -1060,6 +1079,52 @@ impl Out {
         }
         self.flush_section();
         self.put(text);
+    }
+
+    /// As [`note`](Self::note), but said once per run under `key` however many
+    /// rows would have prompted it.
+    ///
+    /// For the standing pointers — "`fields <Type>` counts these", "`--part
+    /// full` prints the block" — whose text names its subject and so defeats
+    /// the plain text-dedup: fourteen structs meant fourteen copies of one
+    /// sentence. A hint repeated once per row is wallpaper, and wallpaper is
+    /// what readers learn to skip. `fields` was pointed at fourteen times in
+    /// one project's sessions and run zero times.
+    pub fn note_once(&self, key: &str, text: &str) {
+        // Prefixed so a key can never collide with a note's own text.
+        if !self.said.borrow_mut().insert(format!("key:{}", key)) {
+            return;
+        }
+        self.note(text);
+    }
+
+    /// Coaching that is *about* the listing rather than part of it: "narrow
+    /// this with `--name` instead of piping it to `grep`".
+    ///
+    /// **Stderr**, which is the opposite of [`note`](Self::note) and for the
+    /// opposite reason. A note is the answer, so it must survive
+    /// `2>/dev/null`. This is advice about how the reader asked, and the reader
+    /// it is aimed at is the one who just wrote `| grep <name>` — a filter that
+    /// eats every stdout line not matching, this one included. `inventory`'s
+    /// "prefer `--name` to `| grep`" note was emitted on 13 of one project's 14
+    /// `inventory` calls and reached the reader on none of them, because all 13
+    /// were the very pipe it was warning about. Stderr is the one channel a
+    /// pipe does not touch.
+    ///
+    /// JSON keeps it in `notes` beside [`note`](Self::note), so a document
+    /// consumer still reads both from one place.
+    pub fn advice(&self, text: &str) {
+        if self.silent {
+            return;
+        }
+        if !self.said.borrow_mut().insert(text.to_string()) {
+            return;
+        }
+        if self.json() {
+            self.state.borrow_mut().notes.push(text.to_string());
+            return;
+        }
+        to_stderr(text);
     }
 
     /// `--context N` lines around a row's site, `>`-marking the site line.
