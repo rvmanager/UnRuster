@@ -226,6 +226,39 @@ fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
 /// taxonomy*.
 const TAXONOMY_SIZE: usize = 6;
 
+/// Tree-wide population of a *shape* past which a cluster of it is a family,
+/// however small the cluster is. A shape is a signature for fns and an inner
+/// type for newtypes — both are grouped whole and then split by name word,
+/// which is the step that hides the population from every other guard.
+///
+/// [`TAXONOMY_SIZE`] cannot reach this case and says so: `cognate_partition`
+/// splits a large signature family into word groups *first*, so the clusters
+/// that reach the score are small by construction no matter how common the
+/// signature is. [`signature_rarity`] measures the population correctly and
+/// then enters the score as `0.15 * (0.4 * rarity)` — 0.0004 at a population of
+/// 139, against a 0.28 floor. Both guards are looking at the right thing and
+/// neither can move the answer.
+///
+/// A spec-per-topic engine is the shape that proved it: 139 `pub fn <topic>()
+/// -> Spec`, one per module, named on a convention. Every term the score has
+/// for "somebody designed this interface twice" is maximised by a table that
+/// is merely well organised — all `pub` (1.0), four modules (1.0), positional
+/// (1.0) — and five clusters gated at 0.72–0.83 against a 0.70 gate. All five
+/// were false positives and all five cost a hand-written waiver.
+///
+/// Twelve, because the measured ends bracket it and nothing sits between them:
+/// the false positives this check has recorded are signatures worn by *dozens*
+/// of functions (`() -> bool` with *active*, `() -> usize` with *count*,
+/// `() -> &str` with *label*, and now `() -> Spec` × 139), while the true
+/// positive it must keep is `(AabbHandle, Rect, egui::Pos2) -> bool` on
+/// *three*. It is also `TAXONOMY_SIZE * 2`, which keeps one idea in this file
+/// rather than two.
+///
+/// Demotion, not exclusion, like its siblings: -0.25 puts the 0.83 cluster at
+/// 0.58, under the gate and still listed. A table is where a new member gets
+/// added and where a drifted one would show.
+const SHAPE_FAMILY: usize = TAXONOMY_SIZE * 2;
+
 /// One reported group: N declarations the tool believes name one concept.
 struct Cluster<'a> {
     kind: &'static str,
@@ -243,6 +276,13 @@ struct Cluster<'a> {
     /// field-name overlap for `struct-shape`, the variant overlap for
     /// `enum-shape`. `1.0` when the kind's grouping is itself exact.
     agreement: f64,
+    /// How many declarations tree-wide wear this cluster's shape, counted
+    /// *before* [`cognate_partition`] split it into word groups.
+    ///
+    /// The distinction the size demotion could not see without it. Equal to
+    /// `members.len()` for the kinds whose grouping is not split, which is why
+    /// reading it is always safe.
+    family: usize,
 }
 
 impl Cluster<'_> {
@@ -266,10 +306,13 @@ impl Cluster<'_> {
     /// mechanism this check exists to catch. *How deliberate* — a suffix cohort
     /// is a convention somebody was following, so a collision inside one is
     /// much more likely to be an oversight than a coincidence.
-    /// Is this a family rather than a duplication? Either by size (see
-    /// [`TAXONOMY_SIZE`]) or by shape (see [`Self::dispatch_family`]).
+    /// Is this a family rather than a duplication? By size (see
+    /// [`TAXONOMY_SIZE`]), by shape (see [`Self::dispatch_family`]), or by the
+    /// population of the shape itself (see [`SHAPE_FAMILY`]).
     fn taxonomy(&self) -> bool {
-        self.members.len() >= TAXONOMY_SIZE || self.dispatch_family()
+        self.members.len() >= TAXONOMY_SIZE
+            || self.family >= SHAPE_FAMILY
+            || self.dispatch_family()
     }
 
     /// A `signature` cluster that is one module's dispatch table: three or more
@@ -350,20 +393,40 @@ impl Cluster<'_> {
 /// `; demoted: …` for the summary line, naming each demotion route that fired
 /// and its criterion — or empty when none did.
 ///
-/// Both routes, spelled out, because the output used to say only that a
+/// Every route, spelled out, because the output used to say only that a
 /// demotion had happened. A reader who met that went looking through
 /// `concepts --help` for a `--min-members` flag to lower, found only
 /// `--min-score`, and concluded the demotion could not be relied on — then
 /// wrote a waiver for a family the tool had already accepted. The rule that
 /// fired has to be legible from the run that fired it.
+///
+/// Counted by priority rather than by subtraction: a cluster can satisfy more
+/// than one route (a 12-member group of one shape satisfies all three), and the
+/// old `taxonomy() - dispatch_family()` assumed they were disjoint, so one
+/// overlap would have under-counted the size route — or, once a third route
+/// existed, filed it under the wrong criterion.
 fn demotion_note(clusters: &[Cluster]) -> String {
-    let families = clusters.iter().filter(|c| c.dispatch_family()).count();
-    let by_size = clusters.iter().filter(|c| c.taxonomy()).count() - families;
+    let (mut by_size, mut by_shape, mut families) = (0usize, 0usize, 0usize);
+    for c in clusters.iter().filter(|c| c.taxonomy()) {
+        if c.members.len() >= TAXONOMY_SIZE {
+            by_size += 1;
+        } else if c.family >= SHAPE_FAMILY {
+            by_shape += 1;
+        } else {
+            families += 1;
+        }
+    }
     let mut parts: Vec<String> = Vec::new();
     if by_size > 0 {
         parts.push(format!(
             "{} of {}+ member(s) each (`via taxonomy`)",
             by_size, TAXONOMY_SIZE
+        ));
+    }
+    if by_shape > 0 {
+        parts.push(format!(
+            "{} carved out of a shape {}+ declaration(s) wear (`via shape`)",
+            by_shape, SHAPE_FAMILY
         ));
     }
     if families > 0 {
@@ -474,6 +537,10 @@ fn cognate_partition<'a, F>(
 where
     F: Fn(&str, &[&'a ItemFact]) -> (String, String, f64),
 {
+    // Before the split, which is the only place it can be counted: every
+    // cluster below is a word group carved out of this one shape, and
+    // `members.len()` on the group says nothing about how common the shape is.
+    let family = members.len();
     let mut by_word: BTreeMap<String, Vec<&ItemFact>> = BTreeMap::new();
     for m in &members {
         for w in words_of(&m.name) {
@@ -513,6 +580,7 @@ where
                 positional: positional_cohort(&names, &word),
                 word: Some(word),
                 agreement,
+                family,
                 members: g,
             }
         })
@@ -567,6 +635,8 @@ fn struct_shape_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
                 .unwrap_or(false),
             word,
             agreement: overlap,
+            // Not split by word, so the cluster is the whole family.
+            family: members.len(),
             members,
         });
     }
@@ -651,6 +721,7 @@ fn enum_shape_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
                 positional: false,
                 word,
                 agreement: sim,
+                family: members.len(),
                 members,
             });
         }
@@ -842,6 +913,7 @@ fn doc_clusters<'a>(c: &'a Corpus) -> Vec<Cluster<'a>> {
             positional: false,
             word,
             agreement: 1.0,
+            family: members.len(),
             members,
         });
     }

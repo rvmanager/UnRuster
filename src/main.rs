@@ -475,6 +475,11 @@ enum Cmd {
     /// `assert_eq!(x, "lit")`. Each row = candidate for an enum or newtype
     /// (e.g. `pub struct ActionId(&'static str)`) so the compiler catches
     /// typos and missing cases.
+    ///
+    /// `match-wild-list` rows lead and are a defect rather than a candidate: a
+    /// `for` loop over a literal list whose `match` names fewer members than
+    /// the list holds, so the trailing `_` is serving the rest and a new member
+    /// silently takes its arm.
     Stringly(StringlyArgs),
     /// List `#[test]`/`#[bench]`/`#[tokio::test]` fns with their
     /// `file:start-end` and name. Always scans the full tree (ignores --scope)

@@ -11316,6 +11316,342 @@ fn dead_code_transitive_keeps_a_cycle_that_a_root_reaches() {
     );
 }
 
+/// The rerun hint used to be triggered by *volume*: `cap_note` returns `None`
+/// when nothing was dropped, so a section that fit under its cap printed no
+/// command at all. A short section is exactly the one a reader re-runs to look
+/// wider, and twelve of the twenty-one checks run arguments the bare command
+/// does not.
+///
+/// Two of Augrym's short sections were re-run bare in one session and silently
+/// answered a different question — `arith-drift` at its own 0.50 against the
+/// 0.60 audit gates at, and `casts` with every class against the data-loss
+/// ones. Both reads went into a report.
+/// The finding is the row that is *missing*. A `match` on string literals
+/// ending in `_` emits nothing for the arm the wildcard swallowed, so on
+/// Augrym's `ascend` the two `match-lit` rows were all `stringly` said and the
+/// reader had to notice there was no third — under `for table in
+/// ["plot_machines", "plot_blocks", "ore_balances"]`, on the path that wipes a
+/// player's plot, where a fourth table added to the list compiles, passes, and
+/// deletes from `ore_balances`.
+#[test]
+fn a_literal_list_the_match_does_not_cover_is_reported() {
+    let dir = scratch("stringly-wild-list");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn ascend(user: u32) -> Vec<String> {\n\
+         let mut out = Vec::new();\n\
+         for table in [\"plot_machines\", \"plot_blocks\", \"ore_balances\"] {\n\
+         let sql = match table {\n\
+         \"plot_machines\" => \"DELETE FROM plot_machines WHERE owner_id = $1\",\n\
+         \"plot_blocks\" => \"DELETE FROM plot_blocks WHERE owner_id = $1\",\n\
+         _ => \"DELETE FROM ore_balances WHERE user_id = $1\",\n\
+         };\n\
+         out.push(format!(\"{sql} -- {user}\"));\n\
+         }\n\
+         out\n\
+         }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur_stdout(&["--root", root, "--all-stdout", "stringly", "--top", "0"]);
+    assert_tsv_cols(&out, 4);
+    let text = String::from_utf8(out).unwrap();
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains('\t')).collect();
+    assert!(
+        rows[0].starts_with("match-wild-list\t"),
+        "it leads the list — `audit` shows five rows of a section that runs to \
+         hundreds:\n{text}"
+    );
+    // The `at` is the arm the list falls through to, which is where the repair
+    // goes and where a waiver attaches.
+    assert!(
+        rows[0].ends_with(":7"),
+        "the row points at the `_` arm:\n{text}"
+    );
+    assert!(
+        text.contains("`match-wild-list` row(s) lead the list"),
+        "and the note says why this row is a different question:\n{text}"
+    );
+}
+
+/// Deliberately narrow, and both halves of that were measured. A list the match
+/// covers completely hides nothing, and a plain `_` over an open vocabulary is
+/// the correct arm — 22 of those on unruster itself, every one a classifier,
+/// none of them a defect. Ranked first they would have filled `audit`'s
+/// five-row window with rows nobody would ever fix.
+#[test]
+fn a_covered_list_and_an_open_vocabulary_are_not_reported() {
+    let dir = scratch("stringly-wild-quiet");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn covered() -> Vec<&'static str> {\n\
+         let mut out = Vec::new();\n\
+         for table in [\"a\", \"b\"] {\n\
+         out.push(match table { \"a\" => \"DELETE FROM a\", \"b\" => \"DELETE FROM b\", _ => \"\" });\n\
+         }\n\
+         out\n\
+         }\n\
+         pub fn width(ty: &str) -> u8 {\n\
+         match ty { \"u8\" => 8, \"u16\" => 16, _ => 64 }\n\
+         }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout(&[
+        "--root", root, "--all-stdout", "stringly", "--top", "0",
+    ]))
+    .unwrap();
+    assert!(
+        text.contains("match-lit"),
+        "the per-literal rows are unchanged:\n{text}"
+    );
+    assert!(
+        !text.contains("match-wild-list"),
+        "nothing is hidden in either fn:\n{text}"
+    );
+}
+
+/// A spec-per-topic engine maximises every term the score has for "somebody
+/// designed this interface twice" without duplicating anything: all `pub`
+/// (1.0), one module each (1.0), named on a convention (1.0). On Augrym five
+/// such clusters gated at 0.72–0.83 against a 0.70 gate, all five were false
+/// positives, and all five cost a hand-written waiver.
+///
+/// Neither existing guard could reach it. `TAXONOMY_SIZE` counts the cluster,
+/// and `cognate_partition` splits the family into word groups *first*, so the
+/// clusters that reach the score are small however common the shape is.
+/// `signature_rarity` measures the population correctly and then enters as
+/// `0.15 * (0.4 * rarity)` — 0.0004 at a population of 139, against a 0.28
+/// floor.
+#[test]
+fn a_cluster_carved_out_of_a_common_shape_does_not_gate() {
+    let dir = scratch("concepts-shape-family");
+    std::fs::create_dir_all(dir.join("src/specs")).unwrap();
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod specs;\n\
+         #[derive(Default)]\n\
+         pub struct Spec { pub topic: u32, pub label: String, pub axes: Vec<u32> }\n",
+    )
+    .unwrap();
+    // Four modules, four shared name words, sixteen `pub fn …() -> Spec`.
+    // Distinct bodies, so `clones` does not group them away first.
+    let mods: [(&str, [&str; 4]); 4] = [
+        ("angles", ["unit_circle", "add_arcs", "simple_bearing", "function_sine"]),
+        ("fractions", ["unit_fraction", "add_like", "simple_ratio", "function_of_x"]),
+        ("ratio", ["unit_rate", "add_parts", "simple_interest", "function_scale"]),
+        ("data", ["unit_scale", "add_series", "simple_average", "function_fit"]),
+    ];
+    let mut n = 0;
+    for (m, fns) in mods {
+        let mut body = String::from("use crate::Spec;\n");
+        for f in fns {
+            n += 1;
+            body.push_str(&format!(
+                "\npub fn {f}() -> Spec {{\n\
+                 let mut s = Spec::default();\n\
+                 s.topic = {n};\n\
+                 s.label = \"{f}\".to_string();\n\
+                 s.axes = vec![{n}, {}];\n\
+                 s\n}}\n",
+                n * 2
+            ));
+        }
+        std::fs::write(dir.join(format!("src/specs/{m}.rs")), body).unwrap();
+    }
+    std::fs::write(
+        dir.join("src/specs.rs"),
+        mods.iter().map(|(m, _)| format!("pub mod {m};\n")).collect::<String>(),
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout(&["--root", root, "--all-stdout", "concepts"])).unwrap();
+    let gating: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("signature\t"))
+        .filter(|l| l.split('\t').nth(1).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) >= 0.70)
+        .collect();
+    assert!(
+        gating.is_empty(),
+        "16 fns wearing one signature is a table, not sixteen duplications:\n{text}"
+    );
+    // Demoted, not dropped: a table is where a new member gets added and where
+    // a drifted one would show.
+    assert!(
+        text.lines().any(|l| l.starts_with("signature\t")),
+        "the clusters are still listed:\n{text}"
+    );
+    // And the run that fired the rule says which rule fired.
+    assert!(
+        text.contains("carved out of a shape 12+ declaration(s) wear (`via shape`)"),
+        "the demotion route must be legible from the run:\n{text}"
+    );
+}
+
+/// The other side: a distinctive signature on three functions is an interface
+/// somebody designed twice, and must still gate. This is the true positive the
+/// demotion is measured against — `signature_rarity`'s doc names it.
+#[test]
+fn a_distinctive_signature_on_three_fns_still_gates() {
+    let dir = scratch("concepts-real-duplication");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod pick;\npub mod hit;\npub mod probe;\n\
+         pub struct AabbHandle(pub u32);\n\
+         pub struct Rect { pub x: f32, pub y: f32 }\n\
+         pub struct Pos2 { pub x: f32, pub y: f32 }\n",
+    )
+    .unwrap();
+    for (m, body) in [
+        ("pick", "let _ = h;\n p.x >= r.x && p.y >= r.y"),
+        ("hit", "let id = h.0 as f32;\n p.x + id >= r.x && p.y >= r.y - 1.0"),
+        (
+            "probe",
+            "let slack = h.0 as f32 * 0.5;\n p.x >= r.x - slack && p.y >= r.y - slack && p.x < r.x + 100.0",
+        ),
+    ] {
+        std::fs::write(
+            dir.join(format!("src/{m}.rs")),
+            format!(
+                "use crate::{{AabbHandle, Pos2, Rect}};\n\
+                 pub fn {m}_contains(h: AabbHandle, r: Rect, p: Pos2) -> bool {{\n{body}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout(&["--root", root, "--all-stdout", "concepts"])).unwrap();
+    assert!(
+        text.lines().any(|l| {
+            l.starts_with("signature\t")
+                && l.split('\t').nth(1).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) >= 0.70
+        }),
+        "three fns sharing a designed interface is the finding this check is for:\n{text}"
+    );
+}
+
+#[test]
+fn a_section_names_its_own_arguments_even_when_nothing_was_capped() {
+    let dir = scratch("audit-rerun-uncapped");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn narrow(n: i64) -> i32 { n as i32 }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout_allow_findings(&[
+        "--root", root, "--all-stdout", "audit", "--full", "--only", "casts,dead-code",
+    ]))
+    .unwrap();
+    assert!(
+        text.contains("(note: this section is `unruster casts --class narrow-int"),
+        "one row, no cap — and the section still names what it ran:\n{text}"
+    );
+    // The nine checks that run bare are exact as their own name. A note on
+    // every section is what teaches a reader to skip notes.
+    assert!(
+        !text.contains("`unruster dead-code`"),
+        "`dead-code` runs on its own defaults and needs no note:\n{text}"
+    );
+}
+
+/// And when the section *was* capped, the cap note already carries the command
+/// with `--top 0` on the end — so the two must not both fire.
+#[test]
+fn a_capped_section_names_its_command_once() {
+    let dir = scratch("audit-rerun-capped");
+    let body: String = (0..8)
+        .map(|i| format!("pub fn narrow{i}(n: i64) -> i32 {{ n as i32 }}\n"))
+        .collect();
+    std::fs::write(dir.join("src/lib.rs"), body).unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout(&[
+        "--root", root, "--all-stdout", "audit", "--only", "casts",
+    ]))
+    .unwrap();
+    assert!(
+        text.contains("showing 5 of 8 row(s)") && text.contains("--top 0`"),
+        "the cap note carries the command:\n{text}"
+    );
+    assert!(
+        !text.contains("(note: this section is"),
+        "and the uncapped note must not repeat it:\n{text}"
+    );
+}
+
+/// The standalone half of the same gap. `config-drift` has said "(audit gates
+/// at 0.12)" all along; `arith-drift` said `min_score=0.50` and nothing else,
+/// while `audit` ran it at 0.60.
+#[test]
+fn a_ranked_command_discloses_the_gate_audit_holds_it_to() {
+    let dir = scratch("arith-threshold-note");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn f(a: u64, b: u64, c: u64) -> u64 {\n\
+         let x = a.checked_mul(b).unwrap_or(0);\n\
+         let y = b.checked_mul(c).unwrap_or(0);\n\
+         x + y * c\n\
+         }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text =
+        String::from_utf8(ur_stdout(&["--root", root, "--all-stdout", "arith-drift"])).unwrap();
+    assert!(
+        text.contains("(audit gates at 0.60)"),
+        "the bare command runs at 0.50 and must say what audit holds it to:\n{text}"
+    );
+    // Inside `audit` the two agree, so the note stays off its own sections.
+    let inside = String::from_utf8(ur_stdout(&[
+        "--root", root, "--all-stdout", "audit", "--full", "--only", "arith-drift",
+    ]))
+    .unwrap();
+    assert!(
+        !inside.contains("audit gates at"),
+        "audit does not need telling what audit gates at:\n{inside}"
+    );
+}
+
+/// `casts`' divergence is the one that is invisible in its own footer: the
+/// class breakdown names what was *found*, not what was *asked for*, so a clean
+/// audit section next to a 46-row standalone list reads as a contradiction.
+#[test]
+fn bare_casts_says_which_classes_audit_actually_reports() {
+    let dir = scratch("casts-class-note");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn widen(n: i32) -> i64 { n as i64 }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let bare = String::from_utf8(ur_stdout(&["--root", root, "--all-stdout", "casts"])).unwrap();
+    assert!(
+        bare.contains("every class (audit reports the data-loss ones — `casts --class narrow-int"),
+        "the bare command reports every class and must say so:\n{bare}"
+    );
+    let filtered = String::from_utf8(ur_stdout(&[
+        "--root", root, "--all-stdout", "casts", "--class", "narrow-int",
+    ]))
+    .unwrap();
+    assert!(
+        !filtered.contains("every class"),
+        "a reader who passed --class already knows:\n{filtered}"
+    );
+    // The empty breakdown used to render as `(0 cast(s); ; hide_widen=…)`.
+    assert!(
+        !filtered.contains("; ;"),
+        "no empty column where a breakdown would go:\n{filtered}"
+    );
+}
+
 // ─── routing: naming the better command at the point of need ───────────────
 //
 // Zero pull-through on all five 0.1.82 additions across 5,997 lines of one

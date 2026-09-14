@@ -1,8 +1,8 @@
 # unruster — field findings, Augrym audit session, 13 Sep 2026
 
-**Status:** **D1–D4 fixed on 2026-09-13** (working tree; not yet in the PATH
-binary). See *Outcome* at the foot of this file. Everything else stands as
-written.
+**Status:** **D1–D4, S1, Q1 and Q2 fixed on 2026-09-13.** D1–D3 are committed
+(`e3b92d4`); the rest is working tree and not yet in the PATH binary. See
+*Outcome* at the foot of this file. Everything else stands as written.
 **Baseline:** `0.1.92` — the binary on PATH (`/usr/local/bin/unruster`, installed
 12 Sep 08:11) is the current `HEAD` (`41a70a7`). Every finding below is against
 shipping code, not a stale build.
@@ -843,3 +843,120 @@ against the fixture corpus.
 **S1 → Q1 → Q2.** S1 and Q1 are the same kind of defect — the check already
 knows the thing and either does not say it or does not weigh it — so they can
 share one pass and one measurement run. Q2 is a separate piece of work.
+
+
+---
+
+# Outcome — S1, Q1, Q2
+
+Implemented in that order, as recommended. `cargo clippy --all-targets` clean,
+`unruster self-check` 0 violations, `unruster audit` 0 gating.
+
+## S1 — the rerun hint fires on divergence, not on volume
+
+`Out::cap_note` returns `None` when nothing was dropped, so the hint was
+triggered by row count. `audit`'s section closure now prints the section's own
+command whenever `rerun_cmd(check) != check` **and** no cap note already
+carried it:
+
+```
+## [medium] casts — data-loss classes only (explain: casts)
+(note: this section is `unruster casts --class narrow-int,signed-flip,float-int,narrow-float,ptr`
+ — the bare command runs on its own defaults, which are a different question)
+```
+
+Not for the nine checks that run bare — `other => other` already makes the bare
+name exact there, and a note on every section is what teaches a reader to skip
+notes. Not alongside a cap note either, which already ends in `--top 0`.
+
+The standalone half, three changes:
+
+- `arith-drift` now calls `threshold_note`: `min_score=0.50 (audit gates at 0.60)`. This was the exact pair the session misread.
+- `validation-drift` likewise, on both branches of its summary.
+- `casts` is the one whose divergence its own footer cannot show — the class breakdown names what was *found*, not what was *asked for*, so a clean audit section next to a 46-row standalone list reads as a contradiction. It now says `; every class (audit reports the data-loss ones — `casts --class …`)`, and only when `--class` was not passed.
+
+`enum-coverage`, `error-swallows`, `panics` and `metrics` were left alone:
+each already discloses its own filtering in its footer (`N site(s) hidden by
+--max-missing 1`, `N of these are benign … hidden in audit`, `sort=cyclo;
+threshold=15`).
+
+Fixed in passing: `(0 cast(s); ; hide_widen=…)` — an empty breakdown rendered
+as a column that had lost its value.
+
+Four tests: the uncapped case, the capped case (the two notes must not both
+fire), `arith-drift`'s disclosure inside and outside audit, and `casts` with
+and without `--class`.
+
+## Q1 — a third demotion route, on the population of the shape
+
+`Cluster` gained `family`: how many declarations tree-wide wear this cluster's
+shape, counted **before** `cognate_partition` split it into word groups. That
+is the number no existing guard could see — and `cognate_partition` is the only
+place it can be counted, since every cluster below it is a word group carved
+out of one shape.
+
+`taxonomy()` now fires on `family >= SHAPE_FAMILY` (= `TAXONOMY_SIZE * 2` = 12)
+as well as on cluster size and on `dispatch_family()`. Demotion, not exclusion,
+like its siblings: −0.25.
+
+Named `SHAPE_FAMILY` rather than `SIGNATURE_FAMILY` because it governs
+`newtype` clusters too — 30 newtypes over `String` split by name word is the
+same failure with a different grouping key.
+
+Measured on a reproduction of the Augrym shape (26 `pub fn …() -> Spec` across
+10 modules — the failure does not need 139):
+
+| | 0.1.92 | fixed |
+|---|---|---|
+| gating `signature` clusters | 4 (0.83, 0.80, 0.75, 0.72) | **0** (0.58, 0.55, 0.50, 0.47) |
+| still listed | — | yes, all of them |
+
+And the true positive `signature_rarity`'s doc names —
+`(AabbHandle, Rect, egui::Pos2) -> bool` on three functions — is untouched at
+0.78 and still gates. On unruster's own tree: 51 clusters → 44, one demotion
+via the new route.
+
+`demotion_note` reports the third route by name
+(`N carved out of a shape 12+ declaration(s) wear (via shape)`) — its own doc
+records a reader who met an unexplained demotion and wrote a waiver for a
+family the tool had already accepted. It also stopped counting by subtraction:
+`taxonomy() - dispatch_family()` assumed the routes were disjoint, and with
+three routes one overlap would have filed a demotion under the wrong criterion.
+
+## Q2 — `match-wild-list`, and the class that was measured and dropped
+
+One row per `match`, not per literal, when a `for` loop walks a literal list
+and the `match` inside names **fewer members than the list holds** — so the
+trailing `_` is serving the rest. Ranked first, because `audit` shows five rows
+of a section that runs to hundreds. The `at` is the `_` arm.
+
+```
+match-wild-list  "plot_machines"  ascend  src/lib.rs:9
+match-lit        "plot_machines"  ascend  src/lib.rs:7
+match-lit        "plot_blocks"    ascend  src/lib.rs:8
+```
+
+**The plain-wildcard class was built first, measured, and removed.** 22 rows on
+unruster itself, every one a classifier over an *open* vocabulary — `"u8" => 8,
+_ => 64` in `casts`, `"expect" => …, _ =>` in `divergence` — where the wildcard
+is the correct arm and there is nothing to act on. Ranked first they would have
+filled `audit`'s five-row window with rows nobody would ever fix, which is the
+concern `is_accessor_shape` already records as *"a correct observation and a
+wrong concern"*.
+
+What makes the narrow form a finding is `n > arms`: the list has members the
+`match` does not name. Enumerate all three explicitly and it goes quiet — which
+is also the repair. On unruster's own tree it fires zero times; on the Augrym
+shape, once, on the bug.
+
+Row shape is unchanged (4 columns) and `match-lit` is untouched, so existing
+`awk` keeps working; what moved is the *order*, which the section now declares
+(`READ IT IN ORDER`) the way `error-swallows` does.
+
+Known limit, worth stating: the list has to be a literal array at the `for`
+site. `for t in TABLES` with `const TABLES: [&str; 3]` needs const resolution
+and is not seen.
+
+`explain stringly` and `stringly --help` carry the new class and the worked
+example. Two tests: the Augrym shape, and the two quiet cases (a fully covered
+list, and an open vocabulary).

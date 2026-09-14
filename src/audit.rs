@@ -791,8 +791,36 @@ pub fn run(
         if let Some(s) = own_summary {
             ctx.out.summary(&s);
         }
-        if let Some(note) = cap_note {
-            ctx.out.row_note(&note);
+        match cap_note {
+            // The cap note already carries the section's own command, with
+            // `--top 0` on the end.
+            Some(note) => ctx.out.row_note(&note),
+            // Nothing was dropped, so there is no tail to offer — but this
+            // section still ran arguments the bare command does not, and that
+            // is the case where saying so matters *more*, not less.
+            //
+            // The trigger used to be volume: `cap_note` returns `None` when
+            // nothing was capped, so a short section printed no command at all.
+            // A short section is exactly the one a reader re-runs to look
+            // wider, and 6 of Augrym's shown sections were short. Two of them
+            // were re-run bare in the same session and silently answered a
+            // different question — `arith-drift` at its own 0.50 against the
+            // 0.60 this gates at, and `casts` with every class against the
+            // data-loss ones. Both reads went into a report.
+            //
+            // Only when the two differ. The nine checks that run bare are
+            // exact as their own name, and a note on every section is what
+            // teaches a reader to skip notes.
+            None => {
+                let cmd = rerun_cmd(check);
+                if cmd != check {
+                    ctx.out.row_note(&format!(
+                        "(note: this section is `unruster {}` — the bare command runs on its \
+                         own defaults, which are a different question)",
+                        cmd
+                    ));
+                }
+            }
         }
         ctx.out.set_row_budget(None);
         ctx.out.section_end();

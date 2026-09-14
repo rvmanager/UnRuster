@@ -516,9 +516,14 @@ pub fn run_drift_counted(ctx: &AnalysisCtx, min_score: f64) -> anyhow::Result<Co
             String::new()
         },
         if below > 0 {
-            format!("; {} below --min-score {:.2}", below, min_score)
+            format!(
+                "; {} below --min-score {:.2}{}",
+                below,
+                min_score,
+                ctx.threshold_note(min_score, crate::audit::VALIDATION_DRIFT_MIN_SCORE)
+            )
         } else {
-            String::new()
+            ctx.threshold_note(min_score, crate::audit::VALIDATION_DRIFT_MIN_SCORE)
         },
         if conventions > 0 {
             format!(

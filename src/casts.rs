@@ -393,10 +393,38 @@ pub fn run(
     }
     let break_str: Vec<String> = by_class.iter().map(|(k, n)| format!("{}={}", k, n)).collect();
     ctx.out.summary(&format!(
-        "({} cast(s); {}; hide_widen={}{}{}{}; explain: casts)",
+        "({} cast(s){}; hide_widen={}{}{}{}{}; explain: casts)",
         all.len(),
-        break_str.join(", "),
+        // Nothing to break down when nothing was found, and `(0 cast(s); ; …)`
+        // is a column that lost its value rather than a class that has none.
+        if break_str.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", break_str.join(", "))
+        },
         hide_widen,
+        // Every class, where `audit` reports the data-loss ones only. Unlike
+        // its score-shaped siblings this divergence is invisible in the
+        // footer — the class breakdown names what was found, not what was
+        // asked for — so a clean audit section and a 46-row standalone list
+        // read as a contradiction. One session took the wide list for the
+        // audit's own and reported 25 rows that `audit` had never considered.
+        if class_filter.is_empty() {
+            format!(
+                "; every class (audit reports the data-loss ones — \
+                 `casts --class {}`)",
+                crate::audit::CAST_CLASSES
+                    .iter()
+                    .filter_map(|c| {
+                        <CastClass as clap::ValueEnum>::to_possible_value(c)
+                            .map(|v| v.get_name().to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        } else {
+            String::new()
+        },
         ctx.waived_note(waived),
         if unsafe_ptr_hidden > 0 {
             format!(

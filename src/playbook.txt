@@ -901,7 +901,26 @@ dispatch, oversized functions that should split.
   unruster stringly --include-substring           # also .starts_with/.contains
   unruster stringly --include-map-keys            # also map.get("lit")
   unruster stringly --by fn                       # rank worst offenders
-  Signals: multiple `match-lit` arms in one fn → replace with enum
+  READ IT IN ORDER. `match-wild-list` rows lead, and they are the only
+  ones that are a defect rather than a candidate: a `for` loop over a
+  literal list whose `match` names fewer members than the list holds, so
+  the trailing `_` is serving the rest. One codebase had
+
+    for table in ["plot_machines", "plot_blocks", "ore_balances"] {
+        let sql = match table {
+            "plot_machines" => "DELETE FROM plot_machines WHERE owner_id = $1",
+            "plot_blocks"   => "DELETE FROM plot_blocks WHERE owner_id = $1",
+            _               => "DELETE FROM ore_balances WHERE user_id = $1",
+        };
+
+  on the path that wipes a player's plot: a fourth table added to the
+  list compiles, passes, and deletes from ore_balances. The enumeration
+  is written twice and only one copy is checked by anything. The `at` is
+  the `_` arm; repair by naming every member, or by dropping the list
+  and iterating the statements. Deliberately narrow — a plain `_` over an
+  open vocabulary (`"u8" => 8, _ => 64`) is the correct arm and is not
+  reported.
+  Other signals: multiple `match-lit` arms in one fn → replace with enum
   (compiler catches typos); `cmp-eq`/`cmp-method` hits → newtype the id
   (e.g. `pub struct ActionId(&'static str)`); `map-lit-key` →
   `HashMap<MyEnumKey, V>` instead of `HashMap<String, V>`.

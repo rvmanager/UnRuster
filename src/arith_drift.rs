@@ -269,10 +269,15 @@ pub fn run(ctx: &AnalysisCtx, min_score: f64) -> anyhow::Result<usize> {
         }
     }
     ctx.out.summary(&format!(
-        "({} raw operator(s) among checked siblings; min_score={:.2}{}; \
+        "({} raw operator(s) among checked siblings; min_score={:.2}{}{}; \
          explain: divergence)",
         findings.len(),
         min_score,
+        // `audit` runs this at 0.60 and the bare command at 0.50. A reader
+        // comparing the two lists had no way to know they were asking
+        // different questions — one session read the wider list as the audit's
+        // and reported it that way.
+        ctx.threshold_note(min_score, crate::audit::ARITH_DRIFT_MIN_SCORE),
         ctx.waived_note(waived)
     ));
     Ok(findings.len())
