@@ -1386,9 +1386,16 @@ struct DeadCodeArgs {
     /// syntactic scan, so these rows need per-site review.
     #[arg(long)]
     include_trait_impls: bool,
-    /// Also report the private orphans each deletion would expose, iterated to
-    /// a fixed point. Deleting three dead `pub fn`s once exposed four more over
-    /// four build-delete-rebuild rounds; this closes that loop in one command.
+    /// Also report the orphans each deletion would expose — everything that
+    /// only the dead rows reach. Deleting three dead `pub fn`s once exposed
+    /// four more over four build-delete-rebuild rounds; this closes that loop
+    /// in one command.
+    ///
+    /// Reachability from the roots, so a mutually recursive pair does not keep
+    /// itself (and everything under it) off the list by naming itself. That
+    /// was the shape that let a session delete a 1,098-line module on a run
+    /// predicting no orphans and watch a `pub fn` in another crate go dead.
+    ///
     /// Adds a `via` column (`direct` / `transitive after <item>`); the default
     /// output keeps its four. Transitive rows are conditional and do not gate.
     #[arg(long)]

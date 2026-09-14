@@ -926,15 +926,22 @@ struct ImportSite {
     scope: String,
     /// The path as written, so a reader can see which spelling to edit.
     path: String,
+    /// The leaf: `b` for both `use a::b` and `use a::c as b`.
+    name: String,
     file: String,
     line: usize,
 }
 
-/// Every `use` line in the tree whose leaf names `want`.
-fn import_sites(files: &[crate::parse::ParsedFile], want: &str) -> Vec<ImportSite> {
+/// Every `use` leaf in the tree, with the module it lands in.
+///
+/// One walk, because two questions want it: [`import_sites`] wants every site
+/// of one name, [`imported_names`] wants every name with the files it appears
+/// in. A second visitor for the second question would be the same unwrapper
+/// written twice, which is what [`crate::module_uses::use_paths`] already
+/// exists to prevent one layer down.
+fn use_leaves(files: &[crate::parse::ParsedFile]) -> Vec<ImportSite> {
     struct V<'a> {
         file: &'a str,
-        want: &'a str,
         scope: ScopeTracker,
         out: Vec<ImportSite>,
     }
@@ -945,12 +952,10 @@ fn import_sites(files: &[crate::parse::ParsedFile], want: &str) -> Vec<ImportSit
             let mut leaves = Vec::new();
             crate::module_uses::use_paths(&u.tree, "", &mut leaves);
             for (path, name, line) in leaves {
-                if name != self.want {
-                    continue;
-                }
                 self.out.push(ImportSite {
                     scope: self.scope.enclosing(),
                     path,
+                    name,
                     file: self.file.to_string(),
                     line,
                 });
@@ -962,7 +967,6 @@ fn import_sites(files: &[crate::parse::ParsedFile], want: &str) -> Vec<ImportSit
         let display = crate::parse::display_path(&f.path);
         let mut v = V {
             file: &display,
-            want,
             scope: ScopeTracker::new(f.module.as_str()),
             out: Vec::new(),
         };
@@ -970,6 +974,34 @@ fn import_sites(files: &[crate::parse::ParsedFile], want: &str) -> Vec<ImportSit
         out.extend(v.out);
     }
     out.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+    out
+}
+
+/// Every `use` line in the tree whose leaf names `want`.
+fn import_sites(files: &[crate::parse::ParsedFile], want: &str) -> Vec<ImportSite> {
+    use_leaves(files)
+        .into_iter()
+        .filter(|i| i.name == want)
+        .collect()
+}
+
+/// Imported leaf name -> the files whose `use` lines name it.
+///
+/// For `dead-code`, which reports items that nothing *calls* and then invites a
+/// deletion. A `pub use` re-export is a reference and not a call site, so it
+/// neither keeps an item off that list nor survives the deletion: one session
+/// removed a `pub fn` the check had correctly called dead and broke the build
+/// on the `pub use` in the crate root, then paid a 2m43s `cargo test` to find
+/// out. `callers` has said this all along (see [`note_imports`]); the command
+/// that tells you to delete did not.
+pub(crate) fn imported_names(
+    files: &[crate::parse::ParsedFile],
+) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    let mut out: std::collections::BTreeMap<String, BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for i in use_leaves(files) {
+        out.entry(i.name).or_default().insert(i.file);
+    }
     out
 }
 

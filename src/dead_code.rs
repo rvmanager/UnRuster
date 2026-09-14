@@ -313,15 +313,6 @@ fn sink_over(call_source: &[ParsedFile]) -> CallSink {
     sink
 }
 
-/// How many rounds of "remove these, look again" `--transitive` will run.
-///
-/// A cap rather than a true fixed point only in the pathological case: each
-/// round can only shrink the call set, so it converges, and four rounds covered
-/// the deepest real cascade seen — three dead `pub fn`s exposing four private
-/// orphans over four build-delete-rebuild cycles driven by a Python loop over
-/// `cargo build` warnings.
-const TRANSITIVE_ROUNDS: usize = 16;
-
 pub fn run(
     ctx: &AnalysisCtx,
     call_source: &[ParsedFile],
@@ -399,36 +390,93 @@ pub fn run(
     // cannot, since `pub` is API surface — so the first round of this cascade
     // is only visible here, and the rest of it cost four build-delete-rebuild
     // cycles to find by hand.
+    //
+    // Reachability from the roots, not "remove these, recount, repeat". The
+    // round-based shrink asked *does anything still name this*, and two private
+    // helpers that name each other answer yes for ever — so the whole dead
+    // subgraph under such a pair, and everything only it called, stayed
+    // invisible. A real session deleted a 1,098-line module on a `--transitive`
+    // run that predicted no orphans at all and watched a `pub fn` in another
+    // crate go dead the moment the file left the tree; the ~40 private
+    // generators inside it referenced one another, which is all it takes. A
+    // cycle nobody outside it reaches is not reachable, and mark-and-sweep says
+    // so without needing a round cap.
     if transitive {
-        let mut gone: BTreeSet<String> = hits.iter().map(|h| h.1.qpath.clone()).collect();
-        let mut frontier: Vec<String> = gone.iter().cloned().collect();
-        for _ in 0..TRANSITIVE_ROUNDS {
-            let called = sink.called_without(&gone);
-            let fresh: Vec<&crate::index::Defn> = index
-                .iter()
-                .filter(|d| {
-                    !gone.contains(&d.qpath) && reportable(d) && !called.contains(&d.name)
-                })
-                .collect();
-            if fresh.is_empty() {
-                break;
+        let direct: BTreeSet<&str> = hits.iter().map(|h| h.1.qpath.as_str()).collect();
+
+        // Candidates, by the bare name a call site would spell. Several items
+        // can share one; the base pass matches on the name too, so a single
+        // mention keeps every item wearing it, which is the conservative
+        // reading and the one already in force above.
+        let mut by_name: std::collections::BTreeMap<&str, Vec<&crate::index::Defn>> =
+            std::collections::BTreeMap::new();
+        let mut candidates: BTreeSet<&str> = BTreeSet::new();
+        for d in index.iter().filter(|d| reportable(d)) {
+            by_name.entry(d.name.as_str()).or_default().push(d);
+            candidates.insert(d.qpath.as_str());
+        }
+
+        // Roots: every body that survives whatever gets deleted — `main`, test
+        // fns, trait impls, ABI exports, anything `reportable` declined — plus
+        // the names used outside a fn body at all. A `per_item` key that is not
+        // a candidate is a root by definition, so a qpath this walk spells
+        // differently from the index degrades to "treat its body as live",
+        // which loses rows rather than inventing them.
+        let mut live: BTreeSet<&str> = BTreeSet::new();
+        let mut queue: Vec<&str> = sink.outside.iter().map(String::as_str).collect();
+        for (owner, names) in &sink.per_item {
+            if !candidates.contains(owner.as_str()) {
+                queue.extend(names.iter().map(String::as_str));
             }
-            let next: Vec<String> = fresh.iter().map(|d| d.qpath.clone()).collect();
-            for d in fresh {
-                // Which of the just-removed items was naming it — the answer to
-                // "what would have to go first".
-                let blocker = frontier
-                    .iter()
-                    .find(|q| {
-                        sink.per_item
-                            .get(*q)
-                            .is_some_and(|names| names.contains(&d.name))
-                    })
-                    .cloned();
-                hits.push((d.kind, d, Some(blocker.unwrap_or_else(|| "—".to_string()))));
+        }
+        while let Some(name) = queue.pop() {
+            for d in by_name.get(name).into_iter().flatten() {
+                if !live.insert(d.qpath.as_str()) {
+                    continue;
+                }
+                if let Some(names) = sink.per_item.get(&d.qpath) {
+                    queue.extend(names.iter().map(String::as_str));
+                }
             }
-            gone.extend(next.iter().cloned());
-            frontier = next;
+        }
+
+        let mut fresh: Vec<&crate::index::Defn> = index
+            .iter()
+            .filter(|d| {
+                reportable(d)
+                    && !live.contains(d.qpath.as_str())
+                    && !direct.contains(d.qpath.as_str())
+            })
+            .collect();
+        fresh.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+
+        let unreachable: BTreeSet<&str> = direct
+            .iter()
+            .copied()
+            .chain(fresh.iter().map(|d| d.qpath.as_str()))
+            .collect();
+        for d in fresh {
+            // "What would have to go first": a caller that is itself going.
+            // A *direct* one when there is one — for a mutually recursive pair
+            // the honest answer is the live entry point that went, not the
+            // other half of the cycle, which is equally conditional.
+            let mut fallback: Option<&str> = None;
+            let mut blocker: Option<&str> = None;
+            for (owner, names) in &sink.per_item {
+                if owner == &d.qpath
+                    || !names.contains(&d.name)
+                    || !unreachable.contains(owner.as_str())
+                {
+                    continue;
+                }
+                if direct.contains(owner.as_str()) {
+                    blocker = Some(owner.as_str());
+                    break;
+                }
+                fallback.get_or_insert(owner.as_str());
+            }
+            let via = blocker.or(fallback).unwrap_or("—").to_string();
+            hits.push((d.kind, d, Some(via)));
         }
     }
 
@@ -487,6 +535,63 @@ pub fn run(
             ctx.suggest("dead-code", Some(&d.name), today, (&d.file, d.line));
         }
     }
+    // A `pub use` re-export is a reference, not a call site: it does not keep
+    // an item off this list, and it does not survive the item either. One
+    // session deleted `stencil::engine::all_specs` on a row from this check,
+    // broke the build on the `pub use` in the crate root two lines later, and
+    // paid a 2m43s `cargo test --workspace` to find out. `callers` has printed
+    // this note all along — the command that tells you to delete did not, and
+    // the note it *did* print pointed at `tests --mentions`, which found
+    // nothing.
+    //
+    // Computed only when there is something to say: the walk is over ASTs
+    // already in hand, but a tree with no dead fns should not pay for it.
+    if !hits.is_empty() {
+        let imports = crate::callers::imported_names(call_source);
+        // Rows for the fraction, distinct names for the list: two items can
+        // wear one name, and both rows are equally undeletable.
+        let mut affected = 0usize;
+        let mut named: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for (_, d, _) in &hits {
+            // A file importing an item it also defines is the `use self::…`
+            // shape, not a reference a deletion has to reach.
+            let n = imports
+                .get(&d.name)
+                .map_or(0, |files| files.iter().filter(|f| *f != &d.file).count());
+            if n > 0 {
+                affected += 1;
+                named.entry(d.name.as_str()).or_insert(n);
+            }
+        }
+        if !named.is_empty() {
+            const SHOWN: usize = 5;
+            let more = named.len().saturating_sub(SHOWN);
+            let list = named
+                .iter()
+                .take(SHOWN)
+                .map(|(n, f)| format!("`{}` in {} file(s)", n, f))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ctx.out.note(&format!(
+                "(note: {} also imported by name elsewhere — {}{}. A `pub use` re-export is a \
+                 reference and not a call site, so it neither keeps an item off this list nor \
+                 survives its deletion: remove the `use` line in the same edit. \
+                 `callers <name> --with-imports` lists them.)",
+                if affected == total {
+                    format!("every row ({})", total)
+                } else {
+                    format!("{} of {} row(s)", affected, total)
+                },
+                list,
+                if more > 0 {
+                    format!(", and {} more", more)
+                } else {
+                    String::new()
+                },
+            ));
+        }
+    }
     // Named where the deletion is about to happen. This check's call set is
     // identifier-based, so a fn a test only names *inside a string* — a fixture
     // literal, an expected-output assertion — is not a call and does not save
@@ -525,7 +630,7 @@ pub fn run(
         if transitive {
             ""
         } else {
-            " `--transitive` also reports the private orphans each deletion would expose."
+            " `--transitive` also reports the orphans each deletion would expose."
         }
     ));
     Ok(total)

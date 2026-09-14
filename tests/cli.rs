@@ -5653,6 +5653,80 @@ fn audit_separates_dead_waivers_from_merely_below_threshold_ones() {
     );
 }
 
+/// A waiver the parser read but nobody can review — no date, no reason — hides
+/// its finding exactly as well as a good one, and the digest used to read
+/// byte-for-byte the same either way.
+///
+/// One session's waivers were written by a script whose `^(\s*)` matched the
+/// preceding newline, so a blank line landed between each `ok(...)` key and its
+/// date. `is_continuation` stops at a blank line, so the date and the reason
+/// were lost; `is_codeless` walks past it to the item, so the suppression
+/// landed anyway. Seven of them took a tree from 13 gating findings to zero.
+/// The hygiene note said so — below the digest, and the command consuming it
+/// was `audit | grep -E "^\(audit:"`.
+#[test]
+fn the_audit_line_says_when_a_waiver_cannot_be_reviewed() {
+    let dir = scratch("audit-waiver-hygiene");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "// unruster: ok(dead-code)\n\
+         \n\
+         // 2026-09-13 — a reason the parser never reaches, past the blank line.\n\
+         \n\
+         pub fn split_from_its_date() -> u32 { 7 }\n\
+         \n\
+         // unruster: ok(dead-code) 2026-09-13 — adjacent, and so readable.\n\
+         pub fn well_formed() -> u32 { 8 }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur_stdout(&["--root", root, "--all-stdout", "audit"]);
+    let text = String::from_utf8(out).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("(audit:"))
+        .unwrap_or_else(|| panic!("no audit summary line:\n{text}"));
+    assert!(
+        line.contains("2 waiver(s) hiding 2 finding(s)"),
+        "both still suppress — that half is deliberate:\n{line}"
+    );
+    assert!(
+        line.contains("1 undated") && line.contains("1 with no reason"),
+        "and the digest says which one cannot be reviewed:\n{line}"
+    );
+    assert!(
+        line.contains("`unruster waivers` to review"),
+        "with the command that can rewrite it:\n{line}"
+    );
+
+    // The same tree with both waivers written properly: nothing extra, because
+    // appending an alarm to every run is what teaches readers to ignore it.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "// unruster: ok(dead-code)\n\
+         // 2026-09-13 — the date on the continuation line, where the parser reads it.\n\
+         pub fn split_from_its_date() -> u32 { 7 }\n\
+         \n\
+         // unruster: ok(dead-code) 2026-09-13 — adjacent, and so readable.\n\
+         pub fn well_formed() -> u32 { 8 }\n",
+    )
+    .unwrap();
+    let clean = String::from_utf8(ur_stdout(&["--root", root, "--all-stdout", "audit"])).unwrap();
+    let line = clean
+        .lines()
+        .find(|l| l.starts_with("(audit:"))
+        .unwrap_or_else(|| panic!("no audit summary line:\n{clean}"));
+    assert!(
+        line.contains("2 waiver(s) hiding 2 finding(s)"),
+        "same suppression:\n{line}"
+    );
+    assert!(
+        !line.contains("undated") && !line.contains("no reason"),
+        "and nothing to say about it:\n{line}"
+    );
+}
+
 #[test]
 fn orphan_detection_agrees_with_the_audit_line() {
     // These two used to contradict each other in the same run: `audit` counted
@@ -10950,6 +11024,191 @@ fn dead_code_transitive_reports_the_orphans_a_deletion_would_expose() {
     assert_eq!(via("a"), "direct");
     assert_eq!(via("b"), "transitive after a", "and it says what has to go first");
     assert_eq!(via("c"), "transitive after b");
+}
+
+/// `dead-code` is the one check whose rows are an invitation to delete, and a
+/// `pub use` re-export is the commonest reason the deletion does not compile.
+/// It is a reference and not a call site, so it neither keeps the item off the
+/// list nor survives it.
+///
+/// One session removed `stencil::engine::all_specs` on a row from this check,
+/// broke the build on the `pub use` in the crate root, and paid a 2m43s
+/// `cargo test --workspace` to find out. `callers` prints this note already;
+/// the row that says "delete me" printed only `tests --mentions`, which found
+/// nothing.
+#[test]
+fn dead_code_names_the_rows_a_use_line_still_points_at() {
+    let dir = scratch("dead-code-reexport");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod engine;\npub use engine::all_specs;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/engine.rs"),
+        "pub fn all_specs() -> u32 { 42 }\npub fn untouched() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout(&["--root", root, "dead-code"])).unwrap();
+    assert!(
+        text.contains("1 of 2 row(s) also imported by name elsewhere"),
+        "the fraction counts rows, not names:\n{text}"
+    );
+    assert!(
+        text.contains("`all_specs` in 1 file(s)"),
+        "and names the one that is:\n{text}"
+    );
+    assert!(
+        !text.contains("`untouched`"),
+        "a row nothing imports is not in the note:\n{text}"
+    );
+    assert!(
+        text.contains("callers <name> --with-imports"),
+        "and routes to the command that lists the sites:\n{text}"
+    );
+
+    // No `use` line anywhere: the note costs nothing and says nothing.
+    std::fs::write(dir.join("src/lib.rs"), "pub mod engine;\n").unwrap();
+    let quiet = String::from_utf8(ur_stdout(&["--root", root, "dead-code"])).unwrap();
+    assert!(
+        !quiet.contains("imported by name elsewhere"),
+        "nothing imports either row:\n{quiet}"
+    );
+}
+
+/// A mutually recursive pair keeps itself alive under "remove these, recount,
+/// repeat": each round asks *does anything still name this*, and each half of
+/// the cycle answers yes for the other, for ever. So the whole dead subgraph
+/// under such a pair — and everything only it called — was invisible.
+///
+/// A session deleted a 1,098-line module on a `--transitive` run that predicted
+/// no orphans at all, and watched a `pub fn` in another crate go dead the moment
+/// the file left the tree: the ~40 private generators inside it referenced one
+/// another, which is all it takes. The closure is reachability from the roots
+/// now, which has no such blind spot.
+#[test]
+fn dead_code_transitive_sees_through_a_cycle_of_private_helpers() {
+    let dir = scratch("dead-transitive-cycle");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod rng;
+pub mod gen;
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/rng.rs"),
+        "pub struct Rng(u64);
+         impl Rng {
+         pub fn next_u64(&mut self) -> u64 { self.0 += 1; self.0 }
+         pub fn chance(&mut self, one_in: u64) -> bool { self.next_u64() % one_in.max(1) == 0 }
+         }
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/gen.rs"),
+        "use crate::rng::Rng;
+         fn add(r: &mut Rng, d: u8) -> u32 { if d > 0 { sub(r, d - 1) } else if r.chance(3) { 1 } else { 2 } }
+         fn sub(r: &mut Rng, d: u8) -> u32 { if d > 0 { add(r, d - 1) } else { 4 } }
+         pub fn dispatch(r: &mut Rng, w: u8) -> u32 { if w == 0 { add(r, 2) } else { sub(r, 2) } }
+",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout(&["--root", root, "dead-code", "--transitive"])).unwrap();
+    let via = |name: &str| -> String {
+        text.lines()
+            .find(|l| l.split('\t').nth(2).is_some_and(|q| q.ends_with(name)))
+            .unwrap_or_else(|| panic!("no row for {name}:\n{text}"))
+            .split('\t')
+            .nth(4)
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(via("dispatch"), "direct");
+    // The cycle itself, attributed to the live entry point that went — not to
+    // the other half, which is equally conditional.
+    assert_eq!(via("add"), "transitive after gen::dispatch");
+    assert_eq!(via("sub"), "transitive after gen::dispatch");
+    // And what only the cycle called. This is the row the old closure lost:
+    // `chance` surfaced only once the file had actually been deleted.
+    assert_eq!(via("Rng::chance"), "transitive after gen::add");
+    assert_eq!(via("Rng::next_u64"), "transitive after rng::Rng::chance");
+
+    // Nothing appears after the deletion that was not predicted before it.
+    std::fs::remove_file(dir.join("src/gen.rs")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub mod rng;\n").unwrap();
+    let after = String::from_utf8(ur_stdout(&["--root", root, "dead-code"])).unwrap();
+    for row in after.lines().filter(|l| l.contains('\t')) {
+        let q = row.split('\t').nth(2).unwrap();
+        assert!(
+            text.contains(q),
+            "`{q}` went dead on the deletion and `--transitive` had not said so:\n{text}"
+        );
+    }
+}
+
+/// The other half of the same question: a cycle nobody reaches is dead, a cycle
+/// something reaches is not. Reachability is only an improvement if it still
+/// says no.
+#[test]
+fn dead_code_transitive_keeps_a_cycle_that_a_root_reaches() {
+    let dir = scratch("dead-transitive-live-cycle");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn entry(n: u32) -> u32 { ping(n) }
+         fn ping(n: u32) -> u32 { if n == 0 { deep() } else { pong(n - 1) } }
+         fn pong(n: u32) -> u32 { if n == 0 { 0 } else { ping(n - 1) } }
+         fn deep() -> u32 { 7 }
+",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout(&["--root", root, "dead-code", "--transitive"])).unwrap();
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains('\t')).collect();
+    // `entry` is dead (nothing calls it), and everything under it follows —
+    // but `ping`/`pong` must be listed as *conditional*, never as direct, and
+    // the same tree with a caller for `entry` must list nothing at all.
+    assert!(
+        rows.iter().any(|r| r.ends_with("direct")) && rows.len() == 4,
+        "one direct entry point, three conditional:\n{text}"
+    );
+
+    std::fs::write(
+        dir.join("src/main.rs"),
+        "fn main() { println!(\"{}\", lib_entry()); }
+         fn lib_entry() -> u32 { 0 }
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn entry(n: u32) -> u32 { ping(n) }
+         fn ping(n: u32) -> u32 { if n == 0 { deep() } else { pong(n - 1) } }
+         fn pong(n: u32) -> u32 { if n == 0 { 0 } else { ping(n - 1) } }
+         fn deep() -> u32 { 7 }
+         #[cfg(test)]
+         mod tests {
+         #[test]
+         fn t() { assert_eq!(super::entry(2), 0); }
+         }
+",
+    )
+    .unwrap();
+    let live = String::from_utf8(ur_stdout(&[
+        "--root", root, "dead-code", "--transitive", "--scope", "all",
+    ]))
+    .unwrap();
+    assert_eq!(
+        live.lines().filter(|l| l.contains('\t')).count(),
+        0,
+        "a test reaches `entry`, so the whole cycle under it is live:\n{live}"
+    );
 }
 
 // ─── routing: naming the better command at the point of need ───────────────

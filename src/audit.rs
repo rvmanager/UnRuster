@@ -1358,9 +1358,33 @@ pub fn run(
                 .iter()
                 .filter(|w| w.hits() == 0 && w.below_audit() > 0)
                 .count();
+            // A waiver with no date or no reason suppresses exactly as well as
+            // a good one and cannot be reviewed: nobody can tell whether the
+            // judgment still holds, or what it was.
+            //
+            // Counted *here*, on the digest, rather than left to the hygiene
+            // note below it — because the digest is the line that gets grepped.
+            // One session's waivers were written by a script whose `^(\s*)`
+            // matched the preceding newline, putting a blank line between each
+            // `ok(...)` key and its date; `is_continuation` stops at a blank, so
+            // seven waivers parsed with no date and no reason, while
+            // `is_codeless` still walked past the blank to the item and
+            // suppressed it. The tree went from 13 gating findings to 0, and
+            // this line read byte-for-byte the same as it did for the seven
+            // correct ones it was replaced with. The reader found it by eye in
+            // `git diff`; the command consuming the digest was
+            // `audit | grep -E "^\(audit:"`, which drops every note.
+            let undated = ledger.iter().filter(|w| w.date.is_none()).count();
+            let unexplained = ledger.iter().filter(|w| w.reason.trim().is_empty()).count();
             let mut tail = String::new();
             if dead > 0 {
                 tail.push_str(&format!(", {} of them suppressing nothing", dead));
+            }
+            if undated > 0 {
+                tail.push_str(&format!(", {} undated", undated));
+            }
+            if unexplained > 0 {
+                tail.push_str(&format!(", {} with no reason", unexplained));
             }
             // Stated, because a reader comparing `waivers` output against this
             // line has to be able to account for every waiver — but phrased as
@@ -1387,8 +1411,11 @@ pub fn run(
                 tail,
                 // Only when there is a decision to make. Appending it to every
                 // run is what taught readers to walk to the ledger and find
-                // nothing there.
-                if dead > 0 {
+                // nothing there. An undated or unexplained waiver is such a
+                // decision: `waivers` is where the empty reason column and the
+                // `N undated` count are, and it is the only command that can
+                // rewrite them (`--upgrade`, `--remove`).
+                if dead > 0 || undated > 0 || unexplained > 0 {
                     " — `unruster waivers` to review"
                 } else {
                     ""
