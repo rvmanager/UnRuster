@@ -528,6 +528,13 @@ impl Out {
         let lines = cache.entry(file.to_string()).or_insert_with(|| {
             std::fs::read_to_string(file)
                 .map(|s| s.lines().map(str::to_string).collect())
+                // unruster: ok(error-swallows/.unwrap_or_default)
+                // 2026-09-13 — the file was parsed moments ago, so a failure
+                //   here is a race on disk, and what it costs is a rendering:
+                //   the ±N context lines under one row. Reporting it would put
+                //   a warning about a display detail in front of the finding
+                //   the reader asked for. Same shape as the waiver in
+                //   `suppress::scan`.
                 .unwrap_or_default()
         });
         lines.get(line.checked_sub(1)?).cloned()

@@ -5123,6 +5123,111 @@ fn error_swallows_keeps_benign_families_by_default_and_audit_drops_them() {
     );
 }
 
+/// The kind scale claims to measure *how completely the failure vanished*, and
+/// it used to contradict itself: `.unwrap_or_default` scored 0.15 and `.ok`
+/// scored 0.20, so a value nothing can tell from a success ranked below an
+/// `Option` the caller can still branch on.
+///
+/// It cost a real bug. `ZoneServiceImpl::display_name` (`.ok`, io) scored 0.55
+/// and gated; its sibling `looks` (`.unwrap_or_default`, io) scored 0.50 and did
+/// not — the same failure in the same impl, one fixed and one left silent until
+/// somebody read the advisory tier by hand.
+#[test]
+fn a_substituted_value_outranks_an_option_the_caller_can_still_check() {
+    let dir = scratch("swallow-kind-order");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct S;\n\
+         impl S {\n\
+         pub fn named(&self) -> String {\n\
+         sqlx_query_scalar().fetch_optional().ok().flatten().unwrap_or_else(|| \"x\".to_string())\n\
+         }\n\
+         pub fn looks(&self) -> Vec<u8> {\n\
+         sqlx_query_scalar().fetch_all().unwrap_or_default()\n\
+         }\n\
+         }\n\
+         fn sqlx_query_scalar() -> S { S }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let text = String::from_utf8(ur_stdout_allow_findings(&[
+        "--root", root, "error-swallows", "--top", "0",
+    ]))
+    .unwrap();
+    let score = |kind: &str| -> f64 {
+        text.lines()
+            .find(|l| l.starts_with(kind))
+            .unwrap_or_else(|| panic!("no {kind} row:\n{text}"))
+            .split('\t')
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let substituted = score(".unwrap_or_default");
+    let optioned = score(".ok");
+    assert!(
+        substituted > optioned,
+        "a substituted value hides the failure more completely than an Option: \
+         .unwrap_or_default={substituted} .ok={optioned}\n{text}"
+    );
+    // Both sides of the same io failure now land on the same side of the gate,
+    // which is the whole point: fixing one must not leave its sibling silent.
+    assert!(
+        substituted >= 0.55 && optioned >= 0.55,
+        "both gate: .unwrap_or_default={substituted} .ok={optioned}\n{text}"
+    );
+}
+
+/// Raising the fallback kinds must not drag the poisoned-lock idiom into the
+/// gating tier with them. `.lock().unwrap_or_else(|e| e.into_inner())` computes
+/// its fallback *from* the error — the guard is the data, intact, and
+/// `into_inner` is what std prescribes. Seven of ten `io` fallbacks on unruster
+/// itself are that one line.
+#[test]
+fn a_fallback_built_from_the_error_is_benign() {
+    let dir = scratch("swallow-error-used");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "use std::sync::Mutex;\n\
+         pub static LOCK: Mutex<Vec<u8>> = Mutex::new(Vec::new());\n\
+         pub fn recovered() -> usize { LOCK.lock().unwrap_or_else(|e| e.into_inner()).len() }\n\
+         pub fn dropped() -> Vec<u8> { fetch_rows().unwrap_or_else(|_| Vec::new()) }\n\
+         fn fetch_rows() -> std::io::Result<Vec<u8>> { std::fs::read(\"x\") }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let shown = String::from_utf8(ur_stdout_allow_findings(&[
+        "--root", root, "error-swallows", "--top", "0",
+    ]))
+    .unwrap();
+    assert!(
+        shown.contains("recovered"),
+        "the dedicated command still shows benign families:\n{shown}"
+    );
+
+    let gated = String::from_utf8(ur_stdout_allow_findings(&[
+        "--root",
+        root,
+        "error-swallows",
+        "--hide-infallible",
+        "--hide-logged",
+        "--top",
+        "0",
+    ]))
+    .unwrap();
+    assert!(
+        !gated.contains("recovered"),
+        "`|e| e.into_inner()` consulted the error, so `audit` drops it:\n{gated}"
+    );
+    assert!(
+        gated.contains("dropped"),
+        "`|_|` names no error and reads none — still a swallow:\n{gated}"
+    );
+}
+
 #[test]
 fn ok_under_a_question_mark_is_propagation_not_a_swallow() {
     // `parse().ok()?` discards the error value but propagates the failure, so

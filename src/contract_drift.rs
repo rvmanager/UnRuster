@@ -285,6 +285,11 @@ fn arg_shape(e: &syn::Expr) -> Arg {
         },
         syn::Expr::Call(_) | syn::Expr::MethodCall(_) | syn::Expr::Macro(_) => Arg {
             shape: "call",
+            // unruster: ok(error-swallows/.unwrap_or_default)
+            // 2026-09-13 — `call_of` returns an `Option`, so there is no error here
+            //   to swallow. `receiver_is_option` bottoms out at a method name it
+            //   knows and cannot see through a local fn's return type, which is the
+            //   documented limit of that check, not a defect at this site.
             text: call_of(inner).map(|(t, _)| t).unwrap_or_default(),
         },
         syn::Expr::Field(_) => Arg {

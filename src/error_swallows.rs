@@ -48,13 +48,27 @@ impl Hit {
     /// this ranking was built against, all correct, all previously
     /// indistinguishable from the money bug.
     fn score(&self) -> f64 {
+        // Ordered by the axis, highest first, because they used not to be:
+        // `.unwrap_or_default` sat *below* `.ok`, which reads the scale
+        // backwards. `.ok()` hands the caller an `Option` — the failure is
+        // still in the type and the next reader can act on it;
+        // `.unwrap_or_default()` hands back a value indistinguishable from
+        // success and there is nothing left to act on. The inversion cost a
+        // real bug: `ZoneServiceImpl::display_name` (`.ok`, io) scored 0.55 and
+        // gated, its sibling `looks` (`.unwrap_or_default`, io) scored 0.50 and
+        // did not — the same failure in the same impl, one fixed and one left
+        // silent, found later by hand.
         let kind = match self.kind {
             // Error and value both gone, control continues on the happy path.
             "let-_" | "match-err-wild" => 0.30,
-            // The failure becomes a `None` the caller may or may not check.
+            // A substituted value: execution continues as if it had succeeded,
+            // and the caller cannot tell that it did not. As complete a
+            // vanishing as `let _`, less the tell that a discard is written
+            // down at the site.
+            ".unwrap_or_default" | ".unwrap_or_else" | ".unwrap_or" => 0.25,
+            // The failure becomes a `None` the caller may or may not check —
+            // still in the type, so it can still be acted on.
             ".ok" | ".err" | "if-let-ok" | "while-let-ok" => 0.20,
-            // A substituted value: execution continues as if it had succeeded.
-            ".unwrap_or_default" | ".unwrap_or_else" | ".unwrap_or" => 0.15,
             // Cause replaced, failure still propagates — the sanitization shape.
             ".map_err(|_|)" => 0.05,
             _ => 0.15,
@@ -97,9 +111,11 @@ impl Hit {
 }
 
 /// Weight of the value-substitution term. Tuned to the boundary it exists to
-/// cross: `.unwrap_or_else` (0.15) on an `Unknown` effect (0.20) is 0.35, and
+/// cross: `.unwrap_or_else` (0.25) on an `Unknown` effect (0.20) is 0.45, and
 /// 0.55 is the gate — so a substituting fallback on an unrecognised call gates,
-/// and a defaulting one still does not.
+/// and a defaulting one still does not. That boundary is what the number is
+/// for; the margin either side of it is not tuned, which is why raising the
+/// fallback kinds from 0.15 to 0.25 moved no verdict here and this stayed put.
 const SUBSTITUTION_WEIGHT: f64 = 0.20;
 
 /// What the discarded `Result` was reporting on — the single feature that
@@ -733,6 +749,22 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
                 Some("option-default")
             } else if k == ".unwrap_or_else" && fallback_is_logged(e) {
                 Some("logged-fallback")
+            } else if k == ".unwrap_or_else"
+                && matches!(e.args.first(), Some(syn::Expr::Closure(c)) if closure_uses_its_error(c))
+            {
+                // The fallback was computed *from* the error, so the error was
+                // consulted rather than dropped — the "inspects" tier of the
+                // care scale `divergence --handling` ranks on, one step above a
+                // bare default. [`fallback_substitutes`] already exempts this
+                // shape for the same reason; this is the other half of it.
+                //
+                // The family that makes it worth a name is the poisoned-lock
+                // recovery, `.lock().unwrap_or_else(|e| e.into_inner())`: the
+                // guard is the data, intact, and `into_inner` is what the std
+                // docs prescribe. Seven of ten `io` fallbacks on this crate are
+                // that one line, and without this they would lead a gating tier
+                // that had nothing wrong in it.
+                Some("error-used")
             } else if matches!(k, ".ok" | ".err") && self.is_propagated(&e.method) {
                 Some("propagated")
             } else if k == ".ok" && self.closure_tail.last().copied().unwrap_or(false) {
@@ -845,6 +877,24 @@ impl<'ast, 'a> Visit<'ast> for SwallowVisitor<'a> {
 /// reproduce the unranked list this score exists to replace.
 pub const GATING_SCORE: f64 = 0.55;
 
+/// Does a hit survive the `--include-*` filters for its benign family?
+///
+/// One policy, read twice — by the waiver retain (which must agree with it, or
+/// a waiver's hit count stops meaning "suppressed something audit would have
+/// gated on") and by the row retain. It was two copies of the same match, which
+/// is the shape `near-clones` reports and the shape where one side gets a new
+/// family and the other does not.
+fn benign_kept(benign: Option<&str>, opts: SwallowOpts) -> bool {
+    match benign {
+        Some("infallible-write") => opts.include_infallible,
+        Some("logged-fallback") | Some("combinator-ok") | Some("propagated")
+        | Some("option-default") | Some("fallthrough-is-handler") | Some("error-used") => {
+            opts.include_logged
+        }
+        _ => true,
+    }
+}
+
 /// Which families of swallow site to report.
 #[derive(Clone, Copy)]
 pub struct SwallowOpts {
@@ -917,22 +967,13 @@ pub fn run_counted(
         &mut all,
         |h| crate::suppress::Site::keyed(h.file.as_str(), h.line, h.kind),
         |h| {
-            let kept = match h.benign {
-                Some("infallible-write") => opts.include_infallible,
-                Some("logged-fallback") | Some("combinator-ok") | Some("propagated")
-                | Some("option-default") | Some("fallthrough-is-handler") => opts.include_logged,
-                _ => true,
-            };
-            kept && h.score() >= opts.min_score && h.score() >= GATING_SCORE
+            benign_kept(h.benign, opts)
+                && h.score() >= opts.min_score
+                && h.score() >= GATING_SCORE
         },
     );
     let before = all.len();
-    all.retain(|h| match h.benign {
-        Some("infallible-write") => opts.include_infallible,
-        Some("logged-fallback") | Some("combinator-ok") | Some("propagated")
-        | Some("option-default") | Some("fallthrough-is-handler") => opts.include_logged,
-        _ => true,
-    });
+    all.retain(|h| benign_kept(h.benign, opts));
     let benign_hidden = before - all.len();
     // Before the counts are taken: `--min-score` is a different question from
     // `--top`. A cap says "show me fewer of these"; a floor says "these are
@@ -1022,8 +1063,9 @@ pub fn run_counted(
         ctx.waived_note(waived),
         if benign_hidden > 0 {
             format!(
-                "; {} benign site(s) hidden (infallible writes / logged fallbacks — \
-                 `--include-infallible` / `--include-logged` to restore)",
+                "; {} benign site(s) hidden (infallible writes / logged fallbacks / \
+                 fallbacks built from the error — `--include-infallible` / \
+                 `--include-logged` to restore)",
                 benign_hidden
             )
         } else if benign_shown > 0 {
@@ -1033,7 +1075,8 @@ pub fn run_counted(
             // ineffective. Say which rows are already accounted for.
             format!(
                 "; {} of these are benign (Option defaults, propagated `?`, logged \
-                 fallbacks, infallible writes) and are hidden in `audit`",
+                 fallbacks, fallbacks built from the error, infallible writes) and are \
+                 hidden in `audit`",
                 benign_shown
             )
         } else {
@@ -1325,6 +1368,33 @@ mod tests {
     #[test]
     fn unknown_chains_do_not_gate() {
         assert!(hit("let-_", Effect::Unknown).score() < GATING_SCORE);
-        assert!(hit(".unwrap_or_default", Effect::Io).score() < GATING_SCORE);
+        assert!(hit(".unwrap_or_default", Effect::Unknown).score() < GATING_SCORE);
+    }
+
+    /// The kind scale measures *how completely the failure vanished*, and it
+    /// used to contradict itself: `.unwrap_or_default` scored below `.ok`, so a
+    /// value nothing can tell from a success ranked under an `Option` the caller
+    /// can still branch on.
+    ///
+    /// This assertion used to live — inverted — inside `unknown_chains_do_not
+    /// _gate`, where `Effect::Io` is not an unknown chain and never was. It cost
+    /// a real bug: `ZoneServiceImpl::display_name` (`.ok`, io) gated at 0.55 and
+    /// was fixed; its sibling `looks` (`.unwrap_or_default`, io) scored 0.50,
+    /// did not gate, and stayed silent through the same outage.
+    #[test]
+    fn a_substituted_value_vanishes_more_completely_than_an_option() {
+        for e in [Effect::Mutation, Effect::Io, Effect::Decode, Effect::Unknown] {
+            assert!(
+                hit(".unwrap_or_default", e).score() > hit(".ok", e).score(),
+                "{e:?}: a substituted value outranks an Option"
+            );
+            assert!(
+                hit("let-_", e).score() > hit(".unwrap_or_default", e).score(),
+                "{e:?}: and a bare discard outranks both"
+            );
+        }
+        // The pair that motivated it, on the same side of the gate at last.
+        assert!(hit(".ok", Effect::Io).score() >= GATING_SCORE);
+        assert!(hit(".unwrap_or_default", Effect::Io).score() >= GATING_SCORE);
     }
 }

@@ -934,13 +934,16 @@ Runtime risks hidden in the code: silent error-swallowing, silent data
 loss from casts and conversions.
 
 ◇ SILENT FALLBACKS (Result/Option error swallowing)
-  Two families are idiomatic rather than defective, and dominated this
+  Three families are idiomatic rather than defective, and dominated this
   check's output before they were split out: `let _ = write!(buf, …)`
   into an in-memory `String` (infallible, so the discard is the correct
-  spelling) and `.unwrap_or_else(|| { log!(…); default })` (the failure
-  is already observable, so the fallback is a policy). The dedicated
-  command shows them; `audit` hides them. Restore or hide with
-  `--include-infallible <bool>` / `--include-logged <bool>`.
+  spelling), `.unwrap_or_else(|| { log!(…); default })` (the failure
+  is already observable, so the fallback is a policy), and a fallback
+  computed from the error itself — `.lock().unwrap_or_else(|e|
+  e.into_inner())` and its relatives, where the error was consulted
+  rather than dropped. The dedicated command shows them; `audit` hides
+  them. Restore or hide with `--include-infallible <bool>` /
+  `--include-logged <bool>`.
   For "one callee, two levels of care", use `divergence --handling`.
   unruster error-swallows [--include-unwrap-or]
   Signal: `match-err-wild` / `if-let-ok` / `let-_` / `.map_err(|_|)` /
@@ -955,8 +958,11 @@ loss from casts and conversions.
              or convert of data already in hand)
     kind     how completely the failure vanished — `let _` and
              `match … Err(_) =>` drop error and value and carry on;
-             `.map_err(|_|)` replaces the cause but still propagates, so
-             the caller can act
+             `.unwrap_or_default()` hands back a value nothing can tell
+             from a success; `.ok()` leaves the failure in the type,
+             where the next reader can still act on it; `.map_err(|_|)`
+             replaces the cause but still propagates, so the caller can
+             act
   `audit` gates at 0.55, which is "an external effect happened and the
   only report of whether it worked was discarded".
   The two ends of that scale look identical without it. On one workspace

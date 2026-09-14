@@ -1,7 +1,7 @@
 # unruster — field findings, Augrym audit session, 13 Sep 2026
 
-**Status:** **D1, D2 and D3 fixed on 2026-09-13** (working tree; not yet in the
-PATH binary). See *Outcome* at the foot of this file. Everything else stands as
+**Status:** **D1–D4 fixed on 2026-09-13** (working tree; not yet in the PATH
+binary). See *Outcome* at the foot of this file. Everything else stands as
 written.
 **Baseline:** `0.1.92` — the binary on PATH (`/usr/local/bin/unruster`, installed
 12 Sep 08:11) is the current `HEAD` (`41a70a7`). Every finding below is against
@@ -334,8 +334,10 @@ reader runs next does not.
 
 ### Change
 Footer: `(46 cast(s); … ; audit reports the data-loss classes only —
-`casts --class narrow-int,signed-flip`)`. `rerun_cmd` already builds that exact
-string from `CAST_CLASSES`.
+`casts --class narrow-int,signed-flip,float-int,narrow-float,ptr`)`. `rerun_cmd`
+already builds that exact string from `CAST_CLASSES` — `audit --list-checks`
+prints it today. (Corrected: the section runs five classes; `narrow-int` and
+`signed-flip` were merely the two with rows on Augrym.)
 
 ---
 
@@ -547,9 +549,9 @@ are the same class.
 
 # Outcome — 2026-09-13
 
-**D1, D2, D3 implemented.** `cargo clippy --all-targets` clean, 858 tests green
-(247 unit + 611 CLI, 3 new), `unruster self-check` 0 violations,
-`audit --changed-since HEAD` 0 gating on the change.
+**D1, D2, D3, D4 implemented.** `cargo clippy --all-targets` clean, 861 tests
+green (248 unit + 613 CLI, 6 new), `unruster self-check` 0 violations,
+`unruster audit` 0 gating.
 
 ## D1 — `dead-code --transitive` (`src/dead_code.rs`, `src/main.rs`)
 
@@ -629,3 +631,215 @@ alarm and the silence.
 **Still open from D3:** whether an unexplained waiver should hold the exit code
 open under `--strict`. Left alone — it changes what a gate means, and that is a
 call to make deliberately rather than as part of a reporting fix.
+
+
+## D4 — the kind scale, ordered by the axis it claims (`src/error_swallows.rs`)
+
+`.unwrap_or_default` / `.unwrap_or_else` / `.unwrap_or` moved from 0.15 to
+**0.25**, above `.ok`/`.err`/`if-let-ok`/`while-let-ok` at 0.20 and below
+`let-_`/`match-err-wild` at 0.30. The arms are now written in descending order
+so the scale reads down the page. `.ok` was *not* lowered: that would have
+un-gated `display_name`, a confirmed real bug.
+
+One new gating class results: **a silent substituted fallback on an `Io`
+effect**, 0.50 → 0.60. That is exactly the reported miss (`ZoneServiceImpl::
+looks`). Every other combination keeps its verdict — `Unknown` 0.35 → 0.45 and
+`Decode` 0.20 → 0.30 are both still below the gate, and `Mutation` already
+gated.
+
+`SUBSTITUTION_WEIGHT` stayed at 0.20. Its doc was tuned to a boundary
+(*"a substituting fallback on an unrecognised call gates, and a defaulting one
+still does not"*) and that boundary still holds at the new weight — 0.45 + 0.20
+gates, 0.45 alone does not. Only the arithmetic in the doc moved.
+
+### The half that was not in the proposal: a new benign family
+
+Raising the fallback kinds without this would have promoted
+`Mutex::lock().unwrap_or_else(|e| e.into_inner())` — **7 of the 10 `io`
+fallbacks on unruster itself** — into a gating tier with nothing wrong in it.
+
+So `.unwrap_or_else` whose closure reads its error is now the benign family
+`error-used`: the error was *consulted*, not dropped, which is the "inspects"
+tier of the care scale `divergence --handling` ranks on.
+`fallback_substitutes` already exempted this exact shape for this exact reason
+and named the poisoned-lock idiom while doing it; this is the other half of
+that judgment. `|_|` still reads as a swallow, and the dedicated command still
+shows the family — only `audit` drops it.
+
+Measured on unruster's own tree: the 7 poison-recovery rows fell 0.50 → 0.25
+(benign, effect zeroed) and three rows rose 0.50 → 0.60. All three were
+verified and waived with reasons, which is the prescribed repair for that tier:
+
+| site | verdict |
+|---|---|
+| `contract_drift::arg_shape` | false positive — `call_of` returns `Option`, so there is no error. `receiver_is_option` bottoms out at method names it knows and cannot see through a local fn's return type. |
+| `emit::Out::source_line` | real but a rendering — a file parsed moments ago, re-read for `--context` lines. Same shape as the standing waiver in `suppress::scan`. |
+| `outline::run` | same, for `--sig` lines. |
+
+### Also fixed in passing
+
+The benign-family filter was two identical `match` arms — one in the waiver
+retain, one in the row retain — which is the shape where one side gets a new
+family and the other does not. Extracted to `benign_kept`.
+
+One existing unit test had to change: `unknown_chains_do_not_gate` asserted
+`.unwrap_or_default` on **`Effect::Io`** does not gate. `Io` is not an unknown
+chain and never was — the assertion was in the wrong test and was itself the
+defect, stated as a guarantee. Replaced with the `Unknown` case the test's name
+claims, plus
+`a_substituted_value_vanishes_more_completely_than_an_option`, which asserts
+the full ordering across all four effects. Two CLI tests cover the end-to-end
+shape and the new benign family.
+
+`explain silent-fallbacks` / `playbook.txt` updated: three idiomatic families,
+not two, and the `kind` axis now spells out where `.unwrap_or_default` and
+`.ok` sit relative to each other.
+
+---
+
+# Recommendation on Q1, S1, Q2 — 2026-09-13
+
+Arithmetic below is from `Cluster::score` (`src/concepts.rs:324`),
+`Out::cap_note` (`src/emit.rs`), `audit::rerun_cmd` (`src/audit.rs:159`) and
+`stringly::visit_expr_match` (`src/stringly.rs:106`), read against the Augrym
+session's numbers.
+
+## Q1 — do it, as a hard demotion on signature population
+
+### Why it scores 0.83
+
+The `unit` cluster: 4 members, all `pub`, 4 modules, positional.
+
+```
+0.28  floor
+0.15  0.22 × count      (4 members → 0.67)
+0.14  0.14 × public     (4/4 pub          → 1.0, maxed)
+0.16  0.16 × spread     (4 modules        → 1.0, maxed)
+0.10  0.10 × deliberate (positional cohort → 1.0, maxed)
+0.00  0.15 × agreement  (signature_rarity(139) ≈ 0.007 → ≈0.0004)
+────
+0.83  against a 0.70 gate
+```
+
+Three of the six terms — 0.40 of the score — are **maximised by construction**
+for a well-organised table. Every spec is `pub` because the engine calls it
+from elsewhere. Every spec is in its own topic module, which the check reads as
+"these authors could not see each other". Every spec is named `<word>_<word>`,
+which the check reads as "a convention, so a collision inside it is an
+oversight". Add the 0.28 floor and you are at 0.68 before any evidence of
+duplication has been weighed.
+
+### Why all four guards missed
+
+| guard | why it did not fire |
+|---|---|
+| `TAXONOMY_SIZE` (≥6 members) | `cognate_partition` splits *first*: 139 members became word-groups of 3–5. Its own doc says so — *"the clusters that reach the score are small by construction no matter how common the signature is"*. |
+| `dispatch_family()` | needs `modules() == 1` **and** every member private. A spec-per-module table is the exact opposite of both. |
+| `is_accessor_shape` | restricted to `SCALAR_RETURNS`. `Spec` is a domain type, deliberately exempt. |
+| `signature_rarity` | measures the pre-split population correctly, then enters as `0.15 × (0.4 × rarity)` ≈ 0.0004. Its sibling doc already measured this: *"its entire authority is 0.06 of a score whose floor is 0.28"*. |
+
+### The change
+
+Do what `is_accessor_shape` did — a hard demotion, not another weight. Carry
+the tree-wide signature population (already computed for `signature_rarity`)
+onto `Cluster`, and extend `taxonomy()`:
+
+```rust
+fn taxonomy(&self) -> bool {
+    self.members.len() >= TAXONOMY_SIZE
+        || self.dispatch_family()
+        || self.signature_population >= SIGNATURE_FAMILY
+}
+```
+
+`SIGNATURE_FAMILY = 12`. The evidence brackets it cleanly: the false positives
+this check has measured are signatures *"worn by dozens of functions"*
+(`() -> bool`/*active*, `() -> usize`/*count*, `() -> &str`/*label*, and now
+`() -> Spec` × 139); the true positive it must keep is
+`(AabbHandle, Rect, egui::Pos2) -> bool` **on three functions**. 12 is also
+`TAXONOMY_SIZE × 2`, which keeps one idea in the file rather than two.
+
+Demotion, not a drop: 0.83 − 0.25 = 0.58, under the gate, still listed — which
+is what `taxonomy()` already means and why *"a taxonomy is still worth one line
+of a reader's attention"*.
+
+**Effort S–M · risk low** (a demotion can only remove gating rows, never add
+one) · measure against the fixture corpus and the four noise rows
+`TAXONOMY_SIZE`'s doc records (0.87, 0.77, 0.77, 0.89).
+
+**Priority: highest of the three.** A gating check that went 0-for-5 on a real
+codebase and cost five hand-written waivers is worse than a noisy advisory one:
+it teaches the reader to waive without reading, which is the habit the waiver
+rule exists to prevent.
+
+## S1 — do it, and note the trigger is inverted
+
+`rerun_cmd` runs 12 of 21 checks with non-default arguments. `cap_note()`
+returns `None` when `dropped == 0`, so the hint is triggered by **volume** —
+and a short section is precisely the one whose standalone command asks a
+*different question*. The trigger is backwards: it fires when there is more of
+the same, and stays silent when the answer would change.
+
+Measured on unruster's own tree: 8 sections shown, 6 hints. On Augrym: `casts`
+(4 rows), `arith-drift` (2), `config-drift` (3), `builder-drift` (1),
+`near-clones` (4), `panics` (2) all printed nothing, and two of them were then
+re-run bare and misread.
+
+1. Print it whenever `rerun_cmd(check) != check`, capped or not — and phrase it
+   as what ran, not as "for the rest": `(this section ran arith-drift
+   --min-score 0.6; the bare command defaults to 0.50)`. ~8–12 lines on a full
+   audit.
+2. Do **not** print it for the 9 checks that run bare. `other => other` already
+   makes the bare name exact there, and a no-op hint on every section is the
+   mistake the codebase already names — *"appending it to every run is what
+   taught readers to walk to the ledger and find nothing there"*.
+3. Separately, the standalone side of the same gap: `threshold_note` is called
+   by 3 checks (`divergence`, `config-drift`, `builder-drift`) out of the 12
+   that diverge. `config-drift` says *"min_score=0.05 (audit gates at 0.12)"*;
+   `arith-drift` says `min_score=0.50` and nothing else. `self_check` can assert
+   that every `rerun_cmd` arm has a matching disclosure.
+
+**Effort S · risk none** (pure output). Do it first — it is hours, and it
+directly caused two wrong readings in one session.
+
+## Q2 — do it, but as its own piece, and mind the row shape
+
+`visit_expr_match` records one row per string literal *in a pattern*. A `_ =>`
+arm has no literal, so it emits nothing: on `user_service::ascend` the tell was
+the **absent third row**, and the reader found the bug by reading the source
+around the two that were there.
+
+`catch_all.rs` and `enum-coverage` already do this analysis — all of it keyed
+on an enum type, and a `match` on `&str` has none. That is the gap.
+
+Group `match-lit` hits by their enclosing `syn::ExprMatch` and carry arm count,
+literal count and whether the last arm is a wildcard. Then:
+
+- **Rank a literal match with a `_` arm above one without.** The wildcard is
+  what turns "add a case, get a compile error" into "add a case, get silent
+  fallthrough" — which *is* the argument for the newtype the check already
+  recommends.
+- **Flag the iterate-a-list-and-match-it-back shape** — `for x in ["a","b","c"]
+  { match x { "a" => …, _ => … } }`. Syntactically local, and it is the exact
+  Augrym bug: a fourth entry compiles and deletes from the wrong table.
+
+Side benefit: it collapses the row count (Augrym 21 → far fewer; unruster 265 →
+~80), which answers the session's other `stringly` complaint, and it removes
+the duplicate-context problem in S4 — two literals on one line become one row.
+
+**Effort M · risk medium**, and the risk is the row shape: this check's output
+is `awk`-ed, and the codebase is explicit about not moving columns (*"appending
+it unconditionally would move every existing reader's awk"*). Mitigate by
+keeping per-literal rows as they are and adding the match-level row as a new
+kind (`match-wild`) rather than changing `match-lit`.
+
+**Priority: after Q1.** It is the highest-yield *new* finding in the session,
+but it is the only one of the three that is new capability rather than
+finishing something already half-built — and it wants its own measurement pass
+against the fixture corpus.
+
+## Order
+
+**S1 → Q1 → Q2.** S1 and Q1 are the same kind of defect — the check already
+knows the thing and either does not say it or does not weigh it — so they can
+share one pass and one measurement run. Q2 is a separate piece of work.

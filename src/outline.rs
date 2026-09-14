@@ -191,6 +191,13 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
                 let src = sources.entry(d.file.as_str()).or_insert_with(|| {
                     std::fs::read_to_string(&d.file)
                         .map(|s| s.lines().map(str::to_string).collect())
+                        // unruster: ok(error-swallows/.unwrap_or_default)
+                        // 2026-09-13 — the file was parsed moments ago, so a
+                        //   failure here is a race on disk, and what it costs
+                        //   is a rendering: the signature lines under `--sig`.
+                        //   Reporting it would put a warning about a display
+                        //   detail in front of the finding the reader asked
+                        //   for. Same shape as `suppress::scan`'s waiver.
                         .unwrap_or_default()
                 });
                 let all = signature_lines(d, src);
