@@ -489,10 +489,6 @@ pub fn run(
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);
             if variant_names.is_empty() {
-                ctx.out.summary(&format!(
-                        "(0 match site(s) across 0 variant-set group(s) on `{}`)",
-                        enum_name
-                    ));
                     return Err(ctx.unknown_target("enum", enum_name));
             }
             let (sites, groups) = scan_groups(ctx, enum_name, &variant_names, opts, false);
@@ -844,13 +840,6 @@ pub fn run_enum_coverage(
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);
             if variant_names.is_empty() {
-                let summary_line = || {
-                    ctx.out.summary(&format!(
-                        "(0 partial site(s) on `{}`; 0 total variant(s); exhaustive sites hidden)",
-                        enum_name
-                    ));
-                };
-                summary_line();
                 return Err(ctx.unknown_target("enum", enum_name));
             }
             let scan = coverage_one(ctx, enum_name, &variant_names, opts, false);

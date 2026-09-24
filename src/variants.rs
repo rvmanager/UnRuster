@@ -225,11 +225,9 @@ fn run_one(
         v.visit_file(&f.ast);
         defs.extend(v.out);
     }
+    // No zero-count summary first: see `fields::run` — a count of nothing on
+    // a name that does not resolve asserts the thing the next line denies.
     if defs.is_empty() {
-        ctx.out.summary(&format!(
-            "(0 variants; 0 ctor sites, 0 match sites; bare={})",
-            bare
-        ));
         return Err(ctx.unknown_target("enum", enum_name));
     }
 

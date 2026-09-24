@@ -514,7 +514,17 @@ impl AnalysisCtx<'_> {
                 }
             }
         }
-        let near = self.idx.similar_to_query(name, 6);
+        // Close names of the kind this command can use, first. Only when there
+        // are none, close names of any kind — said as such: `callers Documnet`
+        // has no fn to offer, but `Document` is still the likeliest thing the
+        // reader meant, and "nothing close" would send them to grep for it.
+        let wanted = kinds_for(what);
+        let mut near = self.idx.similar_to_query(name, 6, wanted);
+        let other_kinds = near.is_empty() && wanted.is_some() && {
+            near = self.idx.similar_to_query(name, 6, None);
+            !near.is_empty()
+        };
+        let filter = if other_kinds { None } else { wanted };
         if near.is_empty() {
             self.out.answer(&format!(
                 "note: no {} `{}` in the scanned tree, and nothing close to it \
@@ -528,7 +538,16 @@ impl AnalysisCtx<'_> {
         // half wrong, and saying so names the repair — where "did you mean"
         // invites the reader to re-check a spelling that was already right.
         let exact = crate::ast::last_segment(name);
-        if near.iter().all(|d| d.name.eq_ignore_ascii_case(exact)) {
+        if other_kinds {
+            self.out.answer(&format!(
+                "note: no {} `{}`, and no {} close to it — but these other items are. \
+                 Did you mean:",
+                what,
+                name,
+                // The noun alone: "no fn or method close to it".
+                what.trim_end_matches(" matching").trim_end_matches(" named")
+            ));
+        } else if near.iter().all(|d| d.name.eq_ignore_ascii_case(exact)) {
             self.out.answer(&format!(
                 "note: no {} `{}` — `{}` is not in that module. It is declared here:",
                 what, name, exact
@@ -548,9 +567,18 @@ impl AnalysisCtx<'_> {
         // `trace::dist` alone and the reader had no way to know a second `dist`
         // existed. Ranking now prefers the shared module prefix; this says when
         // the choice was made at all.
+        // Copies of the right kind only: a struct listed once is not hiding
+        // the fn that happens to share its name.
         let hidden: usize = near
             .iter()
-            .map(|d| self.idx.lookup(&d.name).len().saturating_sub(1))
+            .map(|d| {
+                self.idx
+                    .lookup(&d.name)
+                    .iter()
+                    .filter(|c| filter.is_none_or(|k| k.contains(&c.kind)))
+                    .count()
+                    .saturating_sub(1)
+            })
             .sum();
         if hidden > 0 {
             self.out.answer(&format!(
@@ -911,6 +939,24 @@ fn pick_type_decl<'a>(found: &[&'a crate::index::Defn]) -> Option<&'a crate::ind
         .find(|d| matches!(d.kind, "struct" | "enum" | "trait" | "type"))
         .or_else(|| found.iter().find(|d| d.kind == "impl"))
         .copied()
+}
+
+/// The item kinds a command asking for `what` can use, for the near-name list
+/// after a miss — or `None` when any item would do (`show`'s "item named").
+///
+/// Keyed on the phrase each command already passes, so a new command gets the
+/// filter by describing its target the way the others do. A phrase not listed
+/// here filters nothing, which is the old behaviour rather than a wrong list.
+fn kinds_for(what: &str) -> Option<&'static [&'static str]> {
+    const TYPES: &[&str] = &["struct", "enum", "type", "trait", "union"];
+    const FNS: &[&str] = &["fn", "impl-fn", "trait-fn"];
+    match what {
+        "struct with named fields" | "struct literal of type" => Some(&["struct"]),
+        "enum" => Some(&["enum"]),
+        "type" | "builder chain rooted at" => Some(TYPES),
+        w if w.starts_with("fn") => Some(FNS),
+        _ => None,
+    }
 }
 
 /// `a` or `an` for a target kind. The kinds are a fixed, tiny vocabulary

@@ -16,10 +16,6 @@ pub fn run(ctx: &AnalysisCtx, target: Option<&str>) -> anyhow::Result<usize> {
         Some(enum_name) => {
             let variant_names = variant_names_of(ctx.files, enum_name);
             if variant_names.is_empty() {
-                ctx.out.summary(&format!(
-                        "(0 match site(s) on `{}` with a wildcard arm)",
-                        enum_name
-                    ));
                     return Err(ctx.unknown_target("enum", enum_name));
             }
             let (count, sealed_rows) = scan_one(ctx, enum_name, &variant_names, false);

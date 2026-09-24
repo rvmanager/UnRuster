@@ -383,8 +383,6 @@ pub fn run(
 
     if single && per_enum.is_empty() {
         let enum_name = &names[0];
-        ctx.out
-            .summary(&format!("(0 divergent pair(s) on `{}`)", enum_name));
         return Err(ctx.unknown_target("enum", enum_name));
     }
 

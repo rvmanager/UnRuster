@@ -65,8 +65,11 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
         defs.extend(v.out);
     }
 
+    // No `(0 field(s) on …)` line first. It printed above the explanation it
+    // contradicted — "0 fields on `RoutingReport`", then "no struct
+    // `RoutingReport`" — and a count asserts the thing it counts exists. The
+    // miss is explained by `unknown_target`, and `main` says what exit 2 means.
     if defs.is_empty() {
-        ctx.out.summary(&format!("(0 field(s) on `{}`)", ty));
         return Err(ctx.unknown_target("struct with named fields", ty));
     }
 

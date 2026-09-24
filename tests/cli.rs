@@ -2282,6 +2282,45 @@ fn callees_says_when_a_homonym_makes_no_calls() {
         .stdout(contains("1 other fn(s) named `new`"));
 }
 
+/// A miss on a kind-specific command offers only items of that kind, and says
+/// no count first. `fields RoutingReport` printed `(0 field(s) on
+/// RoutingReport)` above "no struct `RoutingReport`", then offered
+/// `fn print::report` beside the `RouteReport` it meant.
+#[test]
+fn a_kind_specific_miss_suggests_only_that_kind() {
+    let dir = scratch("kind-filtered-near-names");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct RouteReport { pub unrouted: Vec<String> }\n\
+         pub fn report() {}\n\
+         pub enum SortKey { Loc, Cyclo }\n\
+         pub fn sort_keys() {}\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+
+    let out = ur().args(["--root", root, "fields", "RoutingReport"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let all = all_output(&out);
+    assert!(all.contains("struct RouteReport"), "{all}");
+    assert!(!all.contains("fn report"), "a fn has no fields:\n{all}");
+    assert!(!all.contains("0 field(s)"), "no count for a type that does not resolve:\n{all}");
+
+    let out = ur().args(["--root", root, "variants", "SortKy"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let all = all_output(&out);
+    assert!(all.contains("enum SortKey"), "{all}");
+    assert!(!all.contains("sort_keys"), "a fn has no variants:\n{all}");
+    assert!(!all.contains("0 variants"), "{all}");
+
+    // No fn is close to `Documnet`, but a struct is: offered, and labelled as
+    // another kind rather than passed off as a fn.
+    let out = ur().args(["--root", FIXTURE, "callers", "Documnet"]).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("but these other items are"), "{s}");
+    assert!(s.contains("struct Document"), "{s}");
+}
+
 #[test]
 fn callees_unknown_fn_warns_and_exits_2() {
     let out = ur()

@@ -203,7 +203,7 @@ impl NameIndex {
     /// which throws away the only evidence available about *which* copy was
     /// meant.
     pub fn similar(&self, query: &str, limit: usize) -> Vec<&Defn> {
-        self.similar_ranked(query, limit, false)
+        self.similar_ranked(query, limit, false, None)
     }
 
     /// As [`similar`](Self::similar), but the representative for each name is
@@ -217,11 +217,29 @@ impl NameIndex {
     /// the one candidate sharing the query's `geom` prefix, and the only one a
     /// reader could have meant, was the copy that got dropped. Six suggestions,
     /// none of them the answer.
-    pub fn similar_to_query(&self, query: &str, limit: usize) -> Vec<&Defn> {
-        self.similar_ranked(query, limit, true)
+    ///
+    /// `kinds`, when given, is the only kinds a candidate may be: the command
+    /// that missed needs one kind of item, and suggesting another is a row the
+    /// reader has to read and rule out. `fields RoutingReport` offered
+    /// `fn print::report` beside the `RouteReport` it meant — a fn has no
+    /// fields, so the row could only ever be wrong.
+    pub fn similar_to_query(
+        &self,
+        query: &str,
+        limit: usize,
+        kinds: Option<&[&str]>,
+    ) -> Vec<&Defn> {
+        self.similar_ranked(query, limit, true, kinds)
     }
 
-    fn similar_ranked(&self, query: &str, limit: usize, use_prefix: bool) -> Vec<&Defn> {
+    fn similar_ranked(
+        &self,
+        query: &str,
+        limit: usize,
+        use_prefix: bool,
+        kinds: Option<&[&str]>,
+    ) -> Vec<&Defn> {
+        let kind_ok = |d: &Defn| kinds.is_none_or(|k| k.contains(&d.kind));
         let want = crate::ast::last_segment(query).to_lowercase();
         // A one- or two-letter query is close to everything; suggesting from it
         // would be noise wearing the shape of an answer.
@@ -253,6 +271,7 @@ impl NameIndex {
             // apart; a shared module prefix decides first when there is one.
             let Some(&best) = ids
                 .iter()
+                .filter(|&&i| kind_ok(&self.defns[i]))
                 .max_by_key(|&&i| (shared(&self.defns[i]), usize::MAX - i))
             else {
                 continue;
