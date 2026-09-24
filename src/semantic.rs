@@ -773,6 +773,7 @@ mod tests {
             path: PathBuf::from(path),
             ast: syn::parse_str(src).expect("test source must parse"),
             module: module.to_string(),
+            derived: Default::default(),
         }
     }
 

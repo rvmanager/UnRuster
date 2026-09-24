@@ -97,6 +97,7 @@ impl Corpus {
                 path: p.clone(),
                 ast,
                 module: crate::parse::module_of(root, p),
+                derived: Default::default(),
             };
             let f = crate::facts::derive(&pf);
             if let Some(cache) = cache {

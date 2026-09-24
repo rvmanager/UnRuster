@@ -809,6 +809,7 @@ mod tests {
             path: std::path::PathBuf::from("src/t.rs"),
             ast,
             module: "t".into(),
+            derived: Default::default(),
         };
         derive(&pf)
     }

@@ -388,26 +388,12 @@ pub(crate) fn variant_names_of(files: &[ParsedFile], enum_name: &str) -> Vec<Str
 /// same spelling, and one command disagreeing with the rest about what a name
 /// means is what sent a reader back to `grep` in the first place.
 pub(crate) fn variant_sets_of(files: &[ParsedFile], enum_name: &str) -> Vec<Vec<String>> {
-    struct V<'a> {
-        target: &'a str,
-        out: Vec<Vec<String>>,
-    }
-    impl<'ast, 'a> Visit<'ast> for V<'a> {
-        fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
-            if e.ident == self.target {
-                self.out
-                    .push(e.variants.iter().map(|v| v.ident.to_string()).collect());
-            }
-        }
-    }
-    let mut v = V {
-        target: enum_name,
-        out: Vec::new(),
-    };
-    for f in files {
-        v.visit_file(&f.ast);
-    }
-    v.out
+    files
+        .iter()
+        .flat_map(|f| f.enums())
+        .filter(|e| e.name == enum_name)
+        .map(|e| e.variants.clone())
+        .collect()
 }
 
 /// The definition a site dispatches on: the smallest variant set that contains
@@ -434,6 +420,13 @@ pub(crate) fn collect_sites(
 ) -> Vec<Site> {
     let mut all_sites: Vec<Site> = Vec::new();
     for f in files {
+        // Every site this visitor records names the enum — `enum_variant_of_path`
+        // requires `Enum::Variant`, never a bare variant — so a file that does
+        // not spell it cannot hold one. Skipping it is what keeps a sweep over
+        // every enum from walking the whole tree once per enum.
+        if !f.mentions(enum_name) {
+            continue;
+        }
         let mut v = ParaVisitor {
             target_enum: enum_name,
             variant_names,
@@ -773,28 +766,10 @@ fn group_label(
 /// findings SEALED and `audit` treats them as highest severity. The marker
 /// lives with the code; there is no config file.
 pub(crate) fn enum_sealed(files: &[ParsedFile], enum_name: &str) -> bool {
-    struct V<'a> {
-        target: &'a str,
-        sealed: bool,
-    }
-    impl<'ast, 'a> Visit<'ast> for V<'a> {
-        fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
-            // Shares one marker parser with `concept(…)` — see
-            // [`crate::ast::doc_marker`]. The inline `contains` this replaced
-            // also accepted `/// unruster: sealedish`.
-            if e.ident == self.target && crate::ast::doc_marker(&e.attrs, "sealed").is_some() {
-                self.sealed = true;
-            }
-        }
-    }
-    let mut v = V {
-        target: enum_name,
-        sealed: false,
-    };
-    for f in files {
-        v.visit_file(&f.ast);
-    }
-    v.sealed
+    files
+        .iter()
+        .flat_map(|f| f.enums())
+        .any(|e| e.name == enum_name && e.sealed)
 }
 
 /// Knobs for an `enum-coverage` scan.

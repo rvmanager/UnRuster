@@ -1179,6 +1179,7 @@ mod tests {
                 path: std::path::PathBuf::from(path),
                 ast: syn::parse_file(src).expect("parse"),
                 module: crate::parse::module_of(std::path::Path::new("."), std::path::Path::new(path)),
+                derived: Default::default(),
             })
             .collect();
         let mut c = Corpus::default();

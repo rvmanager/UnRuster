@@ -326,7 +326,12 @@ fn facts_of_snippet(text: &str, as_path: &str) -> Option<FileFacts> {
         .or_else(|| syn::parse_file(&format!("{} {{ unimplemented!() }}", text.trim())).ok())?;
     let path = std::path::PathBuf::from(as_path);
     let module = crate::parse::module_of(Path::new("."), &path);
-    Some(crate::facts::derive(&crate::parse::ParsedFile { path, ast, module }))
+    Some(crate::facts::derive(&crate::parse::ParsedFile {
+        path,
+        ast,
+        module,
+        derived: Default::default(),
+    }))
 }
 
 /// A bare `unruster gate UserId --kind struct` — a name with no declaration.
@@ -454,6 +459,7 @@ mod tests {
                 path: std::path::PathBuf::from(path),
                 ast: syn::parse_file(src).expect("parse"),
                 module: crate::parse::module_of(Path::new("."), Path::new(path)),
+                derived: Default::default(),
             };
             let f = crate::facts::derive(&pf);
             c.items.extend(f.items);

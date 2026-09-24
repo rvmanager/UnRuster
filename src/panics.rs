@@ -672,6 +672,7 @@ mod tests {
             path: std::path::PathBuf::from("src/lib.rs"),
             module: "t".to_string(),
             ast: file,
+            derived: Default::default(),
         }];
         let sigs = crate::semantic::FnSigIndex::build(&parsed);
         let mut v = PanicVisitor {

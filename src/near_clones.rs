@@ -427,6 +427,7 @@ mod tests {
                 path: std::path::PathBuf::from(path),
                 ast: syn::parse_file(src).expect("parse"),
                 module: "m".into(),
+                derived: Default::default(),
             };
             let f = crate::facts::derive(&pf);
             c.items.extend(f.items);

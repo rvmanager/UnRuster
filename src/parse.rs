@@ -9,6 +9,88 @@ pub struct ParsedFile {
     /// Implicit module path derived from the file location, e.g. `src/foo/bar.rs` -> `foo::bar`.
     /// Empty for `main.rs` / `lib.rs` / `mod.rs` (their parent dir is the module).
     pub module: String,
+    /// Facts about this file that several checks want once each, derived on
+    /// first use and kept exactly as long as the file. See [`Derived`].
+    pub derived: Derived,
+}
+
+/// One enum declared in a file: its name, its variants in order, and whether
+/// it carries the `/// unruster: sealed` marker.
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<String>,
+    pub sealed: bool,
+}
+
+/// Per-file facts computed lazily and cached on the [`ParsedFile`].
+///
+/// **Why.** The enum sweeps (`divergence`, `enum-coverage`, `catch-all-arms`)
+/// asked four questions per enum, and each one walked the entire tree to
+/// answer it: the enum's variants, its per-definition variant sets, its sealed
+/// marker, and its dispatch sites. That is (enums × tree) work — quadratic in
+/// the size of the codebase — and a scoped `audit` on a 2,750-fn workspace took
+/// 48 s, most of it rediscovering the same enum declarations. Declarations are
+/// now read once per file, and the site walk skips every file that never
+/// spells the enum's name.
+///
+/// On the file rather than in a side table keyed by address, so a cache entry
+/// cannot outlive the parse it describes — the `--since` snapshots parse and
+/// drop whole trees mid-run.
+#[derive(Default)]
+pub struct Derived {
+    idents: std::sync::OnceLock<std::collections::HashSet<String>>,
+    enums: std::sync::OnceLock<Vec<EnumDef>>,
+}
+
+impl ParsedFile {
+    /// Does this file spell `name` as an identifier anywhere — macro bodies
+    /// included, since the enum scanners parse those too?
+    ///
+    /// Read from the token stream rather than the syntax tree for exactly that
+    /// reason: a `syn` visitor does not descend into a macro's tokens.
+    pub fn mentions(&self, name: &str) -> bool {
+        self.derived
+            .idents
+            .get_or_init(|| {
+                fn walk(ts: proc_macro2::TokenStream, out: &mut std::collections::HashSet<String>) {
+                    for tt in ts {
+                        match tt {
+                            proc_macro2::TokenTree::Ident(i) => {
+                                out.insert(i.to_string());
+                            }
+                            proc_macro2::TokenTree::Group(g) => walk(g.stream(), out),
+                            _ => {}
+                        }
+                    }
+                }
+                let mut out = std::collections::HashSet::new();
+                walk(quote::ToTokens::to_token_stream(&self.ast), &mut out);
+                out
+            })
+            .contains(name)
+    }
+
+    /// Every enum declared in this file, nested inline modules included.
+    pub fn enums(&self) -> &[EnumDef] {
+        self.derived.enums.get_or_init(|| {
+            struct V(Vec<EnumDef>);
+            impl<'ast> syn::visit::Visit<'ast> for V {
+                fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
+                    self.0.push(EnumDef {
+                        name: e.ident.to_string(),
+                        variants: e.variants.iter().map(|v| v.ident.to_string()).collect(),
+                        // Shares one marker parser with `concept(…)` — see
+                        // [`crate::ast::doc_marker`].
+                        sealed: crate::ast::doc_marker(&e.attrs, "sealed").is_some(),
+                    });
+                    syn::visit::visit_item_enum(self, e);
+                }
+            }
+            let mut v = V(Vec::new());
+            syn::visit::Visit::visit_file(&mut v, &self.ast);
+            v.0
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -121,6 +203,7 @@ pub fn parse_excluded() -> Vec<ParsedFile> {
                 path: path.clone(),
                 ast,
                 module: module_path_for(root, path),
+                derived: Default::default(),
             })
         })
         .collect()
@@ -253,6 +336,7 @@ pub fn parse_dir(
                     path: path.to_path_buf(),
                     ast,
                     module,
+                    derived: Default::default(),
                 });
             }
             Err(e) => {
@@ -518,5 +602,47 @@ fn strip_dead_cfg_items(items: &mut Vec<syn::Item>, env: &CfgEnv) {
                 strip_dead_cfg_items(sub, env);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pf(src: &str) -> ParsedFile {
+        ParsedFile {
+            path: PathBuf::from("src/t.rs"),
+            ast: syn::parse_file(src).expect("parse"),
+            module: "t".into(),
+            derived: Default::default(),
+        }
+    }
+
+    /// The enum site walk skips a file that does not spell the enum, so the
+    /// check has to see what the scanners see — including a `match` written
+    /// inside a macro body, which a `syn` visitor never descends into.
+    #[test]
+    fn mentions_reads_macro_bodies_and_nothing_else() {
+        let f = pf("fn f(k: u8) { log!(match k { Kind::A => 1, _ => 2 }); }");
+        assert!(f.mentions("Kind"));
+        assert!(f.mentions("A"));
+        assert!(!f.mentions("Other"));
+        // Idents only: a string literal spelling the name is not a mention.
+        assert!(!pf(r#"fn f() { let _ = "Kind"; }"#).mentions("Kind"));
+    }
+
+    #[test]
+    fn enums_finds_nested_declarations_and_the_sealed_marker() {
+        let f = pf(
+            "pub enum Top { A, B }\n\
+             mod inner {\n    /// unruster: sealed\n    pub enum Deep { X }\n}\n\
+             fn f() { enum Local { L } }\n",
+        );
+        let names: Vec<(&str, usize, bool)> = f
+            .enums()
+            .iter()
+            .map(|e| (e.name.as_str(), e.variants.len(), e.sealed))
+            .collect();
+        assert_eq!(names, [("Top", 2, false), ("Deep", 1, true), ("Local", 1, false)]);
     }
 }

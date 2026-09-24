@@ -339,6 +339,7 @@ mod tests {
                     std::path::Path::new("."),
                     std::path::Path::new(path),
                 ),
+                derived: Default::default(),
             };
             let f = crate::facts::derive(&pf);
             c.items.extend(f.items);

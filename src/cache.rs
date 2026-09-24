@@ -335,6 +335,7 @@ mod tests {
             path: std::path::PathBuf::from("src/x.rs"),
             ast,
             module: "x".into(),
+            derived: Default::default(),
         };
         let f = crate::facts::derive(&pf);
         let key = Cache::key(b"pub struct Id(u64);");
