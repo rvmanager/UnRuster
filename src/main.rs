@@ -2177,6 +2177,28 @@ fn report_root_gap(out: &emit::Out, root: &std::path::Path, excludes: &[String])
     ));
 }
 
+/// `-r` names a file in no crate and outside the working directory, so its
+/// items are named without a module and will not line up with a scan of the
+/// tree it came from.
+///
+/// The shape that produces one is a copy taken to compare against: a session
+/// ran `git show HEAD:<file> > scratch.rs`, then `metrics -r scratch.rs`, to
+/// learn what a fn measured before its edit — which `metrics --since` and
+/// `audit --changed-since` now answer from git directly. Advice, on stderr: the
+/// rows are right for what was asked.
+fn report_unanchored_file(out: &emit::Out, root: &std::path::Path) {
+    if !parse::is_unanchored_file(root) {
+        return;
+    }
+    out.advice(&format!(
+        "(note: `{}` sits outside the working directory and any crate, so its items are \
+         named without a module path. If it is a copy of a tracked file taken to compare \
+         against, `metrics --since <ref>` and `audit --changed-since <ref>` read the ref \
+         from git directly.)",
+        root.display()
+    ));
+}
+
 /// The caveat line: what this run could not read.
 ///
 /// It names the macros and the files rather than a follow-up command. The line
@@ -3387,6 +3409,7 @@ fn main() -> Result<()> {
     }
     if traits.analyses_code {
         report_root_gap(&out, &root, &exclude);
+        report_unanchored_file(&out, &root);
         report_blind_spots(&out, target_names.as_deref(), &idx);
     }
     // The exit code, said out loud, from the one place that knows the run is

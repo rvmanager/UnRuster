@@ -792,6 +792,37 @@ pub fn run(
         if let Some(s) = own_summary {
             ctx.out.summary(&s);
         }
+        // A tiered section's tag is the *check's* tier, and its rows span the
+        // gate: `[high] near-clones` listed one pair at 0.74 under a 0.75 gate,
+        // `[high] concepts` five rows of which one gated — and the only thing
+        // telling the two apart was a `!` against an empty first column. The
+        // header cannot say it (it prints before the check has ranked
+        // anything), so the section says it once it knows. Silent when every
+        // row gates, since then the tag and the rows agree.
+        if gate == Gate::Tiered && !strict && n.total > n.gating {
+            let floor = tier_floor(check);
+            let gate_is = if floor.is_finite() {
+                format!("this check's gate (score >= {:.2})", floor)
+            } else {
+                "this check's gate".to_string()
+            };
+            ctx.out.row_note(&if n.gating == 0 {
+                format!(
+                    "(note: none of these {} row(s) reach {} — the section's tag is the \
+                     check's tier, not theirs; they are context and hold no exit code)",
+                    n.total, gate_is
+                )
+            } else {
+                format!(
+                    "(note: {} of {} row(s) reach {}, marked `!`; the other {} are context \
+                     and hold no exit code)",
+                    n.gating,
+                    n.total,
+                    gate_is,
+                    n.total - n.gating
+                )
+            });
+        }
         match cap_note {
             // The cap note already carries the section's own command, with
             // `--top 0` on the end.

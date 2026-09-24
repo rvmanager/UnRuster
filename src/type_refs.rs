@@ -72,6 +72,13 @@ struct RefVisitor<'a> {
 }
 
 impl<'a> RefVisitor<'a> {
+    /// Walk `f` with `field` rows attributed to the type named `ident`.
+    fn owned_by(&mut self, ident: &syn::Ident, f: impl FnOnce(&mut Self)) {
+        let prev = self.owner.replace(ident.to_string());
+        f(self);
+        self.owner = prev;
+    }
+
     /// Walk `f` with type paths recorded under `pos`, then restore.
     fn at_pos(&mut self, pos: &'static str, f: impl FnOnce(&mut Self)) {
         let prev = std::mem::replace(&mut self.pos, pos);
@@ -153,15 +160,11 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     }
 
     fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
-        let prev = self.owner.replace(i.ident.to_string());
-        visit::visit_item_struct(self, i);
-        self.owner = prev;
+        self.owned_by(&i.ident, |v| visit::visit_item_struct(v, i));
     }
 
     fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
-        let prev = self.owner.replace(i.ident.to_string());
-        visit::visit_item_enum(self, i);
-        self.owner = prev;
+        self.owned_by(&i.ident, |v| visit::visit_item_enum(v, i));
     }
 
     fn visit_field(&mut self, f: &'ast syn::Field) {

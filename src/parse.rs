@@ -332,7 +332,23 @@ fn build_cfg_env(scope: Scope, user_cfgs: &[String]) -> CfgEnv {
 }
 
 fn module_path_for(root: &Path, file: &Path) -> String {
-    let rel = file.strip_prefix(root).unwrap_or(file);
+    // `-r <file>`: relative to itself the file has no path at all, so every
+    // item in it lost its module — `metrics -r core/src/model/solver/layout.rs`
+    // named `ParameterLayout::build`, while `audit` from the same directory
+    // named `core::model::solver::layout::ParameterLayout::build`, and the two
+    // rows could not be matched up. Anchor it where a directory scan would.
+    let anchored;
+    let rel: &Path = if file == root {
+        match single_file_base(file) {
+            Some((abs, base)) => {
+                anchored = abs;
+                anchored.strip_prefix(&base).unwrap_or(&anchored)
+            }
+            None => Path::new(""),
+        }
+    } else {
+        file.strip_prefix(root).unwrap_or(file)
+    };
     let mut parts: Vec<String> = rel
         .components()
         .filter_map(|c| match c {
@@ -412,6 +428,33 @@ fn name_says_test_support(name: &str) -> bool {
         || n.ends_with("-testing")
         || n.ends_with("-test-utils")
         || n.ends_with("-test-support")
+}
+
+/// Where a file scanned on its own takes its module path from, with the file
+/// made absolute to match: the working directory when the file is inside it —
+/// so `-r <file>` names an item exactly as `-r .` from the same place does —
+/// else the crate directory holding it, as `-r <crate>` would. `None` for a
+/// file in no crate outside the working directory (a scratch copy of one taken
+/// with `git show`), which has no module to recover.
+fn single_file_base(file: &Path) -> Option<(PathBuf, PathBuf)> {
+    let abs = std::fs::canonicalize(file).ok()?;
+    if let Some(cwd) = std::env::current_dir().ok().and_then(|d| std::fs::canonicalize(d).ok()) {
+        if abs.starts_with(&cwd) {
+            return Some((abs, cwd));
+        }
+    }
+    let krate = abs.parent()?.ancestors().find(|d| {
+        std::fs::read_to_string(d.join("Cargo.toml"))
+            .is_ok_and(|m| package_name(&m).is_some())
+    })?;
+    let krate = krate.to_path_buf();
+    Some((abs, krate))
+}
+
+/// Is `root` a single file whose items get no module path — one outside both
+/// the working directory and any crate? See [`single_file_base`].
+pub fn is_unanchored_file(root: &Path) -> bool {
+    root.is_file() && single_file_base(root).is_none()
 }
 
 /// `[package] name` of the nearest ancestor `Cargo.toml`, cached per directory.

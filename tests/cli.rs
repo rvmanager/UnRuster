@@ -12696,6 +12696,83 @@ fn metrics_since_carries_the_previous_value_and_keeps_the_fn_that_improved() {
     );
 }
 
+/// `-r <file>` names items as a directory scan would. Relative to itself a file
+/// has no path, so `metrics -r core/src/model/solver/layout.rs` named
+/// `ParameterLayout::build` while `audit` from the same directory named
+/// `core::model::solver::layout::ParameterLayout::build`.
+#[test]
+fn a_single_file_root_names_items_as_a_directory_scan_would() {
+    let ws = scratch("single-file-root");
+    let krate = ws.join("core");
+    std::fs::create_dir_all(krate.join("src/model")).unwrap();
+    std::fs::write(krate.join("Cargo.toml"), "[package]\nname = \"core\"\n").unwrap();
+    let body = "pub struct Layout;\nimpl Layout {\n    pub fn build(&self) -> u8 { 1 }\n}\n";
+    std::fs::write(krate.join("src/model/layout.rs"), body).unwrap();
+    let names = |cwd: &std::path::Path, root: &str| -> Vec<String> {
+        let out = ur().current_dir(cwd).args(["--root", root, "metrics"]).output().unwrap();
+        rows_of(&out.stdout)
+            .iter()
+            .filter(|r| r.starts_with("fn\t"))
+            .map(|r| r.split('\t').nth(5).unwrap().to_string())
+            .collect()
+    };
+    // Inside the working directory: exactly what `-r .` from there says.
+    assert_eq!(names(&ws, "core/src/model/layout.rs"), names(&ws, "."));
+    assert_eq!(names(&ws, "."), ["core::model::layout::Layout::build"]);
+    // Outside it, but in a crate: what `-r <crate>` says.
+    let elsewhere = scratch("single-file-root-elsewhere");
+    let file = krate.join("src/model/layout.rs");
+    assert_eq!(
+        names(&elsewhere, file.to_str().unwrap()),
+        names(&elsewhere, krate.to_str().unwrap())
+    );
+    assert_eq!(names(&elsewhere, file.to_str().unwrap()), ["model::layout::Layout::build"]);
+
+    // In neither — a `git show` copy in a scratch directory: no module to
+    // recover, and a line pointing at the comparison that needs no copy.
+    let copy = scratch("single-file-root-copy").join("layout_head.rs");
+    std::fs::write(&copy, body).unwrap();
+    let out = ur().current_dir(&elsewhere).args(["--root", copy.to_str().unwrap(), "metrics"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("sits outside the working directory and any crate"), "{err}");
+    assert!(err.contains("metrics --since <ref>"), "{err}");
+    let inside = ur().current_dir(&ws).args(["--root", "core/src/model/layout.rs", "metrics"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&inside.stderr).contains("outside the working directory"));
+}
+
+/// A tiered `[high]` section says how many of its rows reach the gate. The tag
+/// is the check's tier, and `[high] near-clones` listing one pair at 0.74
+/// under a 0.75 gate read as a high-severity finding; only a `!` against an
+/// empty first column told the two apart.
+#[test]
+fn a_tiered_section_says_which_of_its_rows_reach_the_gate() {
+    let dir = scratch("audit-tier-note");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn gone(p: &std::path::Path) { let _ = std::fs::remove_file(p); }\n\
+         pub fn num(s: &str) -> u8 { s.parse::<u8>().unwrap_or_default() }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let mixed = String::from_utf8_lossy(
+        &ur().args(["--root", root, "audit", "--only", "error-swallows"]).output().unwrap().stdout,
+    )
+    .into_owned();
+    assert!(
+        mixed.contains("1 of 2 row(s) reach this check's gate (score >= 0.55), marked `!`"),
+        "{mixed}"
+    );
+
+    // Nothing gating: the section says its tag is not its rows'.
+    let none = ur_stdout(&["--root", FIXTURE, "audit", "--only", "near-clones"]);
+    let none = String::from_utf8_lossy(&none);
+    assert!(none.contains("none of these 1 row(s) reach this check's gate (score >= 0.75)"), "{none}");
+
+    // `--strict` gates every row, so tag and rows agree and nothing is said.
+    let strict = ur().args(["--root", root, "audit", "--strict", "--only", "error-swallows"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&strict.stdout).contains("reach this check's gate"));
+}
+
 /// `audit --changed-since <ref>` prints each metrics row's value at the ref.
 ///
 /// The question a scoped audit is run to answer is "did my edit do that".
