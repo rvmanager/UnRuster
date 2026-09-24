@@ -2044,7 +2044,10 @@ fn report_scope_default(out: &emit::Out, traits: CmdTraits) {
     if !traits.usage_query {
         return;
     }
-    out.note("(scope: all — tests included by default for a usage query; `--scope production` narrows it)");
+    // Advice, not a note: under `--scope all` nothing was left out, so the rows
+    // are the whole answer without it. On stdout it rode every usage query into
+    // every pipe — six copies in one session's single line of six `callers`.
+    out.advice("(scope: all — tests included by default for a usage query; `--scope production` narrows it)");
 }
 
 /// Would a waiver change what this command prints?
@@ -2164,16 +2167,84 @@ fn report_root_gap(out: &emit::Out, root: &std::path::Path, excludes: &[String])
 /// second command to act on is a caveat nobody acts on, and the whole payload
 /// here is a handful of macro names; most of the value fits on the line that
 /// was already going to be printed.
-fn report_blind_spots(out: &emit::Out) {
+///
+/// A query about one name gets it on stdout only when a dark body bears on
+/// that name ([`macro_scan::blind_spots_naming`]), and then says which bodies.
+/// Otherwise the line is advice on stderr: it was printed on every run, into
+/// every pipe, identical from call to call — six copies in one session's line
+/// of six `callers`, stripped with `grep -v '^('` in another — and a caveat
+/// that is always there and never about the question is one readers learn to
+/// skip, including on the run where it mattered.
+fn report_blind_spots(out: &emit::Out, targets: Option<&[String]>, idx: &index::NameIndex) {
     let sites = macro_scan::blind_spot_sites();
     if sites.is_empty() {
         return;
     }
+    let Some(targets) = targets else {
+        out.note(&blind_spots_line(&sites));
+        return;
+    };
+    let names: Vec<&str> = targets.iter().map(String::as_str).collect();
+    // The items the query is about, so a dark body *inside* one counts even
+    // when it does not spell the name (`callees f` reads all of `f`).
+    let spans: Vec<(&str, usize, usize)> = idx
+        .iter()
+        .filter(|d| names.contains(&d.name.as_str()))
+        .map(|d| (d.file.as_str(), d.line, d.end.max(d.line)))
+        .collect();
+    let hit = macro_scan::blind_spots_naming(&names, &spans);
+    if hit.is_empty() {
+        out.advice(&blind_spots_line(&sites));
+        return;
+    }
+    let shown: Vec<String> = hit
+        .iter()
+        .take(BLIND_SPOT_FILES)
+        .map(|(f, l, m)| format!("{} at {}:{}", m, f, l))
+        .collect();
+    out.note(&format!(
+        "(blind spots: {} macro body(ies) no check could read name `{}` or sit inside it — \
+         {}{}. What is in them may be missing from the rows above; `blind-spots` prints every one.)",
+        hit.len(),
+        names.join("`/`"),
+        shown.join(", "),
+        if hit.len() > shown.len() {
+            format!(" and {} more", hit.len() - shown.len())
+        } else {
+            String::new()
+        }
+    ));
+}
+
+/// The names a targeted query is about — last segments, as the dark macro
+/// bodies would spell them — or `None` for a sweep, which is about the whole
+/// tree and so keeps the blind-spot line on stdout.
+fn query_targets(cmd: &Cmd) -> Option<Vec<String>> {
+    fn last(q: &str) -> String {
+        crate::ast::last_segment(q.trim_start_matches('.').trim_end_matches('!')).to_string()
+    }
+    let names = match cmd {
+        Cmd::Callers(a) => vec![last(&a.name)],
+        Cmd::Callees(a) => vec![last(&a.name)],
+        Cmd::CoCall(a) => vec![last(&a.a), last(&a.b)],
+        Cmd::FieldUses(a) => vec![last(&a.ty), a.field.clone()],
+        Cmd::Fields(a) => vec![last(&a.ty)],
+        Cmd::TypeRefs(a) => vec![last(&a.ty)],
+        Cmd::TakesMut(a) => vec![last(a.ty.as_deref()?)],
+        Cmd::Variants(a) => vec![last(a.name.as_deref()?)],
+        Cmd::ContractDrift(a) => vec![last(a.name.as_deref()?)],
+        _ => return None,
+    };
+    Some(names)
+}
+
+/// The tree-wide caveat: how many macro bodies are dark, which macros, where.
+fn blind_spots_line(sites: &[(String, usize, String)]) -> String {
     // `name ×n` for the macros, and the files they sit in — ranked, because
     // a single `lazy_static!` behaves very differently from forty `kdl!`s.
     let mut by_macro: Vec<(String, usize)> = Vec::new();
     let mut files: Vec<&str> = Vec::new();
-    for (file, _, name) in &sites {
+    for (file, _, name) in sites {
         match by_macro.iter_mut().find(|(n, _)| n == name) {
             Some((_, c)) => *c += 1,
             None => by_macro.push((name.clone(), 1)),
@@ -2188,7 +2259,7 @@ fn report_blind_spots(out: &emit::Out) {
         .take(BLIND_SPOT_NAMES)
         .map(|(n, c)| if *c > 1 { format!("{} ×{}", n, c) } else { n.clone() })
         .collect();
-    out.note(&format!(
+    format!(
         "(blind spots: {} macro body(ies) not analyzed — {}{}; in {}{}. \
          `blind-spots` prints every site.)",
         sites.len(),
@@ -2209,7 +2280,7 @@ fn report_blind_spots(out: &emit::Out) {
         } else {
             String::new()
         }
-    ));
+    )
 }
 
 /// Distinct macro names the blind-spot caveat names before summarising.
@@ -3234,6 +3305,9 @@ fn main() -> Result<()> {
     // the whole run. `audit` re-sets it per section from its own defaults.
     // `Some(0)` is "no cap", not "cap at zero" — see the flag's own help.
     out.set_row_budget(top.filter(|n| *n > 0));
+    // Read before `dispatch` consumes the command: the blind-spot line asks
+    // whether the dark macro bodies name what this run was asked about.
+    let target_names = query_targets(&cmd);
     let result = dispatch(cmd, &ctx, &files, &root, scope, &cfg, &exclude, top);
     if let Some(note) = out.cap_note() {
         out.row_note(&note);
@@ -3256,7 +3330,7 @@ fn main() -> Result<()> {
     }
     if traits.analyses_code {
         report_root_gap(&out, &root, &exclude);
-        report_blind_spots(&out);
+        report_blind_spots(&out, target_names.as_deref(), &idx);
     }
     // The exit code, said out loud, from the one place that knows the run is
     // about to use it.

@@ -4778,13 +4778,33 @@ fn context_flag_prints_snippets() {
 #[test]
 fn blind_spots_reported_with_the_rows() {
     // The fixture contains a macro whose tokens don't parse as expressions.
-    // The count rides stdout with the rows: it says what the rows leave out.
-    let out = ur()
-        .args(["--root", FIXTURE, "callers", "println"])
-        .output()
-        .unwrap();
+    // On a sweep the count rides stdout with the rows: it says what the rows
+    // leave out, and the rows are about the whole tree.
+    let out = ur().args(["--root", FIXTURE, "dead-code"]).output().unwrap();
     let e = String::from_utf8_lossy(&out.stdout);
     assert!(e.contains("blind spots:"), "expected blind-spot count:\n{}", e);
+}
+
+#[test]
+fn a_targeted_query_names_the_dark_bodies_that_bear_on_it() {
+    // `state_machine! { idle -> running on start; … }` spells `start`: a
+    // `callers start` cannot see it, so the line says so, on stdout, by site.
+    let out = ur().args(["--root", FIXTURE, "callers", "start"]).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("name `start`"), "{s}");
+    assert!(s.contains("state_machine! at tests/fixtures/sample/src/main.rs:"), "{s}");
+    // `callees transitions` reads the body the macro sits in.
+    let out = ur().args(["--root", FIXTURE, "callees", "transitions"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("name `transitions` or sit inside it"));
+}
+
+#[test]
+fn a_targeted_query_keeps_an_unrelated_blind_spot_off_stdout() {
+    // Nothing dark mentions `println`, so the tree-wide caveat is advice: on
+    // stderr, where it cannot land in a pipe, and still said.
+    let out = ur().args(["--root", FIXTURE, "callers", "println"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("blind spots"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("blind spots: 1 macro body(ies) not analyzed"));
 }
 
 #[test]
@@ -11847,10 +11867,13 @@ fn the_size_gated_navigation_notes_fire_when_the_list_is_long() {
         full.extend(args);
         String::from_utf8_lossy(&ur().args(&full).output().unwrap().stdout).into_owned()
     };
+    // Advice, so stderr — the one channel a pipe over the rows does not eat.
+    let outline = ur().args(["--root", root, "outline", "src/lib.rs"]).output().unwrap();
     assert!(
-        run(&["outline", "src/lib.rs"]).contains("reverse lookup"),
+        String::from_utf8_lossy(&outline.stderr).contains("reverse lookup"),
         "a 25-item file is one a reader navigates"
     );
+    assert!(!String::from_utf8_lossy(&outline.stdout).contains("reverse lookup"));
     let m = run(&["metrics"]);
     assert!(m.contains("--by file"), "25 ranked fns is where `--by` helps:\n{m}");
     // …and asking for the grouped view is not then told it exists.
@@ -12711,7 +12734,12 @@ fn usage_queries_default_to_the_whole_tree() {
     let out = ur().args(["--root", root, "callers", "target"]).output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("tests/it.rs"), "the test caller must be in the default answer:\n{s}");
-    assert!(s.contains("tests included by default"), "the default should be said once:\n{s}");
+    // Said, but as advice: nothing was left out, so it stays out of the pipe.
+    assert!(!s.contains("tests included by default"), "not on stdout:\n{s}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("tests included by default"),
+        "the default should be said once"
+    );
     // A check keeps the production default.
     let out = ur().args(["--root", root, "dead-code"]).output().unwrap();
     assert!(!all_output(&out).contains("by default"));

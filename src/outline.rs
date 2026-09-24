@@ -294,8 +294,13 @@ pub fn run(ctx: &AnalysisCtx, paths: &[String], opts: &OutlineOpts) -> anyhow::R
     // `at <file>:<line>` turns one into an item. It went unused across a whole
     // session in which fourteen `sed -n 'N,Mp'` range reads were written by
     // hand, because nothing points at it when the question arises.
+    //
+    // Advice, on stderr: a pointer about the tool, not a fact about the file.
+    // On stdout it landed in every pipe an outline is fed to — one session's
+    // keyword `grep` over an outline matched it on "lookup" — and readers
+    // strip it with `grep -v '^('` before they read it.
     if items.len() >= ROUTE_TO_AT_ABOVE {
-        ctx.out.note(&format!(
+        ctx.out.advice(&format!(
             "(note: `at {}:<line>` is the reverse lookup — it names the item a line number \
              falls in, and prints its extent so a read needs no guessed range)",
             if files.len() == 1 { files[0] } else { "<file>" }

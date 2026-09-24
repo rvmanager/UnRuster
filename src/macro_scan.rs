@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
 
 use proc_macro2::{TokenStream, TokenTree};
@@ -17,12 +16,13 @@ use syn::spanned::Spanned;
 /// files collided into one entry and the count silently ran low — an
 /// undercount in the one number whose whole job is to bound what the run did
 /// not see.
-/// (file, line, column, macro name, token hash). The name is carried so the
+/// (file, line, column, macro name, body tokens). The name is carried so the
 /// listing can say *which* macro is dark — a bare count is a fact nobody can
 /// act on, and on a real 6k-item codebase "45 macro bodies" left the reader
 /// writing "a `dbg_log!`/`format!`-heavy region could be hiding something none
-/// of this saw" with no way to check.
-type BlindSpot = (String, usize, usize, String, u64);
+/// of this saw" with no way to check. The body is carried so a query can ask
+/// whether the dark region names *its* target — see [`blind_spots_naming`].
+type BlindSpot = (String, usize, usize, String, String);
 static UNPARSED_MACRO_BODIES: Mutex<Option<HashSet<BlindSpot>>> = Mutex::new(None);
 
 /// Set once [`survey`] has walked the tree. After that the count is a closed
@@ -48,15 +48,13 @@ fn record_blind_spot(m: &syn::Macro) {
 
 fn record_in(m: &syn::Macro, file: &str) {
     let start = m.path.span().start();
-    let mut h = DefaultHasher::new();
-    m.tokens.to_string().hash(&mut h);
     let name = m
         .path
         .segments
         .last()
         .map(|s| format!("{}!", s.ident))
         .unwrap_or_else(|| "?!".to_string());
-    let key = (file.to_string(), start.line, start.column, name, h.finish());
+    let key = (file.to_string(), start.line, start.column, name, m.tokens.to_string());
     let mut guard = UNPARSED_MACRO_BODIES.lock().unwrap();
     guard.get_or_insert_with(HashSet::new).insert(key);
 }
@@ -112,6 +110,37 @@ pub fn blind_spot_sites() -> Vec<(String, usize, String)> {
         .as_ref()
         .map(|s| {
             s.iter()
+                .map(|(f, l, _, n, _)| (f.clone(), *l, n.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// The blind spots that bear on a query about `names`, as `(file, line, macro)`.
+///
+/// A body bears on it when it spells one of the names as an identifier — a
+/// call, a field, a type written inside `json!` is exactly what no check saw —
+/// or when it sits inside one of `spans`, the items the query is *about*
+/// (`callees f` reads `f`'s body, so a dark macro there is a dark part of the
+/// answer whatever it names). Everything else is dark code the rows could not
+/// have included anyway.
+pub fn blind_spots_naming(
+    names: &[&str],
+    spans: &[(&str, usize, usize)],
+) -> Vec<(String, usize, String)> {
+    let guard = UNPARSED_MACRO_BODIES.lock().unwrap();
+    let mut out: Vec<(String, usize, String)> = guard
+        .as_ref()
+        .map(|set| {
+            set.iter()
+                .filter(|(f, l, _, _, body)| {
+                    spans.iter().any(|(sf, lo, hi)| sf == f && (lo..=hi).contains(&l))
+                        || body
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .any(|tok| names.contains(&tok))
+                })
                 .map(|(f, l, _, n, _)| (f.clone(), *l, n.clone()))
                 .collect()
         })
