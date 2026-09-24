@@ -1539,23 +1539,87 @@ pub fn run_co_call(ctx: &AnalysisCtx, a: &str, b: &str) -> anyhow::Result<usize>
     Ok(a_only.len() + b_only.len())
 }
 
-pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<usize> {
+/// `callees <fn>` — what one function calls.
+///
+/// "One" is the contract. A bare name used to pool every function that bears
+/// it: `callees run` in a tree with 37 `run`s printed 405 callees from all of
+/// them as if they were one body, and `callees validate` in a session named no
+/// function at all, so the reader could not tell whether the list was the
+/// `validate` they meant. Now a name that selects several functions lists them
+/// — the way `show` does — and `--all` asks for the pool on purpose.
+pub fn run_callees(ctx: &AnalysisCtx, query: &str, all: bool) -> anyhow::Result<usize> {
     let files = ctx.files;
     let index = ctx.idx;
     let sem = ctx.sem;
     let summary = ctx.summary;
     let sites = collect_sites(files, sem, index, ctx.spans);
     let last = crate::ast::last_segment(query);
+    // A qualified query that is some function's whole path means that function
+    // alone — `callees audit::run` must not also pull in a `x::audit::run`
+    // that merely ends the same way. Suffixes widen only when nothing is exact.
+    let exact = query.contains("::") && sites.iter().any(|s| s.caller == query);
 
     let in_target = |caller: &str| -> bool {
-        if query.contains("::") {
-            caller == query || caller.ends_with(&format!("::{}", query))
+        if exact {
+            caller == query
+        } else if query.contains("::") {
+            caller.ends_with(&format!("::{}", query))
         } else {
             crate::ast::last_segment(caller) == last
         }
     };
 
     let hits: Vec<&CallSite> = sites.iter().filter(|s| in_target(&s.caller)).collect();
+
+    // The functions the query selected, each with how many call sites its body
+    // holds. A `BTreeMap` so the listing is stable across runs.
+    let mut by_fn: BTreeMap<&str, usize> = BTreeMap::new();
+    for h in &hits {
+        *by_fn.entry(h.caller.as_str()).or_default() += 1;
+    }
+    // Where each selected function is declared, for the listing's `at` and the
+    // summary's "of `x`". A caller the index has no fn for (a closure's owner
+    // spelled differently, say) falls back to its first call site.
+    let decl_of = |caller: &str| -> (String, usize, usize) {
+        index
+            .iter()
+            .find(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn") && d.qpath == caller)
+            .map(|d| (d.file.clone(), d.line, d.end.max(d.line)))
+            .or_else(|| {
+                hits.iter()
+                    .find(|h| h.caller == caller)
+                    .map(|h| (h.file.clone(), h.line, h.line))
+            })
+            .unwrap_or_default()
+    };
+
+    if by_fn.len() > 1 && !all {
+        ctx.out.note(&format!(
+            "note: `{}` names {} functions that make calls — listing them rather than \
+             pooling their callees. Re-run with a qualified name from the `fn` column \
+             (`callees {}`), or `--all` to pool them.",
+            query,
+            by_fn.len(),
+            by_fn.keys().next().copied().unwrap_or(query),
+        ));
+        if !summary {
+            for (caller, n) in &by_fn {
+                let (file, start, end) = decl_of(caller);
+                row!(
+                    ctx.out,
+                    "calls" => *n,
+                    "fn" => caller.to_string(),
+                    "at" => crate::emit::span_site(&file, start, end),
+                );
+            }
+        }
+        ctx.out.summary(&format!(
+            "({} function(s) named `{}`; pick one, or `--all`)",
+            by_fn.len(),
+            query
+        ));
+        return Ok(by_fn.len());
+    }
     if hits.is_empty() {
         let known = query_known(index, query);
         if !known {
@@ -1589,7 +1653,30 @@ pub fn run_callees(ctx: &AnalysisCtx, query: &str) -> anyhow::Result<usize> {
             );
         }
     }
+    // Name the function the rows belong to. Without it a bare-name query gave
+    // no way to tell *which* `validate` answered — and when other functions
+    // share the name but make no calls, that is worth saying too, since the
+    // one listed may not be the one meant.
+    let of = match by_fn.keys().collect::<Vec<_>>().as_slice() {
+        [one] => {
+            let (file, start, _) = decl_of(one);
+            let homonyms = index
+                .iter()
+                .filter(|d| matches!(d.kind, "fn" | "impl-fn" | "trait-fn") && in_target(&d.qpath))
+                .count();
+            let others = homonyms.saturating_sub(1);
+            if others > 0 {
+                ctx.out.note(&format!(
+                    "note: these are the callees of `{}`; {} other fn(s) named `{}` make \
+                     no calls — `show {} --all` lists every one",
+                    one, others, query, query
+                ));
+            }
+            format!(" of `{}` {}:{}", one, file, start)
+        }
+        many => format!(" pooled over {} functions named `{}`", many.len(), query),
+    };
     ctx.out
-        .summary(&format!("({} distinct callees)", rows.len()));
+        .summary(&format!("({} distinct callees{})", rows.len(), of));
     Ok(rows.len())
 }

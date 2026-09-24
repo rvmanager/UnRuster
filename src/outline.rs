@@ -1,4 +1,5 @@
-//! `outline <file>` — the AST table of contents for one file.
+//! `outline <file>…` — the AST table of contents for one file, several, or a
+//! directory.
 //!
 //! Replaces the hand-rolled anchor that every agent transcript reaches for:
 //!
@@ -90,34 +91,99 @@ fn in_file(d: &Defn, want: &std::path::Path) -> bool {
     have.len() >= want.len() && have[have.len() - want.len()..] == want[..]
 }
 
+/// Does `d` sit anywhere under the directory the user named?
+///
+/// The same component-suffix rule as [`in_file`], applied to each of the
+/// file's ancestor directories: `outline src/render`, `outline render` and
+/// `outline render/` all take every scanned file below `…/render/`, at any
+/// depth, while `outline nder` takes none of them.
+fn in_dir(d: &Defn, want: &std::path::Path) -> bool {
+    let want: Vec<_> = want.components().collect();
+    let have: Vec<_> = std::path::Path::new(&d.file).components().collect();
+    // `k` is the length of an ancestor directory's component list; the file
+    // name itself (`have.len()`) is excluded, which is what makes this a
+    // directory match rather than a second spelling of `in_file`.
+    (want.len()..have.len()).any(|k| have[k - want.len()..k] == want[..])
+}
+
+/// Is `path` a directory, asked where the user is pointing (`--root`) as well
+/// as at the working directory?
+fn is_dir(path: &str, root: &std::path::Path) -> bool {
+    std::path::Path::new(path).is_dir() || root.join(path).is_dir()
+}
+
 /// Items past which an outline is long enough to route to `at`.
 ///
 /// A file with a handful of items is one a reader is about to read whole; a
 /// file with twenty is one they are navigating.
 const ROUTE_TO_AT_ABOVE: usize = 20;
 
-pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<usize> {
-    let want = std::path::Path::new(path);
-    let mut items: Vec<&Defn> = ctx.idx.iter().filter(|d| in_file(d, want)).collect();
-
-    if items.is_empty() {
-        return nothing_here(ctx, path, opts.root);
+/// Outline every file `paths` names, in one pass over the index.
+///
+/// Several paths, and directories, because one file at a time was the shape
+/// that failed: a session wrote `outline plan.rs section.rs mod.rs piece.rs`,
+/// got clap's `unexpected argument`, piped the next attempt into `grep -c fn`
+/// (which printed `0` and hid the error), and fell back to a shell loop and
+/// `grep '^fn'`. `show a b c` already took a batch; this now does too.
+///
+/// A path that matches nothing is explained and skipped, as `show` does with
+/// a name: one typo must not cost the other files. Only when every path
+/// misses is it the exit-2 case.
+pub fn run(ctx: &AnalysisCtx, paths: &[String], opts: &OutlineOpts) -> anyhow::Result<usize> {
+    let mut items: Vec<&Defn> = Vec::new();
+    let mut missed: Vec<&str> = Vec::new();
+    for path in paths {
+        let want = std::path::Path::new(path.as_str());
+        let under = || -> Vec<&Defn> { ctx.idx.iter().filter(|d| in_dir(d, want)).collect() };
+        // A directory on disk is a directory. Otherwise a file first, and a
+        // trailing directory fragment (`outline render`) only when no file
+        // answers to the name — the same suffix rule either way.
+        let (dir, hits) = if is_dir(path, opts.root) {
+            (true, under())
+        } else {
+            let files: Vec<&Defn> = ctx.idx.iter().filter(|d| in_file(d, want)).collect();
+            if files.is_empty() {
+                let dirs = under();
+                (!dirs.is_empty(), dirs)
+            } else {
+                (false, files)
+            }
+        };
+        if hits.is_empty() {
+            ctx.out.note(&why_nothing(path, opts.root, dir));
+            missed.push(path);
+            continue;
+        }
+        // Which files a *file* path matched, so an ambiguous suffix is
+        // reported rather than silently rendered as one interleaved outline.
+        // A directory matching many files is what it was asked for.
+        if !dir {
+            let mut matched: Vec<&str> = hits.iter().map(|d| d.file.as_str()).collect();
+            matched.sort_unstable();
+            matched.dedup();
+            if matched.len() > 1 {
+                ctx.out.note(&format!(
+                    "note: `{}` matches {} files ({}) — outlining all of them; \
+                     pass a longer path to pick one",
+                    path,
+                    matched.len(),
+                    matched.join(", ")
+                ));
+            }
+        }
+        items.extend(hits);
     }
+    if missed.len() == paths.len() {
+        return Err(crate::context::TargetNotFound::err("file", &paths.join(", ")));
+    }
+    // Two paths can name one file (`main.rs src/main.rs`, or a file and its
+    // directory); an outline lists each item once.
+    items.sort_by_key(|d| *d as *const Defn);
+    items.dedup_by_key(|d| *d as *const Defn);
 
-    // Which files actually matched, so an ambiguous suffix is reported rather
-    // than silently rendered as one interleaved outline.
     let mut files: Vec<&str> = items.iter().map(|d| d.file.as_str()).collect();
     files.sort_unstable();
     files.dedup();
-    if files.len() > 1 {
-        ctx.out.note(&format!(
-            "note: `{}` matches {} files ({}) — outlining all of them; \
-             pass a longer path to pick one",
-            path,
-            files.len(),
-            files.join(", ")
-        ));
-    }
 
     if let Some(k) = opts.kind {
         items.retain(|d| d.kind == k);
@@ -232,7 +298,7 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
         ctx.out.note(&format!(
             "(note: `at {}:<line>` is the reverse lookup — it names the item a line number \
              falls in, and prints its extent so a read needs no guessed range)",
-            files[0]
+            if files.len() == 1 { files[0] } else { "<file>" }
         ));
     }
     // The pointer sits here because this is where a reader *has* a list of
@@ -240,14 +306,30 @@ pub fn run(ctx: &AnalysisCtx, path: &str, opts: &OutlineOpts) -> anyhow::Result<
     // batch form goes unused: one session made 34 `show` calls of which 23 sat
     // in groups of two to four on a single shell line, each re-parsing the tree.
     crate::inventory::note_name_filter(ctx, opts.name, items.len(), true);
+    // Up to a handful of files the summary names them; past that — a directory
+    // — the names are already in every row's `at`, and a list of forty paths
+    // would bury the count.
+    let where_ = if files.len() <= FILES_NAMED_MAX {
+        files.join(", ")
+    } else {
+        format!("{} files", files.len())
+    };
     ctx.out.summary(&format!(
-        "({} item(s) in {}; `at` is file:decl-end — `show <name>` prints one \
+        "({} item(s) in {}{}; `at` is file:decl-end — `show <name>` prints one \
          with its docs, `show <a> <b> <c>` several in one pass)",
         items.len(),
-        files.join(", ")
+        where_,
+        if missed.is_empty() {
+            String::new()
+        } else {
+            format!("; {} path(s) unresolved: {}", missed.len(), missed.join(", "))
+        }
     ));
     Ok(items.len())
 }
+
+/// Files a summary line names one by one before it switches to a count.
+const FILES_NAMED_MAX: usize = 4;
 
 /// The name to render. Nested items already sit under their parent's row, so
 /// the bare name plus the indent says what a repeated `module::Type::method`
@@ -260,18 +342,20 @@ fn short_name(d: &Defn) -> String {
     }
 }
 
-/// No items matched the path. Distinguish the three reasons, because the fix
+/// No items matched the path. Distinguish the reasons, because the fix
 /// differs for each and an empty listing suggests none of them.
-fn nothing_here(
-    ctx: &AnalysisCtx,
-    path: &str,
-    root: &std::path::Path,
-) -> anyhow::Result<usize> {
+fn why_nothing(path: &str, root: &std::path::Path, dir: bool) -> String {
     let exists = std::path::Path::new(path).exists() || root.join(path).exists();
-    let msg = if !exists {
+    if !exists {
         format!(
             "note: no file matching `{}` was scanned, and no such path exists here — \
              check the path and --root",
+            path
+        )
+    } else if dir {
+        format!(
+            "note: directory `{}` holds no scanned Rust file (its files are out of \
+             --scope, excluded, or gitignored) — try --scope all",
             path
         )
     } else {
@@ -280,9 +364,7 @@ fn nothing_here(
              or gitignored) — try --scope all",
             path
         )
-    };
-    ctx.out.note(&msg);
-    Err(crate::context::TargetNotFound::err("file", path))
+    }
 }
 
 /// `at <file>:<line>` — which item owns a line.
@@ -323,7 +405,8 @@ pub fn run_at(ctx: &AnalysisCtx, target: &str, root: &std::path::Path) -> anyhow
     let want = std::path::Path::new(path);
     let in_this_file: Vec<&Defn> = ctx.idx.iter().filter(|d| in_file(d, want)).collect();
     if in_this_file.is_empty() {
-        return nothing_here(ctx, path, root);
+        ctx.out.note(&why_nothing(path, root, false));
+        return Err(crate::context::TargetNotFound::err("file", path));
     }
 
     let mut files: Vec<&str> = in_this_file.iter().map(|d| d.file.as_str()).collect();

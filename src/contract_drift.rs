@@ -1622,7 +1622,7 @@ fn run_reveal(
     // `callees` writes its own trailing summary, and two summary lines under
     // one command reads as two commands having run.
     let prev = ctx.out.hold_summary(true);
-    let n = crate::callers::run_callees(ctx, &d.qpath).unwrap_or(0);
+    let n = crate::callers::run_callees(ctx, &d.qpath, false).unwrap_or(0);
     ctx.out.hold_summary(prev);
     ctx.out.take_held_summary();
     ctx.out.summary(&format!(

@@ -324,8 +324,9 @@ enum Cmd {
     /// `file:start-end`. A name that doesn't resolve answers with the near
     /// names, not silence.
     Show(ShowArgs),
-    /// AST table of contents for one file: every item with `file:start-end`,
-    /// indented by scope. `outline src/trace.rs`. Complete where a
+    /// AST table of contents for one or more files: every item with
+    /// `file:start-end`, indented by scope. `outline src/trace.rs`, or several
+    /// at once — `outline a.rs b.rs`, `outline src/render`. Complete where a
     /// `grep -n '^pub fn'` anchor is not — it sees private items, indented
     /// methods and multi-line signatures — and every row says where the item
     /// ends, so the follow-up read is exact rather than a 150-line window.
@@ -1167,10 +1168,16 @@ struct AtArgs {
 
 #[derive(Args)]
 struct OutlineArgs {
-    /// The file, as a path or any trailing part of one: `src/geom/window.rs`,
-    /// `geom/window.rs` and `window.rs` all resolve. Matching is on whole path
-    /// components, so `dow.rs` does not.
-    file: String,
+    /// The file(s), each as a path or any trailing part of one:
+    /// `src/geom/window.rs`, `geom/window.rs` and `window.rs` all resolve.
+    /// Matching is on whole path components, so `dow.rs` does not.
+    ///
+    /// Repeatable, and a directory takes every scanned file under it:
+    /// `outline plan.rs section.rs` or `outline src/render` is one pass over
+    /// the tree. A path that matches nothing is explained and the rest still
+    /// run.
+    #[arg(required = true, num_args = 1.., value_name = "FILE")]
+    file: Vec<String>,
 
     /// Only items of this kind.
     #[arg(long, short = 'k', value_enum)]
@@ -1258,7 +1265,13 @@ struct CallersArgs {
 #[derive(Args)]
 struct CalleesArgs {
     /// Containing function (last-segment match: `translate` or `Doc::translate`).
+    /// A name that selects several functions lists them instead of pooling
+    /// their callees; re-run with a qualified name from the `fn` column.
     name: String,
+    /// Pool the callees of every function the name selects into one list —
+    /// what a bare name used to do silently.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -2410,7 +2423,7 @@ fn dispatch(
                 )
             }
         }
-        Cmd::Callees(a) => callers::run_callees(ctx, &a.name),
+        Cmd::Callees(a) => callers::run_callees(ctx, &a.name, a.all),
         Cmd::CoCall(a) => callers::run_co_call(ctx, &a.a, &a.b),
         Cmd::FieldUses(a) => field_uses::run(
             ctx,

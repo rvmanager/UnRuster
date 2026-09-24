@@ -1529,6 +1529,64 @@ fn outline_of_a_nonexistent_file_says_that_instead() {
 }
 
 #[test]
+fn outline_takes_several_files_in_one_call() {
+    // The call a session wrote and clap rejected with `unexpected argument`.
+    let out = ur()
+        .args(["--root", FIXTURE, "outline", "src/main.rs", "src/homonyms.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let rows = rows_of(&out.stdout);
+    assert!(rows.iter().any(|r| r.contains("src/main.rs:")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("src/homonyms.rs:")), "{rows:?}");
+}
+
+#[test]
+fn outline_of_a_directory_takes_every_file_under_it() {
+    let out = ur_stdout(&["--root", FIXTURE, "outline", "src"]);
+    let rows = rows_of(&out);
+    let mut files: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.rsplit('\t').next()?.split(':').next())
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    assert!(files.len() > 2, "expected several files, got {files:?}");
+    assert!(files.iter().all(|f| f.contains("sample/src/")), "{files:?}");
+}
+
+#[test]
+fn outline_lists_an_item_once_when_two_paths_name_its_file() {
+    let once = rows_of(&ur_stdout(&["--root", FIXTURE, "outline", "src/main.rs"]));
+    let twice = rows_of(&ur_stdout(&["--root", FIXTURE, "outline", "main.rs", "src/main.rs"]));
+    assert_eq!(once, twice);
+}
+
+#[test]
+fn outline_skips_a_path_that_misses_and_still_outlines_the_rest() {
+    let out = ur()
+        .args(["--root", FIXTURE, "outline", "src/main.rs", "src/no_such_file.rs"])
+        .output()
+        .unwrap();
+    // One typo must not cost the other files: exit 0, the miss explained.
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no file matching `src/no_such_file.rs`"), "{stdout}");
+    assert!(rows_of(&out.stdout).iter().any(|r| r.contains("src/main.rs:")));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 path(s) unresolved"));
+}
+
+#[test]
+fn outline_exits_2_when_every_path_misses() {
+    ur().args(["--root", FIXTURE, "outline", "nope.rs", "zz.rs"])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(contains("`nope.rs`"))
+        .stdout(contains("`zz.rs`"));
+}
+
+#[test]
 fn outline_summary_mode() {
     assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "outline", "src/main.rs"]);
 }
@@ -2132,6 +2190,54 @@ fn takes_mut_unknown_type_warns_and_exits_2() {
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("no type `NoSuchType`"));
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn callees_lists_homonyms_instead_of_pooling_them() {
+    // Two fns named `step`, each calling something different. Pooled, the
+    // answer is a body that does not exist.
+    let root = std::env::temp_dir().join("unruster_callees_homonyms");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub mod a { pub fn step() { super::left(); } }\n\
+         pub mod b { pub fn step() { super::right(); } }\n\
+         pub fn left() {}\npub fn right() {}\n",
+    )
+    .unwrap();
+    let r = root.to_str().unwrap();
+
+    let out = ur_stdout(&["--root", r, "callees", "step"]);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("names 2 functions"), "{s}");
+    let rows = rows_of(&out);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("a::step")) && rows.iter().any(|r| r.contains("b::step")));
+    assert!(!s.contains("left") && !s.contains("right"), "callees must not be pooled:\n{s}");
+
+    // A qualified name picks one, and the summary says which.
+    let out = ur().args(["--root", r, "callees", "a::step"]).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("left") && !s.contains("right"), "{s}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("of `a::step`"));
+
+    // `--all` is the pool, asked for on purpose.
+    let out = ur().args(["--root", r, "callees", "step", "--all"]).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("left") && s.contains("right"), "{s}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pooled over 2 functions"));
+}
+
+#[test]
+fn callees_says_when_a_homonym_makes_no_calls() {
+    // `new` is `Document::new` (calls `vec!`) and `Atom::new` (calls nothing):
+    // the one listed may not be the one meant, so it is named.
+    ur().args(["--root", FIXTURE, "callees", "new"])
+        .assert()
+        .success()
+        .stdout(contains("callees of `Document::new`"))
+        .stdout(contains("1 other fn(s) named `new`"));
 }
 
 #[test]
