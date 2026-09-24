@@ -1586,6 +1586,48 @@ fn outline_exits_2_when_every_path_misses() {
         .stdout(contains("`zz.rs`"));
 }
 
+/// `--name` takes several patterns — `a|b`, or the flag repeated — and names
+/// the ones that matched nothing. One session wanted eight names out of an
+/// outline, could give the flag one, and piped to `grep -iE` instead.
+#[test]
+fn name_filter_takes_several_patterns() {
+    let names = |args: &[&str]| -> Vec<String> {
+        rows_of(&ur_stdout(args))
+            .iter()
+            .map(|r| r.split('\t').nth(3).unwrap_or("").trim().to_string())
+            .collect()
+    };
+    let alt = names(&["--root", FIXTURE, "outline", "src/main.rs", "--name", "Document|transitions"]);
+    assert!(alt.iter().any(|n| n == "Document"), "{alt:?}");
+    assert!(alt.iter().any(|n| n == "transitions"), "{alt:?}");
+    let rep = names(&[
+        "--root", FIXTURE, "outline", "src/main.rs", "--name", "Document", "--name", "transitions",
+    ]);
+    assert_eq!(alt, rep, "`a|b` and a repeated flag are one filter");
+    // `inventory` shares the flag and the matcher.
+    let inv = ur_stdout(&["--root", FIXTURE, "inventory", "--name", "Document|transitions"]);
+    let inv = String::from_utf8_lossy(&inv);
+    assert!(inv.contains("\tDocument\t") && inv.contains("\ttransitions\t"), "{inv}");
+}
+
+#[test]
+fn name_filter_names_the_pattern_that_matched_nothing() {
+    // One typo among several is invisible in a non-empty listing.
+    let out = ur()
+        .args(["--root", FIXTURE, "outline", "src/main.rs", "--name", "Document|nopezz"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("1 of 2 `--name` pattern(s) matched nothing: `nopezz`"), "{s}");
+    // A stray `|` is not a pattern the reader wrote.
+    let out = ur()
+        .args(["--root", FIXTURE, "outline", "src/main.rs", "--name", "Document|"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("matched nothing"));
+}
+
 #[test]
 fn outline_summary_mode() {
     assert_summary_silent_stdout(&["--root", FIXTURE, "--summary", "outline", "src/main.rs"]);

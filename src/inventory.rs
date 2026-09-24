@@ -101,6 +101,48 @@ pub(crate) fn name_matches(pat: &str, qpath: &str) -> bool {
         .any(|suffix| glob_match_smart(pat, suffix))
 }
 
+/// Keep the items any of `pats` selects, and return the patterns that selected
+/// none — the `--name` filter, for every listing that has one.
+///
+/// Several patterns because the question is often several names: one session
+/// wanted eight (`material|vocab|look|rise|decal|shape|stair|grain`) out of
+/// an outline, could give `--name` one, and piped to `grep -iE` — which the
+/// tool's own note tells the reader not to do, and which also matched a note
+/// line on "lookup". A pattern that matched nothing is returned rather than
+/// lost in the union: one typo among eight is invisible in a non-empty listing.
+pub(crate) fn retain_by_name(items: &mut Vec<&Defn>, pats: &[String]) -> Vec<String> {
+    if pats.is_empty() {
+        return Vec::new();
+    }
+    let mut hit = vec![false; pats.len()];
+    items.retain(|d| {
+        let path = match_path(d);
+        let mut any = false;
+        for (i, pat) in pats.iter().enumerate() {
+            if name_matches(pat, &path) {
+                hit[i] = true;
+                any = true;
+            }
+        }
+        any
+    });
+    pats.iter()
+        .zip(hit)
+        .filter(|(_, h)| !h)
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
+/// `--name` as the summary line spells it back: the patterns, `|`-joined —
+/// the same spelling the flag accepts.
+pub(crate) fn name_filter_label(pats: &[String]) -> String {
+    if pats.is_empty() {
+        String::new()
+    } else {
+        format!("; --name {}", pats.join("|"))
+    }
+}
+
 /// The path-shaped spelling of an item, for [`name_matches`].
 ///
 /// An `impl` header's `qpath` is its rendered `impl Trait for Type` line, not a
@@ -124,7 +166,7 @@ pub fn run(
     ctx: &AnalysisCtx,
     kind_filter: Option<ItemKind>,
     vis_filter: Option<VisFilter>,
-    name_filter: Option<&str>,
+    name_filter: &[String],
     tree: bool,
     sort: ItemSort,
     docs: bool,
@@ -145,9 +187,7 @@ pub fn run(
     // and matches the file path and the doc summary as happily as the name.
     // Matching on the last segment keeps `--name Options` from being defeated
     // by every item's module prefix.
-    if let Some(pat) = name_filter {
-        all.retain(|d| name_matches(pat, &match_path(d)));
-    }
+    let unmatched = retain_by_name(&mut all, name_filter);
 
     if tree {
         print_tree(ctx, &all);
@@ -190,10 +230,7 @@ pub fn run(
     ctx.out.summary(&format!(
         "({} items{})",
         all.len(),
-        match name_filter {
-            Some(p) => format!("; --name {}", p),
-            None => String::new(),
-        }
+        name_filter_label(name_filter)
     ));
     // A glob that matches nothing is a typo far more often than a fact about
     // the tree, and an empty listing plus `(0 items)` says neither. `show`
@@ -204,7 +241,7 @@ pub fn run(
     // written by a reader who never opened the help — and a grep matches the
     // file path and the doc column as readily as the name, takes this count
     // down with the stderr it redirects, and hides the `--top` cut.
-    note_name_filter(ctx, name_filter, all.len(), !tree);
+    note_name_filter(ctx, name_filter, &unmatched, all.len(), !tree);
     Ok(all.len())
 }
 
@@ -218,22 +255,47 @@ pub fn run(
 ///
 /// `offer` is false where the pointer would be wrong: `--tree` is already a
 /// narrowing view, so suggesting a narrower one is noise.
-pub(crate) fn note_name_filter(ctx: &AnalysisCtx, pat: Option<&str>, shown: usize, offer: bool) {
+pub(crate) fn note_name_filter(
+    ctx: &AnalysisCtx,
+    pats: &[String],
+    unmatched: &[String],
+    shown: usize,
+    offer: bool,
+) {
     // A listing long enough to scroll is where the reader reaches for `grep`
     // — which also matches the path and the doc column, and discards the
     // count and the `--top` cut along with the stderr it redirects.
-    if pat.is_none() && offer && shown > 40 {
+    if pats.is_empty() && offer && shown > 40 {
         // `advice`, not `note`: this sentence is aimed at the reader who is
         // about to pipe the listing into `grep`, and on stdout their own grep
         // is what deletes it. See `Out::advice`.
         ctx.out.advice(
             "note: `--name <glob>` narrows by name — `*` the only metacharacter, smartcase, \
-             `Type::*` for one type's members, and a leading glob for a crate or module \
-             (`--name 'crates::fab-vcs::*'`). Prefer it to `| grep`, which also matches \
+             `Type::*` for one type's members, a leading glob for a crate or module \
+             (`--name 'crates::fab-vcs::*'`), and `|` for several at once \
+             (`--name '*stair*|*decal*'`). Prefer it to `| grep`, which also matches \
              the path and the doc column and discards the count above.",
         );
     }
-    if let Some(pat) = pat.filter(|_| shown == 0) {
+    if unmatched.is_empty() {
+        return;
+    }
+    // Some patterns matched and some did not: the listing is not empty, so
+    // nothing else would say that part of the question went unanswered.
+    if shown > 0 {
+        ctx.out.note(&format!(
+            "note: {} of {} `--name` pattern(s) matched nothing: {} — the rows above are \
+             the other patterns'. `*` is the only metacharacter, so a bare word matches a \
+             whole name; `*{}*` matches names containing it.",
+            unmatched.len(),
+            pats.len(),
+            unmatched.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", "),
+            unmatched[0].trim_matches('*'),
+        ));
+        return;
+    }
+    let pat = pats.join("|");
+    {
         ctx.out.note(&format!(
             "note: nothing matches `{}` — `*` is the only metacharacter, the match is on the \
              last `::` segment (a pattern with `::` matches any qualified suffix, the whole \
@@ -241,7 +303,8 @@ pub(crate) fn note_name_filter(ctx: &AnalysisCtx, pat: Option<&str>, shown: usiz
              already matches case-insensitively. `show {}` answers with the near names if \
              it is a typo.",
             pat,
-            pat.trim_matches('*')
+            // `show` takes several names, so every pattern is offered at once.
+            pats.iter().map(|p| p.trim_matches('*')).collect::<Vec<_>>().join(" ")
         ));
     }
 }

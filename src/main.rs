@@ -1053,8 +1053,12 @@ struct InventoryArgs {
     /// wrote was `inventory | grep -i mask` — which throws away the item count
     /// and the `--top` cut along with the stderr it redirects, and matches the
     /// file path and the doc column as readily as the name.
-    #[arg(long, value_name = "GLOB")]
-    name: Option<String>,
+    ///
+    /// Several at once: `--name 'Mask|*stair*|Document::*'`, or the flag
+    /// repeated. An item any of them selects is listed, and a pattern that
+    /// selected nothing is named.
+    #[arg(long, value_name = "GLOB", value_delimiter = '|')]
+    name: Vec<String>,
 
     /// Shorthand for `--vis pub`: the tree's external surface.
     // The same pair `outline` and `dead-code` offer. `--vis` was here and this
@@ -1195,8 +1199,11 @@ struct OutlineArgs {
     /// It was the one filter the two listings did not share, and the shape
     /// that filled the gap was `outline <file> | grep -iE '<type>|<method>'`,
     /// which drops every member whose name the filter does not happen to name.
-    #[arg(long, value_name = "GLOB")]
-    name: Option<String>,
+    ///
+    /// Several at once, as `inventory --name`: `--name 'vocab|*stair*|*decal*'`
+    /// or the flag repeated.
+    #[arg(long, value_name = "GLOB", value_delimiter = '|')]
+    name: Vec<String>,
 
     /// Shorthand for `--vis pub`: the file's external surface.
     #[arg(long, conflicts_with = "vis")]
@@ -2446,7 +2453,7 @@ fn dispatch(
             ctx,
             a.kind,
             a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
-            a.name.as_deref(),
+            &names_of(&a.name),
             a.tree,
             a.sort,
             a.include_docs,
@@ -2471,7 +2478,7 @@ fn dispatch(
                 kind: a.kind.map(inventory::ItemKind::as_str),
                 // `--pub-only` is `--vis pub`; clap has already rejected both.
                 vis: a.vis.or(a.pub_only.then_some(inventory::VisFilter::Pub)),
-                name: a.name.as_deref(),
+                name: &names_of(&a.name),
                 sort: a.sort,
                 docs: a.include_docs,
                 flat: a.flat,
@@ -2700,6 +2707,13 @@ fn metrics_at_ref(
     let snap = baseline::snapshot(git_ref, root)?;
     let files = parse::parse_dir(&snap.scan_root, scope, cfg, exclude)?;
     Ok(metrics::baseline_of(&files, sort, git_ref))
+}
+
+/// `--name` patterns as given, less the empty ones a stray `|` leaves
+/// (`'a||b'`, a trailing `|`): an empty glob would select nothing and then be
+/// reported as a pattern that matched nothing, which the reader never wrote.
+fn names_of(raw: &[String]) -> Vec<String> {
+    raw.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).map(str::to_string).collect()
 }
 
 /// Both of `audit`'s metrics baselines from one snapshot of the ref. Neither

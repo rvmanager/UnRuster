@@ -45,7 +45,7 @@ pub struct OutlineOpts<'a> {
     /// matches the tab-separated `impl` row, so the range ran on into three
     /// unrelated types. Two calls and a wrong answer for
     /// `--name 'EditOpState::*'`.
-    pub name: Option<&'a str>,
+    pub name: &'a [String],
     /// Row order. Shared with `inventory`; the two differ only in the default.
     pub sort: crate::inventory::ItemSort,
     /// Append the first line of each item's doc comment.
@@ -191,11 +191,7 @@ pub fn run(ctx: &AnalysisCtx, paths: &[String], opts: &OutlineOpts) -> anyhow::R
     if let Some(v) = opts.vis {
         items.retain(|d| d.vis == v.as_str());
     }
-    if let Some(pat) = opts.name {
-        items.retain(|d| {
-            crate::inventory::name_matches(pat, &crate::inventory::match_path(d))
-        });
-    }
+    let unmatched = crate::inventory::retain_by_name(&mut items, opts.name);
     // Source order by default: an outline read out of order is a list, not an
     // outline. `--sort kind` gives `inventory`'s census ordering on one file.
     match opts.sort {
@@ -310,7 +306,7 @@ pub fn run(ctx: &AnalysisCtx, paths: &[String], opts: &OutlineOpts) -> anyhow::R
     // names and is about to read several of them. Told only in `--help`, the
     // batch form goes unused: one session made 34 `show` calls of which 23 sat
     // in groups of two to four on a single shell line, each re-parsing the tree.
-    crate::inventory::note_name_filter(ctx, opts.name, items.len(), true);
+    crate::inventory::note_name_filter(ctx, opts.name, &unmatched, items.len(), true);
     // Up to a handful of files the summary names them; past that — a directory
     // — the names are already in every row's `at`, and a list of forty paths
     // would bury the count.
