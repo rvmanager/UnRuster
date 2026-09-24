@@ -82,6 +82,16 @@ pub fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Cells a flag *adds* to a row that is already a row without them: what the
+/// row says about the item, not which item it is.
+///
+/// `was` is `metrics --since`'s previous value, which `audit --changed-since`
+/// now prints too; `attrs` is `fields --attrs`. Hashed, either one gave the
+/// same finding a second fingerprint whenever the flag was on, so a baseline
+/// written by a scoped audit read every metrics row of a plain one as new.
+/// Excluding them changes no fingerprint a run without the flags produces.
+const ANNOTATION_CELLS: &[&str] = &["was", "attrs"];
+
 /// The identifying part of a row: text cells, normalized. Measurements
 /// (`Num`/`Float`/`Bool`) and the `Site` itself are excluded — the first
 /// carries values that drift, the second is the line number we are trying to
@@ -89,6 +99,7 @@ pub fn normalize(s: &str) -> String {
 fn identity_cells(cells: &[(&'static str, Val)]) -> Vec<String> {
     cells
         .iter()
+        .filter(|(k, _)| !ANNOTATION_CELLS.contains(k))
         .filter_map(|(_, v)| match v {
             Val::Str(s) => Some(normalize(s)),
             Val::List(items) => Some(
@@ -142,6 +153,18 @@ mod tests {
         assert_eq!(normalize("  a   b  "), "a b");
         // A qualified name ending in a segment, not a number, survives intact.
         assert_eq!(normalize("NodeContent::Group"), "NodeContent::Group");
+    }
+
+    #[test]
+    fn an_annotation_cell_does_not_participate() {
+        let plain = cells(&[
+            ("name", Val::Str("unrouted".into())),
+            ("at", crate::emit::site("src/x.rs", 4)),
+        ]);
+        let mut annotated = plain.clone();
+        annotated.push(("attrs", Val::Str("#[serde(default)]".into())));
+        annotated.push(("was", Val::Str("was:new".into())));
+        assert_eq!(of("fields", &plain, None), of("fields", &annotated, None));
     }
 
     #[test]

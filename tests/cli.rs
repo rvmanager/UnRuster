@@ -2196,6 +2196,48 @@ fn type_refs_in_submodule_file() {
         .success();
 }
 
+/// `--role ret` answers "which fns return a `T`" — the question one session
+/// answered with `grep "pub fn .*ParentEdge\|-> Option<ParentEdge>"`.
+#[test]
+fn type_refs_labels_positions_and_filters_by_role() {
+    let dir = scratch("type-refs-roles");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct ParentEdge;\n\
+         pub struct Arena;\n\
+         impl Arena {\n\
+             pub fn parent(&self) -> Option<ParentEdge> { None }\n\
+             pub fn reparent(&mut self, e: ParentEdge) { let _k: ParentEdge = e; }\n\
+         }\n\
+         pub struct Holder { pub e: ParentEdge }\n\
+         pub trait T { fn get(&self) -> Result<ParentEdge, ()>; }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let role_of = |fn_name: &str, rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.split('\t').nth(4) == Some(fn_name))
+            .map(|r| r.split('\t').next().unwrap().to_string())
+            .collect()
+    };
+    let rows = rows_of(&ur_stdout(&["--root", root, "type-refs", "ParentEdge"]));
+    // Nested in `Option<…>` or `Result<…>`, still the return type.
+    assert_eq!(role_of("Arena::parent", &rows), ["ret"], "{rows:?}");
+    assert_eq!(role_of("get", &rows), ["ret"], "{rows:?}");
+    // A parameter, and a `let` in the body, which is neither.
+    let mut reparent = role_of("Arena::reparent", &rows);
+    reparent.sort();
+    assert_eq!(reparent, ["param", "type"], "{rows:?}");
+    // A field row names the struct that holds it.
+    assert_eq!(role_of("Holder", &rows), ["field"], "{rows:?}");
+
+    let ret = rows_of(&ur_stdout(&["--root", root, "type-refs", "ParentEdge", "--role", "ret"]));
+    assert_eq!(ret.len(), 2, "{ret:?}");
+    assert!(ret.iter().all(|r| r.starts_with("ret\t")), "{ret:?}");
+    let two = rows_of(&ur_stdout(&["--root", root, "type-refs", "ParentEdge", "--role", "field,param"]));
+    assert_eq!(two.len(), 2, "{two:?}");
+}
+
 #[test]
 fn type_refs_tuple_struct_ctor() {
     // `TupleS(1, 2)` is a single-segment Expr::Call — type_refs.rs len==1 branch.
@@ -4103,6 +4145,52 @@ fn inventory_kind_struct_row_shape() {
     let out = ur_stdout(&["--root", FIXTURE, "inventory", "--kind", "struct"]);
     assert!(!rows_of(&out).is_empty(), "expected at least one struct row");
     assert_tsv_cols(&out, 5);
+}
+
+/// `--attrs` prints each field's attributes; without it the column is absent
+/// and a line says there is something to show. What a session wanted from
+/// `fields` was whether `unrouted` carried `skip_serializing_if`, and it went
+/// to `grep -B1` for it.
+#[test]
+fn fields_attrs_prints_attributes_and_is_offered_when_there_are_some() {
+    let dir = scratch("fields-attrs");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub struct RouteReport {\n\
+             /// Doc comments are not attributes worth a column.\n\
+             #[serde(skip_serializing_if = \"Vec::is_empty\", default)]\n\
+             pub unrouted: Vec<String>,\n\
+             #[serde(rename = \"a, b\")]\n\
+             pub vias: usize,\n\
+             pub routed: u32,\n\
+         }\n",
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let plain = ur().args(["--root", root, "fields", "RouteReport"]).output().unwrap();
+    assert_tsv_cols(&plain.stdout, 7);
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("2 of these field(s) carry attributes"));
+
+    let out = ur_stdout(&["--root", root, "fields", "RouteReport", "--attrs"]);
+    assert_tsv_cols(&out, 8);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\t#[serde(skip_serializing_if = \"Vec::is_empty\", default)]"), "{s}");
+    // A string literal is printed as written, not re-spaced.
+    assert!(s.contains("#[serde(rename = \"a, b\")]"), "{s}");
+    assert!(!s.contains("#[doc"), "{s}");
+    assert!(s.lines().any(|l| l.starts_with("pub\trouted\t") && l.ends_with("\t—")), "{s}");
+
+    // The column is an annotation: it does not change which finding a row is.
+    let fp = |args: &[&str]| -> Vec<String> {
+        rows_of(&ur_stdout(args))
+            .iter()
+            .map(|r| r.rsplit('\t').next().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        fp(&["--root", root, "--fingerprints", "fields", "RouteReport"]),
+        fp(&["--root", root, "--fingerprints", "fields", "RouteReport", "--attrs"]),
+    );
 }
 
 #[test]

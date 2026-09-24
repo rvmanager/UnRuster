@@ -357,7 +357,8 @@ enum Cmd {
     Variants(VariantsArgs),
     /// List `impl` blocks; filter by self-type or by trait.
     Impls(ImplsArgs),
-    /// Find every site that names a given type (coupling footprint).
+    /// Find every site that names a given type (coupling footprint), labelled by
+    /// position; `--role ret` lists the fns that return it.
     TypeRefs(TypeRefsArgs),
     /// Find fns whose signature takes `&mut <Type>`.
     TakesMut(TakesMutArgs),
@@ -1317,6 +1318,11 @@ struct FieldUsesArgs {
 struct FieldsArgs {
     /// Struct name (last segment, e.g. `Document`).
     ty: String,
+    /// Add an `attrs` column: each field's attributes other than its doc
+    /// comment, as written — `#[serde(skip_serializing_if = "Vec::is_empty")]`,
+    /// `#[cfg(test)]`. `--json` always carries it.
+    #[arg(long)]
+    attrs: bool,
 }
 
 #[derive(Args)]
@@ -1351,6 +1357,12 @@ struct TypeRefsArgs {
     /// definition in the tree, else `heuristic`).
     #[arg(long, value_enum)]
     min_confidence: Option<context::Confidence>,
+    /// Keep only references in these positions (repeatable, or
+    /// comma-separated): `ret` — `type-refs ParentEdge --role ret` lists the
+    /// fns that return one, `Option<ParentEdge>` included — `param`, `field`,
+    /// `type` (anywhere else a type is written), `ctor` (construction).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    role: Vec<type_refs::Role>,
 }
 
 #[derive(Args)]
@@ -2523,10 +2535,10 @@ fn dispatch(
                 min_confidence: a.min_confidence,
             },
         ),
-        Cmd::Fields(a) => fields::run(ctx, &a.ty),
+        Cmd::Fields(a) => fields::run(ctx, &a.ty, a.attrs),
         Cmd::Variants(a) => variants::run(ctx, a.name.as_deref(), a.bare),
         Cmd::Impls(a) => impls::run(ctx, a.of.as_deref(), a.trait_.as_deref()),
-        Cmd::TypeRefs(a) => type_refs::run(ctx, &a.ty, a.min_confidence),
+        Cmd::TypeRefs(a) => type_refs::run(ctx, &a.ty, a.min_confidence, &a.role),
         Cmd::TakesMut(a) => match a.ty.as_deref() {
             Some(ty) => takes_mut::run(ctx, ty),
             None => takes_mut::run_candidates(ctx),

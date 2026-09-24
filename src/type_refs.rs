@@ -5,12 +5,43 @@ use crate::context::{AnalysisCtx, Confidence, TargetNotFound};
 use crate::parse::display_path;
 use crate::emit::{row, site};
 
+/// `--role`: which positions to keep. Same words as the `role` column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Role {
+    /// A fn's return type — `type-refs T --role ret` lists what returns a `T`.
+    Ret,
+    /// A fn's parameter type.
+    Param,
+    /// A struct or enum-variant field's type.
+    Field,
+    /// Any other place a type is written: a `let`, a bound, an `impl` header.
+    Type,
+    /// Construction: `T { .. }`, `T(..)`, `T::new(..)`.
+    Ctor,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Ret => "ret",
+            Role::Param => "param",
+            Role::Field => "field",
+            Role::Type => "type",
+            Role::Ctor => "ctor",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Ref {
     file: String,
     line: usize,
     context: String,
-    role: &'static str, // "type" | "ctor"
+    /// Where the type is named: `ret` (a fn's return type), `param` (a fn's
+    /// parameter), `field` (a struct or variant field), `type` (anywhere else
+    /// a type is written — a `let`, a generic bound, an `impl` header), or
+    /// `ctor` (built: `Type { .. }`, `Type(..)`, `Type::new(..)`).
+    role: &'static str,
     written: String,    // path as written, e.g. `crate::doc::Document`
     matched_via: &'static str, // "name" | "alias"
 }
@@ -30,9 +61,24 @@ struct RefVisitor<'a> {
     file: &'a str,
     scope: ScopeTracker,
     out: Vec<Ref>,
+    /// The role a type path met right now would get — see [`Ref::role`].
+    /// Set while a signature's parameters, its return type or a field's type
+    /// is walked, and `type` otherwise.
+    pos: &'static str,
+    /// The struct or enum whose fields are being walked, so a `field` row
+    /// names its owner — `<top-level>` said where the struct was declared,
+    /// not which struct holds the field.
+    owner: Option<String>,
 }
 
 impl<'a> RefVisitor<'a> {
+    /// Walk `f` with type paths recorded under `pos`, then restore.
+    fn at_pos(&mut self, pos: &'static str, f: impl FnOnce(&mut Self)) {
+        let prev = std::mem::replace(&mut self.pos, pos);
+        f(self);
+        self.pos = prev;
+    }
+
     fn enclosing(&self) -> String {
         self.scope.enclosing()
     }
@@ -55,7 +101,13 @@ impl<'a> RefVisitor<'a> {
     }
 
     fn record(&mut self, role: &'static str, written: String, line: usize, via: &'static str) {
-        let ctx = self.enclosing();
+        let ctx = match (&self.owner, role) {
+            (Some(o), "field") => match self.enclosing().as_str() {
+                "<top-level>" => o.clone(),
+                outer => format!("{}::{}", outer, o),
+            },
+            _ => self.enclosing(),
+        };
         self.out.push(Ref {
             file: self.file.to_string(),
             line,
@@ -78,9 +130,50 @@ impl<'ast, 'a> Visit<'ast> for RefVisitor<'a> {
     fn visit_type_path(&mut self, t: &'ast syn::TypePath) {
         if let Some(via) = self.matches_path_last(&t.path) {
             let line = path_line(&t.path);
-            self.record("type", path_to_string_with_args(&t.path), line, via);
+            self.record(self.pos, path_to_string_with_args(&t.path), line, via);
         }
         visit::visit_type_path(self, t);
+    }
+
+    // The positions `--role` asks about. The question they answer is "which
+    // fns return a `ParentEdge`": one session, having called a method that did
+    // not exist, grepped `pub fn .*ParentEdge\|-> Option<ParentEdge>` to find
+    // the one that did. `type-refs` already found every mention; it could not
+    // say which ones were a return type. A type nested inside another
+    // (`Option<ParentEdge>`, `Result<_, ParentEdge>`) keeps the position of
+    // the type it sits in.
+    fn visit_signature(&mut self, sig: &'ast syn::Signature) {
+        self.visit_generics(&sig.generics);
+        self.at_pos("param", |v| {
+            for input in &sig.inputs {
+                v.visit_fn_arg(input);
+            }
+        });
+        self.at_pos("ret", |v| v.visit_return_type(&sig.output));
+    }
+
+    fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
+        let prev = self.owner.replace(i.ident.to_string());
+        visit::visit_item_struct(self, i);
+        self.owner = prev;
+    }
+
+    fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
+        let prev = self.owner.replace(i.ident.to_string());
+        visit::visit_item_enum(self, i);
+        self.owner = prev;
+    }
+
+    fn visit_field(&mut self, f: &'ast syn::Field) {
+        self.at_pos("field", |v| visit::visit_field(v, f));
+    }
+
+    // A closure's parameters and return type are not a fn signature, and a
+    // body's `let x: T` is not a field: back to `type` inside any block, so a
+    // closure in a default argument or a const initializer cannot inherit an
+    // outer position.
+    fn visit_block(&mut self, b: &'ast syn::Block) {
+        self.at_pos("type", |v| visit::visit_block(v, b));
     }
 
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
@@ -126,6 +219,7 @@ pub fn run(
     ctx: &AnalysisCtx,
     ty: &str,
     min_confidence: Option<Confidence>,
+    roles: &[Role],
 ) -> anyhow::Result<usize> {
     // Targets resolve by last `::` segment here as everywhere else: every row
     // this command prints is matched against a bare `ident`, so the qualified
@@ -178,6 +272,8 @@ pub fn run(
             file: &display_path(&f.path),
             scope: ScopeTracker::new(f.module.as_str()).with_spans(ctx.spans),
             out: Vec::new(),
+            pos: "type",
+            owner: None,
         };
         v.visit_file(&f.ast);
         all.extend(v.out);
@@ -185,6 +281,9 @@ pub fn run(
 
     if let Some(min) = min_confidence {
         all.retain(|r| conf_of(r.matched_via) >= min);
+    }
+    if !roles.is_empty() {
+        all.retain(|r| roles.iter().any(|want| want.as_str() == r.role));
     }
     ctx.retain_changed(&mut all, |r| &r.file);
     all.sort_by(|a, b| {

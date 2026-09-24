@@ -644,7 +644,7 @@ const TYPE_QUERIES: &[TypeQuery] = &[
     TypeQuery {
         label: "type-refs",
         kind: "",
-        ask: |c, t| crate::type_refs::run(c, t, None),
+        ask: |c, t| crate::type_refs::run(c, t, None, &[]),
     },
     TypeQuery {
         label: "takes-mut",

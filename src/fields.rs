@@ -3,7 +3,7 @@ use syn::visit::Visit;
 use crate::ast::{line_of, type_to_string, vis_str};
 use crate::context::AnalysisCtx;
 use crate::parse::display_path;
-use crate::emit::{row, site};
+use crate::emit::site;
 
 #[derive(Debug)]
 struct FieldDef {
@@ -12,6 +12,67 @@ struct FieldDef {
     vis: &'static str,
     file: String,
     line: usize,
+    /// The field's attributes other than its doc comment, rendered as written
+    /// — `#[serde(skip_serializing_if = "Vec::is_empty", default)]`.
+    attrs: Vec<String>,
+}
+
+/// One attribute as source text, for the `attrs` column.
+///
+/// Rendered from tokens rather than sliced from the file, with Rust's own
+/// spacing (`a::b`, `f(x, y)`, `k = v`) so the column reads like the source.
+/// Token-aware rather than a string tidy-up over `to_string()`, which would
+/// also re-space the inside of a string literal.
+fn render_attr(a: &syn::Attribute) -> String {
+    let inner = if matches!(a.style, syn::AttrStyle::Inner(_)) { "!" } else { "" };
+    format!("#{}[{}]", inner, render_tokens(quote::ToTokens::to_token_stream(&a.meta)))
+}
+
+fn render_tokens(ts: proc_macro2::TokenStream) -> String {
+    use proc_macro2::{Delimiter, Spacing, TokenTree};
+    let mut out = String::new();
+    // Whether the last token was a word (ident or literal): two words in a
+    // row need a space between them, nothing else does.
+    let mut after_word = false;
+    for tt in ts {
+        match tt {
+            TokenTree::Ident(i) => {
+                if after_word {
+                    out.push(' ');
+                }
+                out.push_str(&i.to_string());
+                after_word = true;
+            }
+            TokenTree::Literal(l) => {
+                if after_word {
+                    out.push(' ');
+                }
+                out.push_str(&l.to_string());
+                after_word = true;
+            }
+            TokenTree::Punct(p) => {
+                match p.as_char() {
+                    '=' if p.spacing() == Spacing::Alone => out.push_str(" = "),
+                    ',' => out.push_str(", "),
+                    c => out.push(c),
+                }
+                after_word = false;
+            }
+            TokenTree::Group(g) => {
+                let (open, close) = match g.delimiter() {
+                    Delimiter::Parenthesis => ("(", ")"),
+                    Delimiter::Bracket => ("[", "]"),
+                    Delimiter::Brace => ("{", "}"),
+                    Delimiter::None => ("", ""),
+                };
+                out.push_str(open);
+                out.push_str(render_tokens(g.stream()).trim_end_matches(", "));
+                out.push_str(close);
+                after_word = false;
+            }
+        }
+    }
+    out
 }
 
 /// Locate field definitions for a given struct (or struct-like enum variant container).
@@ -33,6 +94,12 @@ impl<'ast, 'a> Visit<'ast> for FieldDefVisitor<'a> {
                             vis: vis_str(&f.vis),
                             file: self.file.to_string(),
                             line: line_of(id),
+                            attrs: f
+                                .attrs
+                                .iter()
+                                .filter(|a| !a.path().is_ident("doc"))
+                                .map(render_attr)
+                                .collect(),
                         });
                     }
                 }
@@ -41,7 +108,10 @@ impl<'ast, 'a> Visit<'ast> for FieldDefVisitor<'a> {
     }
 }
 
-pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
+/// `show_attrs` is `--attrs`: an `attrs` column after the site. JSON always
+/// carries it — a named key costs a document consumer nothing, where a new TSV
+/// column would shift every reader counting tabs.
+pub fn run(ctx: &AnalysisCtx, ty: &str, show_attrs: bool) -> anyhow::Result<usize> {
     // Targets resolve by last `::` segment throughout this tool — the playbook
     // says so, `impls --of` and `callers` already do it, and `show` prints the
     // *qualified* path in its header row. These three commands compared the raw
@@ -85,16 +155,20 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
             write_only.push(&fd.name);
         }
         if !summary {
-            row!(
-                ctx.out,
-                "vis" => fd.vis,
-                "name" => fd.name.clone(),
-                "type" => fd.ty.clone(),
-                "reads" => format!("r:{}", reads),
-                "writes" => format!("w:{}", writes),
-                "inits" => format!("i:{}", inits),
-                "at" => site(&fd.file, fd.line),
-            );
+            let mut cells: Vec<(&'static str, crate::emit::Val)> = vec![
+                ("vis", fd.vis.into()),
+                ("name", fd.name.clone().into()),
+                ("type", fd.ty.clone().into()),
+                ("reads", format!("r:{}", reads).into()),
+                ("writes", format!("w:{}", writes).into()),
+                ("inits", format!("i:{}", inits).into()),
+                ("at", site(&fd.file, fd.line)),
+            ];
+            if show_attrs || ctx.out.format == crate::emit::Format::Json {
+                let a = if fd.attrs.is_empty() { "—".to_string() } else { fd.attrs.join(" ") };
+                cells.push(("attrs", a.into()));
+            }
+            ctx.out.row(cells);
         }
     }
     ctx.out.summary(&format!(
@@ -103,6 +177,17 @@ pub fn run(ctx: &AnalysisCtx, ty: &str) -> anyhow::Result<usize> {
         ty,
         ty
     ));
+    // The column is opt-in, so say when it would have had something in it.
+    // What a session wanted from `fields` was whether `unrouted` carried
+    // `skip_serializing_if` — the one fact the rows did not hold — and it went
+    // to `grep -B1` for it.
+    let with_attrs = defs.iter().filter(|d| !d.attrs.is_empty()).count();
+    if !show_attrs && with_attrs > 0 && ctx.out.format != crate::emit::Format::Json {
+        ctx.out.advice(&format!(
+            "(note: {} of these field(s) carry attributes (serde, cfg, …) — `--attrs` prints them)",
+            with_attrs
+        ));
+    }
     if !write_only.is_empty() {
         ctx.out.note(&format!(
             "note: written and never read: {} — no site reads {}. Confirm with `--scope all` \
