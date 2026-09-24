@@ -599,6 +599,7 @@ pub fn run(
         gate_deferred,
         gating_only,
         gate_pre_existing,
+        metrics_since,
     } = *opts;
     // Under `--summary` the battery still runs *dense*.
     //
@@ -812,7 +813,12 @@ pub fn run(
             // exact as their own name, and a note on every section is what
             // teaches a reader to skip notes.
             None => {
-                let cmd = rerun_cmd(check);
+                let mut cmd = rerun_cmd(check);
+                // The `was:N` column is `metrics --since`'s, so the command
+                // that reproduces the section has to carry the ref too.
+                if let (Some(m), true) = (metrics_since, cmd.starts_with("metrics")) {
+                    cmd.push_str(&format!(" --since {}", m.cyclo.git_ref));
+                }
                 if cmd != check {
                     ctx.out.row_note(&format!(
                         "(note: this section is `unruster {}` — the bare command runs on its \
@@ -1100,7 +1106,16 @@ pub fn run(
         "metrics",
         Gate::Advisory,
         Some(DEFAULT_METRICS_TOP),
-        &mut || Ok(Counts::flat(metrics::run(ctx, SortKey::Cyclo, Some(CYCLO_THRESHOLD), true, crate::context::GroupBy::Fn, None)?)),
+        &mut || {
+            Ok(Counts::flat(metrics::run(
+                ctx,
+                SortKey::Cyclo,
+                Some(CYCLO_THRESHOLD),
+                true,
+                crate::context::GroupBy::Fn,
+                metrics_since.map(|m| &m.cyclo),
+            )?))
+        },
     )?;
     section(
         &format!(
@@ -1117,9 +1132,10 @@ pub fn run(
                 Some(PARAMS_THRESHOLD),
                 true,
                 crate::context::GroupBy::Fn,
-                // The battery has its own `--since`, which compares whole
-                // findings sets rather than one ranking's numbers.
-                None,
+                // Not the battery's `--since`, which compares whole findings
+                // sets: this is `--changed-since`'s ref, for one ranking's
+                // numbers.
+                metrics_since.map(|m| &m.params),
             )?))
         },
     )?;
@@ -1612,6 +1628,12 @@ fn install_change_classifier(ctx: &AnalysisCtx) {
 }
 
 /// How `audit` runs, gathered so the signature stops growing a flag at a time.
+/// The two rankings the audit's `metrics` sections compare against.
+pub struct MetricsSince {
+    pub cyclo: crate::metrics::Baseline,
+    pub params: crate::metrics::Baseline,
+}
+
 #[derive(Clone, Copy)]
 pub struct Opts<'a> {
     /// `--top N`: rows per section. `None` takes the defaults.
@@ -1637,6 +1659,15 @@ pub struct Opts<'a> {
     /// in one command, once for the rows and once for the summary a pipe had
     /// eaten.
     pub gating_only: bool,
+    /// Under `--changed-since <ref>`: the fn metrics as they were at the ref,
+    /// so the two `metrics` sections print `was:N` beside each row.
+    ///
+    /// Without it a scoped audit said `cyclo:38` and nothing else, and the
+    /// question it is run to answer is "did my edit do that". One session got
+    /// the answer by `git show HEAD:<file> > scratch.rs` and a second
+    /// `metrics -r scratch.rs` — the per-file workaround `metrics --since` was
+    /// built to replace, which the audit never used.
+    pub metrics_since: Option<&'a MetricsSince>,
     /// `--gate-pre-existing`: under `--changed-since`, let a finding the edit
     /// merely *touched* hold the exit code open, as it used to.
     ///

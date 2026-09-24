@@ -2318,6 +2318,14 @@ fn dispatch(
                     .then(|| ctx.changed.as_ref().map(|c| c.git_ref.clone()))
                     .flatten()
             });
+            // The metrics sections' `was:N`, when the audit is scoped to a
+            // diff. A failed snapshot costs only the column, so it is not an
+            // error: the audit's own answer does not depend on it.
+            let metrics_since = ctx
+                .changed
+                .as_ref()
+                .filter(|c| !c.files.is_empty())
+                .and_then(|c| audit_metrics_at_ref(&c.git_ref, root, scope, cfg, exclude).ok());
             let comparing = since.is_some() || a.baseline.is_some();
             if comparing || a.write_baseline.is_some() {
                 ctx.out.start_recording();
@@ -2337,6 +2345,7 @@ fn dispatch(
                     gate_deferred: a.fail_on_new,
                     gating_only: a.gating_only,
                     gate_pre_existing: a.gate_pre_existing,
+                    metrics_since: metrics_since.as_ref(),
                 },
             )?;
             let current = ctx.out.take_recording();
@@ -2691,6 +2700,28 @@ fn metrics_at_ref(
     let snap = baseline::snapshot(git_ref, root)?;
     let files = parse::parse_dir(&snap.scan_root, scope, cfg, exclude)?;
     Ok(metrics::baseline_of(&files, sort, git_ref))
+}
+
+/// Both of `audit`'s metrics baselines from one snapshot of the ref. Neither
+/// keeps a fn that fell under its threshold as a row: in `audit` a row is a
+/// finding, and a fn the edit brought under the bar is a fix.
+fn audit_metrics_at_ref(
+    git_ref: &str,
+    root: &std::path::Path,
+    scope: Scope,
+    cfg: &[String],
+    exclude: &[String],
+) -> Result<audit::MetricsSince> {
+    let snap = baseline::snapshot(git_ref, root)?;
+    let files = parse::parse_dir(&snap.scan_root, scope, cfg, exclude)?;
+    let at = |sort| metrics::Baseline {
+        keep_fallen: false,
+        ..metrics::baseline_of(&files, sort, git_ref)
+    };
+    Ok(audit::MetricsSince {
+        cyclo: at(metrics::SortKey::Cyclo),
+        params: at(metrics::SortKey::Params),
+    })
 }
 
 /// Run the gating battery over `root` as it existed at `git_ref`, and return

@@ -12527,6 +12527,58 @@ fn metrics_since_carries_the_previous_value_and_keeps_the_fn_that_improved() {
     );
 }
 
+/// `audit --changed-since <ref>` prints each metrics row's value at the ref.
+///
+/// The question a scoped audit is run to answer is "did my edit do that".
+/// Its metrics section said `cyclo:38` and nothing else, and one session built
+/// the comparison by hand: `git show HEAD:<file> > scratch.rs`, then
+/// `metrics -r scratch.rs`, to learn the fn had been 27.
+#[test]
+fn a_scoped_audit_says_what_each_metrics_row_was_at_the_ref() {
+    let branchy = |name: &str, n: usize| {
+        let mut b = format!("pub fn {name}(x: u32) -> u32 {{\n");
+        for i in 0..n {
+            b.push_str(&format!("    if x == {i} {{ return {i}; }}\n"));
+        }
+        b.push_str("    0\n}\n");
+        b
+    };
+    let dir = git_fixture(
+        "audit-metrics-since",
+        &format!("{}{}", branchy("grows", 16), branchy("shrinks", 20)),
+    );
+    // One fn made worse, one cut under the bar, one new.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        format!("{}{}{}", branchy("grows", 22), branchy("shrinks", 5), branchy("fresh", 18)),
+    )
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let out = ur()
+        .args(["--root", root, "audit", "--changed-since", "HEAD", "--only", "metrics"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    let rows = rows_of(&out.stdout);
+    let row = |name: &str| {
+        rows.iter()
+            .find(|l| l.contains(&format!("\t{name}\t")))
+            .cloned()
+            .unwrap_or_else(|| panic!("no `{name}` row:\n{s}"))
+    };
+    assert!(row("grows").ends_with("\twas:17"), "{}", row("grows"));
+    assert!(row("fresh").ends_with("\twas:new"), "{}", row("fresh"));
+    // A fix is not a finding: counted in the summary, never a row.
+    assert!(!rows.iter().any(|l| l.contains("\tshrinks\t")), "{s}");
+    assert!(s.contains("1 worse, 0 better, 0 unchanged, 1 new, 0 gone, 1 now under the threshold"), "{s}");
+    // …and the command that reproduces the section carries the ref.
+    assert!(s.contains("metrics --sort cyclo --threshold 15 --since HEAD"), "{s}");
+
+    // Unscoped, nothing to compare against: the rows keep their old shape.
+    let plain = ur().args(["--root", root, "audit", "--only", "metrics"]).output().unwrap();
+    assert!(rows_of(&plain.stdout).iter().all(|l| !l.contains("was:")));
+}
+
 /// A waiver for a check `--only` did not run has not "suppressed nothing".
 #[test]
 fn audit_only_does_not_accuse_waivers_for_checks_it_did_not_run() {

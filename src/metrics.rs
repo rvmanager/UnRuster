@@ -316,6 +316,12 @@ pub struct Baseline {
     /// every fn in an untouched file counts as `gone`. It read `42 gone` on a
     /// two-file edit.
     pub by_qpath: std::collections::HashMap<String, (usize, String)>,
+    /// Keep a fn that was over `--threshold` at the ref and is under it now as
+    /// a row — see [`apply_threshold`]. On for `metrics --since`, where that
+    /// row is the one the reader ran the command to see. Off for `audit`,
+    /// whose rows are findings: a fn cut from 20 to 10 is a fix, not a finding,
+    /// so there it is counted in the summary instead.
+    pub keep_fallen: bool,
 }
 
 /// Collect the ranked metric for every fn in an already-parsed tree.
@@ -347,6 +353,7 @@ pub fn baseline_of(
             .into_iter()
             .map(|m| (m.qpath.clone(), (m.key(sort), m.file.clone())))
             .collect(),
+        keep_fallen: true,
     }
 }
 
@@ -357,13 +364,29 @@ pub fn baseline_of(
 /// they just cut from 60 to 19 — is the row the threshold hides, and "did it
 /// improve" comes back as an empty table, which is the same output as "it never
 /// tripped the threshold at all".
-fn apply_threshold(fns: &mut Vec<FnMetric>, sort: SortKey, t: usize, base: Option<&Baseline>) {
+///
+/// Unless the baseline says not to ([`Baseline::keep_fallen`]); then those fns
+/// are dropped like any other, and the count of them is returned so the
+/// summary can still say the edit brought them under the bar.
+fn apply_threshold(fns: &mut Vec<FnMetric>, sort: SortKey, t: usize, base: Option<&Baseline>) -> usize {
+    let mut fallen = 0;
     fns.retain(|m| {
-        m.key(sort) >= t
-            || base
-                .and_then(|b| b.by_qpath.get(&m.qpath))
-                .is_some_and(|(was, _)| *was >= t)
+        if m.key(sort) >= t {
+            return true;
+        }
+        let was_over = base
+            .and_then(|b| b.by_qpath.get(&m.qpath))
+            .is_some_and(|(was, _)| *was >= t);
+        if !was_over {
+            return false;
+        }
+        if base.is_some_and(|b| b.keep_fallen) {
+            return true;
+        }
+        fallen += 1;
+        false
     });
+    fallen
 }
 
 /// Sort the fn table by the key, descending, with stable tie-breakers.
@@ -547,9 +570,15 @@ pub fn run(
     ctx.retain_changed(&mut structs, |m| &m.file);
     ctx.retain_changed(&mut enums, |m| &m.file);
 
-    if let Some(t) = threshold {
-        apply_threshold(&mut fns, sort, t, base);
-    }
+    // Every fn in frame, before the threshold and the waivers thin the rows —
+    // what `gone` is measured against. Measured against the rows instead, a fn
+    // still in the tree but under the bar, or waived, read as deleted.
+    let present: std::collections::HashSet<String> =
+        fns.iter().map(|m| m.qpath.clone()).collect();
+    let fallen = match threshold {
+        Some(t) => apply_threshold(&mut fns, sort, t, base),
+        None => 0,
+    };
     // After the threshold, so a waiver over a fn that no longer trips it is
     // not credited with a hit. Keyed by the fn's short name, so
     // `ok(metrics/evaluate)` reads as it is meant and bare `ok(metrics)`
@@ -634,12 +663,10 @@ pub fn run(
         // deletion and a rename both land here, and so does a fn that fell
         // below a threshold it no longer needs to pass — but that last one is
         // kept as a row by `apply_threshold`, so what is left really is gone.
-        let here: std::collections::HashSet<&str> =
-            fns.iter().map(|m| m.qpath.as_str()).collect();
         let gone: Vec<&str> = b
             .by_qpath
             .iter()
-            .filter(|(q, _)| !here.contains(q.as_str()))
+            .filter(|(q, _)| !present.contains(q.as_str()))
             // Same scope as the rows it is compared against: under
             // `--changed-since` the current side sees only the changed files,
             // so a baseline fn in an untouched file is not gone, it is out of
@@ -650,13 +677,18 @@ pub fn run(
             .collect();
         (
             format!(
-                "; vs {}: {} worse, {} better, {} unchanged, {} new, {} gone",
+                "; vs {}: {} worse, {} better, {} unchanged, {} new, {} gone{}",
                 b.git_ref,
                 worse,
                 better,
                 same,
                 fresh,
-                gone.len()
+                gone.len(),
+                if fallen > 0 {
+                    format!(", {} now under the threshold", fallen)
+                } else {
+                    String::new()
+                }
             ),
             gone.len(),
         )
